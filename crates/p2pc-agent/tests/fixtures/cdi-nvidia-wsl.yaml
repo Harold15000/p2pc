@@ -1,0 +1,32 @@
+---
+cdiVersion: 0.3.0
+containerEdits:
+  hooks:
+  - args:
+    - nvidia-cdi-hook
+    - create-symlinks
+    - --link
+    - /usr/lib/wsl/drivers/nv_dispi.inf_amd64_0000000000000000/nvidia-smi::/usr/bin/nvidia-smi
+    hookName: createContainer
+    path: /usr/bin/nvidia-cdi-hook
+  - args:
+    - nvidia-cdi-hook
+    - update-ldcache
+    - --folder
+    - /usr/lib/wsl/lib
+    hookName: createContainer
+    path: /usr/bin/nvidia-cdi-hook
+  mounts:
+  - containerPath: /usr/lib/wsl/lib/libdxcore.so
+    hostPath: /usr/lib/wsl/lib/libdxcore.so
+    options:
+    - ro
+    - nosuid
+    - nodev
+    - bind
+devices:
+- containerEdits:
+    deviceNodes:
+    - path: /dev/dxg
+  name: all
+kind: nvidia.com/gpu

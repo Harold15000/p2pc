@@ -1,0 +1,19 @@
+<svg viewBox="24 20 236 76" width="236" height="76" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="p2pc-logo-title">
+  <title id="p2pc-logo-title">P2PC</title>
+  <!-- Four nodes joined into one pool; the highlighted one runs the job. Mid-tone colours, readable on light and dark
+       backgrounds (GitHub light and dark themes, the GitHub mobile app). docs/assets/logo.png is rendered from this. -->
+  <g stroke="#4A8DB5" stroke-width="3" stroke-linecap="round" fill="none">
+    <line x1="44" y1="40" x2="96" y2="40"/>
+    <line x1="44" y1="40" x2="44" y2="76"/>
+    <line x1="96" y1="40" x2="96" y2="76"/>
+    <line x1="44" y1="76" x2="96" y2="76"/>
+    <line x1="44" y1="40" x2="96" y2="76"/>
+  </g>
+  <g fill="#2F6F8F">
+    <rect x="34" y="30" width="20" height="20" rx="4"/>
+    <rect x="86" y="30" width="20" height="20" rx="4"/>
+    <rect x="34" y="66" width="20" height="20" rx="4"/>
+  </g>
+  <rect x="86" y="66" width="20" height="20" rx="4" fill="#5FA8C9"/>
+  <text x="128" y="74" font-family="Ubuntu, 'DejaVu Sans', Arial, sans-serif" font-size="50" font-weight="700" fill="#3B82A8">p2pc</text>
+</svg>

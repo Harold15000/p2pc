@@ -1,0 +1,25 @@
+[package]
+name = "p2pc-net"
+description = "P2PC iroh endpoint plumbing shared by the server and the agent: address hygiene, bind, network watcher."
+license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# The one implementation of the §10 endpoint plumbing (T05b review, P2-3). The pure rules stay in
+# `p2pc_proto::net` (no iroh there); this crate applies them to iroh and to netwatch.
+[dependencies]
+iroh.workspace = true
+netwatch.workspace = true
+p2pc-proto = { version = "0.1.0", path = "../p2pc-proto" }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+n0-watcher = "1.0.1"
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time", "test-util"] }
+
+[lints]
+workspace = true

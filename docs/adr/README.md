@@ -1,0 +1,21 @@
+# Architecture decision records
+
+Decisions are taken by the project's architect. The full rationale lives in the maintainers' design notes. This
+index is the public summary. Each record has a status: accepted, superseded or proposed.
+
+| ADR | Decision | Status |
+|---|---|---|
+| 001 | **Language:** Rust for the agent, the control plane, the CLI and the protocol. TypeScript only for web UIs. | Accepted |
+| 002 | **Isolation by platform:** <ul><li>**Windows:** a dedicated WSL2 distro.</li><li>**Linux:** a microVM (Firecracker) for untrusted CPU work, and gVisor + nvproxy or a VFIO VM for untrusted GPU work.</li><li>**macOS:** later.</li></ul> Untrusted (third-party) code **only** ever runs in a VM-class sandbox. | Accepted |
+| 003 | **Networking:** <ul><li>Agents only connect outbound, over QUIC/TLS with iroh 1.x (hole punching, relay fallback). We plan to run our own relays.</li><li>Job egress goes only through a proxy with an allowlist.</li><li>The LAN, the host and tailnets are always blocked.</li></ul> | Accepted |
+| 004 | **Licensing:** <ul><li>Agent, CLI, protocol, shim and SDKs: Apache-2.0.</li><li>Control plane (`p2pc-server`): AGPL-3.0-only.</li><li>Contributions under the DCO.</li><li>Dependencies: permissive licenses only (`deny.toml`).</li></ul> | Accepted |
+| 005 | **Control-plane storage:** <ul><li>Postgres for the hosted service.</li><li>SQLite for the self-hosted single binary (v0.1 ships SQLite only, behind a repository layer).</li><li>Artifacts: local disk in v0.1, S3-compatible later.</li></ul> | Accepted |
+| 006 | **Scheduling:** <ul><li>Two-phase reservations with leases and fencing epochs.</li><li>Idempotent retries.</li><li>Only node loss consumes an attempt.</li></ul> | Accepted |
+| 007 | **Payments:** deferred to Milestone 5. No money moves before a legal and tax review. | Proposed |
+| 008 | **Trust levels:** <ul><li>Pools `mine`, then `team`, `verified` and `community`.</li><li>v0.1 executes only the node owner's jobs.</li></ul> | Accepted |
+| 009 | **Personal Cloud first:** <ul><li>The first product is a private cloud of the user's own machines.</li><li>It is closed by default, never touches the LAN, and on Windows never runs at the same time as marketplace work.</li></ul> | Accepted |
+| 010 | **One Jobs API:** <ul><li>Asynchronous jobs.</li><li>`placement.pools`, region, data class and spend cap.</li><li>Falling back to other pools only when the request asks for it.</li></ul> | Accepted |
+| 011 | **Hybrid cloud (later):** <ul><li>A `cloud` pool of ephemeral nodes in the customer's own cloud account (bring your own cloud).</li><li>CPU on Hetzner first, GPUs through SkyPilot later.</li><li>Every cloud node has caps, an expiry and an orphan collector.</li></ul> | Accepted |
+| 012 | **API surfaces:** <ul><li>One OpenAPI document.</li><li>REST, the CLI, the Python SDK and MCP in v0.1.</li><li>The JS SDK and an OpenAI-compatible endpoint (pools `mine`, `verified` and `cloud` only) later.</li></ul> | Accepted |
+| 013 | **v0.1 sandbox:** <ul><li>Rootless Podman (crun, optionally gVisor) with `--network=none`, plus a per-job egress proxy over a unix socket bridged by an in-container shim.</li><li>Only for the owner's own jobs (ADR-008).</li><li>VM-class drivers come before any untrusted work.</li></ul> | Accepted |
+| 014 | **API exposure without open ports:** <ul><li>REST on localhost by default.</li><li>The same REST API tunnelled over iroh with `p2pc proxy`.</li><li>A reverse proxy is optional.</li></ul> | Accepted |

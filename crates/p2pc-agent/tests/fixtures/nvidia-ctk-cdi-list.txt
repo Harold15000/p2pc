@@ -1,0 +1,4 @@
+INFO[0000] Found 3 CDI devices                          
+nvidia.com/gpu=0
+nvidia.com/gpu=GPU-00000000-0000-4000-8000-000000000001
+nvidia.com/gpu=all

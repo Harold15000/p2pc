@@ -1,0 +1,71 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# p2pc-server: the P2PC control plane as a hardened system service (spec §10, §12).
+# Installed to /etc/systemd/system/ by deploy/linux/install-server.sh, which also creates the `p2pc-server` system
+# user and runs `p2pc-server init` once (outside systemd, so the admin key never reaches the journal).
+#
+# Data: /var/lib/p2pc-server (0700, owned by p2pc-server): server.toml, p2pc.db, server.key, logs/, artifacts/.
+# REST: the `bind` in server.toml, 127.0.0.1:7477 by default. iroh: outbound QUIC only, no port mapping.
+
+[Unit]
+Description=P2PC control plane (p2pc-server)
+Wants=network-online.target
+After=network-online.target
+# Give up after 5 failed starts in 5 minutes instead of looping forever (`systemctl reset-failed` to retry).
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=p2pc-server
+Group=p2pc-server
+# Creates /var/lib/p2pc-server owned by p2pc-server with mode 0700 if it is missing, and fixes its owner otherwise.
+StateDirectory=p2pc-server
+StateDirectoryMode=0700
+Environment=P2PC_DATA_DIR=/var/lib/p2pc-server
+ExecStart=/usr/local/bin/p2pc-server serve
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+UMask=0077
+
+# --- Hardening ---------------------------------------------------------------------------------------------------
+NoNewPrivileges=yes
+# The whole file system is read-only except the StateDirectory above.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+# A user namespace of its own: the service sees only its own user, and holds no capability on the host.
+# Some container hosts cannot create one (217/USER): install-server.sh probes for that and, only there, adds the
+# drop-in p2pc-server.service.d/10-container.conf with PrivateUsers=no.
+PrivateUsers=yes
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# No JIT and no runtime code generation in a Rust binary: writable memory is never executable.
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+# It binds an unprivileged port (7477 by default): no capability at all.
+CapabilityBoundingSet=
+AmbientCapabilities=
+# AF_INET/AF_INET6: the REST API and iroh's outbound QUIC.
+# AF_UNIX: local sockets of the C library and the runtime (no listening unix socket is opened).
+# AF_NETLINK: iroh's `netwatch` reads the interfaces and the default route over rtnetlink, and watches them for
+#   changes, to pick the addresses it advertises (spec §10, address hygiene). Without it the endpoint cannot start.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

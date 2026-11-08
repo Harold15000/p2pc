@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# p2pc-agent.service: the P2PC node agent, as a systemd USER unit of the unprivileged user p2pc (spec §9.0, "Linux
+# host": rootless Podman needs a systemd user session with cgroup delegation; setup-host.sh enables linger for p2pc,
+# so this user manager runs from boot, without a login).
+#
+# install-node.sh installs it as /etc/systemd/user/p2pc-agent.service and enables it with
+#   systemctl --user -M p2pc@ enable p2pc-agent
+# Logs: sudo journalctl _UID=$(id -u p2pc) _SYSTEMD_USER_UNIT=p2pc-agent.service   (the agent logs to stderr, which
+# goes to p2pc's user journal; `journalctl --user -M p2pc@` would need systemd-container)
+#
+# Hardening in a USER unit is narrow, because rootless Podman needs two things a sandbox would take away:
+#   - the setuid-root newuidmap/newgidmap helpers (they write the subuid/subgid maps of every container);
+#   - a user namespace whose parent maps the whole subuid range.
+# So, deliberately NOT set (each one would break every job):
+#   NoNewPrivileges=yes   blocks the setuid bit of newuidmap/newgidmap: rootless Podman cannot map the subuid range.
+#   SystemCallFilter=, SystemCallArchitectures=, LockPersonality=, MemoryDenyWriteExecute=, RestrictNamespaces=,
+#   RestrictRealtime=, RestrictAddressFamilies=, RestrictSUIDSGID=
+#                         in a user manager these are seccomp filters, and systemd then IMPLIES NoNewPrivileges=yes
+#                         (see above). RestrictNamespaces would also forbid the namespaces every container needs.
+#   ProtectSystem=, ProtectHome=, PrivateTmp=, PrivateDevices=, ProtectKernel*=, ProtectProc=, ReadOnlyPaths= ...
+#                         in a user manager these need a mount namespace, so systemd IMPLIES PrivateUsers=yes: a user
+#                         namespace that maps only p2pc's own uid, inside which newuidmap cannot map the subuid range.
+#   PrivateUsers=yes      the same.
+#   CapabilityBoundingSet=  the bounding set also caps file capabilities: newuidmap/newgidmap installed with
+#                         cap_setuid/cap_setgid (instead of setuid root) would stop working.
+# The jobs' own sandbox is not this unit: it is the fixed `podman run` argv of spec §9 (--cap-drop=all,
+# no-new-privileges, seccomp, --network=none, limits), which the agent always builds.
+
+[Unit]
+Description=P2PC node agent
+Documentation=https://example.invalid/p2pc/docs/deploy
+# Global user units (/etc/systemd/user) are visible to the user manager of every user: this one only ever runs for p2pc.
+ConditionUser=p2pc
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/p2pc-agent run
+# The agent reconnects by itself (with a backoff) while the server is unreachable; it exits only when it cannot go on.
+Restart=on-failure
+RestartSec=10s
+# The agent's terminal exit codes (crates/p2pc-agent/src/connection/exit.rs): restarting cannot help, a person must
+# act. 6 AGENT_TOO_OLD (upgrade the agent), 7 NOT_ENROLLED (the node was removed: join again), 8 NOT_JOINED (never
+# joined: run install-node.sh or `p2pc-agent join`).
+RestartPreventExitStatus=6 7 8
+# The agent stops its running jobs on SIGTERM (spec §9, SI-13): give it the time to do so.
+TimeoutStopSec=60s
+# Hardening that a user unit CAN take without a namespace or seccomp (see the header for what it cannot):
+# Files the agent creates (config, identity key, job scratch dirs) are private to p2pc.
+UMask=0077
+# No core dumps: the agent's memory holds its identity key.
+LimitCORE=0
+# Its own session keyring, so it never shares keys with anything else p2pc runs. (A keyring needs no namespace.)
+KeyringMode=private
+SyslogIdentifier=p2pc-agent
+# Belt and braces for the cgroup check (T10j). systemd turns a controller on in a cgroup only when some unit there
+# asks for it, and nothing in app.slice asks for `cpu`: `podman info` (which reports the agent's own cgroup) would then
+# list only `memory pids`. A cpu weight at the default value changes no scheduling, but makes systemd turn `cpu` on
+# along this unit's own path, so `podman info` agrees with the delegation the agent reads from user@<uid>.service.
+CPUWeight=100
+
+[Install]
+WantedBy=default.target

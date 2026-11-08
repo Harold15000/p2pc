@@ -1,0 +1,61 @@
+[package]
+name = "p2pc-client"
+description = "Typed async client for the P2PC REST API (spec section 7). Reused by the p2pc CLI and the MCP server."
+license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# The `p2pc/http/1` tunnel (spec §10, option B): reach a server by its address `p2pc_srv_…` over iroh, and
+# `p2pc_client::tunnel::relay_tcp` for `p2pc proxy`. The CLI enables it.
+tunnel = [
+  "dep:iroh",
+  "dep:p2pc-net",
+  "dep:hyper",
+  "dep:hyper-util",
+  "dep:http-body-util",
+  "tokio/net",
+  "tokio/sync",
+  "tokio/macros",
+]
+# An in-process mock HTTP server for tests (`p2pc_client::testing`), and with `tunnel` a mock tunnel server. Never
+# enabled in a release build.
+test-util = ["hyper?/server"]
+
+[dependencies]
+bytes.workspace = true
+http-body-util = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true, features = ["client", "http1"] }
+hyper-util = { workspace = true, optional = true, features = ["tokio"] }
+iroh = { workspace = true, optional = true }
+# The §10 endpoint plumbing (bind, interfaces, network watcher), shared with the server and the agent. Apache-2.0.
+p2pc-net = { version = "0.1.0", path = "../p2pc-net", optional = true }
+p2pc-proto = { version = "0.1.0", path = "../p2pc-proto" }
+rand.workspace = true
+reqwest = { workspace = true }
+rustls = { workspace = true }
+rustls-platform-verifier = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["time", "rt", "fs", "io-util"] }
+tracing.workspace = true
+ulid.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+# The mock server and fixtures of `testing`, for the integration tests of this very crate.
+p2pc-client = { version = "0.1.0", path = ".", features = ["test-util", "tunnel"] }
+tempfile.workspace = true
+# `test-util` for the paused clock of the `failing_since` test.
+tokio = { workspace = true, features = ["macros", "rt", "net", "test-util"] }
+# SI-6: captures every log line (all crates, TRACE) to check that the key never appears in one.
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

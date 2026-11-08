@@ -1,0 +1,230 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The machines file of the P2PC acceptance harness (spec §14).
+#
+# Copy this file to `machines.toml` (git-ignored), fill in your own machines and run:
+#
+#     ./run.py --machines machines.toml                 # every criterion
+#     ./run.py --machines machines.toml --only AC-2,AC-5
+#
+# Everything below is a PLACEHOLDER: names end in `.invalid` and every role has `enabled = false`, so this example is
+# valid and `./run.py --only AC-12 --machines machines.example.toml` runs (AC-12 is local), while every criterion that
+# needs a machine is reported as `skip`. Set `enabled = true` on the roles you really have.
+#
+# Unknown keys are errors (a typo is reported, not ignored). All problems are listed at once.
+#
+# --------------------------------------------------------------------------------------------------------------
+# The lab this example describes (three machines and the one that runs the harness):
+#
+#   server          A Linux host reached over `ssh`. It runs p2pc-server, and the harness also runs the `p2pc` CLI there,
+#                   against the server's loopback address.
+#   node_wsl2_gpu   A Windows machine with an NVIDIA GPU, reached over `ssh`. Its WSL2 distro `p2pc-node` is the node:
+#                   the harness runs `ssh <host>` -> `wsl.exe -d p2pc-node -u root --exec sh -c ...`.
+#   node_linux      A Linux node reached over `ssh`, WITHOUT a GPU.
+#
+# Not in this lab (leave them out, or `enabled = false`: the criteria that need them are reported as `skip`):
+#
+#   node_linux_gpu  A Linux node WITH an NVIDIA GPU. AC-3 needs one besides the WSL2 node, so without it AC-3 is `skip`
+#                   for Linux and cannot be `pass`.
+#   client_remote   A machine on ANOTHER network (4G, say) that uses `p2pc proxy` (AC-8).
+#
+# Every host below is a placeholder alias of YOUR `~/.ssh/config`; no real name, address or key belongs in this file.
+#
+# Keys every role accepts:
+#
+#   executor     (required) How the harness runs commands on the machine:
+#                  "local"         on the machine that runs the harness. No host.
+#                  "ssh"           through `ssh <host> <command>`. `host` is an alias of your ssh config.
+#                  "wsl_over_ssh"  `host` is an ssh alias of a WINDOWS machine, and `distro` is the WSL distro. The
+#                                  harness runs `wsl.exe -d <distro> -u root --exec sh -c ...` through PowerShell. The
+#                                  command travels base64-encoded, so quotes, spaces and `$` survive every layer
+#                                  (see executors.py). Windows needs OpenSSH Server, with PowerShell 5.1 or later.
+#   enabled      true (default) or false. A disabled role counts as "not configured": its criteria are skipped. The
+#                roles below are `false` so that this example is valid as it is (`./run.py --only AC-12 --machines
+#                machines.example.toml` runs: AC-12 is local); set `true` on the ones you really have.
+#   host         The ssh host alias (ssh, wsl_over_ssh). Letters, digits, . _ @ - ; never starting with "-".
+#   distro       The WSL distro name (wsl_over_ssh only). The dedicated distro is `p2pc-node` (spec §9.0).
+#   workdir      An absolute POSIX path where the harness puts its files on that machine, INSIDE the distro for
+#                wsl_over_ssh; never a Windows path. The three binaries are copied to `<workdir>/bin` (sha256 checked).
+#                Default (recommended for a throwaway run): leave it out, and the harness makes a private directory with
+#                `mktemp -d` (random name, mode 0700) and removes it at the end. A directory you name is made with mode
+#                0700 too, but is never removed.
+#   ssh_options  Extra arguments for ssh, for example ["-J", "jump-host"]. Optional.
+# --------------------------------------------------------------------------------------------------------------
+
+[server]
+executor = "ssh"
+host = "lab-server"
+enabled = false
+# The directory you name for the binaries on the server: the harness copies p2pc, p2pc-server and p2pc-agent to
+# /home/acceptance/p2pc-acceptance/bin and checks their sha256.
+workdir = "/home/acceptance/p2pc-acceptance"
+
+# The URL the CLI uses when it runs ON the server (default: the server's default loopback bind, spec §10).
+url = "http://127.0.0.1:7477"
+
+# AC-1 runs this one command on the machine and times it (budget: 10 minutes). The installer is install-server.sh
+# (deploy/linux/, also shipped in each release's dist/<version>/ that scripts/release.sh writes). Copy that directory to
+# the server first; the harness does not. The output must contain the admin key, which the harness captures and uses for
+# the other criteria. Without install_command AC-1's server step is `skip` (the installer exists, it just is not run).
+# install_command = "sudo sh /home/acceptance/dist/install-server.sh --from /home/acceptance/dist"
+#
+# To run the criteria against a server that is ALREADY installed, put its admin key in an environment variable of the
+# harness's own shell (never in this file, never on a command line) and name the variable here:
+admin_key_env = "P2PC_ACC_ADMIN_KEY"
+
+# AC-8: the address a remote client could dial, for the "no open ports" probe from `client_remote`.
+# public_host = "198.51.100.10"
+
+# AC-8: TCP ports allowed to listen on a non-loopback address, besides the ssh port. Default: [22].
+# allowed_listen_ports = [22]
+
+[node_wsl2_gpu]
+# The Windows machine's ssh alias; the node is the WSL2 distro `p2pc-node` (what deploy/wsl/install.ps1 creates).
+executor = "wsl_over_ssh"
+host = "lab-windows"
+distro = "p2pc-node"
+enabled = false
+# A directory INSIDE the distro (the distro has no Windows drive, spec §9.0).
+workdir = "/root/p2pc-acceptance"
+# The node's name as `p2pc machines` shows it. Default: the harness finds the node by platform and GPU.
+# node_name = "lab-windows"
+# AC-1 on Windows (deploy/wsl/install.ps1 runs on the WINDOWS HOST, not inside the distro): these two are PowerShell, sent
+# over ssh to the host. Copy install.ps1 and the image (p2pc-node-<version>.tar.gz and its .sha256) there first; the
+# harness does not.
+#   image_install_command  installs the distro (run once; optional: without it that step is `skip`, and the distro is
+#                          assumed to be installed already). Not timed against a budget.
+#   install_command        joins the node: the harness pipes the join token into it (`$input | <command>`), which is how
+#                          install.ps1 -Join takes it; never an argument. `-Join` ends with `Joined: <node> on <server>`,
+#                          registers the "P2PC node" task and waits for the agent; the harness then reads
+#                          /var/lib/p2pc/node-run.status in the distro and wants state=running. Budget: 2 minutes.
+#                          Add -Force to enroll an already enrolled node again (the same node, spec 5). Exit codes:
+#                          the header of install.ps1 (the harness explains 31 to 35).
+# The harness runs these with `powershell.exe -ExecutionPolicy Bypass` (this process only), because the default policy of a
+# Windows client, Restricted, refuses any .ps1. A script copied from the internet may also need `Unblock-File` on the host:
+#   Unblock-File C:\p2pc-dist\install.ps1
+# Without install_command the step is `skip`, and the node joins with the p2pc-agent the harness copied (not what a user gets).
+# Run ONCE, on a Windows machine without the distro: leave it commented afterwards. On a second run install.ps1 -Tar exits 16
+# ("the p2pc-node distro already exists"); the harness reports that as a `skip` ("distro already installed"), never a failure.
+# image_install_command = "& 'C:\\p2pc-dist\\install.ps1' -Tar 'C:\\p2pc-dist\\p2pc-node-0.2.2.tar.gz'"
+# install_command MUST be a single command, with no `;`, `&&`, `||` or newline (the file is refused otherwise): the token is
+# the stdin of the ssh call and PowerShell gives it to the first statement only, so `Unblock-File x; & x -Join` would hand
+# it to Unblock-File. Run `Unblock-File` on the host yourself, once, if the script came from the internet.
+install_command = "& 'C:\\p2pc-dist\\install.ps1' -Join"
+# agent_start_command: only for a node WITHOUT install_command (the installer starts the agent through the task). The
+# harness's own start is `nohup p2pc-agent run` as the user of the executor (root in the distro). It receives the agent
+# binary as $0 and the log path as $1.
+# agent_start_command = "nohup \"$0\" run > \"$1\" 2>&1 < /dev/null &"
+# The command that runs Podman as the user that runs the agent (AC-6 and AC-7 look for leftover containers).
+podman = ["podman"]
+# AC-6 "kill the node's network mid-job": a command that cuts the agent's traffic WITHOUT cutting the harness's own
+# ssh connection, and the one that restores it. The harness always runs `heal_command` at the end, pass or fail.
+# WSL2 distros share one network namespace (spec §9.0): this cuts the network of every distro of that Windows user.
+# Never use iptables for it. AC-6 needs one node with both commands (the Linux one below is enough). Example:
+# partition_command = "ip link set eth0 down"
+# heal_command = "ip link set eth0 up"
+# AC-4: addresses the job must NOT be able to reach: the LAN gateway and the node's own LAN address. Real ones go in
+# your private machines.toml, never in the repo.
+lan_gateway = "192.0.2.1"
+lan_host = "192.0.2.51"
+# AC-11 (SI-3) and every other `#[ignore]`d test that needs real Podman run ON the node: an absolute path of a p2pc
+# checkout there, with the Rust toolchain and the musl shim built as crates/p2pc-agent/tests/podman_real.rs says. The
+# harness runs `cargo test --manifest-path <repo_dir>/Cargo.toml ... -- --include-ignored` through the node's executor.
+# Without it on any node, that test is reported as `skip` ("exists, needs real Podman"), never as missing.
+# repo_dir = "/root/p2pc"
+
+[node_linux]
+# A Linux node WITHOUT a GPU, over ssh. (A Linux node WITH a GPU is the role `node_linux_gpu`, which takes the same keys.)
+executor = "ssh"
+host = "lab-linux"
+enabled = false
+workdir = "/home/acceptance/p2pc-acceptance"
+# node_name = "lab-linux"
+# AC-1: deploy/linux/install-node.sh, from the release directory (dist/<version>/ of scripts/release.sh) that you copied to
+# the node first. The harness runs this command and writes the join token to its STDIN (the installer hands it to
+# `p2pc-agent join -`; it is never an argument). The ssh user needs passwordless sudo. The installer enrolls the node and
+# starts its agent as the systemd user unit of `p2pc`; it ends with `Joined: <node> on <server>`. Budget: 2 minutes. Add
+# --force to enroll an already enrolled node again (the same node, spec 5). Exit codes: 0 done, 1 failed or refused (its
+# log: /var/log/p2pc-node-install.log), 2 usage. The agent's log: sudo journalctl _UID=$(id -u p2pc)
+# _SYSTEMD_USER_UNIT=p2pc-agent.service. Without install_command the step is `skip`, and the node joins with the
+# p2pc-agent the harness copied (not what a user gets).
+install_command = "sudo sh /home/acceptance/dist/install-node.sh --from /home/acceptance/dist"
+# agent_start_command: only for a node WITHOUT install_command (the installer starts the agent).
+# agent_start_command = "sudo -u p2pc nohup \"$0\" run > \"$1\" 2>&1 < /dev/null &"
+# The command that runs Podman as the user that runs the agent (`p2pc`, whose home is /var/lib/p2pc, with its runtime
+# directory). AC-6 and AC-7 look for leftover containers with it. `cd /` first: `sudo -u p2pc` keeps the current directory, the ssh
+# user's home, which `p2pc` cannot read (0700 on Arch, 0750 on Ubuntu since 21.04), and podman ends with "cannot chdir".
+podman = ["sudo", "-u", "p2pc", "-H", "sh", "-c", "cd / && XDG_RUNTIME_DIR=/run/user/$(id -u) exec podman \"$@\"", "podman"]
+# AC-6: cut the agent user's outbound packets (the harness's own ssh is another user's) and restore them.
+partition_command = "sudo nft add table inet p2pc_acc && sudo nft 'add chain inet p2pc_acc out { type filter hook output priority 0 ; }' && sudo nft 'add rule inet p2pc_acc out meta skuid p2pc drop'"
+heal_command = "sudo nft delete table inet p2pc_acc"
+lan_gateway = "192.0.2.1"
+lan_host = "192.0.2.50"
+# repo_dir = "/home/p2pc/p2pc"
+# test_prefix: optional, a command prefix like `podman`. The harness prepends it to the `cargo test --manifest-path
+# <repo_dir>/Cargo.toml ...` command it runs on this node for the ignored tests (AC-11 SI-3). On a NATIVE Linux node it is
+# needed: crates/p2pc-agent/tests/podman_real.rs must run as the node user (`p2pc`) inside a systemd USER SERVICE, and an ssh
+# login is a session scope (the test panics "run as a user with a systemd user session (p2pc)"). This runs it as `p2pc` in a
+# transient user service with delegation, from `/`, with XDG_RUNTIME_DIR and the Rust toolchain on PATH. Then `repo_dir` must
+# be readable AND writable by `p2pc` (cargo builds into its target/ directory there), for example /home/p2pc/p2pc, and the
+# toolchain must be installed for that user (the PATH below holds ~/.cargo/bin of `p2pc`).
+# test_prefix = ["sudo", "-u", "p2pc", "-H", "sh", "-c", "cd / && XDG_RUNTIME_DIR=/run/user/$(id -u) exec systemd-run --user --wait --pipe --quiet --collect -p Delegate=yes --setenv=PATH=$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin \"$@\"", "p2pc-test"]
+# test_env: optional, a table of strings passed to the tests as `env VAR=value ...` after the prefix (inside it, so they
+# survive sudo and the user service). They are on a command line: NEVER a secret. podman_real.rs reads P2PC_SHIM (the
+# musl shim, `cargo build -p p2pc-shim --release --target x86_64-unknown-linux-musl`; set it only when the shim is NOT at
+# its default path under target/ of `repo_dir`, as here) among others. Leave P2PC_TEST_IMAGE out unless you need another
+# smoke image than the test's own default (busybox, pinned).
+# test_env = { P2PC_SHIM = "/opt/p2pc/p2pc-shim" }
+# allowed_listen_ports = [22]
+
+[node_linux_gpu]
+# Not in the lab above. A Linux node with an NVIDIA GPU: the same keys as node_linux.
+executor = "ssh"
+host = "lab-linux-gpu"
+enabled = false
+
+[client_remote]
+# AC-8. Not in the lab above: a machine on another network.
+executor = "ssh"
+host = "lab-client-4g"
+enabled = false
+# AC-8: the server's public address, which must refuse connections (no open ports).
+# public_host = "198.51.100.10"
+
+# --------------------------------------------------------------------------------------------------------------
+# Binaries, built locally (`cargo build --release`) and copied by the harness into each machine's `workdir`/bin. After
+# the copy the harness runs `sha256sum` on the remote and compares it with the local file's hash. A mismatch fails the
+# run. Paths are relative to this file. Add `<name>_sha256` to pin the exact build you mean to test.
+# --------------------------------------------------------------------------------------------------------------
+[binaries]
+p2pc = "../../target/release/p2pc"
+p2pc_server = "../../target/release/p2pc-server"
+p2pc_agent = "../../target/release/p2pc-agent"
+# p2pc_sha256 = "<64 hex characters>"
+
+# --------------------------------------------------------------------------------------------------------------
+# Optional knobs. All of these have the default shown.
+# --------------------------------------------------------------------------------------------------------------
+[params]
+# job_count = 100          # AC-10: how many jobs (1-1000)
+# jobs_per_node = 4        # AC-10: concurrency per node (1-64)
+# big_output_mb = 1000     # AC-5: size of the big output file (1-1024)
+# input_kib = 512          # AC-5: size of the inline input (1-512)
+# lease_ttl_s = 60         # AC-6: the server's lease_ttl_s (spec §6)
+# overhead_budget_s = 5    # AC-2: submit to start, with the image cached
+
+# The images the criteria use. Pin by digest (`@sha256:...`) for evidence you want to repeat.
+[images]
+# cpu = "docker.io/library/python:3.12-slim"
+# gpu_smi = "nvcr.io/nvidia/cuda:12.4.1-base-ubuntu22.04"
+# gpu_torch = "docker.io/pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime"
+# denied_image = "docker.io/library/alpine:3.20"   # AC-9: an image the capped key must NOT be allowed to run
+
+# --------------------------------------------------------------------------------------------------------------
+# Manual evidence. Some parts of the criteria need a human. Point to the report and the harness records its
+# sha256; without it, that check is `skip` (never `pass`). Paths are relative to this file.
+# --------------------------------------------------------------------------------------------------------------
+[manual]
+# pentest_report = "evidence/pentest.md"               # AC-11: the internal pentest from a separate machine
+# claude_code_session = "evidence/claude-code-mcp.md"  # AC-9: the MCP server used from Claude Code
+# stranger_walkthrough = "evidence/stranger.md"        # AC-12: a stranger did AC-1 to AC-3 from the docs alone

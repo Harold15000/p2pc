@@ -1,0 +1,242 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+#
+# p2pc-boot: installed as /usr/local/sbin/p2pc-boot and run by `[boot] command=` in /etc/wsl.conf every time the
+# p2pc-node distro starts (spec 9.0, "CDI at boot").
+#
+# It regenerates the NVIDIA CDI spec (/etc/cdi/nvidia.yaml) when the spec is missing or older than the newest file
+# in /usr/lib/wsl/lib (the Windows driver's libraries, which a driver update replaces). It does nothing, quietly,
+# when there is no /dev/dxg (no GPU passthrough), and when there is one but no NVIDIA GPU behind it: WSL exposes
+# /dev/dxg for every GPU-PV driver, Intel and AMD integrated GPUs included, so the device alone proves nothing (no
+# libcuda: the status says "no_nvidia_gpu"; that is not an error, and a CDI spec left over from when there was an NVIDIA
+# GPU is renamed to nvidia.yaml.stale-<time> so that podman stops loading devices that no longer exist, with a note). If libcuda IS there but `nvidia-smi -L` fails or
+# hangs, a GPU is expected and it does not work: the status says "nvidia_smi_failed", with the reason in "errors", and
+# the existing CDI spec is left untouched. See nvidia.sh. It then writes a one-line status to
+# /var/lib/p2pc/boot-status.json for the agent to read. The status records "init_starttime", the raw start ticks of this
+# distro's init (field 22 of /proc/1/stat): readers decide that the status is from THIS start of the distro by comparing
+# it with their own /proc/1/stat for equality (see boot-status.sh), never by its time.
+#
+# Contract: fast, and it NEVER blocks or fails the distro boot. nvidia-ctk runs under a timeout, the spec is written
+# to a temporary file and renamed into place only on success (so a killed run cannot leave a half-written spec),
+# and the script always exits 0.
+#
+# The P2PC_BOOT_* variables exist so the tests can point it at a scratch directory; leave them unset in production.
+
+DXG="${P2PC_BOOT_DXG:-/dev/dxg}"
+WSL_LIB="${P2PC_BOOT_WSL_LIB:-/usr/lib/wsl/lib}"
+CDI_SPEC="${P2PC_BOOT_CDI_SPEC:-/etc/cdi/nvidia.yaml}"
+STATE_DIR="${P2PC_BOOT_STATE_DIR:-/var/lib/p2pc}"
+CTK="${P2PC_BOOT_CTK:-nvidia-ctk}"
+CTK_TIMEOUT="${P2PC_BOOT_CTK_TIMEOUT:-20}"
+SMI="${P2PC_BOOT_SMI:-}" # default: nvidia-smi on PATH first (like the agent), else the one in the driver directory
+
+# The shared "is there an NVIDIA GPU?" check (nvidia_gpu_check): $P2PC_NVIDIA_LIB, else next to this script (a
+# checkout), else where the image installs it. If it cannot be found the boot still goes on (see main).
+for _nv in "${P2PC_NVIDIA_LIB:-}" "$(dirname "${BASH_SOURCE[0]}")/nvidia.sh" /usr/local/lib/p2pc/nvidia.sh; do
+  if [[ -n "$_nv" && -r "$_nv" ]]; then
+    # shellcheck source=deploy/wsl/nvidia.sh
+    source "$_nv"
+    break
+  fi
+done
+unset _nv
+# The boot-status identity (proc_starttime, current_init_starttime): the same search. Without it the status says
+# "init_starttime":null, which no reader takes as fresh.
+for _bs in "${P2PC_BOOT_STATUS_LIB:-}" "$(dirname "${BASH_SOURCE[0]}")/boot-status.sh" /usr/local/lib/p2pc/boot-status.sh; do
+  if [[ -n "$_bs" && -r "$_bs" ]]; then
+    # shellcheck source=deploy/wsl/boot-status.sh
+    source "$_bs"
+    break
+  fi
+done
+unset _bs
+
+# cdi_missing_paths <spec>: the absolute host paths a CDI spec refers to (`hostPath:` of mounts, `path:` of hooks and
+# device nodes) that no longer exist, one per line. A driver update that renames or removes a library leaves the spec
+# pointing at nothing, and then a container that asks for the GPU fails to start. This is a line-based read, not a
+# YAML parser: nvidia-ctk writes one `key: value` per line, and an unreadable value is simply not checked.
+cdi_missing_paths() {
+  local line value
+  [[ -r "$1" ]] || return 0
+  while IFS= read -r line; do
+    value="${line#*:}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    value="${value#[\"\']}"
+    value="${value%[\"\']}"
+    [[ "$value" == /* ]] || continue
+    [[ -e "$value" ]] || printf '%s\n' "$value"
+  done < <(grep -E '^[[:space:]]*(-[[:space:]]+)?(hostPath|path):[[:space:]]' "$1" 2>/dev/null)
+  return 0
+}
+
+# cdi_needs_regen <spec> <libdir>: true if the spec is missing or empty, if any file in <libdir> is newer than it, or if
+# a path the spec refers to no longer exists. `find -L` compares what the driver symlinks point to, not the links.
+cdi_needs_regen() {
+  local spec="$1" libdir="$2" newer
+  [[ -s "$spec" ]] || return 0
+  if [[ -d "$libdir" ]]; then
+    newer="$(find -L "$libdir" -type f -newer "$spec" -print -quit 2>/dev/null)"
+    [[ -z "$newer" ]] || return 0
+  fi
+  [[ -n "$(cdi_missing_paths "$spec")" ]]
+}
+
+# json_escape <string>: the contents of a JSON string literal (no surrounding quotes).
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\t'/\\t}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  printf '%s' "$s"
+}
+
+# status_json <time> <cdi-state> <regenerated: true|false> [error...]: one JSON line. The global NOTES array, if any, is
+# written as "notes": facts that are not errors (for example a stale CDI spec that was moved aside). The global
+# INIT_STARTTIME is written as "init_starttime" when it is a number, and as null otherwise.
+status_json() {
+  local time="$1" cdi="$2" regen="$3" errors="" notes="" e init=null
+  [[ "${INIT_STARTTIME:-}" =~ ^[0-9]+$ ]] && init="$INIT_STARTTIME"
+  shift 3
+  for e in "$@"; do
+    errors+="${errors:+,}\"$(json_escape "$e")\""
+  done
+  for e in "${NOTES[@]}"; do
+    notes+="${notes:+,}\"$(json_escape "$e")\""
+  done
+  printf '{"time":"%s","init_starttime":%s,"cdi":"%s","cdi_regenerated":%s,"errors":[%s],"notes":[%s]}\n' \
+    "$(json_escape "$time")" "$init" "$(json_escape "$cdi")" "$regen" "$errors" "$notes"
+}
+
+# write_status <json-line>: atomic, mode 0600, best effort.
+write_status() {
+  local tmp
+  (
+    umask 077
+    install -d -m 0700 "$STATE_DIR" 2>/dev/null || exit 0
+    tmp="$(mktemp "$STATE_DIR/.boot-status.XXXXXX" 2>/dev/null)" || exit 0
+    if printf '%s\n' "$1" >"$tmp" 2>/dev/null; then
+      mv -f "$tmp" "$STATE_DIR/boot-status.json" 2>/dev/null || rm -f "$tmp"
+    else
+      rm -f "$tmp"
+    fi
+  )
+}
+
+# remove_stale_tmp: temporary specs left in the CDI directory by older versions of this script (they were named
+# .nvidia-cdi.*, and nvidia-ctk appended ".yaml", so podman loaded them as real specs).
+remove_stale_tmp() {
+  rm -f -- "$(dirname "$CDI_SPEC")"/.nvidia-cdi.* 2>/dev/null
+  return 0
+}
+
+# regenerate_cdi: nvidia-ctk writes to a temporary file OUTSIDE the CDI directory (podman loads every *.yaml in
+# /etc/cdi, so a half-written or stray file there would be picked up), then the result is moved into place.
+# The temporary name ends in ".yaml" on purpose: when --output has no known extension nvidia-ctk APPENDS ".yaml"
+# (measured on the real thing), which would leave the file we created empty and write the spec elsewhere.
+# The temporary directory is under STATE_DIR, on the same filesystem as /etc/cdi, so the final mv is an atomic rename.
+regenerate_cdi() {
+  local tmpdir="$STATE_DIR/tmp" tmp="" rc
+  if [[ "$CTK" == */* ]]; then
+    [[ -x "$CTK" ]] || {
+      ERRORS+=("nvidia-ctk not found at $CTK")
+      return 1
+    }
+  else
+    command -v "$CTK" >/dev/null 2>&1 || {
+      ERRORS+=("nvidia-ctk not found in PATH")
+      return 1
+    }
+  fi
+  install -d -m 0755 "$(dirname "$CDI_SPEC")" 2>/dev/null || {
+    ERRORS+=("cannot create $(dirname "$CDI_SPEC")")
+    return 1
+  }
+  install -d -m 0700 "$STATE_DIR" "$tmpdir" 2>/dev/null || {
+    ERRORS+=("cannot create $tmpdir")
+    return 1
+  }
+  tmp="$(mktemp --suffix=.yaml "$tmpdir/nvidia-cdi.XXXXXX" 2>/dev/null)" || {
+    ERRORS+=("cannot create a temporary file in $tmpdir")
+    return 1
+  }
+  timeout --kill-after=2 "$CTK_TIMEOUT" "$CTK" cdi generate --mode=wsl --output="$tmp" >/dev/null 2>&1
+  rc=$?
+  if ((rc == 124 || rc == 137)); then
+    ERRORS+=("nvidia-ctk timed out after ${CTK_TIMEOUT}s")
+  elif ((rc != 0)); then
+    ERRORS+=("nvidia-ctk cdi generate failed (exit $rc)")
+  elif [[ ! -s "$tmp" ]]; then
+    ERRORS+=("nvidia-ctk produced an empty CDI spec")
+  elif chmod 0644 "$tmp" 2>/dev/null && mv -f "$tmp" "$CDI_SPEC" 2>/dev/null; then
+    return 0
+  else
+    ERRORS+=("cannot move the new CDI spec into place")
+  fi
+  rm -f -- "$tmp" "$tmp.yaml"
+  return 1
+}
+
+# retire_stale_cdi: there is no NVIDIA GPU any more (the GPU was removed or the driver changed), but a CDI spec from the
+# time there was one is still in /etc/cdi, and podman would keep loading devices that no longer exist. Move it aside
+# under a name podman does not load (it reads only *.yaml and *.json) and say so in the status.
+retire_stale_cdi() {
+  local stale
+  [[ -e "$CDI_SPEC" ]] || return 0
+  stale="$CDI_SPEC.stale-$(date -u +%Y%m%dT%H%M%SZ)"
+  if mv -f -- "$CDI_SPEC" "$stale" 2>/dev/null; then
+    NOTES+=("no NVIDIA GPU: the old CDI spec $CDI_SPEC was renamed to $stale so that podman stops loading devices that no longer exist")
+  else
+    ERRORS+=("no NVIDIA GPU, but the old CDI spec $CDI_SPEC could not be renamed out of the way")
+  fi
+  return 0
+}
+
+main() {
+  local cdi=skipped regen=false
+  ERRORS=()
+  NOTES=()
+  INIT_STARTTIME=""
+  if declare -F current_init_starttime >/dev/null; then
+    INIT_STARTTIME="$(current_init_starttime)" || INIT_STARTTIME=""
+  fi
+  remove_stale_tmp
+  if [[ -e "$DXG" ]]; then
+    local reason rc
+    if declare -F nvidia_gpu_check >/dev/null; then
+      reason="$(nvidia_gpu_check "$WSL_LIB" "$SMI")"
+      rc=$?
+    else
+      reason="the shared GPU check (nvidia.sh) was not found"
+      rc=2
+    fi
+    if ((rc == 1)); then
+      cdi=no_nvidia_gpu # /dev/dxg of an Intel or AMD GPU-PV driver: nothing for nvidia-ctk to describe
+      retire_stale_cdi
+    elif ((rc != 0)); then
+      cdi=nvidia_smi_failed
+      if [[ -s "$CDI_SPEC" ]]; then
+        ERRORS+=("$reason; the existing CDI spec $CDI_SPEC was kept as it is")
+      else
+        ERRORS+=("$reason; there is no CDI spec yet and none was generated")
+      fi
+    elif cdi_needs_regen "$CDI_SPEC" "$WSL_LIB"; then
+      if regenerate_cdi; then
+        cdi=regenerated
+        regen=true
+      else
+        cdi=failed
+      fi
+    else
+      cdi=fresh
+    fi
+  fi
+  write_status "$(status_json "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$cdi" "$regen" "${ERRORS[@]}")"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@" || true
+  exit 0
+fi

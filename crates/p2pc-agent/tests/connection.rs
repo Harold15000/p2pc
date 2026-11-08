@@ -1,0 +1,1212 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! `p2pc-agent run`'s connection logic against a fake server over in-memory pipes, on tokio's paused clock: the
+//! timing of heartbeats, the agent-side lease timer (SI-13), the backoff and the inventory updates is checked
+//! without a single real sleep. The same logic over real iroh (QUIC on loopback) is in `iroh_fake_server.rs`.
+//!
+//! The fake server speaks the `p2pc-proto` codec but writes and reads plain JSON values, so these tests never build
+//! protocol structs by hand (they grow).
+
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use p2pc_agent::connection::daemon::{Daemon, DaemonExit};
+use p2pc_agent::connection::lease::{LeaseDecision, LeaseHandler, LeaseOffer, LeaseSupervisor, NotReady};
+use p2pc_agent::connection::load::LoadSource;
+use p2pc_agent::connection::session::{INVENTORY_INTERVAL, InventorySource, MAX_PENDING_DECISIONS, Shared};
+use p2pc_agent::connection::state::{AgentState, ConnectionState, StateFile};
+use p2pc_agent::connection::transport::{ConnectError, Connector, Link};
+use p2pc_agent::connection::watchdog::Watchdog;
+use p2pc_agent::connection::{BoxFuture, Uplink, exit};
+use p2pc_proto::api::Inventory;
+use p2pc_proto::ids::{AccountId, LeaseId, NodeId};
+use p2pc_proto::net::{AddressChange, SelectedAddr};
+use p2pc_proto::protocol::{Load, MAX_FRAME_LEN, RunningLease, read_frame, write_frame};
+use serde_json::{Value, json};
+use tokio::io::{DuplexStream, ReadHalf, WriteHalf};
+use tokio::sync::{Notify, Semaphore, mpsc, watch};
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
+
+const SERVER_ID: &str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+/// This node's ID on the server, from the `Welcome` of its `join`.
+const AGENT_NODE_ID: &str = "node_01JBQ6Z5E8Y1V8Y6Y3C8V9N2W4";
+
+// ---------------------------------------------------------------------------------------------------------------
+// The fake world: a connector over pipes, a fake server end, recording traits.
+
+/// Hands the server end of every connection to the test.
+#[derive(Debug)]
+struct PipeConnector {
+    accepted: mpsc::UnboundedSender<ServerEnd>,
+    refuse: AtomicBool,
+    attempts: Mutex<Vec<Instant>>,
+    rebinds: Mutex<Vec<Vec<SelectedAddr>>>,
+}
+
+impl Connector for PipeConnector {
+    fn connect(&self) -> BoxFuture<'_, Result<Link, ConnectError>> {
+        Box::pin(async move {
+            self.attempts.lock().unwrap().push(Instant::now());
+            if self.refuse.load(Ordering::SeqCst) {
+                return Err(ConnectError("refused by the test".into()));
+            }
+            let (agent, server) = tokio::io::duplex(4 * 1024 * 1024);
+            let (ar, aw) = tokio::io::split(agent);
+            let (sr, sw) = tokio::io::split(server);
+            let _ = self.accepted.send(ServerEnd { r: sr, w: sw });
+            Ok(Link::new(Box::new(aw), Box::new(ar), Box::new(|| {})))
+        })
+    }
+
+    fn set_addresses(&self, addrs: Vec<SelectedAddr>) -> BoxFuture<'_, ()> {
+        self.rebinds.lock().unwrap().push(addrs);
+        Box::pin(async {})
+    }
+
+    fn shutdown(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async {})
+    }
+}
+
+/// The server's side of one connection.
+struct ServerEnd {
+    r: ReadHalf<DuplexStream>,
+    w: WriteHalf<DuplexStream>,
+}
+
+impl ServerEnd {
+    /// The next agent message, as JSON; `None` when the agent closed.
+    async fn recv(&mut self) -> Option<Value> {
+        read_frame::<Value, _>(&mut self.r, MAX_FRAME_LEN).await.ok().flatten()
+    }
+
+    /// The next agent message that is not a heartbeat.
+    async fn recv_not_heartbeat(&mut self) -> Option<Value> {
+        loop {
+            let m = self.recv().await?;
+            if m["type"] != "heartbeat" {
+                return Some(m);
+            }
+        }
+    }
+
+    async fn send(&mut self, msg: Value) {
+        write_frame(&mut self.w, &msg).await.unwrap();
+    }
+
+    async fn welcome(&mut self, account: AccountId, lease_ttl_s: u32) {
+        self.send(json!({
+            "type": "welcome",
+            "server_version": "0.1.0",
+            "node_id": NodeId::generate(),
+            "account_id": account,
+            "heartbeat_interval_s": 5,
+            "lease_ttl_s": lease_ttl_s,
+        }))
+        .await;
+    }
+
+    /// Reads `Hello`, answers `Welcome`, and returns the `Hello`.
+    async fn handshake(&mut self, account: AccountId) -> Value {
+        let hello = self.recv().await.unwrap();
+        assert_eq!(hello["type"], "hello", "{hello}");
+        self.welcome(account, 60).await;
+        hello
+    }
+
+    /// Drains whatever the agent sends, in the background, acknowledging heartbeats when `ack` is set.
+    fn serve(mut self, ack: bool) -> (JoinHandle<()>, mpsc::UnboundedReceiver<Value>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            while let Some(m) = self.recv().await {
+                if ack && m["type"] == "heartbeat" {
+                    let seq = m["seq"].clone();
+                    self.send(json!({"type": "heartbeat_ack", "seq": seq})).await;
+                }
+                let _ = tx.send(m);
+            }
+        });
+        (task, rx)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Event {
+    StopAll(&'static str),
+    Drain,
+    Resume,
+    /// A lease decision still in progress was dropped (aborted).
+    DecisionDropped,
+}
+
+#[derive(Debug)]
+struct Supervisor {
+    events: mpsc::UnboundedSender<(Instant, Event)>,
+    running: Mutex<Vec<RunningLease>>,
+    /// What `Heartbeat.running` lists; `None` lists `running`, like a supervisor without the T06e split.
+    holding: Mutex<Option<Vec<RunningLease>>>,
+    /// A lease released its resources.
+    release: Notify,
+    stops: AtomicUsize,
+}
+
+impl LeaseSupervisor for Supervisor {
+    fn running(&self) -> Vec<RunningLease> {
+        self.running.lock().unwrap().clone()
+    }
+
+    fn holding(&self) -> Vec<RunningLease> {
+        self.holding.lock().unwrap().clone().unwrap_or_else(|| self.running())
+    }
+
+    fn released(&self) -> BoxFuture<'_, ()> {
+        Box::pin(self.release.notified())
+    }
+
+    fn stop_all(&self, reason: &'static str) -> BoxFuture<'_, ()> {
+        self.stops.fetch_add(1, Ordering::SeqCst);
+        let _ = self.events.send((Instant::now(), Event::StopAll(reason)));
+        Box::pin(async {})
+    }
+
+    fn drain(&self) -> BoxFuture<'_, ()> {
+        let _ = self.events.send((Instant::now(), Event::Drain));
+        Box::pin(async {})
+    }
+
+    fn resume(&self) -> BoxFuture<'_, ()> {
+        let _ = self.events.send((Instant::now(), Event::Resume));
+        Box::pin(async {})
+    }
+}
+
+/// Accepts every lease and records it, to check what reaches a handler.
+#[derive(Debug, Default)]
+struct Recorder {
+    offers: Mutex<Vec<LeaseId>>,
+    cancels: Mutex<Vec<LeaseId>>,
+}
+
+impl LeaseHandler for Recorder {
+    fn lease(&self, offer: LeaseOffer) -> BoxFuture<'_, LeaseDecision> {
+        self.offers.lock().unwrap().push(offer.lease_id);
+        Box::pin(async { LeaseDecision::Accept })
+    }
+
+    fn cancel(&self, lease_id: LeaseId, _epoch: u64, _reason: String) -> BoxFuture<'_, ()> {
+        self.cancels.lock().unwrap().push(lease_id);
+        Box::pin(async {})
+    }
+}
+
+fn inventory(hostname: &str) -> Inventory {
+    serde_json::from_value(json!({
+        "hostname": hostname,
+        "platform": "linux",
+        "cpu": {"model": "Example CPU", "cores": 4},
+        "memory_mb": 8192,
+        "os": "Ubuntu 24.04",
+        "arch": "x86_64",
+        "gpus": [],
+        "gpu_status": {"status": "not_found"},
+        "dxg": false,
+        "sandbox": [],
+        "offered": {"cpu": 3.0, "memory_mb": 6144, "gpu": 0},
+        "agent_version": "0.1.0",
+    }))
+    .unwrap()
+}
+
+/// An inventory the test can change.
+#[derive(Debug)]
+/// The inventory, how long a detection takes, and how many detections ran.
+struct FakeInventory(Mutex<Inventory>, Mutex<Duration>, AtomicUsize);
+
+impl InventorySource for FakeInventory {
+    /// Takes the configured (virtual) time, like a slow `nvidia-smi` or the WSL2 boot wait.
+    fn detect(&self) -> BoxFuture<'_, Result<Inventory, String>> {
+        let delay = *self.1.lock().unwrap();
+        self.2.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            Ok(self.0.lock().unwrap().clone())
+        })
+    }
+}
+
+#[derive(Debug)]
+struct FixedLoad;
+
+impl LoadSource for FixedLoad {
+    fn sample(&self) -> BoxFuture<'_, Load> {
+        Box::pin(async { serde_json::from_value(json!({"cpu_pct": 12, "mem_used_mb": 2048})).unwrap() })
+    }
+}
+
+struct World {
+    owner: AccountId,
+    connector: Arc<PipeConnector>,
+    accepted: mpsc::UnboundedReceiver<ServerEnd>,
+    events: mpsc::UnboundedReceiver<(Instant, Event)>,
+    supervisor: Arc<Supervisor>,
+    inventory: Arc<FakeInventory>,
+    stop: watch::Sender<bool>,
+    network: mpsc::Sender<AddressChange>,
+    daemon: JoinHandle<DaemonExit>,
+    _dir: tempfile::TempDir,
+    state: StateFile,
+}
+
+/// Builds the handler with the world's event channel, for handlers that report into it.
+type HandlerWithEvents = Box<dyn FnOnce(mpsc::UnboundedSender<(Instant, Event)>) -> Arc<dyn LeaseHandler>>;
+
+struct Options {
+    handler: Arc<dyn LeaseHandler>,
+    /// Overrides `handler`.
+    handler_with_events: Option<HandlerWithEvents>,
+    agent_lease_ttl: Duration,
+    /// A state file left by an earlier `run`, written before the daemon starts.
+    earlier_state: Option<AgentState>,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            handler: Arc::new(NotReady),
+            handler_with_events: None,
+            agent_lease_ttl: Duration::from_secs(45),
+            earlier_state: None,
+        }
+    }
+}
+
+fn start(opts: Options) -> World {
+    let owner = AccountId::generate();
+    let (acc_tx, accepted) = mpsc::unbounded_channel();
+    let connector = Arc::new(PipeConnector {
+        accepted: acc_tx,
+        refuse: AtomicBool::new(false),
+        attempts: Mutex::new(Vec::new()),
+        rebinds: Mutex::new(Vec::new()),
+    });
+    let (ev_tx, events) = mpsc::unbounded_channel();
+    let handler = match opts.handler_with_events {
+        Some(make) => make(ev_tx.clone()),
+        None => opts.handler,
+    };
+    let supervisor = Arc::new(Supervisor {
+        events: ev_tx,
+        running: Mutex::new(Vec::new()),
+        holding: Mutex::new(None),
+        release: Notify::new(),
+        stops: AtomicUsize::new(0),
+    });
+    let inventory = Arc::new(FakeInventory(
+        Mutex::new(inventory("node-1")),
+        Mutex::new(Duration::ZERO),
+        AtomicUsize::new(0),
+    ));
+    let dir = tempfile::tempdir().unwrap();
+    let state = StateFile::in_dir(dir.path());
+    if let Some(earlier) = &opts.earlier_state {
+        state.write(earlier);
+    }
+    let shared = Shared {
+        owner,
+        agent_lease_ttl: opts.agent_lease_ttl,
+        watchdog: Watchdog::new(opts.agent_lease_ttl),
+        supervisor: supervisor.clone(),
+        handler,
+        inventory: inventory.clone(),
+        load: Arc::new(FixedLoad),
+        inventory_interval: INVENTORY_INTERVAL,
+        decisions: Arc::new(Semaphore::new(MAX_PENDING_DECISIONS)),
+        uplink: Uplink::new(),
+    };
+    let daemon = Daemon {
+        shared,
+        connector: connector.clone(),
+        backoff_seed: 7,
+        state_file: Some(state.clone()),
+        server_node_id: SERVER_ID.into(),
+        agent_node_id: AGENT_NODE_ID.into(),
+    };
+    let (stop, stop_rx) = watch::channel(false);
+    let (network, net_rx) = mpsc::channel(4);
+    let daemon = tokio::spawn(daemon.run(stop_rx, net_rx));
+    World {
+        owner,
+        connector,
+        accepted,
+        events,
+        supervisor,
+        inventory,
+        stop,
+        network,
+        daemon,
+        _dir: dir,
+        state,
+    }
+}
+
+impl World {
+    /// The state file is written off the runtime: wait (a few virtual milliseconds at most) for `expected`.
+    async fn state_becomes(&self, expected: ConnectionState) {
+        for _ in 0..200 {
+            if self.state.read().is_some_and(|s| s.connection == expected) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("the state file never said {expected:?}: {:?}", self.state.read());
+    }
+
+    async fn next_connection(&mut self) -> ServerEnd {
+        self.accepted.recv().await.unwrap()
+    }
+
+    async fn next_event(&mut self) -> (Instant, Event) {
+        self.events.recv().await.unwrap()
+    }
+
+    async fn shutdown(self) -> DaemonExit {
+        self.stop.send(true).unwrap();
+        self.daemon.await.unwrap()
+    }
+}
+
+fn lease_msg(account: AccountId, job: Value) -> (LeaseId, Value) {
+    let id = LeaseId::generate();
+    let msg = json!({
+        "type": "lease",
+        "lease_id": id,
+        "epoch": 1,
+        "job": job,
+        "account_id": account,
+        "deadline": "2030-01-01T00:00:00Z",
+    });
+    (id, msg)
+}
+
+fn good_job() -> Value {
+    json!({
+        "image": "docker.io/library/python:3.12-slim",
+        "command": ["python", "-c", "print(6*7)"],
+        "env": {"API_TOKEN": "s3cr3t-value-example"},
+        "resources": {"cpu": 1, "memory_mb": 512},
+    })
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Hello / Welcome
+
+#[tokio::test(start_paused = true)]
+async fn hello_carries_the_version_an_empty_feature_list_the_inventory_and_the_running_leases() {
+    let mut w = start(Options::default());
+    let lease = RunningLease {
+        lease_id: LeaseId::generate(),
+        epoch: 3,
+    };
+    w.supervisor.running.lock().unwrap().push(lease);
+    let mut s = w.next_connection().await;
+    let hello = s.handshake(w.owner).await;
+    assert_eq!(hello["agent_version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(hello["features"], json!([]), "no capability in v0.1");
+    assert_eq!(hello["inventory"]["hostname"], "node-1");
+    assert_eq!(hello["running"], json!([{"lease_id": lease.lease_id, "epoch": 3}]));
+    // Connected: the state file says so, with the Welcome time.
+    let _ = s.recv().await; // the first heartbeat: the Welcome was processed
+    let state = w.state.read().unwrap();
+    assert_eq!(state.connection, ConnectionState::Connected);
+    assert!(state.last_welcome_at.is_some());
+    assert_eq!(state.server_node_id, SERVER_ID);
+    let (_task, _rx) = s.serve(true);
+    assert_eq!(w.shutdown().await, DaemonExit::Shutdown);
+}
+
+/// The server allows 10 s from the handshake to the first message (§6 "Before Join", T05's first-message
+/// timeout). A detection that takes 14 s must therefore happen **before** the dial (T05b review, P2-1): the fake
+/// server here enforces the deadline. Each connection still gets a fresh detection.
+#[tokio::test(start_paused = true)]
+async fn a_slow_detection_happens_before_the_dial_so_hello_beats_the_10_s_deadline() {
+    const FIRST_MESSAGE_DEADLINE: Duration = Duration::from_secs(10);
+    let mut w = start(Options::default());
+    *w.inventory.1.lock().unwrap() = Duration::from_secs(14);
+    for (round, hostname) in [(0, "node-1"), (1, "node-after-a-driver-install")] {
+        let mut s = w.next_connection().await;
+        let hello = tokio::time::timeout(FIRST_MESSAGE_DEADLINE, s.recv())
+            .await
+            .unwrap_or_else(|_| panic!("round {round}: no Hello within 10 s of the dial"))
+            .unwrap();
+        assert_eq!(hello["type"], "hello");
+        assert_eq!(hello["inventory"]["hostname"], hostname, "fresh for every connection");
+        s.welcome(w.owner, 60).await;
+        let _ = s.recv().await; // a heartbeat: welcomed
+        // A driver is installed, and the connection drops: the next Hello carries the new inventory.
+        w.inventory.0.lock().unwrap().hostname = "node-after-a-driver-install".into();
+        drop(s);
+    }
+    w.shutdown().await;
+}
+
+/// SI-1: a `Welcome` for another account is refused: the connection is closed, no lease is taken from it, and the
+/// agent backs off and tries again.
+#[tokio::test(start_paused = true)]
+async fn a_welcome_for_another_account_is_refused() {
+    let recorder = Arc::new(Recorder::default());
+    let mut w = start(Options {
+        handler: recorder.clone(),
+        ..Options::default()
+    });
+    let mut s = w.next_connection().await;
+    let _ = s.recv().await.unwrap();
+    s.welcome(AccountId::generate(), 60).await;
+    // A lease right behind it, for the other account's jobs: never handled.
+    let (_, lease) = lease_msg(AccountId::generate(), good_job());
+    s.send(lease).await;
+    // The agent closes this connection without answering anything.
+    assert_eq!(s.recv().await, None, "closed, and no LeaseAccepted/LeaseRejected");
+    assert!(recorder.offers.lock().unwrap().is_empty());
+    // It backs off (1 s base, jitter in [0.5, 1] s) and reconnects.
+    let mut again = w.next_connection().await;
+    let attempts = w.connector.attempts.lock().unwrap().clone();
+    let gap = attempts[1] - attempts[0];
+    assert!(
+        gap >= Duration::from_millis(500) && gap <= Duration::from_secs(1),
+        "{gap:?}"
+    );
+    w.state_becomes(ConnectionState::Connecting).await;
+    let _ = again.handshake(w.owner).await;
+    let (_task, _rx) = again.serve(true);
+    w.shutdown().await;
+}
+
+/// SI-1 and SI-13: a server that only ever welcomes for another account is no contact: the lease timer runs out
+/// 45 s after the agent started, however often that server answers.
+#[tokio::test(start_paused = true)]
+async fn a_wrong_owner_welcome_does_not_keep_jobs_alive() {
+    let started = Instant::now();
+    let mut w = start(Options::default());
+    let mut accepted = std::mem::replace(&mut w.accepted, mpsc::unbounded_channel().1);
+    let server = tokio::spawn(async move {
+        while let Some(mut c) = accepted.recv().await {
+            let _ = c.recv().await;
+            c.welcome(AccountId::generate(), 60).await;
+        }
+    });
+    let (at, event) = w.next_event().await;
+    assert_eq!(event, Event::StopAll("lease_lost"));
+    assert_eq!(at - started, Duration::from_secs(45));
+    assert!(w.connector.attempts.lock().unwrap().len() > 3);
+    server.abort();
+    w.shutdown().await;
+}
+
+/// SI-13: a server `lease_ttl_s` too small for the configured agent timer lowers the agent's timer.
+#[tokio::test(start_paused = true)]
+async fn a_small_lease_ttl_lowers_the_agent_timer() {
+    let mut w = start(Options::default());
+    let mut s = w.next_connection().await;
+    let _ = s.recv().await.unwrap();
+    s.welcome(w.owner, 40).await;
+    let welcomed = Instant::now();
+    // Never acknowledge anything: the timer runs out after 40 - 10 = 30 s, not 45.
+    let (_task, _rx) = s.serve(false);
+    let (at, event) = w.next_event().await;
+    assert_eq!(event, Event::StopAll("lease_lost"));
+    let after = at - welcomed;
+    assert!(
+        after >= Duration::from_secs(30) && after < Duration::from_secs(31),
+        "{after:?}"
+    );
+    w.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Heartbeats and the lease timer (SI-13)
+
+#[tokio::test(start_paused = true)]
+async fn heartbeats_honour_the_interval_and_seq_increases_and_acks_keep_the_timer_alive() {
+    let mut w = start(Options::default());
+    let mut s = w.next_connection().await;
+    let _ = s.handshake(w.owner).await;
+    let welcomed = Instant::now();
+    let (_task, mut rx) = s.serve(true);
+    let mut beats = Vec::new();
+    while beats.len() < 40 {
+        let m = rx.recv().await.unwrap();
+        if m["type"] == "heartbeat" {
+            beats.push((Instant::now() - welcomed, m));
+        }
+    }
+    for (i, (at, m)) in beats.iter().enumerate() {
+        let n = u64::try_from(i).unwrap() + 1;
+        assert_eq!(m["seq"], json!(n));
+        assert_eq!(*at, Duration::from_secs(5 * n), "heartbeat {n}");
+        assert_eq!(m["load"]["cpu_pct"], 12);
+        assert_eq!(m["load"]["mem_used_mb"], 2048);
+        assert_eq!(m["running"], json!([]));
+    }
+    // 200 s with acks: the lease timer never fired.
+    assert_eq!(w.supervisor.stops.load(Ordering::SeqCst), 0);
+    assert!(w.events.try_recv().is_err());
+    w.shutdown().await;
+}
+
+/// T06e (§6): `Heartbeat.running` lists the leases that hold resources, and a lease's release is followed by a
+/// heartbeat at once, not at the next 5 s tick. `seq` goes on increasing, and the ticks keep their rhythm.
+#[tokio::test(start_paused = true)]
+async fn a_release_sends_a_heartbeat_at_once_listing_what_is_still_held() {
+    let mut w = start(Options::default());
+    let lease = |epoch| RunningLease {
+        lease_id: LeaseId::generate(),
+        epoch,
+    };
+    let (cleaning, running) = (lease(1), lease(2));
+    // `Hello` lists the leases that run or whose report is unconfirmed; `Heartbeat` those that hold resources.
+    *w.supervisor.running.lock().unwrap() = vec![running];
+    *w.supervisor.holding.lock().unwrap() = Some(vec![cleaning, running]);
+    let mut s = w.next_connection().await;
+    let hello = s.handshake(w.owner).await;
+    assert_eq!(hello["running"], json!([running]));
+    let welcomed = Instant::now();
+    let (_task, mut rx) = s.serve(true);
+    let next_beat = async |rx: &mut mpsc::UnboundedReceiver<Value>| loop {
+        let m = rx.recv().await.unwrap();
+        if m["type"] == "heartbeat" {
+            return (Instant::now() - welcomed, m);
+        }
+    };
+    let (at, first) = next_beat(&mut rx).await;
+    assert_eq!((at, first["seq"].clone()), (Duration::from_secs(5), json!(1)));
+    assert_eq!(
+        first["running"],
+        json!([cleaning, running]),
+        "Heartbeat lists what holds resources"
+    );
+
+    // At 7 s the cleanup ends: the lease leaves the list and a heartbeat goes out at that very instant.
+    tokio::time::sleep_until(welcomed + Duration::from_secs(7)).await;
+    *w.supervisor.holding.lock().unwrap() = Some(vec![running]);
+    w.supervisor.release.notify_one();
+    let (at, now) = next_beat(&mut rx).await;
+    assert_eq!(at, Duration::from_secs(7), "not at the 10 s tick");
+    assert_eq!(now["seq"], json!(2), "seq keeps increasing");
+    assert_eq!(
+        now["running"],
+        json!([running]),
+        "the released lease is no longer listed"
+    );
+
+    // The periodic heartbeats go on at their own pace.
+    let (at, tick) = next_beat(&mut rx).await;
+    assert_eq!((at, tick["seq"].clone()), (Duration::from_secs(10), json!(3)));
+    w.shutdown().await;
+}
+
+/// SI-13: no server message for 45 s: `stop_all("lease_lost")`, exactly once.
+#[tokio::test(start_paused = true)]
+async fn no_server_message_for_45_s_stops_all_jobs_exactly_once() {
+    let mut w = start(Options::default());
+    let mut s = w.next_connection().await;
+    let _ = s.handshake(w.owner).await;
+    let last_message = Instant::now();
+    // The server reads but never answers.
+    let (_task, _rx) = s.serve(false);
+    let (at, event) = w.next_event().await;
+    assert_eq!(event, Event::StopAll("lease_lost"));
+    assert_eq!(at - last_message, Duration::from_secs(45));
+    // Much later: still exactly one call.
+    tokio::time::sleep(Duration::from_secs(600)).await;
+    assert_eq!(w.supervisor.stops.load(Ordering::SeqCst), 1);
+    w.shutdown().await;
+}
+
+/// SI-13: a server message that arrives late (here: the `Welcome` of a reconnect, 44 s after the last message)
+/// starts the timer again. The precise 44 s case is in the watchdog's unit tests.
+#[tokio::test(start_paused = true)]
+async fn a_late_message_on_a_new_connection_resets_the_timer() {
+    let mut w = start(Options::default());
+    let mut s = w.next_connection().await;
+    let _ = s.handshake(w.owner).await;
+    let last_message = Instant::now();
+    // The server stops answering; the agent drops the silent connection (15 s) and reconnects on its own. The server
+    // answers again only at 44 s, on a connection still waiting for its Welcome (each waits 15 s).
+    let (_task, _rx) = s.serve(false);
+    // Connections kept open and unanswered: each waits out its 15 s, so the next one comes after ~30 s.
+    let mut unanswered = Vec::new();
+    let mut late = loop {
+        let mut c = w.next_connection().await;
+        if Instant::now() - last_message >= Duration::from_secs(29) {
+            break c;
+        }
+        let _ = c.recv().await; // its Hello
+        unanswered.push(c);
+    };
+    let _ = late.recv().await.unwrap();
+    tokio::time::sleep_until(last_message + Duration::from_secs(44)).await;
+    late.welcome(w.owner, 60).await;
+    let reset_at = Instant::now();
+    let (_late_task, _late_rx) = late.serve(true);
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    assert_eq!(
+        w.supervisor.stops.load(Ordering::SeqCst),
+        0,
+        "the message before 45 s kept the jobs running ({:?} after the last one)",
+        reset_at - last_message
+    );
+    w.shutdown().await;
+}
+
+/// SI-13: the timer keeps running while the agent is disconnected and backing off.
+#[tokio::test(start_paused = true)]
+async fn the_timer_keeps_running_while_disconnected() {
+    let mut w = start(Options::default());
+    let mut s = w.next_connection().await;
+    let _ = s.handshake(w.owner).await;
+    let last_message = Instant::now();
+    // The server goes away and refuses every reconnect.
+    w.connector.refuse.store(true, Ordering::SeqCst);
+    drop(s);
+    let (at, event) = w.next_event().await;
+    assert_eq!(event, Event::StopAll("lease_lost"));
+    assert_eq!(at - last_message, Duration::from_secs(45));
+    assert!(
+        w.connector.attempts.lock().unwrap().len() > 3,
+        "it kept trying meanwhile"
+    );
+    w.state_becomes(ConnectionState::BackingOff).await;
+    w.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Backoff
+
+/// While leases run, reconnect attempts are at most 5 s apart; after a `Welcome` the backoff starts again from 1 s.
+#[tokio::test(start_paused = true)]
+async fn backoff_is_capped_at_5_s_with_running_leases_and_reset_after_welcome() {
+    let mut w = start(Options::default());
+    w.supervisor.running.lock().unwrap().push(RunningLease {
+        lease_id: LeaseId::generate(),
+        epoch: 1,
+    });
+    w.connector.refuse.store(true, Ordering::SeqCst);
+    // Let it fail for a while.
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    let attempts = w.connector.attempts.lock().unwrap().clone();
+    assert!(attempts.len() > 20, "{}", attempts.len());
+    for pair in attempts.windows(2) {
+        assert!(pair[1] - pair[0] <= Duration::from_secs(5), "{:?}", pair[1] - pair[0]);
+    }
+    // Without leases the cap is 30 s, and the delays have grown past 5 s.
+    w.supervisor.running.lock().unwrap().clear();
+    tokio::time::sleep(Duration::from_secs(300)).await;
+    let attempts = w.connector.attempts.lock().unwrap().clone();
+    let gaps: Vec<Duration> = attempts.windows(2).map(|p| p[1] - p[0]).collect();
+    assert!(gaps.iter().any(|g| *g > Duration::from_secs(5)), "{gaps:?}");
+    assert!(gaps.iter().all(|g| *g <= Duration::from_secs(30)), "{gaps:?}");
+    // A Welcome resets it: the next failure waits at most 1 s.
+    w.connector.refuse.store(false, Ordering::SeqCst);
+    let mut s = w.next_connection().await;
+    let _ = s.handshake(w.owner).await;
+    let _ = s.recv().await;
+    let welcomed_attempts = w.connector.attempts.lock().unwrap().len();
+    drop(s);
+    let mut again = w.next_connection().await;
+    let attempts = w.connector.attempts.lock().unwrap().clone();
+    assert_eq!(attempts.len(), welcomed_attempts + 1);
+    let gap = attempts[attempts.len() - 1] - attempts[attempts.len() - 2];
+    assert!(
+        gap <= Duration::from_secs(6),
+        "about 1 s after the drop, not 30: {gap:?}"
+    );
+    let _ = again.handshake(w.owner).await;
+    let (_task, _rx) = again.serve(true);
+    w.shutdown().await;
+}
+
+/// A network change re-binds and reconnects at once, without a backoff delay.
+#[tokio::test(start_paused = true)]
+async fn a_network_change_rebinds_and_reconnects_at_once() {
+    let mut w = start(Options::default());
+    let mut s = w.next_connection().await;
+    let _ = s.handshake(w.owner).await;
+    let (_task, _rx) = s.serve(true);
+    let changed = Instant::now();
+    w.network
+        .send(AddressChange {
+            addrs: Vec::new(),
+            interfaces: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let mut again = w.next_connection().await;
+    assert!(
+        Instant::now() - changed < Duration::from_millis(500),
+        "no backoff delay"
+    );
+    assert_eq!(w.connector.rebinds.lock().unwrap().len(), 1);
+    let _ = again.handshake(w.owner).await;
+    let (_task2, _rx2) = again.serve(true);
+    w.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// InventoryUpdate
+
+#[tokio::test(start_paused = true)]
+async fn inventory_update_is_sent_only_on_a_change() {
+    let mut w = start(Options::default());
+    let mut s = w.next_connection().await;
+    let _ = s.handshake(w.owner).await;
+    let (_task, mut rx) = s.serve(true);
+    // 25 minutes, two re-detections, nothing changed: no update.
+    tokio::time::sleep(Duration::from_secs(25 * 60)).await;
+    let mut updates = 0;
+    while let Ok(m) = rx.try_recv() {
+        updates += usize::from(m["type"] == "inventory_update");
+    }
+    assert_eq!(updates, 0);
+    // A driver is installed: the next re-detection (at 30 min) sends the new inventory, once.
+    w.inventory.0.lock().unwrap().hostname = "node-renamed".into();
+    tokio::time::sleep(Duration::from_secs(25 * 60)).await;
+    let mut sent = Vec::new();
+    while let Ok(m) = rx.try_recv() {
+        if m["type"] == "inventory_update" {
+            sent.push(m);
+        }
+    }
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["inventory"]["hostname"], "node-renamed");
+    w.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Routing
+
+#[tokio::test(start_paused = true)]
+async fn a_lease_gets_agent_not_ready_by_default() {
+    let mut w = start(Options::default());
+    let mut s = w.next_connection().await;
+    let _ = s.handshake(w.owner).await;
+    let (id, lease) = lease_msg(w.owner, good_job());
+    s.send(lease).await;
+    let answer = s.recv_not_heartbeat().await.unwrap();
+    assert_eq!(
+        answer,
+        json!({"type": "lease_rejected", "lease_id": id, "epoch": 1, "reason": "agent_not_ready"})
+    );
+    // A cancel for that unknown lease is ignored, and the connection stays up.
+    s.send(json!({"type": "cancel", "lease_id": id, "epoch": 1, "reason": "user"}))
+        .await;
+    s.send(json!({"type": "drain"})).await;
+    assert_eq!(w.next_event().await.1, Event::Drain);
+    let (_task, _rx) = s.serve(true);
+    w.shutdown().await;
+}
+
+/// SI-1 and §6 "must understand": a lease for another account gets `not_owner`, a job the agent does not accept gets
+/// `invalid_job`; neither reaches the handler, and the connection stays open.
+#[tokio::test(start_paused = true)]
+async fn si1_not_owner_is_refused_before_anything() {
+    let recorder = Arc::new(Recorder::default());
+    let mut w = start(Options {
+        handler: recorder.clone(),
+        ..Options::default()
+    });
+    let mut s = w.next_connection().await;
+    let _ = s.handshake(w.owner).await;
+    let (other, lease) = lease_msg(AccountId::generate(), good_job());
+    s.send(lease).await;
+    let answer = s.recv_not_heartbeat().await.unwrap();
+    assert_eq!(answer["type"], "lease_rejected");
+    assert_eq!(answer["lease_id"], json!(other));
+    assert_eq!(answer["reason"], "not_owner");
+    let bad_jobs = [
+        json!({"image": "docker.io/library/python:3.12-slim", "command": ["true"], "resources": {"cpu": 1, "memory_mb": 512}, "from_the_future": 1}),
+        json!({"image": "docker.io/library/python:3.12-slim", "command": ["true"], "env": {"BAD": "a\nINJECTED=1"}, "resources": {"cpu": 1, "memory_mb": 512}}),
+        json!({"image": "docker.io/library/python:3.12-slim", "command": ["true"], "files": [{"path": "/etc/passwd", "content_b64": ""}], "resources": {"cpu": 1, "memory_mb": 512}}),
+        json!({"command": ["true"]}),
+    ];
+    for job in bad_jobs {
+        let (id, lease) = lease_msg(w.owner, job.clone());
+        s.send(lease).await;
+        let answer = s.recv_not_heartbeat().await.unwrap();
+        assert_eq!(answer["lease_id"], json!(id), "{job}");
+        assert_eq!(answer["reason"], "invalid_job", "{job}");
+    }
+    assert!(recorder.offers.lock().unwrap().is_empty(), "no handler saw any of them");
+    // A good lease for the owner reaches the handler, on the same connection.
+    let (id, lease) = lease_msg(w.owner, good_job());
+    s.send(lease).await;
+    let answer = s.recv_not_heartbeat().await.unwrap();
+    assert_eq!(answer, json!({"type": "lease_accepted", "lease_id": id, "epoch": 1}));
+    assert_eq!(*recorder.offers.lock().unwrap(), [id]);
+    s.send(json!({"type": "cancel", "lease_id": id, "epoch": 1, "reason": "user"}))
+        .await;
+    s.send(json!({"type": "resume"})).await;
+    assert_eq!(w.next_event().await.1, Event::Resume);
+    assert_eq!(*recorder.cancels.lock().unwrap(), [id]);
+    assert_eq!(w.connector.attempts.lock().unwrap().len(), 1, "never reconnected");
+    let (_task, _rx) = s.serve(true);
+    w.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn drain_and_resume_reach_the_supervisor_and_unknown_messages_are_ignored() {
+    let mut w = start(Options::default());
+    let mut s = w.next_connection().await;
+    let _ = s.handshake(w.owner).await;
+    s.send(json!({"type": "drain"})).await;
+    s.send(json!({"type": "a_message_from_a_newer_server", "with": ["fields"]}))
+        .await;
+    s.send(json!({"type": "error", "code": "unsupported_message", "message": "x"}))
+        .await;
+    s.send(json!({"type": "resume"})).await;
+    assert_eq!(w.next_event().await.1, Event::Drain);
+    assert_eq!(w.next_event().await.1, Event::Resume);
+    assert_eq!(
+        w.connector.attempts.lock().unwrap().len(),
+        1,
+        "the unknown message did not close anything"
+    );
+    let (_task, _rx) = s.serve(true);
+    w.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn not_enrolled_and_agent_too_old_stop_the_agent_with_their_exit_codes() {
+    for (code, exit_code, state) in [
+        ("not_enrolled", exit::NOT_ENROLLED, ConnectionState::NotEnrolled),
+        ("agent_too_old", exit::AGENT_TOO_OLD, ConnectionState::AgentTooOld),
+    ] {
+        // Before the Welcome (the answer to Hello) ...
+        let mut w = start(Options::default());
+        let mut s = w.next_connection().await;
+        let _ = s.recv().await.unwrap();
+        s.send(json!({"type": "error", "code": code, "message": "x"})).await;
+        let end = w.daemon.await.unwrap();
+        assert_eq!(end.code(), exit_code, "{code}");
+        assert_eq!(w.state.read().unwrap().connection, state);
+        // The running jobs were stopped before the agent exited, with the code as the reason.
+        assert_eq!(w.events.try_recv().map(|e| e.1), Ok(Event::StopAll(code)), "{code}");
+        assert_eq!(w.supervisor.stops.load(Ordering::SeqCst), 1);
+        // ... and after it.
+        let mut w = start(Options::default());
+        let mut s = w.next_connection().await;
+        let _ = s.handshake(w.owner).await;
+        s.send(json!({"type": "error", "code": code, "message": "x"})).await;
+        assert_eq!(w.daemon.await.unwrap().code(), exit_code, "{code}");
+        assert_eq!(w.events.try_recv().map(|e| e.1), Ok(Event::StopAll(code)), "{code}");
+    }
+}
+
+/// SI-10: a malformed frame from the server closes the connection; the agent reconnects.
+#[tokio::test(start_paused = true)]
+async fn a_malformed_frame_closes_the_connection() {
+    use tokio::io::AsyncWriteExt as _;
+    let mut w = start(Options::default());
+    let mut s = w.next_connection().await;
+    let _ = s.handshake(w.owner).await;
+    s.w.write_all(&[0, 0, 0, 3, b'{', b'{', b'{']).await.unwrap();
+    let mut again = w.next_connection().await;
+    let _ = again.handshake(w.owner).await;
+    let (_task, _rx) = again.serve(true);
+    assert_eq!(w.shutdown().await, DaemonExit::Shutdown);
+}
+
+/// A server that welcomes and then stays silent is dropped after three heartbeats, and the agent reconnects.
+#[tokio::test(start_paused = true)]
+async fn a_silent_server_is_dropped_and_reconnected() {
+    let mut w = start(Options::default());
+    let mut s = w.next_connection().await;
+    let _ = s.handshake(w.owner).await;
+    let welcomed = Instant::now();
+    let (_task, _rx) = s.serve(false);
+    let _again = w.next_connection().await;
+    let after = Instant::now() - welcomed;
+    assert!(
+        after >= Duration::from_secs(15) && after <= Duration::from_secs(17),
+        "{after:?}"
+    );
+    w.shutdown().await;
+}
+
+/// A handler that never decides, to fill the decision slots and hit the decision timeout.
+#[derive(Debug, Default)]
+struct Undecided(AtomicUsize);
+
+impl LeaseHandler for Undecided {
+    fn lease(&self, _offer: LeaseOffer) -> BoxFuture<'_, LeaseDecision> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Box::pin(std::future::pending())
+    }
+
+    fn cancel(&self, _lease_id: LeaseId, _epoch: u64, _reason: String) -> BoxFuture<'_, ()> {
+        Box::pin(std::future::pending())
+    }
+}
+
+/// At most 16 decisions in flight: the 17th lease is refused with `insufficient_capacity` at once. A decision that
+/// takes longer than 8 s is answered `agent_not_ready`, within the server's 10 s. A `cancel` that never returns does
+/// not stall the connection.
+#[tokio::test(start_paused = true)]
+async fn the_decision_cap_and_the_decision_timeout() {
+    let handler = Arc::new(Undecided::default());
+    let mut w = start(Options {
+        handler: handler.clone(),
+        ..Options::default()
+    });
+    let mut s = w.next_connection().await;
+    let _ = s.handshake(w.owner).await;
+    let sent_at = Instant::now();
+    let mut ids = Vec::new();
+    for _ in 0..=MAX_PENDING_DECISIONS {
+        let (id, lease) = lease_msg(w.owner, good_job());
+        s.send(lease).await;
+        ids.push(id);
+    }
+    let first = s.recv_not_heartbeat().await.unwrap();
+    assert_eq!(
+        first["lease_id"],
+        json!(ids[MAX_PENDING_DECISIONS]),
+        "the 17th, at once"
+    );
+    assert_eq!(first["reason"], "insufficient_capacity");
+    assert_eq!(Instant::now() - sent_at, Duration::ZERO);
+    assert_eq!(handler.0.load(Ordering::SeqCst), MAX_PENDING_DECISIONS);
+    // A cancel that never returns is abandoned after its budget; meanwhile acks keep arriving.
+    s.send(json!({"type": "cancel", "lease_id": ids[0], "epoch": 1, "reason": "user"}))
+        .await;
+    let mut timed_out = std::collections::BTreeSet::new();
+    while timed_out.len() < MAX_PENDING_DECISIONS {
+        let m = s.recv().await.unwrap();
+        if m["type"] == "heartbeat" {
+            let seq = m["seq"].clone();
+            s.send(json!({"type": "heartbeat_ack", "seq": seq})).await;
+            continue;
+        }
+        assert_eq!(m["type"], "lease_rejected");
+        assert_eq!(m["reason"], "agent_not_ready");
+        assert_eq!(Instant::now() - sent_at, Duration::from_secs(8), "the decision budget");
+        timed_out.insert(m["lease_id"].as_str().unwrap().to_string());
+    }
+    assert_eq!(
+        w.connector.attempts.lock().unwrap().len(),
+        1,
+        "the connection stayed up"
+    );
+    // The slots are free again: a new lease reaches the handler.
+    let (_, lease) = lease_msg(w.owner, good_job());
+    s.send(lease).await;
+    let (_task, _rx) = s.serve(true);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(handler.0.load(Ordering::SeqCst), MAX_PENDING_DECISIONS + 1);
+    w.shutdown().await;
+}
+
+/// SI-10: a frame that decodes but fails `validate()` (an error message over the text limit) closes the
+/// connection; the agent reconnects.
+#[tokio::test(start_paused = true)]
+async fn a_message_that_fails_validation_closes_the_connection() {
+    let mut w = start(Options::default());
+    let mut s = w.next_connection().await;
+    let _ = s.handshake(w.owner).await;
+    let long = "x".repeat(2000);
+    s.send(json!({"type": "error", "code": "something", "message": long}))
+        .await;
+    let mut again = w.next_connection().await;
+    assert_eq!(w.connector.attempts.lock().unwrap().len(), 2);
+    let _ = again.handshake(w.owner).await;
+    let (_task, _rx) = again.serve(true);
+    assert_eq!(w.shutdown().await, DaemonExit::Shutdown);
+}
+
+/// T05b review P3: in the handshake only a Welcome for the owner is contact. A server that answers every Hello with an
+/// Error keeps no job alive: `lease_lost` fires 45 s after the start.
+#[tokio::test(start_paused = true)]
+async fn errors_in_the_handshake_do_not_reset_the_lease_timer() {
+    let started = Instant::now();
+    let mut w = start(Options::default());
+    let mut accepted = std::mem::replace(&mut w.accepted, mpsc::unbounded_channel().1);
+    let server = tokio::spawn(async move {
+        while let Some(mut c) = accepted.recv().await {
+            let _ = c.recv().await;
+            c.send(json!({"type": "error", "code": "x", "message": "not now"}))
+                .await;
+        }
+    });
+    // Bounded: if errors reset the timer, it never fires, and this fails instead of spinning.
+    let (at, event) = tokio::time::timeout(Duration::from_secs(120), w.next_event())
+        .await
+        .expect("lease_lost never fired: the handshake errors kept the jobs alive");
+    assert_eq!(event, Event::StopAll("lease_lost"));
+    assert_eq!(at - started, Duration::from_secs(45));
+    assert!(w.connector.attempts.lock().unwrap().len() > 3, "it kept trying");
+    server.abort();
+    w.shutdown().await;
+}
+
+/// T05b review P3: a detection that takes 15 s (a hung GPU tool) does not run before every dial during an outage. The
+/// inventory of a failed dial is reused, so with a lease running the agent retries at least every 5 s and reconnects
+/// within 5 s of the server coming back, well before the 45 s lease timer.
+#[tokio::test(start_paused = true)]
+async fn a_slow_detection_is_not_repeated_before_every_dial_during_an_outage() {
+    let mut w = start(Options::default());
+    w.supervisor.running.lock().unwrap().push(RunningLease {
+        lease_id: LeaseId::generate(),
+        epoch: 1,
+    });
+    let mut s = w.next_connection().await;
+    let _ = s.handshake(w.owner).await;
+    let _ = s.recv().await;
+    *w.inventory.1.lock().unwrap() = Duration::from_secs(15);
+    let detections_before = w.inventory.2.load(Ordering::SeqCst);
+    // The server goes away; the agent's lease timer counts from the last message.
+    w.connector.refuse.store(true, Ordering::SeqCst);
+    let last_contact = Instant::now();
+    drop(s);
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert_eq!(
+        w.inventory.2.load(Ordering::SeqCst) - detections_before,
+        1,
+        "one detection for the whole outage, not one per dial"
+    );
+    // Back at 30 s: Hello within the 5 s cap of the backoff with leases.
+    w.connector.refuse.store(false, Ordering::SeqCst);
+    let back = Instant::now();
+    let mut again = w.next_connection().await;
+    let _ = again.handshake(w.owner).await;
+    assert!(
+        Instant::now() - back <= Duration::from_secs(5),
+        "{:?}",
+        Instant::now() - back
+    );
+    assert!(Instant::now() - last_contact < Duration::from_secs(45));
+    let (_task, _rx) = again.serve(true);
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_eq!(w.supervisor.stops.load(Ordering::SeqCst), 0, "no lease_lost");
+    w.shutdown().await;
+}
+
+/// T05b review P3: `run` keeps the last Welcome of this enrollment across a restart, and only of this enrollment. An
+/// enrollment is the server **and** this node's ID on it: a `join --force` to the same server is a new one (T05b
+/// real run, round 2).
+#[tokio::test(start_paused = true)]
+async fn the_last_welcome_survives_a_restart_of_run_for_the_same_enrollment() {
+    let at = time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+    for (server, node, kept) in [
+        (SERVER_ID, Some(AGENT_NODE_ID), true),
+        ("another-server", Some(AGENT_NODE_ID), false),
+        (SERVER_ID, Some("node_01JBQ7AAAAAAAAAAAAAAAAAAAA"), false),
+        (SERVER_ID, None, false),
+    ] {
+        let mut earlier = AgentState::new(ConnectionState::Stopped, at, server.into(), node.map(String::from));
+        earlier.last_welcome_at = Some(at);
+        let w = start(Options {
+            earlier_state: Some(earlier),
+            ..Options::default()
+        });
+        w.connector.refuse.store(true, Ordering::SeqCst);
+        w.state_becomes(ConnectionState::BackingOff).await;
+        let state = w.state.read().unwrap();
+        assert_eq!(state.server_node_id, SERVER_ID);
+        assert_eq!(state.agent_node_id.as_deref(), Some(AGENT_NODE_ID));
+        assert_eq!(state.last_welcome_at, kept.then_some(at), "{server} {node:?}");
+        w.shutdown().await;
+    }
+}
+
+/// A handler whose decisions never end; each one reports, when it is dropped, that it was aborted.
+#[derive(Debug)]
+struct Hanging(mpsc::UnboundedSender<(Instant, Event)>);
+
+struct DropReport(mpsc::UnboundedSender<(Instant, Event)>);
+
+impl Drop for DropReport {
+    fn drop(&mut self) {
+        let _ = self.0.send((Instant::now(), Event::DecisionDropped));
+    }
+}
+
+impl LeaseHandler for Hanging {
+    fn lease(&self, _offer: LeaseOffer) -> BoxFuture<'_, LeaseDecision> {
+        let guard = DropReport(self.0.clone());
+        Box::pin(async move {
+            let _guard = guard;
+            std::future::pending().await
+        })
+    }
+
+    fn cancel(&self, _lease_id: LeaseId, _epoch: u64, _reason: String) -> BoxFuture<'_, ()> {
+        Box::pin(async {})
+    }
+}
+
+fn hanging() -> Options {
+    Options {
+        handler_with_events: Some(Box::new(|events| Arc::new(Hanging(events)) as Arc<dyn LeaseHandler>)),
+        ..Options::default()
+    }
+}
+
+/// T05b review (carry-over to T10a): a lease decision belongs to its session. When the connection drops, the decision
+/// still in progress is aborted before the agent dials again: with the real executor, a job could otherwise start
+/// for a connection that no longer exists.
+#[tokio::test(start_paused = true)]
+async fn a_lease_decision_does_not_outlive_its_session() {
+    let mut w = start(hanging());
+    let mut s = w.next_connection().await;
+    let _ = s.handshake(w.owner).await;
+    let (_, lease) = lease_msg(w.owner, good_job());
+    s.send(lease).await;
+    // The decision is in progress; then the connection is lost.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(w.events.try_recv().is_err(), "still deciding");
+    drop(s);
+    let mut again = w.next_connection().await;
+    assert_eq!(
+        w.events.try_recv().map(|e| e.1),
+        Ok(Event::DecisionDropped),
+        "aborted before the next dial"
+    );
+    let _ = again.handshake(w.owner).await;
+    let (_task, _rx) = again.serve(true);
+    w.shutdown().await;
+}
+
+/// The same, on the way out: `not_enrolled` aborts the decision in progress **before** `stop_all`, so no job can start
+/// after the jobs were stopped.
+#[tokio::test(start_paused = true)]
+async fn decisions_in_progress_are_aborted_before_stop_all() {
+    let mut w = start(hanging());
+    let mut s = w.next_connection().await;
+    let _ = s.handshake(w.owner).await;
+    let (_, lease) = lease_msg(w.owner, good_job());
+    s.send(lease).await;
+    // The decision is under way (one that never began is simply never run).
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(w.events.try_recv().is_err(), "still deciding");
+    s.send(json!({"type": "error", "code": "not_enrolled", "message": "removed"}))
+        .await;
+    assert_eq!(w.daemon.await.unwrap(), DaemonExit::NotEnrolled);
+    assert_eq!(w.events.try_recv().map(|e| e.1), Ok(Event::DecisionDropped));
+    assert_eq!(w.events.try_recv().map(|e| e.1), Ok(Event::StopAll("not_enrolled")));
+}
+
+/// No checkpointing in v0.1 (§9): a stopped agent (SIGTERM) stops its jobs before it exits, so no container
+/// outlives it.
+#[tokio::test(start_paused = true)]
+async fn shutdown_stops_every_job_before_the_agent_exits() {
+    let mut w = start(Options::default());
+    let mut s = w.next_connection().await;
+    let _ = s.handshake(w.owner).await;
+    let (_task, _rx) = s.serve(true);
+    let mut events = std::mem::replace(&mut w.events, mpsc::unbounded_channel().1);
+    assert_eq!(w.shutdown().await, DaemonExit::Shutdown);
+    assert_eq!(events.try_recv().map(|e| e.1), Ok(Event::StopAll("shutdown")));
+}

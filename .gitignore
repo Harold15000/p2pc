@@ -1,0 +1,18 @@
+/target/
+**/target/
+*.swp
+.DS_Store
+.idea/
+.vscode/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+/sdk/python/.venv/
+__pycache__/
+.pytest_cache/
+/dist/
+
+# Output of deploy/wsl/build-rootfs.sh (images are build artifacts, never committed)
+/deploy/wsl/out/

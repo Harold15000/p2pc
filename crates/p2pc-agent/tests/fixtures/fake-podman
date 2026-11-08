@@ -1,0 +1,74 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+#
+# A fake `podman` for tests/sandbox_fake_podman.rs. Each test symlinks it into its own state directory and points
+# the driver at the symlink, so "$0" names that directory. The script records every call there (arguments
+# separated by US, 0x1f; calls by RS, 0x1e) and behaves as the state files say:
+#   pull_fails    `podman pull` fails (exit 125)
+#   create_fails  `podman create` fails (exit 125)
+#   image_present `podman image exists` says yes (otherwise exit 1)
+#   start_fails   `podman start` fails before the container runs (exit 125), and `inspect` shows it never started
+#   manifest_size the layer size `podman manifest inspect` (and fake-skopeo) report
+#   podman_manifest_unsupported  `podman manifest inspect` fails as Podman 4.9 does on a single OCI manifest
+#   image_size    the size `podman image inspect` reports after a pull (default 1 MiB)
+#   job.sh        what the container does: `podman start --attach` runs it, so its output and exit code are the
+#                 job's
+# `podman create` copies the --env-file to env_at_create, to show that the file existed when Podman read it.
+set -u
+state=$(dirname "$0")
+# Global options come before the subcommand (`--events-backend=file`, from `PodmanEngine::with_events_backend`). They
+# are recorded apart (one line per call, in `globals`) so `calls` always starts with the subcommand.
+globals=
+while [ "${1#--events-backend=}" != "$1" ]; do globals="$globals $1"; shift; done
+echo "$globals" >> "$state/globals"
+for a in "$@"; do printf '%s\037' "$a"; done >> "$state/calls"
+printf '\036' >> "$state/calls"
+# The names (never the values) of the environment Podman was run with.
+env | cut -d= -f1 >> "$state/env_names"
+
+case "$1" in
+  pull)
+    if [ -f "$state/pull_fails" ]; then echo "Error: pull failed" >&2; exit 125; fi ;;
+  image)
+    case "$2" in
+      exists) [ -f "$state/image_present" ] || exit 1 ;;
+      *) cat "$state/image_size" 2>/dev/null || echo 1048576 ;;
+    esac ;;
+  manifest)
+    if [ -f "$state/podman_manifest_unsupported" ]; then
+      # What Podman 4.9.3 does with a single-image OCI manifest (measured in T08 on the WSL2 node).
+      echo 'Error: parsing manifest blob: unsupported format "application/vnd.oci.image.manifest.v1+json"' >&2
+      exit 125
+    fi
+    # A single-platform image manifest; its layer size comes from manifest_size (default 1000 bytes).
+    size=$(cat "$state/manifest_size" 2>/dev/null || echo 1000)
+    printf '{"schemaVersion":2,"config":{"size":100},"layers":[{"size":%s,"digest":"sha256:a"}]}\n' "$size" ;;
+  rmi) ;;
+  create)
+    if [ -f "$state/create_fails" ]; then echo "Error: create failed" >&2; exit 125; fi
+    prev=
+    for a in "$@"; do
+      if [ "$prev" = "--env-file" ]; then cp "$a" "$state/env_at_create"; fi
+      prev=$a
+    done
+    echo 0123456789abcdef ;;
+  start)
+    if [ -f "$state/start_fails" ]; then
+      # The OCI runtime refuses to start it (for example a missing CDI device); the container stays "created".
+      echo "Error: crun: cannot stat CDI device nvidia.com/gpu=all" >&2; exit 125
+    fi
+    exec sh "$state/job.sh" ;;
+  container)
+    # `inspect`. A container that never started is still there, with Go's zero StartedAt; one that ran is gone
+    # (--rm).
+    if [ -f "$state/start_fails" ]; then
+      echo '[{"State":{"Status":"created","StartedAt":"0001-01-01T00:00:00Z"},"SizeRw":0}]'
+    else
+      echo "Error: no such container" >&2; exit 125
+    fi ;;
+  kill|rm) ;;
+  ps)
+    echo '[]' ;;
+  *)
+    echo "fake podman: unexpected command $1" >&2; exit 125 ;;
+esac

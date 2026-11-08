@@ -1,0 +1,20 @@
+# Reviewed gitleaks findings that are not secrets (architect, 05-11). Each line is a finding fingerprint:
+# <commit>:<file>:<rule>:<line>. All of them are test fixtures, documentation examples (idempotency keys) or the
+# public fingerprint of NVIDIA's apt signing key. New findings are NOT covered: fix them, or mark a fake value in a
+# test with a `gitleaks:allow` comment on the same line (see CONTRIBUTING.md).
+
+3c7c2bad9ce44bc6d31bf843c4fd8efd9936b47c:crates/p2pc-cli/tests/commands.rs:generic-api-key:344
+008bd191acab375af4de5c664cac68f801dc1af9:crates/p2pc-proto/src/api.rs:generic-api-key:1503
+d29ec0ff35e7fbdaeed2683e9ddadde63776ba55:crates/p2pc-proto/src/protocol.rs:generic-api-key:917
+be53170d779f031d5af8c9f9ba38f7ee4714fbb4:deploy/wsl/build-rootfs.sh:generic-api-key:30
+9841b48d5c09e2fcd2b2f71b4ed2ad11910e2b34:deploy/wsl/build-rootfs.sh:generic-api-key:33
+774d04fbafdc5d45c87edd0512daa74f7ac19fe9:sdk/python/README.md:generic-api-key:57
+6c3311055ce942bed7155cf9bf6b03a6ac31342c:sdk/python/README.md:generic-api-key:59
+f2a30a458d77f6a48e545ac57710cb1e60cdc749:sdk/python/tests/helpers.py:generic-api-key:14
+f2a30a458d77f6a48e545ac57710cb1e60cdc749:sdk/python/tests/test_client.py:generic-api-key:763
+2e83b595717f6c53d986fc74283ec25cc913e15d:sdk/python/tests/test_errors.py:generic-api-key:24
+2e83b595717f6c53d986fc74283ec25cc913e15d:sdk/python/tests/test_models.py:generic-api-key:324
+# T13b (PR #17): fake join tokens and keys in SDK test fixtures, reviewed 05-11.
+e8bec9a106f4b4ff173ea56ce0574364bd9cb660:sdk/python/tests/test_client.py:generic-api-key:860
+931018369c152ca88aa2f94390ffef1c1c8ec626:sdk/python/tests/test_models.py:generic-api-key:431
+931018369c152ca88aa2f94390ffef1c1c8ec626:sdk/python/tests/test_server_errors.py:generic-api-key:27

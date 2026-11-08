@@ -1,0 +1,4170 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "P2PC API",
+    "description": "The P2PC control plane REST API. Errors are RFC 9457 `application/problem+json` with a stable `code`. Lists use cursor pagination (`limit` ≤ 100, `cursor`).",
+    "license": {
+      "name": "AGPL-3.0-only",
+      "identifier": "AGPL-3.0-only"
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/healthz": {
+      "get": {
+        "tags": [
+          "meta"
+        ],
+        "summary": "Liveness only, with no data.",
+        "operationId": "healthz",
+        "responses": {
+          "200": {
+            "description": "The server is up.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {}
+        ]
+      }
+    },
+    "/v1/audit": {
+      "get": {
+        "tags": [
+          "audit"
+        ],
+        "summary": "The caller's account's audit events, newest first.",
+        "operationId": "list_audit",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1-100 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "`next_cursor` of the previous page.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "description": "Only events of this kind, for example `key_created`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of events.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_AuditEvent"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid key.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key lacks the admin scope.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid `limit`, `cursor` or `kind`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/estimate": {
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Asks what would happen to a job, without creating it. The body, the header and the validation are those of\n`POST /v1/jobs`.",
+        "description": "`matching_nodes` counts the enrolled nodes that could ever run the job (right pool, labels, a ready sandbox\ndriver, enough offered capacity and GPUs) and `would_queue` says whether it would wait for room right now (no\nmatching node is online, connected, not draining and with enough free capacity). With no matching node,\n`feasible` is false and `would_queue` true, with a `reason`; a job submitted anyway stays queued, because nothing\nexpires in v0.1. When the request carries the idempotency key of a job this key already submitted with the same\nbody, and that job is held in the queue after 10 failed offers (§8 \"Offer cap\"), `reason` is that job's reason.\n`units_per_hour` is the job's cost per hour, in milli-units.",
+        "operationId": "estimate",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Accepted and validated like in `POST /v1/jobs`; an estimate creates nothing.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobSpec"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The estimate.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Estimate"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid key.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: the key lacks `jobs:read`. `image_not_allowed`: the key may not run the image.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid job, as in `POST /v1/jobs`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/jobs": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Lists the caller's jobs, newest first (`created_at` descending, then `id`), with cursor pagination.",
+        "operationId": "list_jobs",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1-100 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "`next_cursor` of the previous page (opaque).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "description": "Only jobs in this state: `queued`, `assigned`, `running`, `succeeded`, `failed`, `timed_out`, `cancelled` or\n`lost`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "node_id",
+            "in": "query",
+            "description": "Only jobs of this node.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of jobs. `spec.env` values are `<redacted>` and `spec.files` have no content.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_Job"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid key.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key lacks `jobs:read`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid `limit`, `cursor`, `status` or `node_id`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Submits a job. It is stored `queued` (attempt 1), and the scheduler places it later.",
+        "description": "- The body is validated with the §7 table; the image is normalized.\n- The key's `allowed_images` must cover the normalized image (`403 image_not_allowed`), and its `daily_unit_cap`\n  must hold the estimate on top of what the key has reserved today, UTC (`402 cap_exceeded`; exactly at the cap is\n  allowed).\n- **Idempotency.** The key comes from `idempotency_key` or the `Idempotency-Key` header (if both are given they\n  must be equal). The same key with the same request returns the existing job (`200`); with a different request,\n  `409 idempotency_conflict`. Two concurrent identical requests create one job. Idempotency keys are scoped to\n  the **API key** that submitted the job, and no response ever contains one: another key reusing the same\n  idempotency key simply gets its own new job (`201`), so it learns nothing about this one.\n- The caller's key is reloaded inside the transaction (§5): a key revoked or expired mid-request gets `401` and\n  no job is created.",
+        "operationId": "create_job",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Makes the submission idempotent; must equal `idempotency_key` if both are given. 1-255 printable ASCII characters.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobSpec"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "This API key already used the idempotency key with the same request: the existing job.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "The job was created and is queued.",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`/v1/jobs/{id}`"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid key, or the key was revoked or expired while the request was in flight.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "`cap_exceeded`: the job's estimate would exceed the key's daily unit cap.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: the key lacks `jobs:write`. `image_not_allowed`: the key's allowed images do not cover the image.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`idempotency_conflict`: this API key already used the idempotency key with a different request. (Idempotency keys are scoped to the API key; another key reusing it gets its own job.)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid job: `errors` lists each field. Codes: `validation_failed`, `unsupported_pool`, `too_large` (the job does not fit its `Lease` frame), `invalid_body`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/jobs/{id}": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "One job of the caller, with its `attempts` (§7): `[{attempt, node_id, outcome, reason, started_at, ended_at}]`,\noldest first. `outcome` uses the job-state words (`running` while the attempt is in progress). A job of another\naccount answers `404`, exactly like one that does not exist (SI-7).",
+        "operationId": "get_job",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The job ID (`job_…`).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The job, with its `attempts` (oldest first; refused or unanswered offers are not attempts). `spec.env` values are `<redacted>` and `spec.files` have no content.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid key.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key lacks `jobs:read`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such job in this account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/jobs/{id}/cancel": {
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Cancels a job. Idempotent.",
+        "description": "- `queued`: becomes `cancelled` at once.\n- `assigned` or `running`: the status does not change yet. `cancel_requested_at` is set (once), and the scheduler\n  delivers the `Cancel` to the node; the job ends `cancelled` when the node reports.\n- Already finished: `200` with the job unchanged.",
+        "operationId": "cancel_job",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The job ID (`job_…`).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The job after the request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid key, or the key was revoked or expired while the request was in flight.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key lacks `jobs:write`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such job in this account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/jobs/{id}/logs": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "The NDJSON log of an attempt: `{seq, stream, ts, data}` per line, `data` as UTF-8 with invalid bytes replaced.",
+        "description": "- **Page** (default): the lines stored now with `seq >= since_seq`. A job with no logs yet gives an empty `200`.\n- **Follow** (`follow=true`): the same, then new lines as they are stored; the stream ends once the attempt is\n  over and its log is flushed.\n- **How the body ends.** A clean end (the HTTP body completes) means the lines asked for are all there: for a follow,\n  the attempt is over and its log is flushed. Anything else ends the body with an **error** (the connection is\n  cut without the end of the body, so a client sees a broken transfer): after `http.keepalive_idle_ms` (60 s by\n  default) with no new line, on a log that cannot be read and on a server error. The client resumes with\n  `since_seq = last seq + 1`, losing and repeating nothing.\n- At most 64 MiB are stored per attempt; past that, one `stderr` line marks the truncation. That line also has\n  the member `truncated: true`, which no job output can produce (readers that do not know it ignore it).",
+        "operationId": "get_logs",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The job ID (`job_…`).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "since_seq",
+            "in": "query",
+            "description": "The first `seq` to return, inclusive (default 0). Resume with the last `seq` seen plus one.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "follow",
+            "in": "query",
+            "description": "Keep the stream open and send new lines as they are stored, until the attempt ends (default false).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "attempt",
+            "in": "query",
+            "description": "The attempt (default: the latest).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "NDJSON, one `LogLine` per line, in `seq` order.",
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogLine"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid key.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key lacks `jobs:read`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such job in this account, or no such attempt.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid query (for example `attempt=0`).",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/jobs/{id}/outputs": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "The published output files of an attempt, by path, with their size and sha256. After the retention period the\nentries stay, with `expired: true`, and their downloads answer `410`.",
+        "operationId": "list_outputs",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The job ID (`job_…`).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1-100 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "`next_cursor` of the previous page (opaque).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "attempt",
+            "in": "query",
+            "description": "The attempt (default: the latest).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of output files.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_OutputEntry"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid key.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key lacks `jobs:read`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such job in this account, or no such attempt.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid `limit`, `cursor` or `attempt`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/jobs/{id}/outputs/{path}": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Downloads one published output file. The path is checked like an upload's (no traversal, SI-9) and opened under\nthe attempt's published directory without following any link. Sends `Content-Length` and `X-P2PC-SHA256`;\n`Range` is not supported (the whole file is sent).",
+        "operationId": "download_output",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The job ID (`job_…`).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "path",
+            "description": "The output's path relative to `/outputs`, for example `results/a.csv` (its segments percent-encoded).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "attempt",
+            "in": "query",
+            "description": "The attempt (default: the latest).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The file.",
+            "headers": {
+              "Content-Length": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "The file's size."
+              },
+              "X-P2PC-SHA256": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The file's SHA-256, 64 lowercase hex characters."
+              }
+            },
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "format": "int32",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid key.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key lacks `jobs:read`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such job in this account, no such attempt, or no such output.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "`expired`: the output was deleted after the retention period.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/keys": {
+      "get": {
+        "tags": [
+          "keys"
+        ],
+        "summary": "The caller's account's keys, in creation order, revoked ones included. Never contains a secret.",
+        "operationId": "list_keys",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1-100 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "`next_cursor` of the previous page.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of keys.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_ApiKeyInfo"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid key.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key lacks the admin scope.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid `limit` or `cursor`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "keys"
+        ],
+        "summary": "Creates an API key in the caller's project. The full key is in the response, once.",
+        "description": "A key can never create a more powerful key (§5 \"No escalation\"): the scopes, `daily_unit_cap`,\n`allowed_images` and `expires_at` of the new key are bounded by the caller's.",
+        "operationId": "create_key",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateApiKey"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The key, shown only this once, and its metadata (flat).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NewApiKey"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid key.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: the key lacks the admin scope. `escalation_denied`: the request asks for more than the calling key has (scopes, `daily_unit_cap`, `allowed_images` or `expires_at`); `errors` lists the fields.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid body. `expires_at` must be in the future and in whole seconds (no fractional part).",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/keys/{key_id}": {
+      "delete": {
+        "tags": [
+          "keys"
+        ],
+        "summary": "Revokes a key of the caller's account. Idempotent.",
+        "description": "A key can revoke itself, or any key it could have created (§5 \"Revoking\"). The account's last live unrestricted\nadmin key (no expiry, no cap, no image list) cannot be revoked.",
+        "operationId": "revoke_key",
+        "parameters": [
+          {
+            "name": "key_id",
+            "in": "path",
+            "description": "The key's public ID (12 characters).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Revoked (or already revoked)."
+          },
+          "401": {
+            "description": "Missing or invalid key.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: the key lacks the admin scope. `escalation_denied`: the target has more power than the calling key, so the calling key could not have created it; `errors` lists the fields.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such key in this account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`last_admin_key`: it is the account's last live unrestricted admin key (no expiry, no cap, no image list). Recover with `p2pc-server keys recover` if every admin key is lost.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/nodes": {
+      "get": {
+        "tags": [
+          "nodes"
+        ],
+        "summary": "The account's nodes, in enrollment order.",
+        "operationId": "list_nodes",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1-100 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "`next_cursor` of the previous page.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "description": "Only nodes in this state: `online` (draining nodes included) or `offline`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of nodes.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_Node"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid query string (for example an unknown `state`).",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid key.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key lacks the nodes:read scope.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid `limit` or `cursor`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/nodes/join-tokens": {
+      "get": {
+        "tags": [
+          "nodes"
+        ],
+        "summary": "The account's join tokens, in creation order. Never contains a token or a code.",
+        "operationId": "list_join_tokens",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1-100 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "`next_cursor` of the previous page.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of join tokens.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_JoinTokenInfo"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid key.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key lacks the admin scope.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid `limit` or `cursor`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "nodes"
+        ],
+        "summary": "Creates a single-use join token. The token is in the response, once.",
+        "operationId": "create_join_token",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateJoinToken"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The token (`p2pc_join_…`), shown only this once.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JoinTokenResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid key (also when the key was revoked or expired during the request).",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key lacks the admin scope.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid `label` or `ttl_s` (1-86400, default 900).",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/nodes/join-tokens/{id}": {
+      "delete": {
+        "tags": [
+          "nodes"
+        ],
+        "summary": "Revokes an unused join token. Idempotent.",
+        "operationId": "revoke_join_token",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The token's row ID (`jtk_…`).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Revoked (or already revoked)."
+          },
+          "401": {
+            "description": "Missing or invalid key (also when the key was revoked or expired during the request).",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key lacks the admin scope.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such token in this account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`token_consumed`: a node already joined with it; delete the node instead.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/nodes/{id}": {
+      "get": {
+        "tags": [
+          "nodes"
+        ],
+        "summary": "One node of the account.",
+        "operationId": "get_node",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The node ID (`node_…`).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The node.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Node"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid key.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key lacks the nodes:read scope.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such node in this account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "nodes"
+        ],
+        "summary": "Deletes the node: closes its live connection, and its NodeId is no longer enrolled (`not_enrolled`).",
+        "operationId": "delete_node",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The node ID (`node_…`).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted."
+          },
+          "401": {
+            "description": "Missing or invalid key.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key lacks the nodes:write scope.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such node in this account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/nodes/{id}/drain": {
+      "post": {
+        "tags": [
+          "nodes"
+        ],
+        "summary": "Stops giving the node new leases, and tells it `Drain` when it is connected. Idempotent.",
+        "operationId": "drain_node",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The node ID (`node_…`).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The node, now draining.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Node"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid key.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key lacks the nodes:write scope.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such node in this account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/nodes/{id}/resume": {
+      "post": {
+        "tags": [
+          "nodes"
+        ],
+        "summary": "Lets the node take leases again, and tells it `Resume` when it is connected. Idempotent.",
+        "operationId": "resume_node",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The node ID (`node_…`).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The node, no longer draining.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Node"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid key.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key lacks the nodes:write scope.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such node in this account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/openapi.json": {
+      "get": {
+        "tags": [
+          "meta"
+        ],
+        "summary": "The OpenAPI 3.1 document of this API.",
+        "operationId": "openapi_json",
+        "responses": {
+          "200": {
+            "description": "The OpenAPI document.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {}
+        ]
+      }
+    },
+    "/v1/server": {
+      "get": {
+        "tags": [
+          "server"
+        ],
+        "summary": "The server's iroh NodeId, relays, address (`p2pc_srv_…`) and version.",
+        "operationId": "get_server",
+        "responses": {
+          "200": {
+            "description": "How to reach this server over iroh.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerInfo"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid key.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/usage": {
+      "get": {
+        "tags": [
+          "usage"
+        ],
+        "summary": "The usage of the caller's project: finished attempts that ended in `[from, to)`, grouped by `group_by`, with\ncursor pagination over the groups and the total of the whole range. Only the caller's own account and project\nare ever counted.",
+        "operationId": "get_usage",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Start of the range (RFC 3339, inclusive). Default: the start of the current UTC day, or one day before `to`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "End of the range (RFC 3339, exclusive). Default: one day after `from`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "group_by",
+            "in": "query",
+            "description": "`job` (default), `node` or `key`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Groups per page, 1-100 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "`next_cursor` of the previous page (opaque).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The grouped usage and the total of the range.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsageReport"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid query string (for example an unknown `group_by`).",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid key.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The key lacks `jobs:read`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid `from`, `to` (`from` must be before `to`), `limit` or `cursor`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/whoami": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Who the presented key is, and its limits. `daily_unit_cap: null` means the key is uncapped; `p2pc mcp` refuses\nsuch a key. Never contains the secret.",
+        "operationId": "whoami",
+        "responses": {
+          "200": {
+            "description": "The key's account, project, ID, scopes and limits (`label`, `daily_unit_cap`, `allowed_images`, `expires_at`; `null` means no limit). Never the secret.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WhoAmI"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid key.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AccountId": {
+        "type": "string",
+        "description": "Identifies an account (`acc_…`)."
+      },
+      "ApiKeyInfo": {
+        "type": "object",
+        "description": "An API key as listed by `GET /v1/keys`. Never contains the secret.",
+        "required": [
+          "id",
+          "project_id",
+          "scopes",
+          "created_at"
+        ],
+        "properties": {
+          "allowed_images": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Image allowlist. `None` allows every image."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Creation time."
+          },
+          "daily_unit_cap": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Units",
+                "description": "Daily cap in milli-units."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Optional expiry (§5)."
+          },
+          "id": {
+            "$ref": "#/components/schemas/KeyId",
+            "description": "Public key ID."
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional human label (§5)."
+          },
+          "last_used_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Last time the key authenticated a request (the server writes it at most once a minute)."
+          },
+          "project_id": {
+            "$ref": "#/components/schemas/ProjectId",
+            "description": "Project the key acts in."
+          },
+          "revoked_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the key was revoked. A revoked key's row is never deleted (§5)."
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Scope"
+            },
+            "description": "Granted scopes."
+          }
+        }
+      },
+      "AuditEvent": {
+        "type": "object",
+        "description": "One row of the append-only audit log, as returned by `GET /v1/audit` (§5 \"Audit\").\n\n`detail` is a JSON object that **never holds a secret**: no key, token, code or env value. The server should\ncheck it with [`audit_detail_has_secret`] before writing.",
+        "required": [
+          "id",
+          "at",
+          "kind",
+          "detail"
+        ],
+        "properties": {
+          "actor_key_id": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/KeyId",
+                "description": "The key that acted, if any."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When it happened (the start of the minute, for `auth_failed`)."
+          },
+          "detail": {
+            "type": "object",
+            "description": "Event-specific, secret-free details."
+          },
+          "id": {
+            "$ref": "#/components/schemas/AuditEventId",
+            "description": "Event ID."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/AuditKind",
+            "description": "What happened."
+          },
+          "subject_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The object acted on (a key, join token or node ID), as an opaque string."
+          }
+        }
+      },
+      "AuditEventId": {
+        "type": "string",
+        "description": "Identifies an audit event (`aud_…`, §5 \"Audit\")."
+      },
+      "AuditKind": {
+        "type": "string",
+        "description": "What an audit event records (§5 \"Audit\"). Closed: one value per event the spec lists.",
+        "enum": [
+          "key_created",
+          "key_revoked",
+          "join_token_created",
+          "join_token_consumed",
+          "join_token_revoked",
+          "node_enrolled",
+          "node_deleted",
+          "auth_failed",
+          "key_recovered",
+          "node_reenrolled"
+        ]
+      },
+      "Capacity": {
+        "type": "object",
+        "description": "An amount of node capacity.",
+        "required": [
+          "cpu",
+          "memory_mb",
+          "gpu"
+        ],
+        "properties": {
+          "cpu": {
+            "type": "number",
+            "format": "double",
+            "description": "vCPUs."
+          },
+          "disk_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Disk for job directories, in MiB (§6 `Inventory`, §8). `None` when the agent does not report it (older than\nthe 2026-11-07 amendment): the scheduler then places by CPU, memory and GPU only.",
+            "minimum": 0
+          },
+          "gpu": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Whole GPUs.",
+            "minimum": 0
+          },
+          "memory_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Memory in MiB.",
+            "minimum": 0
+          }
+        }
+      },
+      "CpuInfo": {
+        "type": "object",
+        "description": "CPU description.",
+        "required": [
+          "model",
+          "cores"
+        ],
+        "properties": {
+          "cores": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Logical cores.",
+            "minimum": 0
+          },
+          "model": {
+            "type": "string",
+            "description": "Model name, for example `AMD Ryzen 9 7950X`."
+          }
+        }
+      },
+      "CreateApiKey": {
+        "type": "object",
+        "description": "Body of `POST /v1/keys`.",
+        "required": [
+          "scopes"
+        ],
+        "properties": {
+          "allowed_images": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Glob patterns on the normalized image reference. `None` allows every image."
+          },
+          "daily_unit_cap": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Units",
+                "description": "Daily cap in milli-units, per UTC day."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Optional expiry (§5). After it, the key authenticates nothing."
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional human label (§5)."
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Scope"
+            },
+            "description": "Scopes granted to the key."
+          }
+        },
+        "additionalProperties": false
+      },
+      "CreateJoinToken": {
+        "type": "object",
+        "description": "Body of `POST /v1/nodes/join-tokens`.",
+        "properties": {
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional human label, shown when tokens are listed."
+          },
+          "ttl_s": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Validity in seconds. Default 900 (15 minutes), maximum 86 400 (24 h).",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "Egress": {
+        "type": "object",
+        "description": "Network egress policy.\n\n**Strict** (request type): the `POST /v1/jobs` body, and what the agent parses a lease's job into (`LeaseJob::parse_strict`). Unknown fields are rejected, which catches typos and refuses a lease the agent would not fully understand (§6). Responses use the lenient twin, [`JobSpecView`].",
+        "properties": {
+          "allow": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Allowed domains. Each one matches itself and its subdomains on whole labels."
+          }
+        },
+        "additionalProperties": false
+      },
+      "EgressView": {
+        "type": "object",
+        "description": "Network egress policy.\n\n**Lenient and redacted** (response type): the `spec` of a [`Job`] in API responses (§7 \"Job representation in responses\"). Unknown fields are ignored, so an older CLI or SDK keeps reading jobs after the server adds a field (§6). `env` values are always `\"<redacted>\"` and `files` carry `{path, size, sha256}` with no content, and there is **no `idempotency_key`**: a response never carries it (§7). Build it with [`JobSpecView::from_stored`].",
+        "properties": {
+          "allow": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Allowed domains. Each one matches itself and its subdomains on whole labels."
+          }
+        }
+      },
+      "ErrorCode": {
+        "type": "string",
+        "description": "A stable, machine-readable validation error code.",
+        "enum": [
+          "out_of_range",
+          "invalid_format",
+          "too_large",
+          "too_many",
+          "reserved",
+          "unsupported_pool",
+          "not_allowed",
+          "duplicate",
+          "path_conflict"
+        ]
+      },
+      "Estimate": {
+        "type": "object",
+        "description": "Response of `POST /v1/estimate`.",
+        "required": [
+          "feasible",
+          "matching_nodes",
+          "would_queue",
+          "units_per_hour"
+        ],
+        "properties": {
+          "feasible": {
+            "type": "boolean",
+            "description": "Whether some enrolled node could ever run the job."
+          },
+          "matching_nodes": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Nodes that match the request.",
+            "minimum": 0
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the job is not feasible, or would queue."
+          },
+          "units_per_hour": {
+            "$ref": "#/components/schemas/Units",
+            "description": "Units the job reserves per hour, in milli-units."
+          },
+          "would_queue": {
+            "type": "boolean",
+            "description": "Whether the job would wait in the queue right now."
+          }
+        }
+      },
+      "FieldError": {
+        "type": "object",
+        "description": "One validation problem.",
+        "required": [
+          "field",
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/ErrorCode",
+            "description": "Stable code."
+          },
+          "field": {
+            "type": "string",
+            "description": "Path of the offending field, for example `resources.cpu` or `files[0].path`."
+          },
+          "message": {
+            "type": "string",
+            "description": "Human explanation. Never contains env values or file contents."
+          }
+        }
+      },
+      "GpuInfo": {
+        "type": "object",
+        "description": "One GPU (§6 \"GPU inventory\"). The `uuid` is its key: a GPU is never identified by its index.",
+        "required": [
+          "uuid",
+          "index",
+          "name",
+          "driver_version"
+        ],
+        "properties": {
+          "compute_capability": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Compute capability, for example `8.9`, if known."
+          },
+          "cuda_driver_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "CUDA version the driver supports, if known."
+          },
+          "driver_version": {
+            "type": "string",
+            "description": "Driver version."
+          },
+          "index": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Device index as the driver enumerates it. Informational only.",
+            "minimum": 0
+          },
+          "mig": {
+            "type": "boolean",
+            "description": "Whether MIG is enabled. A MIG card is reported but not offerable in v0.1."
+          },
+          "name": {
+            "type": "string",
+            "description": "Model name."
+          },
+          "pci_bdf": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "PCI bus/device/function, for example `0000:01:00.0`, if known (not on WSL2)."
+          },
+          "uuid": {
+            "type": "string",
+            "description": "Stable identifier, for example `GPU-6a3d0a2e-…` (NVML), or `MIG-…`."
+          },
+          "vram_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Video memory in MiB. `None` means unknown, and then the GPU is not offerable (it is never guessed).",
+            "minimum": 0
+          }
+        }
+      },
+      "GpuStatus": {
+        "type": "object",
+        "description": "GPU detection status with an optional explanation.",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Human explanation."
+          },
+          "status": {
+            "$ref": "#/components/schemas/GpuStatusKind",
+            "description": "The outcome."
+          }
+        }
+      },
+      "GpuStatusKind": {
+        "type": "string",
+        "description": "Outcome of GPU detection (§6).",
+        "enum": [
+          "ok",
+          "no_driver",
+          "nvml_error",
+          "not_found",
+          "cdi_missing",
+          "cdi_stale"
+        ]
+      },
+      "Health": {
+        "type": "object",
+        "description": "Response of `GET /healthz` (§7): liveness only, with no data.",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "description": "Always `ok`."
+          }
+        }
+      },
+      "InputFile": {
+        "type": "object",
+        "description": "An input file in a request: written to `path` (under `/inputs`) with the base64-decoded `content_b64`.\n\n`Debug` shows the path and the encoded length, never the content. **Strict** (request type): unknown fields are\nrejected.",
+        "required": [
+          "path",
+          "content_b64"
+        ],
+        "properties": {
+          "content_b64": {
+            "type": "string",
+            "description": "File content, standard base64 with padding."
+          },
+          "path": {
+            "type": "string",
+            "description": "Absolute path under `/inputs/`."
+          }
+        },
+        "additionalProperties": false
+      },
+      "InputFileView": {
+        "type": "object",
+        "description": "An input file as shown in responses (§7): its path, decoded size and SHA-256, **never its content**. Lenient:\nunknown fields are ignored.",
+        "required": [
+          "path",
+          "size",
+          "sha256"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Absolute path under `/inputs/`."
+          },
+          "sha256": {
+            "$ref": "#/components/schemas/Sha256Digest",
+            "description": "SHA-256 of the decoded content."
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Decoded size in bytes.",
+            "minimum": 0
+          }
+        }
+      },
+      "Inventory": {
+        "type": "object",
+        "description": "What a node has (§6 `Join`/`Hello`, §7 `GET /v1/nodes`). Reported by the agent; validate it with\n[`crate::protocol::validate_inventory`] when it comes from the network.",
+        "required": [
+          "hostname",
+          "platform",
+          "cpu",
+          "memory_mb",
+          "os",
+          "arch",
+          "gpu_status",
+          "offered",
+          "agent_version"
+        ],
+        "properties": {
+          "agent_version": {
+            "type": "string",
+            "description": "Agent version."
+          },
+          "arch": {
+            "type": "string",
+            "description": "CPU architecture, for example `x86_64`."
+          },
+          "cpu": {
+            "$ref": "#/components/schemas/CpuInfo",
+            "description": "CPU."
+          },
+          "disk_total_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Size of the filesystem that holds the job directories, in MiB, if the agent could read it. `offered.disk_mb`\nnever exceeds it (validated).",
+            "minimum": 0
+          },
+          "dxg": {
+            "type": "boolean",
+            "description": "Whether `/dev/dxg` (the WSL2 GPU device) is present."
+          },
+          "gpu_status": {
+            "$ref": "#/components/schemas/GpuStatus",
+            "description": "Outcome of GPU detection."
+          },
+          "gpus": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GpuInfo"
+            },
+            "description": "GPUs, keyed by `uuid`."
+          },
+          "hostname": {
+            "type": "string",
+            "description": "The machine's hostname, as reported. The server derives the node's unique `name` from it (§5); it is never\nused for authentication."
+          },
+          "memory_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Total RAM in MiB.",
+            "minimum": 0
+          },
+          "offered": {
+            "$ref": "#/components/schemas/Capacity",
+            "description": "Capacity offered to jobs: hardware × the owner's share limits (§8)."
+          },
+          "os": {
+            "type": "string",
+            "description": "Operating system, for example `Ubuntu 24.04`."
+          },
+          "platform": {
+            "$ref": "#/components/schemas/Platform",
+            "description": "Native Linux or the WSL2 distro."
+          },
+          "sandbox": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SandboxCapability"
+            },
+            "description": "Sandbox drivers."
+          },
+          "wsl2": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Wsl2Health",
+                "description": "WSL2 health block; absent on native Linux."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "Job": {
+        "type": "object",
+        "description": "A job as returned by the API.",
+        "required": [
+          "id",
+          "project_id",
+          "status",
+          "attempt",
+          "spec",
+          "estimated_units",
+          "created_at"
+        ],
+        "properties": {
+          "attempt": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Current attempt, starting at 1 (0 while never placed).",
+            "minimum": 0
+          },
+          "attempts": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/JobAttempt"
+            },
+            "description": "The job's attempts, oldest first: only in `GET /v1/jobs/{id}`; lists of jobs leave the field out (§7). An\nattempt is an accepted lease: refused or unanswered offers are not listed."
+          },
+          "cancel_requested_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When a cancel was requested for a job that was already `assigned` or `running` (the scheduler delivers it to\nthe node, and the job ends `cancelled`). `null` if none was requested, or if the job was queued and\ncancelled at once."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the job was created."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Short error code when the job failed without an exit code (for example `disk_limit`)."
+          },
+          "estimated_units": {
+            "$ref": "#/components/schemas/Units",
+            "description": "Estimated units reserved by the job (resources × timeout)."
+          },
+          "exit_code": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Exit code, when the job exited."
+          },
+          "finished_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the job reached a terminal state."
+          },
+          "id": {
+            "$ref": "#/components/schemas/JobId",
+            "description": "Job ID."
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional label, copied from the spec."
+          },
+          "node_id": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/NodeId",
+                "description": "Node of the current or last attempt."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "project_id": {
+            "$ref": "#/components/schemas/ProjectId",
+            "description": "Project the job belongs to."
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the job is in its current state, when there is something to tell the user, for example why a queued job\nis not being placed (§8 \"Offer cap\"). User-visible; never contains secrets."
+          },
+          "spec": {
+            "$ref": "#/components/schemas/JobSpecView",
+            "description": "The submitted spec, with the image normalized, built with [`JobSpecView::from_stored`]: `env` values are\n`\"<redacted>\"` and files carry no content (§7). Lenient: a field added by a newer server does not break\nolder clients."
+          },
+          "started_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the current attempt started running."
+          },
+          "status": {
+            "$ref": "#/components/schemas/JobStatus",
+            "description": "Current state."
+          }
+        }
+      },
+      "JobAttempt": {
+        "type": "object",
+        "description": "One attempt of a job, in `GET /v1/jobs/{id}` (§7): an accepted lease, on one node.",
+        "required": [
+          "attempt",
+          "node_id",
+          "outcome"
+        ],
+        "properties": {
+          "attempt": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The attempt number, from 1. Only node loss starts a new one.",
+            "minimum": 0
+          },
+          "ended_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the attempt ended; `null` while it runs."
+          },
+          "node_id": {
+            "$ref": "#/components/schemas/NodeId",
+            "description": "The node it ran on."
+          },
+          "outcome": {
+            "$ref": "#/components/schemas/JobStatus",
+            "description": "In job-state words: `running` while the attempt is in progress (accepted, or started), then `succeeded`,\n`failed`, `timed_out`, `cancelled` or `lost`. An attempt replaced after node loss (fenced) is `lost`."
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The reason code of the end (for example `exited_0`, `exit_code`, `node_lost`, `absent_from_hello`,\n`watchdog`), or `null` while the attempt runs. Never a secret."
+          },
+          "started_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the job process started on the node (`JobStarted`); `null` if it never did (accepted, then lost or timed\nout during the image pull)."
+          }
+        }
+      },
+      "JobId": {
+        "type": "string",
+        "description": "Identifies a job (`job_…`)."
+      },
+      "JobSpec": {
+        "type": "object",
+        "description": "A job specification: what to run and with which limits (§7).\n\n`Debug` never prints environment values or input file contents (§7: env values are never logged).\n\n**Strict** (request type): the `POST /v1/jobs` body, and what the agent parses a lease's job into (`LeaseJob::parse_strict`). Unknown fields are rejected, which catches typos and refuses a lease the agent would not fully understand (§6). Responses use the lenient twin, [`JobSpecView`].",
+        "required": [
+          "image",
+          "command",
+          "resources"
+        ],
+        "properties": {
+          "command": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The argv to run. There is no shell unless the argv calls one."
+          },
+          "egress": {
+            "$ref": "#/components/schemas/Egress",
+            "description": "Network egress allowlist. Empty means no network at all."
+          },
+          "env": {
+            "type": "object",
+            "description": "Environment variables. Values are secret-like: never logged, and never returned by the API.\n\nValues may not contain NUL, `\\n` or `\\r` (§7): they go into Podman's line-based `--env-file`, where a\nnewline would inject another variable. Encode multi-line secrets as base64, or pass them as `files`.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InputFile"
+            },
+            "description": "Files written under `/inputs` before the job starts."
+          },
+          "idempotency_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Client-chosen key that makes the submission idempotent (§7). Scoped to the API key that submits it. It is\n**never returned**: no response type has it (see [`JobSpecView`])."
+          },
+          "image": {
+            "type": "string",
+            "description": "OCI image reference, for example `docker.io/library/python:3.12-slim`."
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional human label."
+          },
+          "outputs": {
+            "$ref": "#/components/schemas/Outputs",
+            "description": "Limits on the files collected from `/outputs`."
+          },
+          "placement": {
+            "$ref": "#/components/schemas/Placement",
+            "description": "Where the job may run."
+          },
+          "resources": {
+            "$ref": "#/components/schemas/Resources",
+            "description": "Requested resources."
+          },
+          "retry": {
+            "$ref": "#/components/schemas/Retry",
+            "description": "Retry policy (only node loss consumes an attempt)."
+          },
+          "timeout_s": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Wall-clock limit in seconds. Default 3 600.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "JobSpecView": {
+        "type": "object",
+        "description": "A job specification: what to run and with which limits (§7).\n\n`Debug` never prints environment values or input file contents (§7: env values are never logged).\n\n**Lenient and redacted** (response type): the `spec` of a [`Job`] in API responses (§7 \"Job representation in responses\"). Unknown fields are ignored, so an older CLI or SDK keeps reading jobs after the server adds a field (§6). `env` values are always `\"<redacted>\"` and `files` carry `{path, size, sha256}` with no content, and there is **no `idempotency_key`**: a response never carries it (§7). Build it with [`JobSpecView::from_stored`].",
+        "required": [
+          "image",
+          "command",
+          "resources"
+        ],
+        "properties": {
+          "command": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The argv to run. There is no shell unless the argv calls one."
+          },
+          "egress": {
+            "$ref": "#/components/schemas/EgressView",
+            "description": "Network egress allowlist. Empty means no network at all."
+          },
+          "env": {
+            "type": "object",
+            "description": "Environment variables. Values are secret-like: never logged, and never returned by the API.\n\nValues may not contain NUL, `\\n` or `\\r` (§7): they go into Podman's line-based `--env-file`, where a\nnewline would inject another variable. Encode multi-line secrets as base64, or pass them as `files`.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InputFileView"
+            },
+            "description": "Files written under `/inputs` before the job starts."
+          },
+          "image": {
+            "type": "string",
+            "description": "OCI image reference, for example `docker.io/library/python:3.12-slim`."
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional human label."
+          },
+          "outputs": {
+            "$ref": "#/components/schemas/OutputsView",
+            "description": "Limits on the files collected from `/outputs`."
+          },
+          "placement": {
+            "$ref": "#/components/schemas/PlacementView",
+            "description": "Where the job may run."
+          },
+          "resources": {
+            "$ref": "#/components/schemas/ResourcesView",
+            "description": "Requested resources."
+          },
+          "retry": {
+            "$ref": "#/components/schemas/RetryView",
+            "description": "Retry policy (only node loss consumes an attempt)."
+          },
+          "timeout_s": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Wall-clock limit in seconds. Default 3 600.",
+            "minimum": 0
+          }
+        }
+      },
+      "JobStatus": {
+        "type": "string",
+        "description": "State of a job (§7).\n\n`queued → assigned → running → {succeeded | failed | timed_out | cancelled | lost}`, with requeueing on node loss.\nSee [`transition_allowed`].",
+        "enum": [
+          "queued",
+          "assigned",
+          "running",
+          "succeeded",
+          "failed",
+          "timed_out",
+          "cancelled",
+          "lost"
+        ]
+      },
+      "JoinTokenId": {
+        "type": "string",
+        "description": "Identifies a join token row (`jtk_…`), as listed and revoked by the admin API (§5). Never the token itself."
+      },
+      "JoinTokenInfo": {
+        "type": "object",
+        "description": "A join token as listed by `GET /v1/nodes/join-tokens` (§5 \"Listing and revoking\"). Never contains the token or\nits code.",
+        "required": [
+          "id",
+          "created_by_key_id",
+          "created_at",
+          "expires_at"
+        ],
+        "properties": {
+          "consumed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When a `Join` consumed it."
+          },
+          "consumed_by_node_id": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/NodeId",
+                "description": "The node it enrolled."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Creation time."
+          },
+          "created_by_key_id": {
+            "$ref": "#/components/schemas/KeyId",
+            "description": "The key that created it."
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Expiry (from the server's row, the only one that counts)."
+          },
+          "id": {
+            "$ref": "#/components/schemas/JoinTokenId",
+            "description": "Row ID, used by `DELETE /v1/nodes/join-tokens/{id}`."
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional label."
+          },
+          "revoked_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When it was revoked unused."
+          }
+        }
+      },
+      "JoinTokenResponse": {
+        "type": "object",
+        "description": "Response of `POST /v1/nodes/join-tokens`: `{id, join_token, expires_at}`, returned once. `Debug` redacts the\ncode.",
+        "required": [
+          "id",
+          "join_token",
+          "expires_at"
+        ],
+        "properties": {
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When it expires."
+          },
+          "id": {
+            "$ref": "#/components/schemas/JoinTokenId",
+            "description": "The token's row ID, for listing and `DELETE /v1/nodes/join-tokens/{id}`."
+          },
+          "join_token": {
+            "type": "string",
+            "description": "The token, `p2pc_join_…`. Single-use."
+          }
+        }
+      },
+      "KeyId": {
+        "type": "string",
+        "description": "The public ID of an API key: 12 characters of lowercase base32 (spec §5).\n\nIt is not secret. It appears in the key itself (`p2pc_sk_<key_id>_<secret>`) and in `GET /v1/keys`."
+      },
+      "LogLine": {
+        "type": "object",
+        "description": "One line of `GET /v1/jobs/{id}/logs` (NDJSON).",
+        "required": [
+          "seq",
+          "stream",
+          "ts",
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "string",
+            "description": "The text (invalid UTF-8 replaced)."
+          },
+          "seq": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Sequence number within the attempt.",
+            "minimum": 0
+          },
+          "stream": {
+            "$ref": "#/components/schemas/LogStream",
+            "description": "Source stream."
+          },
+          "ts": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the agent captured it."
+          }
+        }
+      },
+      "LogStream": {
+        "type": "string",
+        "description": "Which output stream a log line came from.",
+        "enum": [
+          "stdout",
+          "stderr"
+        ]
+      },
+      "NewApiKey": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ApiKeyInfo",
+            "description": "The key's metadata, serialized at the top level."
+          },
+          {
+            "type": "object",
+            "required": [
+              "key"
+            ],
+            "properties": {
+              "key": {
+                "type": "string",
+                "description": "The full key, `p2pc_sk_<key_id>_<secret>`. Store it now: it cannot be shown again."
+              }
+            }
+          }
+        ],
+        "description": "Response of `POST /v1/keys`, **flat** (§5): every field of the key's metadata plus `key`, the full key, which is\nshown only this once.\n\n`Debug` redacts the secret."
+      },
+      "Node": {
+        "type": "object",
+        "description": "A node as returned by the API.",
+        "required": [
+          "id",
+          "name",
+          "hostname",
+          "state",
+          "draining",
+          "inventory",
+          "free",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the node joined."
+          },
+          "draining": {
+            "type": "boolean",
+            "description": "Whether the node is draining (accepts no new jobs)."
+          },
+          "free": {
+            "$ref": "#/components/schemas/Capacity",
+            "description": "Capacity not reserved by active leases."
+          },
+          "hostname": {
+            "type": "string",
+            "description": "The hostname the agent reported, as is."
+          },
+          "id": {
+            "$ref": "#/components/schemas/NodeId",
+            "description": "Node ID."
+          },
+          "inventory": {
+            "$ref": "#/components/schemas/Inventory",
+            "description": "Last reported inventory."
+          },
+          "labels": {
+            "type": "object",
+            "description": "Labels used by `placement.labels`.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "last_seen": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Last heartbeat."
+          },
+          "name": {
+            "type": "string",
+            "description": "The node's name, **derived by the server** from the reported hostname: sanitized and unique per account\n(`base`, `base-1`, …, compared case-insensitively). An explicit rename that collides is refused. Never used\nfor authentication (§5 \"Names\")."
+          },
+          "state": {
+            "$ref": "#/components/schemas/NodeState",
+            "description": "Connection state."
+          }
+        }
+      },
+      "NodeId": {
+        "type": "string",
+        "description": "Identifies an enrolled node (`node_…`)."
+      },
+      "NodeState": {
+        "type": "string",
+        "description": "Connection state of a node.",
+        "enum": [
+          "online",
+          "offline"
+        ]
+      },
+      "OutputEntry": {
+        "type": "object",
+        "description": "One entry of `GET /v1/jobs/{id}/outputs` (§7): a published output file. Clients that only know [`OutputFile`]\nread it as one (unknown fields are ignored).",
+        "required": [
+          "path",
+          "size",
+          "sha256"
+        ],
+        "properties": {
+          "expired": {
+            "type": "boolean",
+            "description": "The file was garbage-collected after the retention period (§12): the download answers `410 Gone`."
+          },
+          "path": {
+            "type": "string",
+            "description": "Path relative to `/outputs`, for example `results/a.csv`."
+          },
+          "sha256": {
+            "$ref": "#/components/schemas/Sha256Digest",
+            "description": "SHA-256 of the content."
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Size in bytes.",
+            "minimum": 0
+          }
+        }
+      },
+      "Outputs": {
+        "type": "object",
+        "description": "Limits on collected outputs.\n\n**Strict** (request type): the `POST /v1/jobs` body, and what the agent parses a lease's job into (`LeaseJob::parse_strict`). Unknown fields are rejected, which catches typos and refuses a lease the agent would not fully understand (§6). Responses use the lenient twin, [`JobSpecView`].",
+        "properties": {
+          "max_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Maximum total size of the uploaded outputs, in MiB.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "OutputsView": {
+        "type": "object",
+        "description": "Limits on collected outputs.\n\n**Lenient and redacted** (response type): the `spec` of a [`Job`] in API responses (§7 \"Job representation in responses\"). Unknown fields are ignored, so an older CLI or SDK keeps reading jobs after the server adds a field (§6). `env` values are always `\"<redacted>\"` and `files` carry `{path, size, sha256}` with no content, and there is **no `idempotency_key`**: a response never carries it (§7). Build it with [`JobSpecView::from_stored`].",
+        "properties": {
+          "max_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Maximum total size of the uploaded outputs, in MiB.",
+            "minimum": 0
+          }
+        }
+      },
+      "Page_ApiKeyInfo": {
+        "type": "object",
+        "description": "A cursor-paginated list (`limit` ≤ 100).",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "description": "An API key as listed by `GET /v1/keys`. Never contains the secret.",
+              "required": [
+                "id",
+                "project_id",
+                "scopes",
+                "created_at"
+              ],
+              "properties": {
+                "allowed_images": {
+                  "type": [
+                    "array",
+                    "null"
+                  ],
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Image allowlist. `None` allows every image."
+                },
+                "created_at": {
+                  "type": "string",
+                  "format": "date-time",
+                  "description": "Creation time."
+                },
+                "daily_unit_cap": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Units",
+                      "description": "Daily cap in milli-units."
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "expires_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time",
+                  "description": "Optional expiry (§5)."
+                },
+                "id": {
+                  "$ref": "#/components/schemas/KeyId",
+                  "description": "Public key ID."
+                },
+                "label": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Optional human label (§5)."
+                },
+                "last_used_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time",
+                  "description": "Last time the key authenticated a request (the server writes it at most once a minute)."
+                },
+                "project_id": {
+                  "$ref": "#/components/schemas/ProjectId",
+                  "description": "Project the key acts in."
+                },
+                "revoked_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time",
+                  "description": "When the key was revoked. A revoked key's row is never deleted (§5)."
+                },
+                "scopes": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Scope"
+                  },
+                  "description": "Granted scopes."
+                }
+              }
+            },
+            "description": "The items of this page."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pass as `cursor` to get the next page. `None` on the last page."
+          }
+        }
+      },
+      "Page_AuditEvent": {
+        "type": "object",
+        "description": "A cursor-paginated list (`limit` ≤ 100).",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "description": "One row of the append-only audit log, as returned by `GET /v1/audit` (§5 \"Audit\").\n\n`detail` is a JSON object that **never holds a secret**: no key, token, code or env value. The server should\ncheck it with [`audit_detail_has_secret`] before writing.",
+              "required": [
+                "id",
+                "at",
+                "kind",
+                "detail"
+              ],
+              "properties": {
+                "actor_key_id": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/KeyId",
+                      "description": "The key that acted, if any."
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "at": {
+                  "type": "string",
+                  "format": "date-time",
+                  "description": "When it happened (the start of the minute, for `auth_failed`)."
+                },
+                "detail": {
+                  "type": "object",
+                  "description": "Event-specific, secret-free details."
+                },
+                "id": {
+                  "$ref": "#/components/schemas/AuditEventId",
+                  "description": "Event ID."
+                },
+                "kind": {
+                  "$ref": "#/components/schemas/AuditKind",
+                  "description": "What happened."
+                },
+                "subject_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "The object acted on (a key, join token or node ID), as an opaque string."
+                }
+              }
+            },
+            "description": "The items of this page."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pass as `cursor` to get the next page. `None` on the last page."
+          }
+        }
+      },
+      "Page_Job": {
+        "type": "object",
+        "description": "A cursor-paginated list (`limit` ≤ 100).",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "description": "A job as returned by the API.",
+              "required": [
+                "id",
+                "project_id",
+                "status",
+                "attempt",
+                "spec",
+                "estimated_units",
+                "created_at"
+              ],
+              "properties": {
+                "attempt": {
+                  "type": "integer",
+                  "format": "int32",
+                  "description": "Current attempt, starting at 1 (0 while never placed).",
+                  "minimum": 0
+                },
+                "attempts": {
+                  "type": [
+                    "array",
+                    "null"
+                  ],
+                  "items": {
+                    "$ref": "#/components/schemas/JobAttempt"
+                  },
+                  "description": "The job's attempts, oldest first: only in `GET /v1/jobs/{id}`; lists of jobs leave the field out (§7). An\nattempt is an accepted lease: refused or unanswered offers are not listed."
+                },
+                "cancel_requested_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time",
+                  "description": "When a cancel was requested for a job that was already `assigned` or `running` (the scheduler delivers it to\nthe node, and the job ends `cancelled`). `null` if none was requested, or if the job was queued and\ncancelled at once."
+                },
+                "created_at": {
+                  "type": "string",
+                  "format": "date-time",
+                  "description": "When the job was created."
+                },
+                "error": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Short error code when the job failed without an exit code (for example `disk_limit`)."
+                },
+                "estimated_units": {
+                  "$ref": "#/components/schemas/Units",
+                  "description": "Estimated units reserved by the job (resources × timeout)."
+                },
+                "exit_code": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "int32",
+                  "description": "Exit code, when the job exited."
+                },
+                "finished_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time",
+                  "description": "When the job reached a terminal state."
+                },
+                "id": {
+                  "$ref": "#/components/schemas/JobId",
+                  "description": "Job ID."
+                },
+                "name": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Optional label, copied from the spec."
+                },
+                "node_id": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/NodeId",
+                      "description": "Node of the current or last attempt."
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "project_id": {
+                  "$ref": "#/components/schemas/ProjectId",
+                  "description": "Project the job belongs to."
+                },
+                "reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Why the job is in its current state, when there is something to tell the user, for example why a queued job\nis not being placed (§8 \"Offer cap\"). User-visible; never contains secrets."
+                },
+                "spec": {
+                  "$ref": "#/components/schemas/JobSpecView",
+                  "description": "The submitted spec, with the image normalized, built with [`JobSpecView::from_stored`]: `env` values are\n`\"<redacted>\"` and files carry no content (§7). Lenient: a field added by a newer server does not break\nolder clients."
+                },
+                "started_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time",
+                  "description": "When the current attempt started running."
+                },
+                "status": {
+                  "$ref": "#/components/schemas/JobStatus",
+                  "description": "Current state."
+                }
+              }
+            },
+            "description": "The items of this page."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pass as `cursor` to get the next page. `None` on the last page."
+          }
+        }
+      },
+      "Page_JoinTokenInfo": {
+        "type": "object",
+        "description": "A cursor-paginated list (`limit` ≤ 100).",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "description": "A join token as listed by `GET /v1/nodes/join-tokens` (§5 \"Listing and revoking\"). Never contains the token or\nits code.",
+              "required": [
+                "id",
+                "created_by_key_id",
+                "created_at",
+                "expires_at"
+              ],
+              "properties": {
+                "consumed_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time",
+                  "description": "When a `Join` consumed it."
+                },
+                "consumed_by_node_id": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/NodeId",
+                      "description": "The node it enrolled."
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "created_at": {
+                  "type": "string",
+                  "format": "date-time",
+                  "description": "Creation time."
+                },
+                "created_by_key_id": {
+                  "$ref": "#/components/schemas/KeyId",
+                  "description": "The key that created it."
+                },
+                "expires_at": {
+                  "type": "string",
+                  "format": "date-time",
+                  "description": "Expiry (from the server's row, the only one that counts)."
+                },
+                "id": {
+                  "$ref": "#/components/schemas/JoinTokenId",
+                  "description": "Row ID, used by `DELETE /v1/nodes/join-tokens/{id}`."
+                },
+                "label": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Optional label."
+                },
+                "revoked_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time",
+                  "description": "When it was revoked unused."
+                }
+              }
+            },
+            "description": "The items of this page."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pass as `cursor` to get the next page. `None` on the last page."
+          }
+        }
+      },
+      "Page_Node": {
+        "type": "object",
+        "description": "A cursor-paginated list (`limit` ≤ 100).",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "description": "A node as returned by the API.",
+              "required": [
+                "id",
+                "name",
+                "hostname",
+                "state",
+                "draining",
+                "inventory",
+                "free",
+                "created_at"
+              ],
+              "properties": {
+                "created_at": {
+                  "type": "string",
+                  "format": "date-time",
+                  "description": "When the node joined."
+                },
+                "draining": {
+                  "type": "boolean",
+                  "description": "Whether the node is draining (accepts no new jobs)."
+                },
+                "free": {
+                  "$ref": "#/components/schemas/Capacity",
+                  "description": "Capacity not reserved by active leases."
+                },
+                "hostname": {
+                  "type": "string",
+                  "description": "The hostname the agent reported, as is."
+                },
+                "id": {
+                  "$ref": "#/components/schemas/NodeId",
+                  "description": "Node ID."
+                },
+                "inventory": {
+                  "$ref": "#/components/schemas/Inventory",
+                  "description": "Last reported inventory."
+                },
+                "labels": {
+                  "type": "object",
+                  "description": "Labels used by `placement.labels`.",
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "propertyNames": {
+                    "type": "string"
+                  }
+                },
+                "last_seen": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time",
+                  "description": "Last heartbeat."
+                },
+                "name": {
+                  "type": "string",
+                  "description": "The node's name, **derived by the server** from the reported hostname: sanitized and unique per account\n(`base`, `base-1`, …, compared case-insensitively). An explicit rename that collides is refused. Never used\nfor authentication (§5 \"Names\")."
+                },
+                "state": {
+                  "$ref": "#/components/schemas/NodeState",
+                  "description": "Connection state."
+                }
+              }
+            },
+            "description": "The items of this page."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pass as `cursor` to get the next page. `None` on the last page."
+          }
+        }
+      },
+      "Page_OutputEntry": {
+        "type": "object",
+        "description": "A cursor-paginated list (`limit` ≤ 100).",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "description": "One entry of `GET /v1/jobs/{id}/outputs` (§7): a published output file. Clients that only know [`OutputFile`]\nread it as one (unknown fields are ignored).",
+              "required": [
+                "path",
+                "size",
+                "sha256"
+              ],
+              "properties": {
+                "expired": {
+                  "type": "boolean",
+                  "description": "The file was garbage-collected after the retention period (§12): the download answers `410 Gone`."
+                },
+                "path": {
+                  "type": "string",
+                  "description": "Path relative to `/outputs`, for example `results/a.csv`."
+                },
+                "sha256": {
+                  "$ref": "#/components/schemas/Sha256Digest",
+                  "description": "SHA-256 of the content."
+                },
+                "size": {
+                  "type": "integer",
+                  "format": "int64",
+                  "description": "Size in bytes.",
+                  "minimum": 0
+                }
+              }
+            },
+            "description": "The items of this page."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pass as `cursor` to get the next page. `None` on the last page."
+          }
+        }
+      },
+      "Placement": {
+        "type": "object",
+        "description": "Placement constraints.\n\n**Strict** (request type): the `POST /v1/jobs` body, and what the agent parses a lease's job into (`LeaseJob::parse_strict`). Unknown fields are rejected, which catches typos and refuses a lease the agent would not fully understand (§6). Responses use the lenient twin, [`JobSpecView`].",
+        "properties": {
+          "labels": {
+            "type": "object",
+            "description": "Node labels that must all match.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "node_id": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/NodeId",
+                "description": "Pin the job to one node."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "pools": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Pools the job may run in. Only `[\"mine\"]` in v0.1."
+          }
+        },
+        "additionalProperties": false
+      },
+      "PlacementView": {
+        "type": "object",
+        "description": "Placement constraints.\n\n**Lenient and redacted** (response type): the `spec` of a [`Job`] in API responses (§7 \"Job representation in responses\"). Unknown fields are ignored, so an older CLI or SDK keeps reading jobs after the server adds a field (§6). `env` values are always `\"<redacted>\"` and `files` carry `{path, size, sha256}` with no content, and there is **no `idempotency_key`**: a response never carries it (§7). Build it with [`JobSpecView::from_stored`].",
+        "properties": {
+          "labels": {
+            "type": "object",
+            "description": "Node labels that must all match.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "node_id": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/NodeId",
+                "description": "Pin the job to one node."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "pools": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Pools the job may run in. Only `[\"mine\"]` in v0.1."
+          }
+        }
+      },
+      "Platform": {
+        "type": "string",
+        "description": "The node's platform (§6, §9.0).",
+        "enum": [
+          "linux",
+          "wsl2"
+        ]
+      },
+      "Problem": {
+        "type": "object",
+        "description": "An RFC 9457 `application/problem+json` error body, with a stable `code`.",
+        "required": [
+          "type",
+          "title",
+          "status",
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable machine-readable code, for example `unsupported_pool`."
+          },
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Human explanation of this occurrence."
+          },
+          "errors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FieldError"
+            },
+            "description": "Per-field validation errors, for `422` responses."
+          },
+          "status": {
+            "type": "integer",
+            "format": "int32",
+            "description": "HTTP status code.",
+            "minimum": 0
+          },
+          "title": {
+            "type": "string",
+            "description": "Short human summary."
+          },
+          "type": {
+            "type": "string",
+            "description": "Problem type URI."
+          }
+        }
+      },
+      "ProjectId": {
+        "type": "string",
+        "description": "Identifies a project (`prj_…`)."
+      },
+      "Resources": {
+        "type": "object",
+        "description": "Requested resources.\n\n**Strict** (request type): the `POST /v1/jobs` body, and what the agent parses a lease's job into (`LeaseJob::parse_strict`). Unknown fields are rejected, which catches typos and refuses a lease the agent would not fully understand (§6). Responses use the lenient twin, [`JobSpecView`].",
+        "required": [
+          "cpu",
+          "memory_mb"
+        ],
+        "properties": {
+          "cpu": {
+            "type": "number",
+            "format": "double",
+            "description": "vCPUs, 0.25-256, fractional allowed."
+          },
+          "disk_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Disk in MiB for outputs and the writable layer. Default 2 048.",
+            "minimum": 0
+          },
+          "gpu": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Whole GPUs: 0 or 1 in v0.1.",
+            "minimum": 0
+          },
+          "memory_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Memory in MiB, 128-1 048 576.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "ResourcesView": {
+        "type": "object",
+        "description": "Requested resources.\n\n**Lenient and redacted** (response type): the `spec` of a [`Job`] in API responses (§7 \"Job representation in responses\"). Unknown fields are ignored, so an older CLI or SDK keeps reading jobs after the server adds a field (§6). `env` values are always `\"<redacted>\"` and `files` carry `{path, size, sha256}` with no content, and there is **no `idempotency_key`**: a response never carries it (§7). Build it with [`JobSpecView::from_stored`].",
+        "required": [
+          "cpu",
+          "memory_mb"
+        ],
+        "properties": {
+          "cpu": {
+            "type": "number",
+            "format": "double",
+            "description": "vCPUs, 0.25-256, fractional allowed."
+          },
+          "disk_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Disk in MiB for outputs and the writable layer. Default 2 048.",
+            "minimum": 0
+          },
+          "gpu": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Whole GPUs: 0 or 1 in v0.1.",
+            "minimum": 0
+          },
+          "memory_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Memory in MiB, 128-1 048 576.",
+            "minimum": 0
+          }
+        }
+      },
+      "Retry": {
+        "type": "object",
+        "description": "Retry policy.\n\n**Strict** (request type): the `POST /v1/jobs` body, and what the agent parses a lease's job into (`LeaseJob::parse_strict`). Unknown fields are rejected, which catches typos and refuses a lease the agent would not fully understand (§6). Responses use the lenient twin, [`JobSpecView`].",
+        "properties": {
+          "max_attempts": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Attempts in total, 1-5. Default 2. Only node loss consumes an attempt.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "RetryView": {
+        "type": "object",
+        "description": "Retry policy.\n\n**Lenient and redacted** (response type): the `spec` of a [`Job`] in API responses (§7 \"Job representation in responses\"). Unknown fields are ignored, so an older CLI or SDK keeps reading jobs after the server adds a field (§6). `env` values are always `\"<redacted>\"` and `files` carry `{path, size, sha256}` with no content, and there is **no `idempotency_key`**: a response never carries it (§7). Build it with [`JobSpecView::from_stored`].",
+        "properties": {
+          "max_attempts": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Attempts in total, 1-5. Default 2. Only node loss consumes an attempt.",
+            "minimum": 0
+          }
+        }
+      },
+      "SandboxCapability": {
+        "type": "object",
+        "description": "A sandbox driver the node can use.",
+        "required": [
+          "driver",
+          "class",
+          "runtimes"
+        ],
+        "properties": {
+          "class": {
+            "$ref": "#/components/schemas/SandboxClass",
+            "description": "Isolation class."
+          },
+          "driver": {
+            "type": "string",
+            "description": "Driver name, for example `podman`."
+          },
+          "problems": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Why the driver is not ready, one entry per failed §9.0 check, each `<code>: <detail>`. Empty when ready."
+          },
+          "ready": {
+            "type": "boolean",
+            "description": "Whether the node meets the §9.0 requirements of its platform profile for this driver. Added in T07; an\ninventory without it decodes as **not** ready (fail closed)."
+          },
+          "runtimes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "OCI runtimes available, for example `[\"crun\"]`."
+          }
+        }
+      },
+      "SandboxClass": {
+        "type": "string",
+        "description": "Isolation class of a sandbox driver.",
+        "enum": [
+          "container",
+          "container-gvisor"
+        ]
+      },
+      "Scope": {
+        "type": "string",
+        "description": "An API key scope (§5).",
+        "enum": [
+          "admin",
+          "jobs:write",
+          "jobs:read",
+          "nodes:read",
+          "nodes:write"
+        ]
+      },
+      "ServerInfo": {
+        "type": "object",
+        "description": "Response of `GET /v1/server` (§7): how to reach this server's iroh endpoint. Nothing in it is secret.",
+        "required": [
+          "node_id",
+          "relays",
+          "address",
+          "version"
+        ],
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "The server address `p2pc_srv_…` (§10): the NodeId and the relays, for `p2pc login`."
+          },
+          "node_id": {
+            "type": "string",
+            "description": "The server's iroh NodeId (lowercase hex)."
+          },
+          "relays": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The relay URLs the server uses (and hands to agents in join tokens)."
+          },
+          "version": {
+            "type": "string",
+            "description": "The server version (semver)."
+          }
+        }
+      },
+      "Sha256Digest": {
+        "type": "string",
+        "description": "A SHA-256 digest, serialized as 64 lowercase hex characters."
+      },
+      "SmokeResult": {
+        "type": "object",
+        "description": "Result of the once-per-boot smoke container on WSL2.",
+        "required": [
+          "ok"
+        ],
+        "properties": {
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Short explanation when it did not."
+          },
+          "ok": {
+            "type": "boolean",
+            "description": "Whether the smoke container ran correctly."
+          }
+        }
+      },
+      "Units": {
+        "type": "integer",
+        "format": "int64",
+        "description": "An amount of compute, in milli-units (1 unit = 1 000 milli-units = 1 vCPU-hour reserved).\n\nSerialized as a JSON integer of milli-units.",
+        "minimum": 0
+      },
+      "UsageGroupBy": {
+        "type": "string",
+        "description": "How `GET /v1/usage` groups its totals.",
+        "enum": [
+          "job",
+          "node",
+          "key"
+        ]
+      },
+      "UsageReport": {
+        "type": "object",
+        "description": "Response of `GET /v1/usage`: the usage ledger of the caller's project for attempts that ended in `[from, to)`,\ngrouped, with cursor pagination over the groups, and the total of the whole range.",
+        "required": [
+          "from",
+          "to",
+          "group_by",
+          "items",
+          "total"
+        ],
+        "properties": {
+          "from": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Start of the range (inclusive)."
+          },
+          "group_by": {
+            "$ref": "#/components/schemas/UsageGroupBy",
+            "description": "How the items are grouped."
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UsageTotals"
+            },
+            "description": "The groups of this page, ordered by `key`."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pass as `cursor` to get the next page. `None` on the last page."
+          },
+          "to": {
+            "type": "string",
+            "format": "date-time",
+            "description": "End of the range (exclusive)."
+          },
+          "total": {
+            "$ref": "#/components/schemas/UsageTotals",
+            "description": "The total of the whole range (every page)."
+          }
+        }
+      },
+      "UsageTotals": {
+        "type": "object",
+        "description": "Totals of a set of usage records: one group of `GET /v1/usage`, or the whole range.",
+        "required": [
+          "attempts",
+          "reserved_cpu_ms",
+          "reserved_gpu_ms",
+          "used_cpu_ms",
+          "max_rss_mb",
+          "units"
+        ],
+        "properties": {
+          "attempts": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Finished attempts counted.",
+            "minimum": 0
+          },
+          "estimated_attempts": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many of `attempts` are server estimates ([`UsageRecord::estimated`]).",
+            "minimum": 0
+          },
+          "key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The group: a job, node or key ID, after `group_by`. `null` for the total of the range."
+          },
+          "max_rss_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The highest peak resident memory of the attempts, in MiB.",
+            "minimum": 0
+          },
+          "reserved_cpu_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Reserved vCPU time, in vCPU-milliseconds.",
+            "minimum": 0
+          },
+          "reserved_gpu_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Reserved GPU time, in GPU-milliseconds.",
+            "minimum": 0
+          },
+          "units": {
+            "$ref": "#/components/schemas/Units",
+            "description": "Units charged, in milli-units."
+          },
+          "used_cpu_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "CPU time actually used (cgroup stats), in milliseconds.",
+            "minimum": 0
+          }
+        }
+      },
+      "WhoAmI": {
+        "type": "object",
+        "description": "Response of `GET /v1/whoami`: who the presented key is, and its limits (§7). Never contains the secret.\n\nThe limit fields (`label`, `daily_unit_cap`, `allowed_images`, `expires_at`) were added after the first shape\n(`{account_id, project_id, key_id, scopes}`); they default to `null` when an older server omits them.",
+        "required": [
+          "account_id",
+          "project_id",
+          "key_id",
+          "scopes"
+        ],
+        "properties": {
+          "account_id": {
+            "$ref": "#/components/schemas/AccountId",
+            "description": "The key's account."
+          },
+          "allowed_images": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The key's image allowlist (globs on the normalized image). `null` allows every image."
+          },
+          "daily_unit_cap": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Units",
+                "description": "The key's daily cap in milli-units, per UTC day. `null` means **uncapped**: `p2pc mcp` uses this to refuse\na key that could spend without limit (§7)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the key expires, if it does."
+          },
+          "key_id": {
+            "$ref": "#/components/schemas/KeyId",
+            "description": "The key's public ID."
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The key's label, if it has one."
+          },
+          "project_id": {
+            "$ref": "#/components/schemas/ProjectId",
+            "description": "The key's project."
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Scope"
+            },
+            "description": "The key's scopes."
+          }
+        }
+      },
+      "Wsl2Health": {
+        "type": "object",
+        "description": "The WSL2 health block (§6 \"GPU inventory\").",
+        "required": [
+          "cdi_present",
+          "cdi_stale"
+        ],
+        "properties": {
+          "cdi_present": {
+            "type": "boolean",
+            "description": "Whether the CDI spec is present."
+          },
+          "cdi_stale": {
+            "type": "boolean",
+            "description": "Whether the CDI spec is older than the driver."
+          },
+          "distro_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The distro's version stamp. `null` when unknown (no stamp file): never an empty string."
+          },
+          "podman_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Podman version. `null` when unknown (Podman missing or its version unreadable): never an empty string."
+          },
+          "smoke": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SmokeResult",
+                "description": "The once-per-boot smoke container, once it has run."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "p2pc_sk_<key_id>_<secret>"
+      }
+    }
+  },
+  "security": [
+    {
+      "bearer": []
+    }
+  ],
+  "tags": [
+    {
+      "name": "meta",
+      "description": "Health and the API description."
+    },
+    {
+      "name": "auth",
+      "description": "The calling key."
+    },
+    {
+      "name": "keys",
+      "description": "API keys (admin)."
+    },
+    {
+      "name": "audit",
+      "description": "Append-only audit log (admin)."
+    },
+    {
+      "name": "server",
+      "description": "The server's iroh identity."
+    },
+    {
+      "name": "nodes",
+      "description": "Join tokens (admin) and enrolled nodes."
+    },
+    {
+      "name": "jobs",
+      "description": "Submit, list, inspect, cancel and estimate jobs."
+    },
+    {
+      "name": "usage",
+      "description": "The usage ledger: finished attempts and the units they cost."
+    }
+  ]
+}

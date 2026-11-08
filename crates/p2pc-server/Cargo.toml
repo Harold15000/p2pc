@@ -1,0 +1,71 @@
+[package]
+name = "p2pc-server"
+description = "P2PC control plane: REST API, auth, scheduler, node gateway, metering and artifacts."
+license = "AGPL-3.0-only"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "p2pc-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "tracing", "matched-path"] }
+clap.workspace = true
+data-encoding.workspace = true
+hyper = { version = "1.12.0", default-features = false, features = ["server", "http1"] }
+iroh.workspace = true
+# The §10 endpoint plumbing shared with the agent (bind, interface snapshot, network watcher), Apache-2.0.
+p2pc-net = { path = "../p2pc-net", version = "0.1.0" }
+semver.workspace = true
+# `O_NOFOLLOW` and `renameat2(RENAME_NOREPLACE)` for `server.key`, without `unsafe`.
+rustix = { workspace = true, features = ["fs"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["server-graceful", "tokio", "service"] }
+# `version` too: `cargo deny` refuses wildcard (path-only) dependencies.
+p2pc-proto = { path = "../p2pc-proto", version = "0.1.0", features = ["openapi"] }
+serde.workspace = true
+serde_json.workspace = true
+# SHA-256 of the canonical job spec (`spec_hash`); the workspace already uses it in p2pc-proto.
+sha2.workspace = true
+# Runtime queries only (`sqlx::query`/`query_as` with binds). `macros` is needed for `sqlx::migrate!`, which embeds
+# the migrations at build time and needs no DATABASE_URL.
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite-bundled", "migrate", "macros"] }
+thiserror.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "net", "sync", "time", "io-util"] }
+toml = "1.2.0"
+# `ReaderStream`: log and output download bodies are streamed from a pipe the handler writes with an idle limit
+# (§10). Already in the lock file through iroh.
+tokio-util = { version = "0.7.20", default-features = false, features = ["io"] }
+tower-http = { version = "0.7.1", default-features = false, features = ["catch-panic", "timeout"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+utoipa.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true
+# Reads streamed response bodies frame by frame (follow mode).
+http-body-util.workspace = true
+# `p2pc run` and `p2pc logs --follow` (the CLI's `StreamFollower`) run against the real server, across its idle cuts
+# of a follow (T10d). Apache-2.0, a dev-dependency only; the CLI does not depend on the server.
+p2pc-cli = { path = "../p2pc-cli", version = "0.1.0" }
+# The client's log and output calls run against the real server (T10b acceptance), not only its mock.
+p2pc-client = { path = "../p2pc-client", version = "0.1.0" }
+predicates.workspace = true
+# The scheduler's property tests (T06): random event sequences against its invariants. Already a dev-dependency of
+# p2pc-proto.
+proptest.workspace = true
+tempfile = "3.27.0"
+time = { workspace = true, features = ["macros"] }
+tokio = { workspace = true, features = ["io-util", "sync"] }
+tower = { version = "0.5.3", default-features = false, features = ["util"] }
+
+[lints]
+workspace = true

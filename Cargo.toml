@@ -1,0 +1,97 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/p2pc-proto",
+  "crates/p2pc-net",
+  "crates/p2pc-client",
+  "crates/p2pc-server",
+  "crates/p2pc-agent",
+  "crates/p2pc-cli",
+  "crates/p2pc-shim",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.99"
+version = "0.1.0"
+publish = false
+
+# Later tasks add more dependencies here. Only what the stubs use today is listed.
+[workspace.dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+clap_complete = "4.6.11"
+data-encoding = "2.11.1"
+humantime = "2.4.0"
+# HTTP/1.1 over the `p2pc/http/1` tunnel streams (`p2pc-client`, feature `tunnel`). The same versions reqwest already
+# pulls in; no default features, each crate enables what it needs.
+bytes = "1.12.1"
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", default-features = false }
+hyper-util = { version = "0.1.21", default-features = false }
+# The iroh family's key types only (no networking). Pinned to the 1.4 minor (`~1.4.1`): T05 and T05b MUST use
+# iroh 1.4.x, which re-exports this same crate, so that the agent's identity key and the endpoint use one version of
+# the key types. Raise both together, never one alone.
+iroh-base = { version = "~1.4.1", default-features = false, features = ["key"] }
+# The iroh endpoint (server T05, agent T05b). No default features: in particular **no `portmapper`**, so nothing
+# ever asks the owner's router to open a port (spec §10 address hygiene). `tls-ring` is the crypto provider.
+iroh = { version = "~1.4.1", default-features = false, features = ["tls-ring"] }
+# Interface enumeration and the default-route interface, for `p2pc_proto::net::select_addresses`. The same version
+# iroh itself uses.
+netwatch = { version = "0.19.3", default-features = false }
+rand = "0.10.3"
+# HTTP client of `p2pc-client`. TLS is rustls with the `ring` provider (no OpenSSL, no CMake or NASM on Windows or
+# macOS) and the OS certificate store (rustls-platform-verifier), so a server behind a reverse proxy with a private CA
+# works. `rustls-no-provider` keeps reqwest from pulling aws-lc-rs: `p2pc-client` passes its own configuration.
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-platform-verifier = "0.7.1"
+# The official Rust MCP SDK (Apache-2.0), for `p2pc mcp`. Only the server side and the stdio transport: no macros (the
+# tool schemas are written by hand), no HTTP transport and no OAuth. Tests add the `client` feature.
+rmcp = { version = "3.8.0", default-features = false, features = ["server", "transport-io"] }
+# `min_agent_version` and agent versions (spec §6 "Compatibility"); already in the lock file through sqlx.
+semver = "1.0.28"
+# Safe syscall wrappers (statvfs, geteuid) so that crates keep `unsafe_code = "forbid"`.
+rustix = { version = "1.1.6", default-features = false, features = ["std"] }
+# Hidden prompt for `p2pc login` (reads the terminal directly, no echo).
+rpassword = "7.5.4"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+# The shim's signal forwarding (PID 1): safe handlers plus an iterator, with no async runtime.
+signal-hook = "0.3.18"
+subtle = "2.6.1"
+thiserror = "2.0.21"
+time = { version = "0.3.55", features = ["serde", "formatting", "parsing"] }
+# No features here: each crate enables only what it needs (p2pc-proto uses `io-util` only; binaries add the
+# runtime, `macros` and `signal`). Workspace features would be forced on every member.
+tokio = { version = "1.54.1", default-features = false }
+toml = { version = "1.2.0", default-features = false, features = ["std", "serde", "parse", "display"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+ulid = "3.0.0"
+url = "2.5.8"
+utoipa = "6.0.0"
+zeroize = "1.9.1"
+
+# Dev dependencies
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
+proptest = "1.12.0"
+tempfile = "3.27.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+dbg_macro = "deny"
+todo = "warn"
+print_stdout = "allow"
+
+[profile.release]
+lto = "thin"
+strip = true

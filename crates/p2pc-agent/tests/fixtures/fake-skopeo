@@ -1,0 +1,19 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+#
+# A fake `skopeo` for tests/sandbox_fake_podman.rs, symlinked into a test's state directory next to fake-podman.
+# It records each call in the same `calls` file, with `skopeo` as the first field, and answers
+# `skopeo inspect --raw -- docker://<ref>` with a single-image OCI manifest whose layer size comes from
+# manifest_size (default 1000 bytes): the kind of manifest Podman 4.9's `manifest inspect` cannot read.
+set -u
+state=$(dirname "$0")
+{ printf 'skopeo\037'; for a in "$@"; do printf '%s\037' "$a"; done; printf '\036'; } >> "$state/calls"
+env | cut -d= -f1 >> "$state/env_names"
+
+case "$1" in
+  inspect)
+    size=$(cat "$state/manifest_size" 2>/dev/null || echo 1000)
+    printf '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"size":100},"layers":[{"size":%s}]}\n' "$size" ;;
+  *)
+    echo "fake skopeo: unexpected command $1" >&2; exit 1 ;;
+esac

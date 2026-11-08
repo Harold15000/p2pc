@@ -1,0 +1,53 @@
+[package]
+name = "p2pc-cli"
+description = "The p2pc command-line client, with the MCP server (p2pc mcp) and the API tunnel (p2pc proxy)."
+license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "p2pc_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "p2pc"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+clap_complete.workspace = true
+data-encoding.workspace = true
+humantime.workspace = true
+# `tunnel`: profiles whose server is an address `p2pc_srv_…`, and `p2pc proxy` (spec §10).
+p2pc-client = { version = "0.1.0", path = "../p2pc-client", features = ["tunnel"] }
+p2pc-proto = { version = "0.1.0", path = "../p2pc-proto" }
+rmcp.workspace = true
+rpassword.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# The credentials file is written through a temporary file that is created with mode 0600.
+tempfile.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "signal", "time", "net", "sync"] }
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true
+assert_cmd.workspace = true
+p2pc-client = { version = "0.1.0", path = "../p2pc-client", features = ["test-util", "tunnel"] }
+predicates.workspace = true
+rmcp = { workspace = true, features = ["client"] }
+tempfile.workspace = true
+# `io::duplex` and line readers for the in-process MCP client of the tests; `test-util` for the paused clock.
+tokio = { workspace = true, features = ["io-util", "test-util"] }
+# Captures log lines in tests (SI-6: no request content in the MCP server's logs).
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

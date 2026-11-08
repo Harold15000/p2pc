@@ -1,0 +1,35 @@
+name: Feature request
+description: Suggest an idea or an improvement for P2PC.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. P2PC v0.1 runs your own jobs on your own machines; the README's "Roadmap" says where it is
+        heading. Requests that would weaken the sandbox or the network isolation of jobs will not be accepted (see the
+        hard rules in `CONTRIBUTING.md`).
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do, and what gets in the way today?
+      placeholder: "I want to … but …"
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: The solution you would like
+      description: What P2PC could do about it. Commands, flags or API calls you imagine are welcome.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Workarounds you use today, or other ways to solve it.
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else
+      description: Your setup (machines, GPUs, operating systems), links, or anything that helps.

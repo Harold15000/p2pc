@@ -1,0 +1,5 @@
+# Local files of the acceptance harness: never committed.
+/machines.toml
+/machines.*.toml
+!/machines.example.toml
+/reports/

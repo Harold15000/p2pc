@@ -1,0 +1,34 @@
+{
+  "host": {
+    "arch": "amd64",
+    "cgroupManager": "cgroupfs",
+    "cgroupVersion": "v2",
+    "cgroupControllers": [
+      "cpuset",
+      "cpu",
+      "io",
+      "memory",
+      "hugetlb",
+      "pids",
+      "rdma",
+      "misc"
+    ],
+    "kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "ociRuntime": {
+      "name": "crun",
+      "path": "/usr/bin/crun",
+      "version": "crun version 1.14.1"
+    },
+    "os": "linux",
+    "security": {
+      "rootless": false,
+      "seccompEnabled": true
+    }
+  },
+  "version": {
+    "APIVersion": "4.9.3",
+    "Version": "4.9.3",
+    "OsArch": "linux/amd64",
+    "Os": "linux"
+  }
+}

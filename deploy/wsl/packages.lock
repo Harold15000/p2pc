@@ -1,0 +1,31 @@
+# Packages installed into the p2pc-node WSL2 image, one `name=version` per line (see deploy/README.md).
+#
+# - Ubuntu noble packages come first, NVIDIA's apt repository packages last (build-rootfs.sh installs them in that
+#   order, after verifying the pinned signing-key fingerprint).
+# - `snapshot=` is the UTC timestamp (YYYYMMDDTHHMMSSZ) of the Ubuntu snapshot archive that apt uses for every Ubuntu
+#   package (https://snapshot.ubuntu.com/ubuntu/<timestamp>: noble, noble-updates, noble-security). The build runs
+#   `apt-get upgrade` against it, so the image carries every security fix up to that time, and the same snapshot always
+#   gives the same packages. NVIDIA's repository is not snapshotted, hence the four exact pins below.
+#   To update: run `sudo deploy/wsl/build-rootfs.sh --update-lock` (moves the snapshot to now and re-resolves the
+#   Ubuntu pins), rebuild, diff manifest.txt, commit.
+# - Versions below were resolved by the first real build (2026-11-05, Ubuntu 24.04.5 base). A bare `name` (no
+#   `=version`) is UNPINNED and a normal build refuses it; to bump a package, reset its line to a bare name and run
+#   on a trusted build host:   sudo deploy/wsl/build-rootfs.sh --update-lock
+#   then review and commit the diff.
+# - nvidia-container-toolkit 1.20.1-1 is the version measured in experiment E1 (spec 9.0). The other three NVIDIA
+#   packages are pinned to the same version, as NVIDIA's install guide does. The full closure is recorded in
+#   manifest.txt on every build.
+snapshot=20261105T000000Z
+podman=4.9.3+ds1-1ubuntu0.2
+crun=1.14.1-1
+uidmap=1:4.13+dfsg1-4ubuntu3.2
+fuse-overlayfs=1.13-1
+# skopeo: the agent reads the remote manifest's layer sizes with `skopeo inspect --raw` to enforce the image size cap
+# BEFORE pulling (spec 9, "Images"): Podman 4.9 cannot inspect a single-image OCI manifest. Resolved in the real 0.1.4
+# build against the snapshot below (noble release was 1.13.3+ds1-2build2; noble-updates/security is this one).
+skopeo=1.13.3+ds1-2ubuntu0.24.04.3
+ca-certificates=20260816ubuntu0.24.04.1
+nvidia-container-toolkit=1.20.1-1
+nvidia-container-toolkit-base=1.20.1-1
+libnvidia-container-tools=1.20.1-1
+libnvidia-container1=1.20.1-1

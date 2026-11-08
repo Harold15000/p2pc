@@ -1,0 +1,68 @@
+[package]
+name = "p2pc-agent"
+description = "P2PC node daemon: identity, inventory, leases, sandbox driver and egress proxy."
+license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "p2pc-agent"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+if-addrs = "0.15.0"
+iroh-base.workspace = true
+# The agent's endpoint to the control plane (T05b): the workspace pin, no port mapping (spec §10).
+iroh.workspace = true
+# The address list `GateFeed` hands to tests (already iroh's own watcher type; same pin as `p2pc-net`). Only the
+# `test-seams` feature needs it, so a release build does not depend on it directly (T10l review P3 4).
+n0-watcher = { version = "1.0.1", optional = true }
+# The §10 endpoint plumbing shared with the server: bind, interface snapshot, network watcher (T05b review, P2-3).
+p2pc-net = { version = "0.1.0", path = "../p2pc-net" }
+p2pc-proto = { version = "0.1.0", path = "../p2pc-proto" }
+rand.workspace = true
+# `p2pc-agent join` reads the token from a hidden prompt when stdin is a terminal (§7, SI-6).
+rpassword.workspace = true
+rustix = { workspace = true, features = ["fs", "param", "process"] }
+serde.workspace = true
+serde_json.workspace = true
+# SHA-256 of collected outputs (SI-9, T10 uploads them with it).
+sha2.workspace = true
+thiserror.workspace = true
+# RFC 3339 times: the WSL2 boot status, the state file of `run`, `Lease` deadlines.
+time.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+toml.workspace = true
+# `p2pc-agent join` writes `[server]` into agent.toml and keeps the owner's comments and layout; already in the lock
+# file through `toml`'s family.
+toml_edit = "0.25.18"
+tracing.workspace = true
+# Logs of `p2pc-agent run` on stderr (journald picks them up).
+tracing-subscriber.workspace = true
+zeroize.workspace = true
+
+[features]
+# The seam that feeds the egress gate's watcher with a fake host network and endpoint address list
+# (`connection::endpoint::GateFeed`). Tests only: never enabled by the `p2pc-agent` binary or by `run`. The integration
+# tests turn it on through the dev-dependency below, so a plain `cargo test` runs them.
+test-seams = ["dep:n0-watcher"]
+
+[dev-dependencies]
+# The integration tests (and the unit tests) build the agent with its test seams.
+p2pc-agent = { path = ".", features = ["test-seams"] }
+assert_cmd.workspace = true
+data-encoding.workspace = true
+predicates.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
+# Relay URLs of the join tokens the tests make.
+url.workspace = true
+# Paused time for the timeout, cancel and disk-limit sequences.
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "sync", "test-util", "time"] }
+
+[lints]
+workspace = true

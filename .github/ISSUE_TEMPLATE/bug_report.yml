@@ -1,0 +1,76 @@
+name: Bug report
+description: Something in P2PC does not work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug.
+
+        **Is it a security issue** (a job escaping its sandbox or reaching your LAN, a key or token leak, an auth
+        bypass)? Do not file it here: use the repository's **Security** tab, then **Report a vulnerability**
+        (see `SECURITY.md`).
+
+        **Remove every secret before you paste anything:** API keys (`p2pc_sk_…`), join tokens (`p2pc_join_…`),
+        job environment values, and any hostname, IP address or path you do not want public.
+  - type: input
+    id: version
+    attributes:
+      label: P2PC version
+      description: The output of `p2pc --version`, and of `p2pc-server --version` or `p2pc-agent --version` if the bug is there.
+      placeholder: "p2pc 0.1.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Where does the bug show up?
+      multiple: true
+      options:
+        - Server (p2pc-server, install-server.sh)
+        - Linux node (p2pc-agent, install-node.sh, setup-host.sh)
+        - Windows node (install.ps1, the p2pc-node WSL2 distro)
+        - CLI (p2pc)
+        - MCP server (p2pc mcp)
+        - Python SDK
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: OS and node type
+      description: |
+        For each machine involved: its operating system and version, and its role (server, Linux node, Windows node,
+        client). For a node, also the Podman version (`podman --version`) and the GPU, if any.
+      placeholder: |
+        Server: Ubuntu 24.04, x86_64
+        Node: Windows 11 23H2, WSL 2.3.26, p2pc-node image 0.2.2, NVIDIA RTX 3060
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did (the exact commands, with secrets removed), what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and output
+      description: |
+        The relevant output or log lines, **with secrets removed**. `deploy/README.md` ("Where the logs are") says where
+        each machine keeps its logs. This is rendered as code, so no backticks are needed.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you submit
+      options:
+        - label: I removed every key, token, environment value and private hostname or address from this report.
+          required: true
+        - label: This is not a security vulnerability (those go to the Security tab).
+          required: true

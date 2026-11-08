@@ -1,0 +1,276 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+#
+# p2pc-node-run: keeps the P2PC agent running inside the p2pc-node WSL2 distro (spec §9.0, "How the Windows agent stays
+# up"). Installed as /usr/local/sbin/p2pc-node-run; the per-user Scheduled Task "P2PC node" (install.ps1 -Join) starts it
+# at logon with
+#   conhost.exe --headless wsl.exe -d p2pc-node -u root --exec /usr/local/sbin/p2pc-node-run
+# and that attached wsl.exe is what keeps the distro running (the installer never changes .wslconfig).
+#
+# The distro has no systemd (spec §9.0: systemd=false), so this script does what a unit would:
+#   1. one runner at a time (flock): a second one WAITS for the lock and takes over when the first one ends, so the
+#      wsl.exe of its task stays attached (a stopped task can leave the old runner alive: see the lock code below);
+#   2. waits up to 60 s for a boot status of THIS start of the distro (boot-status.sh: p2pc-boot's init_starttime equals
+#      this init's), so the agent's first inventory sees the GPU state; if none comes it starts the agent anyway (the
+#      agent then reports the GPUs as not ready, never as absent);
+#   3. runs `p2pc-agent run` with a clean environment (nothing from Windows reaches it: no WSL_INTEROP, no WSLENV),
+#      without the lock's descriptor and with SIGHUP ignored, and with P2PC_AGENT_CONFIG=/var/lib/p2pc/agent.toml: all
+#      mutable node state, the enrollment ([server]) included, lives in /var/lib/p2pc, the one directory install.ps1
+#      -Upgrade carries over (as root the agent would otherwise read /etc/p2pc/agent.toml, which an upgrade replaces).
+#      The file is created empty (0600) when it is missing: the agent refuses a named config file that does not exist,
+#      and with an empty one it stops for good with "not joined" (exit 8) instead of crash-looping;
+#   4. restarts it on an unexpected exit after 1 s, doubling up to 60 s, and back to 1 s once a run lasted 60 s;
+#   5. stops for good on the agent's terminal exit codes (crates/p2pc-agent/src/connection/exit.rs: 6 agent too old,
+#      7 not enrolled any more, 8 never joined) and exits 64: the task's wrapper (install.ps1, node-task.cmd) then
+#      disables the task, so its 5-minute trigger cannot start a removed node again and again (spec 9.0, "Terminal
+#      exits stop the node for good, watchdog included"). On exit 0 (the agent was asked to stop) it exits 0: an
+#      ordinary end, which the watchdog may restart. Why it stopped goes to /var/lib/p2pc/node-run.status (key=value
+#      lines, mode 0600), which `install.ps1 -Status` shows. A terminal stop also records a stamp (the SHA-256 of
+#      agent.toml and of the agent binary): if the task could not be disabled, the next start finds that stamp
+#      unchanged and exits 64 at once, without running the agent; a new enrollment or a new agent changes it;
+#   6. logs the agent's stdout and stderr, and its own lines, to /var/log/p2pc/agent.log, rotated by size: at most three
+#      files (agent.log, agent.log.1, agent.log.2) of 10 MiB each, because the distro has no journald.
+# SIGTERM, SIGINT or SIGHUP (the task is stopped, the distro shuts down) are passed to the agent, which stops its jobs.
+#
+# The P2PC_NODE_RUN_* and P2PC_PROC variables exist for the tests (deploy/tests/test-node-run.sh); leave them unset.
+# Sourcing this file only defines functions.
+
+# The boot-status identity rule (boot_status_fresh, current_init_starttime): $P2PC_BOOT_STATUS_LIB, else next to this
+# script (a checkout), else where the image installs it.
+for _bs in "${P2PC_BOOT_STATUS_LIB:-}" "$(dirname "${BASH_SOURCE[0]}")/boot-status.sh" /usr/local/lib/p2pc/boot-status.sh; do
+  if [[ -n "$_bs" && -r "$_bs" ]]; then
+    # shellcheck source=deploy/wsl/boot-status.sh
+    source "$_bs"
+    break
+  fi
+done
+unset _bs
+
+readonly BACKOFF_MAX_S=60
+# The exit code that tells the task wrapper to disable the task (spec 9.0).
+readonly TERMINAL_EXIT=64
+readonly BOOT_STATUS_WAIT_S=60
+LOG_KEEP=3
+
+# next_delay <seconds>: the next backoff, doubled, at most BACKOFF_MAX_S.
+next_delay() {
+  local d=$(($1 * 2))
+  ((d > BACKOFF_MAX_S)) && d=$BACKOFF_MAX_S
+  echo "$d"
+}
+
+# is_terminal <exit code>: the agent cannot be helped by a restart; a person must act.
+is_terminal() {
+  case "$1" in
+    6 | 7 | 8) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# terminal_reason <exit code>: why the agent stopped, and what to do, for node-run.status and the log.
+terminal_reason() {
+  case "$1" in
+    6) echo "the server refuses this agent version (exit 6): upgrade the node image with .\\install.ps1 -Upgrade -Tar <new image>" ;;
+    7) echo "the server says this machine is not enrolled any more (exit 7: it was removed): join again with .\\install.ps1 -Join -Force" ;;
+    8) echo "this machine never joined a server (exit 8): run .\\install.ps1 -Join" ;;
+    0) echo "the agent stopped on request (exit 0)" ;;
+    *) echo "the agent exited with $1" ;;
+  esac
+}
+
+# log <message>: one line of the runner's own, to stdout (which main sends to the rotated log).
+log() {
+  printf '%s p2pc-node-run: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
+}
+
+# rotate_logs <log>: agent.log -> .1 -> .2; the oldest beyond LOG_KEEP files is dropped.
+rotate_logs() {
+  local f="$1" i
+  rm -f -- "$f.$((LOG_KEEP - 1))"
+  for ((i = LOG_KEEP - 2; i >= 1; i--)); do
+    [[ -e "$f.$i" ]] && mv -f -- "$f.$i" "$f.$((i + 1))"
+  done
+  [[ -e "$f" ]] && mv -f -- "$f" "$f.1"
+  return 0
+}
+
+# log_writer <log> <max bytes>: appends stdin to the log line by line, rotating before a line would take the file over
+# the limit (a single longer line is cut). It ignores the signals that stop the runner, so it drains to the end.
+log_writer() {
+  local f="$1" max="$2" line size len
+  trap '' TERM INT HUP
+  export LC_ALL=C # ${#line} counts bytes
+  size="$(stat -c %s -- "$f" 2>/dev/null || echo 0)"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    ((${#line} + 1 > max)) && line="${line:0:max-1}"
+    len=$((${#line} + 1))
+    if ((size > 0 && size + len > max)); then
+      rotate_logs "$f"
+      size=0
+    fi
+    printf '%s\n' "$line" >>"$f"
+    size=$((size + len))
+  done
+}
+
+# node_stamp: what a terminal stop depends on: the SHA-256 of agent.toml (the enrollment) and of the agent binary.
+node_stamp() {
+  cat -- "$AGENT_CONFIG" "$AGENT" 2>/dev/null | sha256sum | cut -d' ' -f1
+}
+
+# status_field <key>: a value of node-run.status, or nothing.
+status_field() {
+  sed -n "s/^$1=//p" "$STATE_DIR/node-run.status" 2>/dev/null | head -n 1
+}
+
+# write_status <state> [exit code] [reason] [stamp]: /var/lib/p2pc/node-run.status, atomically, mode 0600.
+write_status() {
+  local tmp
+  tmp="$(mktemp "$STATE_DIR/.node-run.status.XXXXXX" 2>/dev/null)" || return 0
+  {
+    printf 'state=%s\n' "$1"
+    printf 'time=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    [[ -n "${2:-}" ]] && printf 'exit_code=%s\n' "$2"
+    [[ -n "${3:-}" ]] && printf 'reason=%s\n' "$3"
+    [[ -n "${4:-}" ]] && printf 'stamp=%s\n' "$4"
+  } >"$tmp" 2>/dev/null
+  chmod 0600 "$tmp" 2>/dev/null
+  mv -f -- "$tmp" "$STATE_DIR/node-run.status" 2>/dev/null || rm -f -- "$tmp"
+}
+
+# finish <exit code>: close our side of the log pipe and let the writer drain, then exit.
+finish() {
+  exec 1>&- 2>&-
+  [[ -n "${WRITER_PID:-}" ]] && wait "$WRITER_PID" 2>/dev/null
+  exit "$1"
+}
+
+on_signal() {
+  log "stopping on a signal"
+  # In the backoff: the delay's sleep is a background job (see main), so this trap runs at once; end it too.
+  if [[ -n "${SLEEP_PID:-}" ]]; then
+    kill "$SLEEP_PID" 2>/dev/null
+    wait "$SLEEP_PID" 2>/dev/null
+  fi
+  if [[ -n "${AGENT_PID:-}" ]]; then
+    kill -TERM "$AGENT_PID" 2>/dev/null
+    wait "$AGENT_PID" 2>/dev/null
+  fi
+  write_status stopped "" "p2pc-node-run was stopped (the task was ended, or the distro shut down)"
+  finish 0
+}
+
+# wait_boot_status: up to BOOT_STATUS_WAIT_S seconds for a status of this start of the distro.
+wait_boot_status() {
+  local init i text
+  init="$(current_init_starttime 2>/dev/null)" || init=""
+  for ((i = 0; i <= BOOT_STATUS_WAIT_S; i++)); do
+    if [[ -s "$BOOT_STATUS" ]]; then
+      text="$(cat "$BOOT_STATUS" 2>/dev/null)"
+      if [[ -z "$init" ]] || boot_status_fresh "$text" "$init"; then
+        log "boot status: fresh: $text"
+        return 0
+      fi
+    fi
+    ((i < BOOT_STATUS_WAIT_S)) && sleep 1
+  done
+  log "no fresh boot status after ${BOOT_STATUS_WAIT_S} s (did p2pc-boot run?); starting the agent anyway: it reports the GPUs as not ready until there is one"
+}
+
+main() {
+  set -uo pipefail
+  umask 077
+  AGENT="${P2PC_NODE_RUN_AGENT:-/usr/local/bin/p2pc-agent}"
+  STATE_DIR="${P2PC_NODE_RUN_STATE_DIR:-/var/lib/p2pc}"
+  LOG_DIR="${P2PC_NODE_RUN_LOG_DIR:-/var/log/p2pc}"
+  LOCK="${P2PC_NODE_RUN_LOCK:-/run/p2pc-node-run.lock}"
+  local max="${P2PC_NODE_RUN_LOG_MAX_BYTES:-10485760}"
+  BOOT_STATUS="$STATE_DIR/boot-status.json"
+  AGENT_CONFIG="$STATE_DIR/agent.toml"
+  AGENT_PID=""
+  SLEEP_PID=""
+  WRITER_PID=""
+
+  install -d -m 0700 "$LOG_DIR" "$STATE_DIR" 2>/dev/null
+  chmod 0700 "$LOG_DIR" 2>/dev/null
+  # The lock first: a second runner must not start a second log writer (two writers would race on the rotation).
+  if ! { exec 9>"$LOCK"; } 2>/dev/null; then
+    log "cannot open the lock $LOCK: this runner exits" >>"$LOG_DIR/agent.log"
+    exit 1
+  fi
+  if ! flock -n 9; then
+    # Another runner holds it, for example one whose task was stopped: Stop-ScheduledTask kills conhost but not the
+    # wsl.exe under it, so that runner lives on. This one WAITS, so its own wsl.exe stays attached (the task stays
+    # Running and keeps the distro up), and it takes over the moment the other one ends. It never exits at once:
+    # that left the old runner unsupervised (T14b2 real run, W5).
+    log "another p2pc-node-run holds $LOCK: waiting to take over when it ends" >>"$LOG_DIR/agent.log"
+    flock 9 || {
+      log "cannot take the lock $LOCK: this runner exits" >>"$LOG_DIR/agent.log"
+      exit 1
+    }
+  fi
+  exec > >(log_writer "$LOG_DIR/agent.log" "$max") 2>&1
+  WRITER_PID=$!
+  trap on_signal TERM INT HUP
+  log "starting (agent $AGENT)"
+  if [[ ! -x "$AGENT" ]]; then
+    log "$AGENT is missing: this image has no agent"
+    write_status stopped "" "$AGENT is missing: install an image with the agent (.\\install.ps1 -Upgrade -Tar <image>)"
+    finish 0
+  fi
+  if [[ ! -e "$AGENT_CONFIG" ]]; then
+    install -m 0600 /dev/null "$AGENT_CONFIG" 2>/dev/null && log "created an empty $AGENT_CONFIG (no enrollment yet)"
+  fi
+  # The fallback for a task that could not be disabled: a terminal stop with nothing changed since is not retried.
+  local last
+  last="$(status_field exit_code)"
+  if [[ "$(status_field state)" == stopped ]] && is_terminal "$last" && [[ "$(status_field stamp)" == "$(node_stamp)" ]]; then
+    log "the agent stopped for good earlier ($(terminal_reason "$last")), and nothing changed since: not starting it (exit $TERMINAL_EXIT)"
+    finish "$TERMINAL_EXIT"
+  fi
+  wait_boot_status
+
+  local delay=1 rc start ran
+  while :; do
+    write_status running
+    start="$(date +%s)"
+    # A clean environment: nothing from Windows or from the task reaches the agent (spec §9.0). Without the lock (fd 9):
+    # an agent that outlives its runner must never keep the next runner out. With SIGHUP ignored: when the wsl.exe of
+    # the task goes away, the runner (which traps HUP) stops the agent with TERM, so it stops its jobs cleanly.
+    (
+      trap '' HUP
+      exec env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LANG=C.UTF-8 \
+        P2PC_AGENT_CONFIG="$AGENT_CONFIG" "$AGENT" run
+    ) 9>&- &
+    AGENT_PID=$!
+    wait "$AGENT_PID"
+    rc=$?
+    AGENT_PID=""
+    ran=$(($(date +%s) - start))
+    if is_terminal "$rc"; then
+      write_status stopped "$rc" "$(terminal_reason "$rc")" "$(node_stamp)"
+      log "stopped for good: $(terminal_reason "$rc") (exit $TERMINAL_EXIT: the task is disabled)"
+      finish "$TERMINAL_EXIT"
+    fi
+    if ((rc == 0)); then
+      write_status stopped "$rc" "$(terminal_reason "$rc")"
+      log "stopped: $(terminal_reason "$rc")"
+      finish 0
+    fi
+    ((ran >= BACKOFF_MAX_S)) && delay=1
+    write_status restarting "$rc" "$(terminal_reason "$rc"); restarting in ${delay} s"
+    log "p2pc-agent exited with $rc; restarting in ${delay} s"
+    # `sleep & wait`, like the agent: a foreground sleep would hold TERM, INT and HUP back until the delay ended.
+    # Neither the lock (fd 9) nor the log pipe is passed on: a signal between this line and SLEEP_PID=$! leaves the sleep
+    # orphaned for up to 60 s, and it must not keep the next runner or the log writer waiting meanwhile.
+    sleep "$delay" 9>&- >/dev/null 2>&1 &
+    SLEEP_PID=$!
+    wait "$SLEEP_PID"
+    SLEEP_PID=""
+    delay="$(next_delay "$delay")"
+  done
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
