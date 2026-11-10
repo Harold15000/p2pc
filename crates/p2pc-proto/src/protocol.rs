@@ -33,11 +33,11 @@
 //!   [`HubStreamHeader`] for hub-opened streams ([`PortOpen`], answered by [`PortOpenAck`]) and
 //!   [`AgentStreamHeader`] for agent-opened ones (H1's [`UploadHeader`] without a `type`, or [`BlobFetch`], answered
 //!   by [`BlobFetchAck`]). An unknown `type` resets that stream with [`STREAM_RESET_UNSUPPORTED_STREAM`].
-//! - The payloads of the new messages: [`ServiceHealth`], [`VolumeReport`] and [`Leave`] (agent → hub),
-//!   [`VolumeDelete`] and [`NodeApproved`] (hub → agent). They are standalone types for now: the `AgentMsg` and
-//!   `ServerMsg` variants that carry them, `Welcome.pending_approval` and the new `Heartbeat.running[]` fields are
-//!   added in a follow-up, because adding them breaks the exhaustive matches and struct literals of the server and
-//!   the agent, which this change may not edit.
+//! - The new messages, as newtype variants over their payloads: [`AgentMsg::ServiceHealth`],
+//!   [`AgentMsg::VolumeReport`] and [`AgentMsg::Leave`] (agent → hub), [`ServerMsg::VolumeDelete`] and
+//!   [`ServerMsg::NodeApproved`] (hub → agent). The JSON is flat, as for every other message.
+//! - Additive fields: `Welcome.pending_approval` (absent when false) and `Heartbeat.running[]`'s `health`,
+//!   `used_cpu_ms` and `max_rss_mb` (absent when unset), so an H1 peer sees H1's messages.
 
 use std::fmt;
 
@@ -185,14 +185,32 @@ pub struct RunningLease {
     pub lease_id: LeaseId,
     /// Its epoch (the attempt number, a fencing token).
     pub epoch: u64,
+    /// The health of a service lease (H2 §6.1), repeating its last `ServiceHealth`. Absent for batch leases and from
+    /// H1 agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<HealthState>,
+    /// CPU time used so far, cumulative, from the lease cgroup, for service leases at most once a minute (H2 §6.1,
+    /// §12 daily split).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_cpu_ms: Option<u64>,
+    /// The attempt's peak resident memory so far, in MiB, from the lease cgroup, with `used_cpu_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rss_mb: Option<u64>,
 }
 
 impl RunningLease {
-    /// A lease as listed in `Hello` and `Heartbeat`. Outside this crate, build it with this constructor, so that the
-    /// fields H2 adds (`health`, `used_cpu_ms`, `max_rss_mb`, §6.1) do not break callers.
+    /// A lease as listed in `Hello` and `Heartbeat`, with none of the H2 fields. Outside this crate, build it with
+    /// this constructor (plus `..RunningLease::new(…)` for the optional fields), so that added fields do not break
+    /// callers.
     #[must_use]
     pub const fn new(lease_id: LeaseId, epoch: u64) -> Self {
-        Self { lease_id, epoch }
+        Self {
+            lease_id,
+            epoch,
+            health: None,
+            used_cpu_ms: None,
+            max_rss_mb: None,
+        }
     }
 }
 
@@ -369,6 +387,13 @@ pub enum AgentMsg {
         /// Files uploaded from `/outputs`.
         outputs: Vec<OutputFile>,
     },
+    /// The health of a service lease changed (H2 §6.1). Sent only by agents that declared
+    /// [`capability::SERVICE_JOBS`].
+    ServiceHealth(ServiceHealth),
+    /// The node's volumes (H2 §6.1). Sent only by agents that declared [`capability::VOLUMES`].
+    VolumeReport(VolumeReport),
+    /// "Remove me" (H2 §6.1). Sent only by agents that declared [`capability::LEAVE`].
+    Leave(Leave),
     /// A message `type` this version does not know (sent by a newer agent). Not fatal: the server answers
     /// `Error{code: "unsupported_message"}` and keeps the connection. Never send it.
     #[serde(other)]
@@ -393,6 +418,10 @@ pub enum ServerMsg {
         /// The server-side lease TTL. The agent checks `agent_lease_ttl_s + 10 <= lease_ttl_s`, and lowers its own
         /// timer (with a warning) if not.
         lease_ttl_s: u32,
+        /// The node is `pending_approval` (H2 §5.5): it gets no lease until an `admin` approves it. Absent on the
+        /// wire when false, and absent means false, so H1 peers see H1's `Welcome`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pending_approval: bool,
     },
     /// The answer to every `Heartbeat`, echoing its `seq`: the agent's proof that the server is alive
     /// (§6 "Liveness on both sides").
@@ -435,6 +464,10 @@ pub enum ServerMsg {
         /// Human message.
         message: String,
     },
+    /// Delete a node-local volume (H2 §6.1). Sent only to agents that declared [`capability::VOLUMES`].
+    VolumeDelete(VolumeDelete),
+    /// An `admin` approved the node (H2 §5.5, §6.1). Sent only to agents that declared [`capability::APPROVAL`].
+    NodeApproved(NodeApproved),
     /// A message `type` this version does not know (sent by a newer server). Not fatal: the agent ignores it.
     /// Never send it.
     #[serde(other)]
@@ -944,10 +977,15 @@ fn check_pct(field: &'static str, v: u32) -> Result<(), ProtocolViolation> {
 
 fn check_running(running: &[RunningLease]) -> Result<(), ProtocolViolation> {
     if running.len() > MAX_RUNNING_LEASES {
-        Err(violation("running", "too many leases"))
-    } else {
-        Ok(())
+        return Err(violation("running", "too many leases"));
     }
+    if running
+        .iter()
+        .any(|r| r.max_rss_mb.is_some_and(|m| m > MAX_NODE_MEMORY_MB))
+    {
+        return Err(violation("running.max_rss_mb", "must be at most 64 TiB"));
+    }
+    Ok(())
 }
 
 /// Checks the size limits of an inventory received from the network.
@@ -1134,6 +1172,9 @@ impl AgentMsg {
             AgentMsg::JobStarted { .. } => "job_started",
             AgentMsg::LogChunk { .. } => "log_chunk",
             AgentMsg::JobFinished { .. } => "job_finished",
+            AgentMsg::ServiceHealth(_) => "service_health",
+            AgentMsg::VolumeReport(_) => "volume_report",
+            AgentMsg::Leave(_) => "leave",
             AgentMsg::Unknown => "unknown",
         }
     }
@@ -1200,6 +1241,9 @@ impl AgentMsg {
                 }
                 Ok(())
             }
+            AgentMsg::ServiceHealth(health) => health.validate(),
+            AgentMsg::VolumeReport(report) => report.validate(),
+            AgentMsg::Leave(leave) => leave.validate(),
         }
     }
 }
@@ -1216,6 +1260,8 @@ impl ServerMsg {
             ServerMsg::Drain {} => "drain",
             ServerMsg::Resume {} => "resume",
             ServerMsg::Error { .. } => "error",
+            ServerMsg::VolumeDelete(_) => "volume_delete",
+            ServerMsg::NodeApproved(_) => "node_approved",
             ServerMsg::Unknown => "unknown",
         }
     }
@@ -1240,7 +1286,12 @@ impl ServerMsg {
                 Ok(())
             }
             ServerMsg::HeartbeatAck { .. } => Ok(()),
-            ServerMsg::Lease { .. } | ServerMsg::Drain {} | ServerMsg::Resume {} | ServerMsg::Unknown => Ok(()),
+            ServerMsg::Lease { .. }
+            | ServerMsg::Drain {}
+            | ServerMsg::Resume {}
+            | ServerMsg::NodeApproved(_)
+            | ServerMsg::Unknown => Ok(()),
+            ServerMsg::VolumeDelete(delete) => delete.validate(),
             ServerMsg::Cancel { reason, .. } => check_text("reason", reason),
             ServerMsg::Error { code, message } => {
                 check_text("code", code)?;
@@ -1778,10 +1829,7 @@ pub(crate) mod tests {
                 mem_used_mb: 2048,
                 gpu_util_pct: None,
             },
-            running: vec![RunningLease {
-                lease_id: lease(),
-                epoch: 1,
-            }],
+            running: vec![RunningLease::new(lease(), 1)],
         };
         assert_eq!(
             serde_json::to_value(&hb).unwrap(),
@@ -1896,6 +1944,7 @@ pub(crate) mod tests {
             account_id: "acc_01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap(),
             heartbeat_interval_s: DEFAULT_HEARTBEAT_INTERVAL_S,
             lease_ttl_s: DEFAULT_LEASE_TTL_S,
+            pending_approval: false,
         };
         let v = serde_json::to_value(&welcome).unwrap();
         assert_eq!(
@@ -2984,13 +3033,7 @@ pub(crate) mod tests {
             agent_version: "0.1.0".into(),
             inventory: inventory(),
             features: vec![],
-            running: vec![
-                RunningLease {
-                    lease_id: lease(),
-                    epoch: 1
-                };
-                MAX_RUNNING_LEASES + 1
-            ],
+            running: vec![RunningLease::new(lease(), 1); MAX_RUNNING_LEASES + 1],
         };
         assert!(many.validate().is_err());
 
@@ -3060,6 +3103,7 @@ pub(crate) mod tests {
             account_id: AccountId::generate(),
             heartbeat_interval_s,
             lease_ttl_s,
+            pending_approval: false,
         };
         assert!(welcome(5, 60).validate().is_ok());
         assert!(welcome(0, 60).validate().is_err());
@@ -3307,7 +3351,10 @@ mod h2_tests {
             RunningLease::new(lease(), 4),
             RunningLease {
                 lease_id: lease(),
-                epoch: 4
+                epoch: 4,
+                health: None,
+                used_cpu_ms: None,
+                max_rss_mb: None,
             }
         );
     }
@@ -3621,6 +3668,140 @@ mod h2_tests {
             .validate()
             .is_err()
         );
+    }
+
+    #[test]
+    fn the_new_messages_wire_format_matches_the_spec() {
+        let health = ServiceHealth {
+            lease_id: lease(),
+            epoch: 2,
+            state: HealthState::Starting,
+            since: datetime!(2026-11-10 10:00:00 UTC),
+            detail: None,
+        };
+        let cases: [(AgentMsg, serde_json::Value, &str); 3] = [
+            (
+                AgentMsg::ServiceHealth(health),
+                json!({"type": "service_health", "lease_id": LEASE, "epoch": 2, "state": "starting",
+                       "since": "2026-11-10T10:00:00Z"}),
+                "service_health",
+            ),
+            (
+                AgentMsg::VolumeReport(VolumeReport { volumes: vec![] }),
+                json!({"type": "volume_report", "volumes": []}),
+                "volume_report",
+            ),
+            (
+                AgentMsg::Leave(Leave {
+                    reason: "uninstall".into(),
+                }),
+                json!({"type": "leave", "reason": "uninstall"}),
+                "leave",
+            ),
+        ];
+        for (msg, wire, kind) in cases {
+            assert_eq!(serde_json::to_value(&msg).unwrap(), wire);
+            assert_eq!(serde_json::from_value::<AgentMsg>(wire).unwrap(), msg);
+            assert_eq!(msg.kind(), kind);
+            assert_eq!(msg.validate(), Ok(()));
+        }
+        let cases: [(ServerMsg, serde_json::Value, &str); 2] = [
+            (
+                ServerMsg::VolumeDelete(VolumeDelete { name: "cache".into() }),
+                json!({"type": "volume_delete", "name": "cache"}),
+                "volume_delete",
+            ),
+            (
+                ServerMsg::NodeApproved(NodeApproved {}),
+                json!({"type": "node_approved"}),
+                "node_approved",
+            ),
+        ];
+        for (msg, wire, kind) in cases {
+            assert_eq!(serde_json::to_value(&msg).unwrap(), wire);
+            assert_eq!(serde_json::from_value::<ServerMsg>(wire).unwrap(), msg);
+            assert_eq!(msg.kind(), kind);
+            assert_eq!(msg.validate(), Ok(()));
+        }
+        // Each message is validated with its payload's rules.
+        assert!(AgentMsg::Leave(Leave { reason: "a\nb".into() }).validate().is_err());
+        assert!(
+            AgentMsg::VolumeReport(VolumeReport {
+                volumes: vec![
+                    VolumeInfo {
+                        name: String::new(),
+                        size_mb: 0,
+                        last_used_at: datetime!(2026-11-10 10:00:00 UTC),
+                        in_use_by: None
+                    };
+                    1
+                ]
+            })
+            .validate()
+            .is_err()
+        );
+        assert!(
+            ServerMsg::VolumeDelete(VolumeDelete { name: String::new() })
+                .validate()
+                .is_err()
+        );
+    }
+
+    /// H1 compatibility: `Welcome.pending_approval` is absent on the wire unless true, and absent means false.
+    #[test]
+    fn welcome_pending_approval_is_additive() {
+        let welcome = |pending_approval| ServerMsg::Welcome {
+            server_version: "0.2.0".into(),
+            node_id: "node_01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap(),
+            account_id: "acc_01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap(),
+            heartbeat_interval_s: 5,
+            lease_ttl_s: 60,
+            pending_approval,
+        };
+        let h1 = json!({"type": "welcome", "server_version": "0.2.0", "node_id": "node_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "account_id": "acc_01ARZ3NDEKTSV4RRFFQ69G5FAV", "heartbeat_interval_s": 5, "lease_ttl_s": 60});
+        assert_eq!(serde_json::to_value(welcome(false)).unwrap(), h1);
+        assert_eq!(serde_json::from_value::<ServerMsg>(h1.clone()).unwrap(), welcome(false));
+        let mut pending = h1;
+        pending["pending_approval"] = json!(true);
+        assert_eq!(serde_json::to_value(welcome(true)).unwrap(), pending);
+        assert_eq!(serde_json::from_value::<ServerMsg>(pending).unwrap(), welcome(true));
+    }
+
+    /// H1 compatibility: the new `Heartbeat.running[]` fields are absent on the wire unless set.
+    #[test]
+    fn running_lease_fields_are_additive() {
+        let h1 = json!({"lease_id": LEASE, "epoch": 4});
+        assert_eq!(serde_json::to_value(RunningLease::new(lease(), 4)).unwrap(), h1);
+        let back: RunningLease = serde_json::from_value(h1).unwrap();
+        assert_eq!(back, RunningLease::new(lease(), 4));
+        assert_eq!((back.health, back.used_cpu_ms, back.max_rss_mb), (None, None, None));
+        let full = RunningLease {
+            health: Some(HealthState::Healthy),
+            used_cpu_ms: Some(1_500),
+            max_rss_mb: Some(512),
+            ..RunningLease::new(lease(), 4)
+        };
+        let wire = json!({"lease_id": LEASE, "epoch": 4, "health": "healthy", "used_cpu_ms": 1500,
+                          "max_rss_mb": 512});
+        assert_eq!(serde_json::to_value(full).unwrap(), wire);
+        assert_eq!(serde_json::from_value::<RunningLease>(wire).unwrap(), full);
+        // A heartbeat with such leases is valid; a peak beyond the hardware bound is not.
+        let hb = |running| AgentMsg::Heartbeat {
+            seq: 1,
+            load: Load {
+                cpu_pct: 1,
+                mem_used_mb: 1,
+                gpu_util_pct: None,
+            },
+            running,
+        };
+        assert_eq!(hb(vec![full]).validate(), Ok(()));
+        let huge = RunningLease {
+            max_rss_mb: Some(MAX_NODE_MEMORY_MB + 1),
+            ..full
+        };
+        assert!(hb(vec![huge]).validate().is_err());
     }
 
     proptest! {

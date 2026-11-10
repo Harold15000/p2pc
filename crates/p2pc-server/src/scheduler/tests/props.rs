@@ -254,16 +254,10 @@ async fn step(fx: &Fx, m: &mut Model, op: &Op) {
                 .iter()
                 .enumerate()
                 .filter(|(k, _)| mask & (1 << k) != 0)
-                .map(|(_, (_, lease_id, epoch))| RunningLease {
-                    lease_id: *lease_id,
-                    epoch: *epoch,
-                })
+                .map(|(_, (_, lease_id, epoch))| RunningLease::new(*lease_id, *epoch))
                 .collect();
             if ghost {
-                running.push(RunningLease {
-                    lease_id: LeaseId::generate(),
-                    epoch: 1,
-                });
+                running.push(RunningLease::new(LeaseId::generate(), 1));
             }
             // `agent::session`: register, online, activate, then reconcile.
             let mut conn = fx.db.acquire().await.unwrap();

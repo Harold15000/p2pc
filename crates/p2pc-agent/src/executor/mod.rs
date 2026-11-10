@@ -735,10 +735,7 @@ where
             .runs
             .iter()
             .filter(|(_, r)| r.listed)
-            .map(|((lease_id, epoch), _)| RunningLease {
-                lease_id: *lease_id,
-                epoch: *epoch,
-            })
+            .map(|((lease_id, epoch), _)| RunningLease::new(*lease_id, *epoch))
             .collect();
         running.sort_by_key(|r| (r.lease_id.to_string(), r.epoch));
         running
@@ -752,10 +749,7 @@ where
             .runs
             .iter()
             .filter(|(_, r)| r.holds)
-            .map(|((lease_id, epoch), _)| RunningLease {
-                lease_id: *lease_id,
-                epoch: *epoch,
-            })
+            .map(|((lease_id, epoch), _)| RunningLease::new(*lease_id, *epoch))
             .collect();
         holding.sort_by_key(|r| (r.lease_id.to_string(), r.epoch));
         holding

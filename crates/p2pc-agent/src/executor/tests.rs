@@ -608,10 +608,7 @@ async fn admission_checks_readiness_capacity_draining_deadline_and_duplicates() 
         "{:?}",
         w.journal()
     );
-    let mut expected = vec![
-        RunningLease { lease_id: a, epoch: 1 },
-        RunningLease { lease_id: b, epoch: 1 },
-    ];
+    let mut expected = vec![RunningLease::new(a, 1), RunningLease::new(b, 1)];
     expected.sort_by_key(|r| r.lease_id.to_string());
     assert_eq!(w.exec.running(), expected);
     assert_eq!(w.held(), 2);
@@ -904,7 +901,7 @@ async fn the_log_queue_overflows_by_dropping_the_oldest_chunks() {
     }
     assert!(w.journal().iter().any(|l| l == "cleanup 1"), "{:?}", w.journal());
     // Still listed: its JobFinished has not been handed to a server yet.
-    assert_eq!(exec.running(), [RunningLease { lease_id: id, epoch: 1 }]);
+    assert_eq!(exec.running(), [RunningLease::new(id, 1)]);
     let mut s = connect(&w.uplink, &w.journal, accept_all());
     let kinds: Vec<String> = s.until_finished().await.iter().map(kind).collect();
     assert_eq!(
@@ -1722,7 +1719,7 @@ async fn the_same_epoch_as_a_running_lease_is_a_duplicate() {
         !w.journal().iter().any(|l| l.ends_with("cancelled")),
         "the running one goes on"
     );
-    assert_eq!(w.exec.running(), [RunningLease { lease_id: id, epoch: 3 }]);
+    assert_eq!(w.exec.running(), [RunningLease::new(id, 3)]);
     assert_eq!(w.held(), 1);
     w.exec.stop_all("shutdown").await;
 }
@@ -1732,7 +1729,7 @@ async fn the_same_epoch_as_a_running_lease_is_a_duplicate() {
 
 /// The key of a lease `epoch` of `id`, as `Heartbeat.running` and `Hello.running` list it.
 fn listed(id: LeaseId, epoch: u64) -> RunningLease {
-    RunningLease { lease_id: id, epoch }
+    RunningLease::new(id, epoch)
 }
 
 #[tokio::test(start_paused = true)]

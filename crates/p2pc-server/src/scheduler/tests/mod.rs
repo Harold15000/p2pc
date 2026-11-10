@@ -371,10 +371,7 @@ impl Fx {
     pub(crate) async fn heartbeat(&self, node: NodeId, running: &[(LeaseId, u64)]) {
         let running: Vec<RunningLease> = running
             .iter()
-            .map(|(lease_id, epoch)| RunningLease {
-                lease_id: *lease_id,
-                epoch: *epoch,
-            })
+            .map(|(lease_id, epoch)| RunningLease::new(*lease_id, *epoch))
             .collect();
         self.sched.on_heartbeat(node, &running).await.unwrap();
     }
@@ -440,10 +437,7 @@ impl Fx {
         self.link.connect(node);
         let running: Vec<RunningLease> = running
             .iter()
-            .map(|(lease_id, epoch)| RunningLease {
-                lease_id: *lease_id,
-                epoch: *epoch,
-            })
+            .map(|(lease_id, epoch)| RunningLease::new(*lease_id, *epoch))
             .collect();
         let replies = self.sched.reconcile_hello(node, &running).await.unwrap();
         let mut conn = self.db.acquire().await.unwrap();
@@ -1237,10 +1231,7 @@ mt_test!(a_failed_reconciliation_cancels_nothing, async {
         .await
         .unwrap();
     // The Hello lists one lease; losing the other needs a write, which fails.
-    let running = [RunningLease {
-        lease_id: l_kept,
-        epoch: e_kept,
-    }];
+    let running = [RunningLease::new(l_kept, e_kept)];
     let result = LeaseReconciler::reconcile(&fx.sched, node, &running).await;
     assert_eq!(result, Err(ReconcileFailed));
     assert!(fx.link.take().is_empty(), "nothing is sent");
@@ -1427,7 +1418,7 @@ mt_test!(a_server_restart_does_not_lose_or_cancel_healthy_leases, async {
     drop(conn);
     fx.link.connect(node);
     let replies = restarted
-        .reconcile_hello(node, &[RunningLease { lease_id: lease, epoch }])
+        .reconcile_hello(node, &[RunningLease::new(lease, epoch)])
         .await
         .unwrap();
     assert!(replies.is_empty(), "{replies:?}");

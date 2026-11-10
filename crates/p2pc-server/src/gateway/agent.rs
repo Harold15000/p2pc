@@ -555,6 +555,8 @@ async fn session(
         account_id: node.account_id,
         heartbeat_interval_s: inner.state.config.nodes.heartbeat_interval_s,
         lease_ttl_s: inner.state.config.nodes.lease_ttl_s,
+        // H1 behaviour until node approval lands (H2 §5.5, T2-10).
+        pending_approval: false,
     }];
     // The drain request survives reconnects.
     if draining {
@@ -655,7 +657,10 @@ async fn run(inner: &Inner, control: &mut Control, node: &NodeRow) {
                 inner.events.on_message(node_id, msg).await;
                 None
             }
-            AgentMsg::Unknown => Some(error(error_code::UNSUPPORTED_MESSAGE, UNSUPPORTED_MESSAGE)),
+            // The H2 messages (§6.1) are not served yet: answered exactly as an unknown type (H1 §6).
+            AgentMsg::Unknown | AgentMsg::ServiceHealth(_) | AgentMsg::VolumeReport(_) | AgentMsg::Leave(_) => {
+                Some(error(error_code::UNSUPPORTED_MESSAGE, UNSUPPORTED_MESSAGE))
+            }
             // One `Join` or `Hello` per connection.
             AgentMsg::Join { .. } | AgentMsg::Hello { .. } => return,
         };
