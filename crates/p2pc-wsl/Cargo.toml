@@ -7,8 +7,28 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
-# Empty scaffold (T2-00): no dependencies yet. Later tasks add theirs here.
+# Every dependency below is already in the workspace (and in the lock file); none is new to the tree.
 [dependencies]
+# PowerShell's `-EncodedCommand` (base64 of UTF-16LE): the probe scripts never go through command-line quoting.
+data-encoding.workspace = true
+# The image download (H2 §8.3: HTTP range resume). The blocking client, like the rest of this crate (it drives
+# `wsl.exe` synchronously); the app calls it from a blocking thread. TLS is rustls with `ring` and the OS store, as in
+# `p2pc-client`.
+reqwest = { workspace = true, features = ["blocking"] }
+rustls.workspace = true
+rustls-platform-verifier.workspace = true
+# `/var/lib/p2pc/boot-status.json`, read exactly (install.ps1 used regular expressions only because of PowerShell 5.1).
+serde.workspace = true
+serde_json.workspace = true
+# SHA-256 of the image (H1 §9.0: the rootfs is pinned and hash-verified).
+sha2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# Bytes written to a child's stdin (a later task feeds the join token that way) are wiped when dropped.
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true
