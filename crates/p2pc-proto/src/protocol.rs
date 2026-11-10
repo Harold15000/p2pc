@@ -25,6 +25,19 @@
 //!   added field: it requires a capability the agent declared in `Hello.features`, or a new ALPN.
 //! - Versions are semver; the server refuses agents older than its `min_agent_version` with
 //!   [`error_code::AGENT_TOO_OLD`].
+//!
+//! # H2 additions (H2 spec §6.1)
+//!
+//! - The capabilities of [`capability`], the `Cancel` reasons of [`cancel_reason`].
+//! - The streams in both directions after the control stream: each starts with one JSON header frame,
+//!   [`HubStreamHeader`] for hub-opened streams ([`PortOpen`], answered by [`PortOpenAck`]) and
+//!   [`AgentStreamHeader`] for agent-opened ones (H1's [`UploadHeader`] without a `type`, or [`BlobFetch`], answered
+//!   by [`BlobFetchAck`]). An unknown `type` resets that stream with [`STREAM_RESET_UNSUPPORTED_STREAM`].
+//! - The payloads of the new messages: [`ServiceHealth`], [`VolumeReport`] and [`Leave`] (agent → hub),
+//!   [`VolumeDelete`] and [`NodeApproved`] (hub → agent). They are standalone types for now: the `AgentMsg` and
+//!   `ServerMsg` variants that carry them, `Welcome.pending_approval` and the new `Heartbeat.running[]` fields are
+//!   added in a follow-up, because adding them breaks the exhaustive matches and struct literals of the server and
+//!   the agent, which this change may not edit.
 
 use std::fmt;
 
@@ -105,6 +118,66 @@ pub mod error_code {
     pub const INVALID_TOKEN: &str = "invalid_token";
 }
 
+/// Agent capabilities in `Hello.features` added by H2 (H2 spec §6.1).
+///
+/// The hub sends a lease that needs a capability only to agents that declared it (H1 §6 "Compatibility"), and the
+/// scheduler treats a node without it as ineligible for such jobs, with a `reason`.
+pub mod capability {
+    /// Needed by any job with `kind: "service"`. The hub opens [`super::PortOpen`] streams only toward agents that
+    /// declared it.
+    pub const SERVICE_JOBS: &str = "service_jobs";
+    /// Needed by any job with `volumes`.
+    pub const VOLUMES: &str = "volumes";
+    /// Needed by any job whose `inputs` reference a blob.
+    pub const BLOB_INPUTS: &str = "blob_inputs";
+    /// The agent may send `Leave`.
+    pub const LEAVE: &str = "leave";
+    /// The agent applies share changes live, and sends `Inventory.volumes_mb` and `owner_paused` (informative; no
+    /// lease needs it).
+    pub const SHARE_UPDATE: &str = "share_update";
+    /// The agent understands `Welcome.pending_approval` and `NodeApproved` (informative: approval is enforced by the
+    /// scheduler, never by the agent).
+    pub const APPROVAL: &str = "approval";
+    /// Every H2 capability, in the order of the spec's table.
+    pub const ALL: [&str; 6] = [SERVICE_JOBS, VOLUMES, BLOB_INPUTS, LEAVE, SHARE_UPDATE, APPROVAL];
+}
+
+/// `Cancel.reason` values added by H2 (H2 spec §6.1). Informative: the agent's behaviour is the H1 cancel sequence for
+/// every reason.
+pub mod cancel_reason {
+    /// The service was stopped (`POST /v1/jobs/{id}/cancel` on a service, §7.2).
+    pub const STOPPED: &str = "stopped";
+    /// The service had no client connection for its `idle_timeout_s`.
+    pub const IDLE_TIMEOUT: &str = "idle_timeout";
+    /// The service's health check failed.
+    pub const HEALTH_CHECK_FAILED: &str = "health_check_failed";
+    /// The principal's daily cap was reached (§12).
+    pub const CAP_REACHED: &str = "cap_reached";
+    /// The reasons H2 adds.
+    pub const H2: [&str; 4] = [STOPPED, IDLE_TIMEOUT, HEALTH_CHECK_FAILED, CAP_REACHED];
+}
+
+/// QUIC stream reset code for a non-control stream whose header has an unknown `type` (H2 §6.1 "New streams on an
+/// agent connection"): the stream is reset, never the connection. The P2PC application codes are 0 (closed by the
+/// agent), 1 (closed by the server), 2 ([`crate::device::CLOSE_NOT_PAIRED`]) and this one.
+pub const STREAM_RESET_UNSUPPORTED_STREAM: u32 = 3;
+/// The name of [`STREAM_RESET_UNSUPPORTED_STREAM`], for logs.
+pub const STREAM_RESET_UNSUPPORTED_STREAM_REASON: &str = "unsupported_stream";
+/// Most concurrent port streams per agent connection (H2 §6.1).
+pub const MAX_PORT_STREAMS_PER_CONNECTION: usize = 256;
+/// Most concurrent blob fetches per agent connection (H2 §6.1).
+pub const MAX_BLOB_FETCHES_PER_CONNECTION: usize = 8;
+/// Most concurrent port streams per service lease; beyond it the agent answers `too_many_connections` (H2 §6.1).
+pub const MAX_PORT_STREAMS_PER_LEASE: usize = 64;
+/// The agent sends a `VolumeReport` after `Hello`, at this interval, and when a lease that mounted a volume ends (H2
+/// §6.1: every 10 minutes).
+pub const VOLUME_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+/// Most volumes in one `VolumeReport`.
+pub const MAX_VOLUMES_PER_REPORT: usize = 256;
+/// Longest volume name in `VolumeReport` and `VolumeDelete`, in bytes. The name rules themselves are the JobSpec's
+/// (H2 §7.1); this is only the size bound of the agent protocol.
+pub const MAX_VOLUME_NAME_LEN: usize = 128;
+
 /// A lease the agent runs or still holds resources for, as listed in `Hello` and `Heartbeat`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RunningLease {
@@ -112,6 +185,15 @@ pub struct RunningLease {
     pub lease_id: LeaseId,
     /// Its epoch (the attempt number, a fencing token).
     pub epoch: u64,
+}
+
+impl RunningLease {
+    /// A lease as listed in `Hello` and `Heartbeat`. Outside this crate, build it with this constructor, so that the
+    /// fields H2 adds (`health`, `used_cpu_ms`, `max_rss_mb`, §6.1) do not break callers.
+    #[must_use]
+    pub const fn new(lease_id: LeaseId, epoch: u64) -> Self {
+        Self { lease_id, epoch }
+    }
 }
 
 /// Node load, reported in every heartbeat.
@@ -432,6 +514,383 @@ pub mod upload_reason {
     /// The server could not store the file.
     pub const INTERNAL: &str = "internal";
 }
+
+/// Header of a hub-opened `PortOpen` stream (H2 §6.1): open a connection to `port` of the service of
+/// `(lease_id, epoch)`. Raw bytes follow both ways, after the agent's [`PortOpenAck`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortOpen {
+    /// Lease. Refused for anything but the job's current lease, on both ends (SI-H2-6).
+    pub lease_id: LeaseId,
+    /// Epoch.
+    pub epoch: u64,
+    /// The container port, one the service exposes.
+    pub port: u16,
+    /// The hub's ID of this connection, for its traffic and idle accounting.
+    pub conn_id: u64,
+}
+
+/// Header of an agent-opened `BlobFetch` stream (H2 §6.1): send me the blob `sha256` that the lease's job references.
+/// The hub answers [`BlobFetchAck`], then `size` raw bytes, which the agent hashes (`input_integrity` on a mismatch).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobFetch {
+    /// Lease. Refused for anything but the job's current lease (SI-H2-6).
+    pub lease_id: LeaseId,
+    /// Epoch.
+    pub epoch: u64,
+    /// The blob's digest.
+    pub sha256: Sha256Digest,
+}
+
+/// The header of a stream the **hub** opens on an agent connection, read by the agent. Tagged by `"type"`. The hub
+/// opens streams only toward agents that declared [`capability::SERVICE_JOBS`], so an H1 agent never sees one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum HubStreamHeader {
+    /// A connection to a service port.
+    PortOpen(PortOpen),
+    /// A `type` this version does not know: the agent resets the stream with [`STREAM_RESET_UNSUPPORTED_STREAM`],
+    /// never the connection. Never send it.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The header of a stream the **agent** opens on its connection, read by the hub with
+/// [`decode_agent_stream_header`]: a header with a `"type"` is one of the H2 kinds, and a header without one is an H1
+/// [`UploadHeader`] (old agents send no `type`, and uploads stay unchanged).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentStreamHeader {
+    /// An output upload (H1, unchanged): serialized with no `type`.
+    Upload(UploadHeader),
+    /// A blob fetch.
+    BlobFetch(BlobFetch),
+    /// A `type` this version does not know: the hub resets the stream with [`STREAM_RESET_UNSUPPORTED_STREAM`], never
+    /// the connection. Never send it.
+    Unknown,
+}
+
+/// The typed kinds of [`AgentStreamHeader`], as on the wire.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum TaggedAgentStreamHeader {
+    BlobFetch(BlobFetch),
+    #[serde(other)]
+    Unknown,
+}
+
+impl Serialize for AgentStreamHeader {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum Tagged<'a> {
+            BlobFetch(&'a BlobFetch),
+            Unknown,
+        }
+        match self {
+            AgentStreamHeader::Upload(header) => header.serialize(serializer),
+            AgentStreamHeader::BlobFetch(fetch) => Tagged::BlobFetch(fetch).serialize(serializer),
+            AgentStreamHeader::Unknown => Tagged::Unknown.serialize(serializer),
+        }
+    }
+}
+
+/// Decodes the header frame of an agent-opened stream (a body from [`read_frame_bytes`]): without a `"type"` (or
+/// with `"type": null`) it is an H1 [`UploadHeader`]; with a known `type` its kind; with an unknown one
+/// [`AgentStreamHeader::Unknown`]. Errors never quote the content.
+///
+/// The `type` is found first with a pass that skips every other value without building it, so the decode cost stays
+/// that of one message.
+pub fn decode_agent_stream_header(body: &[u8]) -> Result<AgentStreamHeader, FrameError> {
+    #[derive(Deserialize)]
+    struct Probe {
+        #[serde(default, rename = "type")]
+        kind: Option<serde::de::IgnoredAny>,
+    }
+    let probe: Probe = decode_frame(body)?;
+    if probe.kind.is_none() {
+        return decode_frame::<UploadHeader>(body).map(AgentStreamHeader::Upload);
+    }
+    Ok(match decode_frame::<TaggedAgentStreamHeader>(body)? {
+        TaggedAgentStreamHeader::BlobFetch(fetch) => AgentStreamHeader::BlobFetch(fetch),
+        TaggedAgentStreamHeader::Unknown => AgentStreamHeader::Unknown,
+    })
+}
+
+impl HubStreamHeader {
+    /// The `"type"` tag of this header.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            HubStreamHeader::PortOpen(_) => "port_open",
+            HubStreamHeader::Unknown => "unknown",
+        }
+    }
+
+    /// Checks the header: a port is never 0.
+    pub fn validate(&self) -> Result<(), ProtocolViolation> {
+        match self {
+            HubStreamHeader::PortOpen(open) if open.port == 0 => Err(violation("port", "must be 1-65535")),
+            HubStreamHeader::PortOpen(_) | HubStreamHeader::Unknown => Ok(()),
+        }
+    }
+}
+
+impl AgentStreamHeader {
+    /// The kind of this header: `upload` (which has no `"type"` on the wire), or its `"type"` tag.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            AgentStreamHeader::Upload(_) => "upload",
+            AgentStreamHeader::BlobFetch(_) => "blob_fetch",
+            AgentStreamHeader::Unknown => "unknown",
+        }
+    }
+
+    /// Checks the header: an upload's path as H1 does (no traversal, SI-9).
+    pub fn validate(&self) -> Result<(), ProtocolViolation> {
+        match self {
+            AgentStreamHeader::Upload(header) => header.validate(),
+            AgentStreamHeader::BlobFetch(_) | AgentStreamHeader::Unknown => Ok(()),
+        }
+    }
+}
+
+/// The agent's first frame on a [`PortOpen`] stream (H2 §6.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortOpenAck {
+    /// Whether the connection to the port is open.
+    pub ok: bool,
+    /// Why not: one of the [`port_open_reason`] codes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl PortOpenAck {
+    /// The connection is open.
+    #[must_use]
+    pub fn accepted() -> Self {
+        Self { ok: true, reason: None }
+    }
+
+    /// The connection was refused, with one of the [`port_open_reason`] codes.
+    #[must_use]
+    pub fn refused(reason: &str) -> Self {
+        Self {
+            ok: false,
+            reason: Some(reason.to_string()),
+        }
+    }
+
+    /// Checks that `ok` and `reason` agree, and the reason's size.
+    pub fn validate(&self) -> Result<(), ProtocolViolation> {
+        match (&self.ok, &self.reason) {
+            (true, None) => Ok(()),
+            (false, Some(reason)) => check_text("reason", reason),
+            _ => Err(violation("reason", "present exactly when ok is false")),
+        }
+    }
+}
+
+/// The `reason` codes of a refused [`PortOpenAck`] (H2 §6.1). A receiver treats an unknown code as a generic refusal.
+pub mod port_open_reason {
+    /// `(lease_id, epoch)` is not the job's current lease (SI-H2-6).
+    pub const STALE_LEASE: &str = "stale_lease";
+    /// The service does not expose that port.
+    pub const PORT_NOT_EXPOSED: &str = "port_not_exposed";
+    /// The service is not ready yet.
+    pub const NOT_READY: &str = "not_ready";
+    /// The lease already has [`super::MAX_PORT_STREAMS_PER_LEASE`] port streams.
+    pub const TOO_MANY_CONNECTIONS: &str = "too_many_connections";
+    /// The agent could not connect to the port.
+    pub const CONNECT_FAILED: &str = "connect_failed";
+    /// Every code, as in the spec.
+    pub const ALL: [&str; 5] = [
+        STALE_LEASE,
+        PORT_NOT_EXPOSED,
+        NOT_READY,
+        TOO_MANY_CONNECTIONS,
+        CONNECT_FAILED,
+    ];
+}
+
+/// The hub's answer on a [`BlobFetch`] stream (H2 §6.1), followed by exactly `size` raw bytes when `ok`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobFetchAck {
+    /// Whether the blob follows.
+    pub ok: bool,
+    /// The blob's size in bytes, when `ok`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// Why not: one of the [`blob_fetch_reason`] codes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl BlobFetchAck {
+    /// `size` bytes of the blob follow.
+    #[must_use]
+    pub fn accepted(size: u64) -> Self {
+        Self {
+            ok: true,
+            size: Some(size),
+            reason: None,
+        }
+    }
+
+    /// The fetch was refused, with one of the [`blob_fetch_reason`] codes.
+    #[must_use]
+    pub fn refused(reason: &str) -> Self {
+        Self {
+            ok: false,
+            size: None,
+            reason: Some(reason.to_string()),
+        }
+    }
+
+    /// Checks that `ok`, `size` and `reason` agree, and the reason's size.
+    pub fn validate(&self) -> Result<(), ProtocolViolation> {
+        match (&self.ok, &self.size, &self.reason) {
+            (true, Some(_), None) => Ok(()),
+            (false, None, Some(reason)) => check_text("reason", reason),
+            _ => Err(violation(
+                "size",
+                "size present exactly when ok, reason exactly when not",
+            )),
+        }
+    }
+}
+
+/// The `reason` codes of a refused [`BlobFetchAck`] (H2 §6.1). A receiver treats an unknown code as a generic refusal.
+pub mod blob_fetch_reason {
+    /// `(lease_id, epoch)` is not the job's current lease (SI-H2-6).
+    pub const STALE_LEASE: &str = "stale_lease";
+    /// The lease's job does not reference that blob.
+    pub const NOT_REFERENCED: &str = "not_referenced";
+    /// The blob no longer exists.
+    pub const GONE: &str = "gone";
+    /// Every code, as in the spec.
+    pub const ALL: [&str; 3] = [STALE_LEASE, NOT_REFERENCED, GONE];
+}
+
+/// The health of a service lease (H2 §6.1). A closed nested enum (H1 §6): a peer sends only the values its
+/// counterpart knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthState {
+    /// Started; the health check has not passed yet.
+    Starting,
+    /// The health check passes.
+    Healthy,
+    /// The health check fails.
+    Unhealthy,
+}
+
+/// The payload of the agent's `ServiceHealth` message (H2 §6.1), sent on every change of a service lease's health,
+/// which `Heartbeat.running[].health` repeats.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceHealth {
+    /// Lease.
+    pub lease_id: LeaseId,
+    /// Epoch.
+    pub epoch: u64,
+    /// The new state.
+    pub state: HealthState,
+    /// Since when.
+    #[serde(with = "crate::timestamp")]
+    pub since: OffsetDateTime,
+    /// A short detail, for example the status line of a failed check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl ServiceHealth {
+    /// Enforces the size limits.
+    pub fn validate(&self) -> Result<(), ProtocolViolation> {
+        self.detail.as_deref().map_or(Ok(()), |d| check_text("detail", d))
+    }
+}
+
+/// One node-local volume in a [`VolumeReport`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeInfo {
+    /// The volume's name (H2 §7.1 rules, for example `tpl:private-chat/models`).
+    pub name: String,
+    /// Its measured size, in MiB.
+    pub size_mb: u64,
+    /// When a lease last used it.
+    #[serde(with = "crate::timestamp")]
+    pub last_used_at: OffsetDateTime,
+    /// The lease that holds its lock, if any (H2 §11.3 "One holder at a time").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_use_by: Option<LeaseId>,
+}
+
+/// The payload of the agent's `VolumeReport` message (H2 §6.1): after `Hello`, every
+/// [`VOLUME_REPORT_INTERVAL`], when a lease that mounted a volume ends, and in answer to `VolumeDelete`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeReport {
+    /// Every volume on the node.
+    pub volumes: Vec<VolumeInfo>,
+}
+
+fn check_volume_name(field: &'static str, name: &str) -> Result<(), ProtocolViolation> {
+    if name.is_empty() || name.len() > MAX_VOLUME_NAME_LEN {
+        return Err(violation(field, "must be 1-128 bytes"));
+    }
+    check_text(field, name)
+}
+
+impl VolumeReport {
+    /// Enforces the size limits: at most [`MAX_VOLUMES_PER_REPORT`] volumes, each name 1-128 bytes with no control
+    /// characters, and no name twice.
+    pub fn validate(&self) -> Result<(), ProtocolViolation> {
+        if self.volumes.len() > MAX_VOLUMES_PER_REPORT {
+            return Err(violation("volumes", "too many volumes"));
+        }
+        let mut names = std::collections::BTreeSet::new();
+        for v in &self.volumes {
+            check_volume_name("volumes.name", &v.name)?;
+            if !names.insert(v.name.as_str()) {
+                return Err(violation("volumes.name", "duplicate volume name"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The payload of the agent's `Leave` message (H2 §6.1): "remove me". The hub deletes the node, audits `node_left`,
+/// closes the connection and answers nothing; the agent then exits with code 7 (H1 "removed from the server").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Leave {
+    /// Why, for the audit (for example `uninstall`).
+    pub reason: String,
+}
+
+impl Leave {
+    /// Enforces the size limits.
+    pub fn validate(&self) -> Result<(), ProtocolViolation> {
+        check_text("reason", &self.reason)
+    }
+}
+
+/// The payload of the hub's `VolumeDelete` message (H2 §6.1): delete a node-local volume that no lease uses. The
+/// agent answers with a fresh `VolumeReport`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeDelete {
+    /// The volume's name.
+    pub name: String,
+}
+
+impl VolumeDelete {
+    /// Enforces the size limits.
+    pub fn validate(&self) -> Result<(), ProtocolViolation> {
+        check_volume_name("name", &self.name)
+    }
+}
+
+/// The payload of the hub's `NodeApproved{}` message (H2 §5.5, §6.1), sent to agents that declared
+/// [`capability::APPROVAL`] when an `admin` approves the node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct NodeApproved {}
 
 /// A message that is well-formed JSON but breaks a protocol limit.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -2746,5 +3205,455 @@ pub(crate) mod tests {
         let dbg = format!("{lease:?}");
         assert!(!dbg.contains("tok-very-secret-value"), "{dbg}");
         assert!(!dbg.contains("c2VjcmV0LWtleQ=="), "{dbg}");
+    }
+}
+
+/// H2 §6.1: capabilities, stream headers and the payloads of the new agent messages.
+#[cfg(test)]
+mod h2_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use serde_json::json;
+    use time::macros::datetime;
+
+    const LEASE: &str = "lse_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    const SHA: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    fn lease() -> LeaseId {
+        LEASE.parse().unwrap()
+    }
+
+    fn sha() -> Sha256Digest {
+        SHA.parse().unwrap()
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    fn upload() -> UploadHeader {
+        UploadHeader {
+            lease_id: lease(),
+            epoch: 3,
+            path: "out/result.txt".into(),
+            size: 12,
+            sha256: sha(),
+        }
+    }
+
+    fn blob_fetch() -> BlobFetch {
+        BlobFetch {
+            lease_id: lease(),
+            epoch: 3,
+            sha256: sha(),
+        }
+    }
+
+    fn port_open() -> PortOpen {
+        PortOpen {
+            lease_id: lease(),
+            epoch: 2,
+            port: 11434,
+            conn_id: 7,
+        }
+    }
+
+    #[test]
+    fn the_capabilities_match_the_spec() {
+        assert_eq!(
+            capability::ALL,
+            [
+                "service_jobs",
+                "volumes",
+                "blob_inputs",
+                "leave",
+                "share_update",
+                "approval"
+            ]
+        );
+        let hello = AgentMsg::Hello {
+            agent_version: "0.2.0".into(),
+            inventory: tests::inventory(),
+            running: vec![],
+            features: capability::ALL.iter().map(ToString::to_string).collect(),
+        };
+        assert_eq!(hello.validate(), Ok(()));
+        assert!(capability::ALL.iter().all(|c| c.len() <= MAX_FEATURE_LEN));
+    }
+
+    #[test]
+    fn the_new_cancel_reasons_match_the_spec() {
+        assert_eq!(
+            cancel_reason::H2,
+            ["stopped", "idle_timeout", "health_check_failed", "cap_reached"]
+        );
+        for reason in cancel_reason::H2 {
+            let msg = ServerMsg::Cancel {
+                lease_id: lease(),
+                epoch: 1,
+                reason: reason.into(),
+            };
+            assert_eq!(msg.validate(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn running_leases_have_a_constructor() {
+        // Other crates build `RunningLease` through it, so fields can be added (CONTRIBUTING "Shared types grow").
+        assert_eq!(
+            RunningLease::new(lease(), 4),
+            RunningLease {
+                lease_id: lease(),
+                epoch: 4
+            }
+        );
+    }
+
+    #[test]
+    fn stream_headers_wire_format_matches_the_spec() {
+        assert_eq!(
+            serde_json::to_value(HubStreamHeader::PortOpen(port_open())).unwrap(),
+            json!({"type": "port_open", "lease_id": LEASE, "epoch": 2, "port": 11434, "conn_id": 7})
+        );
+        assert_eq!(
+            serde_json::to_value(AgentStreamHeader::BlobFetch(blob_fetch())).unwrap(),
+            json!({"type": "blob_fetch", "lease_id": LEASE, "epoch": 3, "sha256": SHA})
+        );
+        // Uploads stay H1's header, with no `type`.
+        assert_eq!(
+            serde_json::to_value(AgentStreamHeader::Upload(upload())).unwrap(),
+            serde_json::to_value(upload()).unwrap()
+        );
+        // As H1's `Unknown` messages: never sent, and harmless if it ever were.
+        assert_eq!(
+            serde_json::to_value(AgentStreamHeader::Unknown).unwrap(),
+            json!({"type": "unknown"})
+        );
+        assert_eq!(
+            serde_json::to_value(HubStreamHeader::Unknown).unwrap(),
+            json!({"type": "unknown"})
+        );
+        assert_eq!(
+            serde_json::to_value(PortOpenAck::accepted()).unwrap(),
+            json!({"ok": true})
+        );
+        assert_eq!(
+            serde_json::to_value(PortOpenAck::refused(port_open_reason::NOT_READY)).unwrap(),
+            json!({"ok": false, "reason": "not_ready"})
+        );
+        assert_eq!(
+            serde_json::to_value(BlobFetchAck::accepted(42)).unwrap(),
+            json!({"ok": true, "size": 42})
+        );
+        assert_eq!(
+            serde_json::to_value(BlobFetchAck::refused(blob_fetch_reason::GONE)).unwrap(),
+            json!({"ok": false, "reason": "gone"})
+        );
+        assert_eq!(HubStreamHeader::PortOpen(port_open()).kind(), "port_open");
+        assert_eq!(AgentStreamHeader::BlobFetch(blob_fetch()).kind(), "blob_fetch");
+        assert_eq!(AgentStreamHeader::Upload(upload()).kind(), "upload");
+    }
+
+    #[test]
+    fn the_hub_reads_a_header_without_type_as_an_h1_upload() {
+        let decode = |v: serde_json::Value| decode_agent_stream_header(&serde_json::to_vec(&v).unwrap());
+        let h1 = serde_json::to_value(upload()).unwrap();
+        assert_eq!(decode(h1.clone()).unwrap(), AgentStreamHeader::Upload(upload()));
+        let mut with_null = h1.clone();
+        with_null["type"] = json!(null);
+        assert_eq!(decode(with_null).unwrap(), AgentStreamHeader::Upload(upload()));
+        let mut extra = h1;
+        extra["future"] = json!({"x": 1});
+        assert_eq!(decode(extra).unwrap(), AgentStreamHeader::Upload(upload()));
+        let fetch = serde_json::to_value(AgentStreamHeader::BlobFetch(blob_fetch())).unwrap();
+        assert_eq!(decode(fetch).unwrap(), AgentStreamHeader::BlobFetch(blob_fetch()));
+        // An unknown `type` is not fatal: the hub resets that stream with `unsupported_stream`.
+        assert_eq!(
+            decode(json!({"type": "metrics_push", "lease_id": LEASE})).unwrap(),
+            AgentStreamHeader::Unknown
+        );
+        // A known header with an upload's `type` name is unknown, never an upload.
+        let mut typed_upload = serde_json::to_value(upload()).unwrap();
+        typed_upload["type"] = json!("upload");
+        assert_eq!(decode(typed_upload).unwrap(), AgentStreamHeader::Unknown);
+        // Malformed headers are errors, never panics.
+        for bad in [
+            json!({"type": 5}),
+            json!({"type": "blob_fetch", "lease_id": LEASE, "epoch": 1}),
+            json!({"lease_id": LEASE}),
+            json!([1, 2]),
+            json!("upload"),
+        ] {
+            assert!(decode(bad.clone()).is_err(), "{bad}");
+        }
+        assert!(matches!(
+            decode_agent_stream_header(b"\xff\xfe"),
+            Err(FrameError::InvalidUtf8)
+        ));
+    }
+
+    #[test]
+    fn the_agent_reads_hub_opened_streams_by_type() {
+        let bytes = serde_json::to_vec(&HubStreamHeader::PortOpen(port_open())).unwrap();
+        assert_eq!(
+            decode_frame::<HubStreamHeader>(&bytes).unwrap(),
+            HubStreamHeader::PortOpen(port_open())
+        );
+        assert_eq!(
+            decode_frame::<HubStreamHeader>(br#"{"type":"log_follow","x":1}"#).unwrap(),
+            HubStreamHeader::Unknown
+        );
+        // The hub never opens uploads: a header without `type` is an error here.
+        assert!(decode_frame::<HubStreamHeader>(&serde_json::to_vec(&upload()).unwrap()).is_err());
+        assert_eq!(STREAM_RESET_UNSUPPORTED_STREAM_REASON, "unsupported_stream");
+    }
+
+    #[test]
+    fn stream_headers_are_validated() {
+        assert_eq!(HubStreamHeader::PortOpen(port_open()).validate(), Ok(()));
+        let mut zero = port_open();
+        zero.port = 0;
+        assert!(HubStreamHeader::PortOpen(zero).validate().is_err());
+        assert_eq!(AgentStreamHeader::Upload(upload()).validate(), Ok(()));
+        let mut traversal = upload();
+        traversal.path = "../etc/passwd".into();
+        assert!(AgentStreamHeader::Upload(traversal).validate().is_err());
+        assert_eq!(AgentStreamHeader::BlobFetch(blob_fetch()).validate(), Ok(()));
+        assert_eq!(AgentStreamHeader::Unknown.validate(), Ok(()));
+        // Acks: `ok` and the other fields agree.
+        assert_eq!(PortOpenAck::accepted().validate(), Ok(()));
+        assert_eq!(PortOpenAck::refused("stale_lease").validate(), Ok(()));
+        assert!(
+            PortOpenAck {
+                ok: true,
+                reason: Some("x".into())
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            PortOpenAck {
+                ok: false,
+                reason: None
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(PortOpenAck::refused(&"r".repeat(MAX_TEXT_LEN + 1)).validate().is_err());
+        assert_eq!(BlobFetchAck::accepted(0).validate(), Ok(()));
+        assert_eq!(BlobFetchAck::refused("not_referenced").validate(), Ok(()));
+        for bad in [
+            BlobFetchAck {
+                ok: true,
+                size: None,
+                reason: None,
+            },
+            BlobFetchAck {
+                ok: false,
+                size: Some(1),
+                reason: Some("gone".into()),
+            },
+            BlobFetchAck {
+                ok: false,
+                size: None,
+                reason: None,
+            },
+            BlobFetchAck {
+                ok: true,
+                size: Some(1),
+                reason: Some("gone".into()),
+            },
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn stream_reasons_and_limits_match_the_spec() {
+        assert_eq!(
+            port_open_reason::ALL,
+            [
+                "stale_lease",
+                "port_not_exposed",
+                "not_ready",
+                "too_many_connections",
+                "connect_failed"
+            ]
+        );
+        assert_eq!(blob_fetch_reason::ALL, ["stale_lease", "not_referenced", "gone"]);
+        assert_eq!(
+            (
+                MAX_PORT_STREAMS_PER_CONNECTION,
+                MAX_BLOB_FETCHES_PER_CONNECTION,
+                MAX_PORT_STREAMS_PER_LEASE
+            ),
+            (256, 8, 64)
+        );
+        assert_eq!(VOLUME_REPORT_INTERVAL, std::time::Duration::from_secs(600));
+        // Peers key on the numbers: they never change, and no two P2PC application codes share one.
+        assert_eq!(STREAM_RESET_UNSUPPORTED_STREAM, 3);
+        assert_ne!(STREAM_RESET_UNSUPPORTED_STREAM, crate::device::CLOSE_NOT_PAIRED);
+    }
+
+    #[test]
+    fn the_new_agent_message_payloads_match_the_spec() {
+        let health = ServiceHealth {
+            lease_id: lease(),
+            epoch: 2,
+            state: HealthState::Healthy,
+            since: datetime!(2026-11-10 10:00:00 UTC),
+            detail: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&health).unwrap(),
+            json!({"lease_id": LEASE, "epoch": 2, "state": "healthy", "since": "2026-11-10T10:00:00Z"})
+        );
+        for (state, wire) in [
+            (HealthState::Starting, "starting"),
+            (HealthState::Healthy, "healthy"),
+            (HealthState::Unhealthy, "unhealthy"),
+        ] {
+            assert_eq!(serde_json::to_value(state).unwrap(), json!(wire));
+        }
+        // A nested enum stays closed (H1 §6).
+        assert!(serde_json::from_value::<HealthState>(json!("degraded")).is_err());
+
+        let report = VolumeReport {
+            volumes: vec![VolumeInfo {
+                name: "tpl:private-chat/models".into(),
+                size_mb: 1024,
+                last_used_at: datetime!(2026-11-10 09:00:00 UTC),
+                in_use_by: Some(lease()),
+            }],
+        };
+        assert_eq!(
+            serde_json::to_value(&report).unwrap(),
+            json!({"volumes": [{"name": "tpl:private-chat/models", "size_mb": 1024,
+                                "last_used_at": "2026-11-10T09:00:00Z", "in_use_by": LEASE}]})
+        );
+        assert_eq!(
+            serde_json::to_value(Leave {
+                reason: "uninstall".into()
+            })
+            .unwrap(),
+            json!({"reason": "uninstall"})
+        );
+        assert_eq!(
+            serde_json::to_value(VolumeDelete { name: "cache".into() }).unwrap(),
+            json!({"name": "cache"})
+        );
+        assert_eq!(serde_json::to_value(NodeApproved {}).unwrap(), json!({}));
+        // Unknown fields are ignored; round trips are exact.
+        let mut v = serde_json::to_value(&health).unwrap();
+        v["new"] = json!(1);
+        v["detail"] = json!("HTTP 200");
+        let back: ServiceHealth = serde_json::from_value(v).unwrap();
+        assert_eq!(back.detail.as_deref(), Some("HTTP 200"));
+        assert_eq!(
+            serde_json::from_value::<VolumeReport>(serde_json::to_value(&report).unwrap()).unwrap(),
+            report
+        );
+        assert_eq!(
+            serde_json::from_value::<NodeApproved>(json!({"x": 1})).unwrap(),
+            NodeApproved {}
+        );
+    }
+
+    #[test]
+    fn the_new_agent_message_payloads_are_validated() {
+        let health = |detail: Option<String>| ServiceHealth {
+            lease_id: lease(),
+            epoch: 1,
+            state: HealthState::Unhealthy,
+            since: datetime!(2026-11-10 10:00:00 UTC),
+            detail,
+        };
+        assert_eq!(health(Some("HTTP 503".into())).validate(), Ok(()));
+        assert!(health(Some("x".repeat(MAX_TEXT_LEN + 1))).validate().is_err());
+        assert!(health(Some("a\nb".into())).validate().is_err());
+
+        let volume = |name: &str| VolumeInfo {
+            name: name.into(),
+            size_mb: 1,
+            last_used_at: datetime!(2026-11-10 10:00:00 UTC),
+            in_use_by: None,
+        };
+        let report = |volumes| VolumeReport { volumes };
+        assert_eq!(report(vec![volume("cache")]).validate(), Ok(()));
+        assert_eq!(report(vec![]).validate(), Ok(()));
+        assert!(report(vec![volume("")]).validate().is_err());
+        assert!(
+            report(vec![volume(&"v".repeat(MAX_VOLUME_NAME_LEN + 1))])
+                .validate()
+                .is_err()
+        );
+        assert!(report(vec![volume("a\u{0}b")]).validate().is_err());
+        assert!(
+            report(vec![volume("cache"); MAX_VOLUMES_PER_REPORT + 1])
+                .validate()
+                .is_err()
+        );
+        assert!(report(vec![volume("cache"), volume("cache")]).validate().is_err());
+
+        assert_eq!(
+            Leave {
+                reason: "uninstall".into()
+            }
+            .validate(),
+            Ok(())
+        );
+        assert!(
+            Leave {
+                reason: "r".repeat(MAX_TEXT_LEN + 1)
+            }
+            .validate()
+            .is_err()
+        );
+        assert_eq!(VolumeDelete { name: "cache".into() }.validate(), Ok(()));
+        assert!(VolumeDelete { name: String::new() }.validate().is_err());
+        assert!(
+            VolumeDelete {
+                name: "v".repeat(MAX_VOLUME_NAME_LEN + 1)
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// SI-H2-17 style: the stream-header decoders never panic on hostile input.
+        #[test]
+        fn hostile_stream_headers_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..1024)) {
+            if let Ok(h) = decode_agent_stream_header(&bytes) {
+                let _ = h.validate();
+            }
+            if let Ok(h) = decode_frame::<HubStreamHeader>(&bytes) {
+                let _ = h.validate();
+            }
+            let _ = decode_frame::<PortOpenAck>(&bytes);
+            let _ = decode_frame::<BlobFetchAck>(&bytes);
+        }
+
+        #[test]
+        fn stream_headers_round_trip_through_a_frame(epoch in any::<u64>(), port in 1u16.., conn_id in any::<u64>()) {
+            let header = HubStreamHeader::PortOpen(PortOpen { lease_id: lease(), epoch, port, conn_id });
+            let mut buf = Vec::new();
+            block_on(write_frame(&mut buf, &header)).unwrap();
+            let mut r = buf.as_slice();
+            let body = block_on(read_frame_bytes(&mut r, MAX_FRAME_LEN)).unwrap().unwrap();
+            prop_assert_eq!(decode_frame::<HubStreamHeader>(&body).unwrap(), header);
+
+            let header = AgentStreamHeader::BlobFetch(BlobFetch { lease_id: lease(), epoch, sha256: sha() });
+            let mut buf = Vec::new();
+            block_on(write_frame(&mut buf, &header)).unwrap();
+            let mut r = buf.as_slice();
+            let body = block_on(read_frame_bytes(&mut r, MAX_FRAME_LEN)).unwrap().unwrap();
+            prop_assert_eq!(decode_agent_stream_header(&body).unwrap(), header);
+        }
     }
 }
