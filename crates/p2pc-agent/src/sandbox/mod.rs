@@ -11,7 +11,9 @@
 //! - [`jobdir`]: `<data_dir>/jobs/<lease_id>/` and the `O_NOFOLLOW` input writer.
 //! - [`cgroup`]: the per-lease cgroup (`--cgroup-parent`), read for `oom_kill` and `pids.events`.
 //! - [`engine`]: the Podman operations, behind a trait.
-//! - [`logs`]: 64 KiB chunks, the 64 MiB cap with one marker, and draining after it.
+//! - [`logs`]: 64 KiB chunks, the 64 MiB cap with one marker, and draining after it (batch jobs; a service's logs
+//!   are not capped in total, the executor keeps its most recent 64 MiB, H2 §11.4).
+//! - [`health`]: a service's health check and state machine (H2 §7.2), run by the driver's `wait`.
 //! - [`outputs`]: SI-9 collection with SHA-256.
 //! - [`Egress`]: the seam to the per-job egress proxy; [`ProxyEgress`] plugs in T09's [`crate::egress`]. The
 //!   socket directory is mounted with `:U`.
@@ -32,6 +34,7 @@ pub mod cgroup;
 pub mod disk;
 mod driver;
 pub mod engine;
+pub mod health;
 pub mod jobdir;
 pub mod logs;
 pub mod outputs;
@@ -73,6 +76,9 @@ pub mod error_code {
     pub const LOST_EXIT: &str = "lost_exit_code";
     /// The container could not be removed before collecting outputs, or `outputs/` could not be read.
     pub const OUTPUTS_FAILED: &str = "outputs_failed";
+    /// A service was still `starting` after its start period, or failed `failure_threshold` consecutive checks after
+    /// it was healthy, and the agent stopped it (H2 §7.2).
+    pub const HEALTH_CHECK_FAILED: &str = "health_check_failed";
 }
 
 /// The GPU the scheduler assigned through the lease (T06), by UUID.
@@ -106,6 +112,28 @@ pub enum SandboxEvent {
     Started,
     /// Output.
     Log(LogChunk),
+    /// A service's health changed (H2 §6.1 `ServiceHealth`). The first one, `starting`, follows `Started`.
+    Health(HealthChange),
+    /// A service's cumulative usage from its lease cgroup, sampled at most once a minute (H2 §11.4).
+    Usage(UsageSample),
+}
+
+/// A change of a service's health.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthChange {
+    /// The new state.
+    pub state: p2pc_proto::protocol::HealthState,
+    /// A short detail (at most [`health::MAX_DETAIL_LEN`] bytes, no control characters).
+    pub detail: Option<String>,
+}
+
+/// A service's usage so far, from its lease cgroup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsageSample {
+    /// CPU time, cumulative, in milliseconds.
+    pub used_cpu_ms: u64,
+    /// The attempt's peak resident memory so far, in MiB.
+    pub max_rss_mb: u64,
 }
 
 /// The phases before the job runs.
