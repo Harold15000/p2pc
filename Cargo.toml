@@ -8,6 +8,8 @@ members = [
   "crates/p2pc-agent",
   "crates/p2pc-cli",
   "crates/p2pc-shim",
+  "crates/p2pc-device",
+  "crates/p2pc-wsl",
 ]
 
 [workspace.package]
