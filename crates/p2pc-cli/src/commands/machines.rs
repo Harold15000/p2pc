@@ -98,15 +98,15 @@ fn node_table(nodes: &[Node], now: OffsetDateTime) -> Table {
 }
 
 /// A machine found by name or ID. `node` is set when the lookup listed the machines anyway.
-struct Resolved {
-    id: NodeId,
-    node: Option<Node>,
+pub(crate) struct Resolved {
+    pub(crate) id: NodeId,
+    pub(crate) node: Option<Node>,
 }
 
 /// Finds a machine by ID (no request needed) or by name, which lists the machines. The name match ignores case, as
 /// the server's uniqueness rule does, and falls back to the hostname the agent reported. A name that matches more
 /// than one machine is an error that lists them.
-async fn resolve(client: &Client, text: &str) -> Result<Resolved, CliError> {
+pub(crate) async fn resolve(client: &Client, text: &str) -> Result<Resolved, CliError> {
     if let Ok(id) = text.parse::<NodeId>() {
         return Ok(Resolved { id, node: None });
     }

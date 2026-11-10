@@ -66,6 +66,8 @@ pub enum Command {
     Keys(KeysArgs),
     /// Show the audit log.
     Audit(AuditArgs),
+    /// List the persistent volumes of the machines, or remove one.
+    Volumes(VolumesArgs),
     /// Print a shell completion script.
     Completion(CompletionArgs),
     /// Show a job's logs, or follow them live.
@@ -90,6 +92,41 @@ pub enum Command {
     /// For example `claude mcp add p2pc -- p2pc mcp --profile agent`. It refuses a key that has the `admin` scope or
     /// no daily cap, unless you say otherwise. Logs go to stderr; stdout carries only the protocol.
     Mcp(McpArgs),
+}
+
+/// `p2pc volumes`.
+#[derive(Debug, Args)]
+pub struct VolumesArgs {
+    /// What to do.
+    #[command(subcommand)]
+    pub command: VolumesCommand,
+}
+
+/// `p2pc volumes <subcommand>`.
+#[derive(Debug, Subcommand)]
+pub enum VolumesCommand {
+    /// List the volumes: name, machine, size, limit, last use and the job that holds each one now.
+    #[command(visible_alias = "list")]
+    Ls,
+    /// Remove a volume from a machine (admin only). Its data is deleted and cannot be recovered.
+    ///
+    /// The machine must be online and the volume must not be in use. A template's volume is named
+    /// `tpl:<template>/<name>`, for example `tpl:private-chat/models`.
+    Rm(VolumeRm),
+}
+
+/// `p2pc volumes rm`.
+#[derive(Debug, Args)]
+pub struct VolumeRm {
+    /// The machine that holds the volume: its name or ID.
+    #[arg(value_name = "NODE")]
+    pub node: String,
+    /// The volume's name, as `p2pc volumes ls` shows it.
+    #[arg(value_name = "NAME")]
+    pub name: String,
+    /// Do not ask for confirmation. Required when there is no terminal.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 }
 
 /// `p2pc logs`.

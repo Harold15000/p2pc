@@ -14,6 +14,7 @@ pub mod results;
 pub mod run;
 pub mod tokens;
 pub mod usage;
+pub mod volumes;
 
 use std::io::Write;
 
