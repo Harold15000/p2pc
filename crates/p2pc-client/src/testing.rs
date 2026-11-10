@@ -615,6 +615,11 @@ pub mod fixtures {
             placement: Default::default(),
             retry: Default::default(),
             idempotency_key: None,
+            kind: p2pc_proto::api::JobKind::Batch,
+            service: None,
+            volumes: Vec::new(),
+            inputs: Vec::new(),
+            template: None,
         };
         // A constructor, then the fields: a field added to the shared type does not break this (CONTRIBUTING rule 7).
         let mut job = Job::new(
@@ -677,6 +682,9 @@ pub mod fixtures {
             labels: BTreeMap::new(),
             last_seen: Some(t0()),
             created_at: t0(),
+            approval: p2pc_proto::api::NodeApproval::Approved,
+            enrolled_by: None,
+            node_phrase: None,
         }
     }
 
@@ -698,6 +706,7 @@ pub mod fixtures {
             daily_unit_cap: None,
             allowed_images: None,
             expires_at: None,
+            principal: None,
         }
     }
 
@@ -757,6 +766,7 @@ pub mod fixtures {
             at: t0(),
             kind: AuditKind::KeyCreated,
             actor_key_id: Some(KeyId::generate()),
+            actor_device_id: None,
             subject_id: Some("subject".into()),
             detail: serde_json::Map::new(),
         }

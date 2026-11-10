@@ -219,6 +219,11 @@ fn job_spec() -> impl Strategy<Value = JobSpec> {
                 placement,
                 retry: Retry { max_attempts },
                 idempotency_key: idem,
+                kind: p2pc_proto::api::JobKind::Batch,
+                service: None,
+                volumes: Vec::new(),
+                inputs: Vec::new(),
+                template: None,
             }
         },
     )

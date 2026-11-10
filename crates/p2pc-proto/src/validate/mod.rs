@@ -12,9 +12,18 @@
 //! - [`domain_allowed`] and [`validate_egress_domain`]: the egress allowlist (the T09 proxy uses them);
 //! - [`validate_input_path`] and [`validate_output_path`]: path traversal checks (SI-9);
 //! - [`base64_decoded_len`] and [`decode_base64_bounded`]: size-bounded base64.
+//!
+//! H2 (H2 spec §7.1): [`JobSpec::validate_in`] takes a [`SpecContext`], because who may set `template` and `tpl:`
+//! volume names depends on where the spec comes from (SI-H2-9). [`JobSpec::validate`] is the `Create` context, the
+//! strictest. The H2 rules are in [`h2_spec`] (service, volumes, blob inputs, template) and [`h2_api`] (pairing
+//! tickets, device limits, join requests, template launches, `PATCH /v1/server`). Services, volumes and blob inputs
+//! are each behind a switch of [`Limits::h2`] ([`H2Features`]), off by default: a component accepts them only once
+//! it implements them.
 
 pub mod domain;
 pub mod glob;
+pub mod h2_api;
+pub mod h2_spec;
 pub mod image;
 pub mod keys;
 
@@ -25,6 +34,8 @@ use serde::{Deserialize, Serialize};
 
 pub use domain::{DomainError, domain_allowed, validate_egress_domain};
 pub use glob::{glob_match, image_allowed, validate_pattern};
+pub use h2_api::{PrincipalLimits, check_limits_no_escalation};
+pub use h2_spec::{VolumeName, VolumeNameError, is_template_id, validate_volume_mount};
 pub use image::{ImageRef, ImageRefError};
 pub use keys::{EscalationDenied, check_no_escalation};
 
@@ -53,6 +64,16 @@ pub enum ErrorCode {
     Duplicate,
     /// One input file path is a directory of another (`/inputs/a` and `/inputs/a/b`).
     PathConflict,
+    /// A required field is missing (H2: `service` of a service, `template` of a launch).
+    Required,
+    /// A client sent a read-only field (H2 §7.1 `template`): `422 read_only_field`.
+    ReadOnlyField,
+    /// Volumes on a batch job that is not a template launch (H2 §7.1): `422 volumes_not_allowed`.
+    VolumesNotAllowed,
+    /// Blob inputs and inline files do not fit the disk (H2 §7.1): `422 inputs_exceed_disk`.
+    InputsExceedDisk,
+    /// A blob input the caller's account does not hold (H2 §7.1), found by the server: `422 unknown_blob`.
+    UnknownBlob,
 }
 
 impl ErrorCode {
@@ -69,6 +90,11 @@ impl ErrorCode {
             ErrorCode::NotAllowed => "not_allowed",
             ErrorCode::Duplicate => "duplicate",
             ErrorCode::PathConflict => "path_conflict",
+            ErrorCode::Required => "required",
+            ErrorCode::ReadOnlyField => "read_only_field",
+            ErrorCode::VolumesNotAllowed => "volumes_not_allowed",
+            ErrorCode::InputsExceedDisk => "inputs_exceed_disk",
+            ErrorCode::UnknownBlob => "unknown_blob",
         }
     }
 }
@@ -192,6 +218,35 @@ pub struct Limits {
     pub max_disk_mb: u64,
     /// Largest `outputs.max_mb` (10 240, the default disk size).
     pub max_outputs_mb: u64,
+    /// Which H2 job features the validating component implements (H2 §7.1). All off by default.
+    pub h2: H2Features,
+}
+
+/// The H2 job features a component accepts (H2 §7.1), one per agent capability of H2 §6.1 (`service_jobs`,
+/// `volumes`, `blob_inputs`).
+///
+/// A feature that is off refuses its fields with `not_allowed`, before any other check of them, so a server or agent
+/// built with this crate but not implementing the feature yet keeps refusing those jobs, as H1 did (it refused them
+/// as unknown fields). Otherwise an H1 server would accept a service and run it as a batch job, or accept blob
+/// inputs it never delivers. The task that implements a feature turns it on in its own `Limits` (server: T2-12,
+/// T2-14, T2-15; agent: T2-20, T2-22, T2-23). `template` needs no switch: [`SpecContext`] decides who may set it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct H2Features {
+    /// `kind = "service"` and the `service` block.
+    pub services: bool,
+    /// `volumes`.
+    pub volumes: bool,
+    /// Blob `inputs`.
+    pub blob_inputs: bool,
+}
+
+impl H2Features {
+    /// Every H2 job feature on.
+    pub const ALL: Self = Self {
+        services: true,
+        volumes: true,
+        blob_inputs: true,
+    };
 }
 
 /// The default allowed registries (§7).
@@ -210,6 +265,7 @@ impl Default for Limits {
             max_egress_domains: 32,
             max_disk_mb: 1_048_576,
             max_outputs_mb: 10_240,
+            h2: H2Features::default(),
         }
     }
 }
@@ -239,8 +295,16 @@ pub const MIN_MEMORY_MB: u64 = 128;
 pub const MAX_MEMORY_MB: u64 = 1_048_576;
 /// Largest `resources.gpu` in v0.1 (one whole GPU).
 pub const MAX_GPU: u32 = 1;
-/// Largest `timeout_s` (24 h).
+/// Largest `timeout_s` of a batch job (24 h).
 pub const MAX_TIMEOUT_S: u32 = 86_400;
+/// Smallest `timeout_s` of a service (H2 §7.1).
+pub const MIN_SERVICE_TIMEOUT_S: u32 = 60;
+/// Largest `timeout_s` of a service: 30 days (H2 §7.1).
+pub const MAX_SERVICE_TIMEOUT_S: u32 = crate::api::DEFAULT_SERVICE_TIMEOUT_S;
+/// Smallest non-null `service.idle_timeout_s` (H2 §7.1).
+pub const MIN_IDLE_TIMEOUT_S: u32 = 300;
+/// Largest `service.idle_timeout_s`: 7 days (H2 §7.1).
+pub const MAX_IDLE_TIMEOUT_S: u32 = 604_800;
 /// Largest `retry.max_attempts`.
 pub const MAX_ATTEMPTS: u32 = 5;
 /// Longest `name`, in bytes.
@@ -259,6 +323,22 @@ pub const INPUTS_DIR: &str = "/inputs";
 pub const MAX_PATH_LEN: usize = 4096;
 /// Longest path segment, in bytes.
 pub const MAX_SEGMENT_LEN: usize = 255;
+
+/// Where a spec comes from, which decides who may set `template` and `tpl:` volume names (H2 §7.1, SI-H2-9).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum SpecContext {
+    /// A client's `POST /v1/jobs` body (and the CLI's local check). `template` is read-only
+    /// (`422 read_only_field`), `tpl:` volume names are refused, and volumes need `kind = "service"`. The default,
+    /// and what [`JobSpec::validate`] uses.
+    #[default]
+    Create,
+    /// The spec a template launch builds (`POST /v1/templates/{id}/launch`). `template` is required, volumes are
+    /// allowed for batch jobs too, and `tpl:` names must use the launched template's id.
+    Launch,
+    /// A spec the hub already accepted, read back from its store or from a lease. `template` is optional, and when
+    /// it is set the `Launch` rules apply; when it is not, the `Create` rules do.
+    Stored,
+}
 
 struct Collector(Vec<FieldError>);
 
@@ -281,8 +361,14 @@ impl Collector {
 }
 
 impl JobSpec {
-    /// Validates the spec against the §7 table, collecting every problem.
+    /// Validates the spec against the §7 table (and the H2 §7.1 rows) as a client's `POST /v1/jobs` body
+    /// ([`SpecContext::Create`]), collecting every problem. For a batch job without H2 fields every rule is H1's.
     pub fn validate(&self, limits: &Limits) -> Result<(), ValidationErrors> {
+        self.validate_in(limits, SpecContext::Create)
+    }
+
+    /// Validates the spec as coming from `ctx` (see [`SpecContext`]), collecting every problem.
+    pub fn validate_in(&self, limits: &Limits, ctx: SpecContext) -> Result<(), ValidationErrors> {
         let mut c = Collector(Vec::new());
         self.check_name(&mut c);
         self.check_image(limits, &mut c);
@@ -290,11 +376,16 @@ impl JobSpec {
         self.check_env(limits, &mut c);
         self.check_files(limits, &mut c);
         self.check_resources(limits, &mut c);
-        if !(1..=MAX_TIMEOUT_S).contains(&self.timeout_s) {
+        // H2 §7.1: the range depends on `kind`; batch keeps H1's exactly. Out of range is refused, never clamped.
+        let (min_timeout, max_timeout, what) = match self.kind {
+            crate::api::JobKind::Batch => (1, MAX_TIMEOUT_S, ""),
+            crate::api::JobKind::Service => (MIN_SERVICE_TIMEOUT_S, MAX_SERVICE_TIMEOUT_S, " for a service"),
+        };
+        if !(min_timeout..=max_timeout).contains(&self.timeout_s) {
             c.push(
                 "timeout_s",
                 ErrorCode::OutOfRange,
-                format!("must be 1-{MAX_TIMEOUT_S} seconds"),
+                format!("must be {min_timeout}-{max_timeout} seconds{what}"),
             );
         }
         self.check_egress(limits, &mut c);
@@ -314,6 +405,7 @@ impl JobSpec {
             );
         }
         self.check_idempotency_key(&mut c);
+        self.check_h2(limits.h2, ctx, &mut c);
         // Spec §7 `files` (908b42c): the job as delivered must fit in one `Lease` frame. Measured only once every
         // other rule holds, so every field is already bounded and the measurement is cheap (about 1.3 MiB at most).
         if c.0.is_empty() {
@@ -617,15 +709,20 @@ impl JobSpec {
     }
 
     fn check_idempotency_key(&self, c: &mut Collector) {
-        if let Some(key) = &self.idempotency_key {
-            let printable = key.bytes().all(|b| b.is_ascii_graphic());
-            if key.is_empty() || key.len() > MAX_IDEMPOTENCY_KEY_LEN || !printable {
-                c.push(
-                    "idempotency_key",
-                    ErrorCode::InvalidFormat,
-                    format!("must be 1-{MAX_IDEMPOTENCY_KEY_LEN} printable ASCII characters without spaces"),
-                );
-            }
+        check_idempotency_key(self.idempotency_key.as_deref(), c);
+    }
+}
+
+/// The §7 `idempotency_key` rule, shared by jobs and template launches.
+fn check_idempotency_key(key: Option<&str>, c: &mut Collector) {
+    if let Some(key) = key {
+        let printable = key.bytes().all(|b| b.is_ascii_graphic());
+        if key.is_empty() || key.len() > MAX_IDEMPOTENCY_KEY_LEN || !printable {
+            c.push(
+                "idempotency_key",
+                ErrorCode::InvalidFormat,
+                format!("must be 1-{MAX_IDEMPOTENCY_KEY_LEN} printable ASCII characters without spaces"),
+            );
         }
     }
 }
@@ -696,6 +793,13 @@ pub fn path_set_issues<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<Path
     issues
 }
 
+/// Whether `name` is an env variable a job (or a template parameter target) may set: `[A-Z_][A-Z0-9_]*` and not
+/// starting with the reserved `P2PC_`.
+#[must_use]
+pub fn is_settable_env_name(name: &str) -> bool {
+    is_env_name(name) && !name.starts_with(RESERVED_ENV_PREFIX)
+}
+
 /// `[A-Z_][A-Z0-9_]*`
 fn is_env_name(name: &str) -> bool {
     let mut bytes = name.bytes();
@@ -725,6 +829,9 @@ pub enum PathError {
     /// An output path must be relative to `/outputs`.
     #[error("the path must be relative")]
     Absolute,
+    /// A volume mount must be absolute and under `/volumes/` (H2 §7.1).
+    #[error("the path must be absolute and under /volumes/")]
+    NotUnderVolumes,
     /// Empty, `.` or `..` segment, or a segment longer than 255 bytes.
     #[error("the path must not contain empty, `.` or `..` segments, or segments over 255 bytes")]
     InvalidSegment,
@@ -842,7 +949,12 @@ mod tests {
             outputs: Outputs { max_mb: 1024 },
             placement: Placement::default(),
             retry: Retry { max_attempts: 2 },
+            service: None,
+            volumes: Vec::new(),
+            inputs: Vec::new(),
+            template: None,
             idempotency_key: Some("abc-123".into()),
+            kind: crate::api::JobKind::Batch,
         }
     }
 

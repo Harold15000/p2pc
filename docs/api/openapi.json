@@ -1864,6 +1864,17 @@
           "detail"
         ],
         "properties": {
+          "actor_device_id": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DeviceId",
+                "description": "The device that acted, if any (H2 §5.6). At most one of `actor_key_id` and `actor_device_id` is set. Left\nout when `null`."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "actor_key_id": {
             "oneOf": [
               {
@@ -1918,8 +1929,64 @@
           "node_deleted",
           "auth_failed",
           "key_recovered",
-          "node_reenrolled"
+          "node_reenrolled",
+          "pairing_ticket_created",
+          "pairing_ticket_revoked",
+          "device_paired",
+          "device_revoked",
+          "device_added_offline",
+          "device_revoked_offline",
+          "join_request_created",
+          "join_request_revealed",
+          "join_request_reveal_failed",
+          "join_request_approved",
+          "join_request_rejected",
+          "join_request_delivered",
+          "node_approved",
+          "node_left",
+          "template_bundle_loaded"
         ]
+      },
+      "BlobInput": {
+        "type": "object",
+        "description": "A blob input (H2 §7.1): the blob, delivered read-only at `path`.\n\n**Strict** (request type): the `POST /v1/jobs` body, and what the agent parses a lease's job into (`LeaseJob::parse_strict`). Unknown fields are rejected, which catches typos and refuses a lease the agent would not fully understand (§6). Responses use the lenient twin, [`JobSpecView`].",
+        "required": [
+          "path",
+          "blob"
+        ],
+        "properties": {
+          "blob": {
+            "$ref": "#/components/schemas/BlobRef",
+            "description": "The blob, which must exist in the caller's account when the job is created."
+          },
+          "path": {
+            "type": "string",
+            "description": "Absolute path under `/inputs/`, with the `files` path rules."
+          }
+        },
+        "additionalProperties": false
+      },
+      "BlobInputView": {
+        "type": "object",
+        "description": "A blob input (H2 §7.1): the blob, delivered read-only at `path`.\n\n**Lenient and redacted** (response type): the `spec` of a [`Job`] in API responses (§7 \"Job representation in responses\"). Unknown fields are ignored, so an older CLI or SDK keeps reading jobs after the server adds a field (§6). `env` values are always `\"<redacted>\"` and `files` carry `{path, size, sha256}` with no content, and there is **no `idempotency_key`**: a response never carries it (§7). Build it with [`JobSpecView::from_stored`].",
+        "required": [
+          "path",
+          "blob"
+        ],
+        "properties": {
+          "blob": {
+            "$ref": "#/components/schemas/BlobRef",
+            "description": "The blob, which must exist in the caller's account when the job is created."
+          },
+          "path": {
+            "type": "string",
+            "description": "Absolute path under `/inputs/`, with the `files` path rules."
+          }
+        }
+      },
+      "BlobRef": {
+        "type": "string",
+        "description": "A blob input's content address (H2 §7.1, §7.5): `sha256:<64 lowercase hex>`."
       },
       "Capacity": {
         "type": "object",
@@ -2042,17 +2109,25 @@
             ],
             "description": "Optional human label, shown when tokens are listed."
           },
+          "pre_approved": {
+            "type": "boolean",
+            "description": "The node it enrolls starts `approved` (H2 §5.4, §5.5). `admin` principals only (else `403`). Left out when\n`false`."
+          },
           "ttl_s": {
             "type": [
               "integer",
               "null"
             ],
             "format": "int32",
-            "description": "Validity in seconds. Default 900 (15 minutes), maximum 86 400 (24 h).",
+            "description": "Validity in seconds. Default 900 (15 minutes), maximum 86 400 (24 h); at most 900 with `pre_approved`, and\nfor a `nodes:join` principal (H2 §7.3, where the spec calls it `expires_in_s`).",
             "minimum": 0
           }
         },
         "additionalProperties": false
+      },
+      "DeviceId": {
+        "type": "string",
+        "description": "Identifies a paired device (`dev_…`, H2 §5.5): a principal like an API key, authenticated by its iroh NodeId."
       },
       "Egress": {
         "type": "object",
@@ -2093,7 +2168,12 @@
           "unsupported_pool",
           "not_allowed",
           "duplicate",
-          "path_conflict"
+          "path_conflict",
+          "required",
+          "read_only_field",
+          "volumes_not_allowed",
+          "inputs_exceed_disk",
+          "unknown_blob"
         ]
       },
       "Estimate": {
@@ -2262,6 +2342,107 @@
           "status": {
             "type": "string",
             "description": "Always `ok`."
+          }
+        }
+      },
+      "HealthCheck": {
+        "type": "object",
+        "description": "A service health check (H2 §7.1): exactly one of `http_get` or `tcp: true`.\n\n**Strict** (request type): the `POST /v1/jobs` body, and what the agent parses a lease's job into (`LeaseJob::parse_strict`). Unknown fields are rejected, which catches typos and refuses a lease the agent would not fully understand (§6). Responses use the lenient twin, [`JobSpecView`].",
+        "required": [
+          "port"
+        ],
+        "properties": {
+          "failure_threshold": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Consecutive failed checks that make it `unhealthy`, 1-20. Default 3.",
+            "minimum": 0
+          },
+          "http_get": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An absolute path to `GET`, at most 256 bytes. Only the status line is read."
+          },
+          "interval_s": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Seconds between checks, 2-300. Default 10.",
+            "minimum": 0
+          },
+          "port": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The port to check: one of `service.ports`.",
+            "minimum": 0
+          },
+          "start_period_s": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Seconds the service may stay `starting`, 0-3 600. Default 300.",
+            "minimum": 0
+          },
+          "tcp": {
+            "type": "boolean",
+            "description": "A TCP connect check."
+          },
+          "timeout_s": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Seconds before one check fails, 1-60. Default 3.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "HealthCheckView": {
+        "type": "object",
+        "description": "A service health check (H2 §7.1): exactly one of `http_get` or `tcp: true`.\n\n**Lenient and redacted** (response type): the `spec` of a [`Job`] in API responses (§7 \"Job representation in responses\"). Unknown fields are ignored, so an older CLI or SDK keeps reading jobs after the server adds a field (§6). `env` values are always `\"<redacted>\"` and `files` carry `{path, size, sha256}` with no content, and there is **no `idempotency_key`**: a response never carries it (§7). Build it with [`JobSpecView::from_stored`].",
+        "required": [
+          "port"
+        ],
+        "properties": {
+          "failure_threshold": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Consecutive failed checks that make it `unhealthy`, 1-20. Default 3.",
+            "minimum": 0
+          },
+          "http_get": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An absolute path to `GET`, at most 256 bytes. Only the status line is read."
+          },
+          "interval_s": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Seconds between checks, 2-300. Default 10.",
+            "minimum": 0
+          },
+          "port": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The port to check: one of `service.ports`.",
+            "minimum": 0
+          },
+          "start_period_s": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Seconds the service may stay `starting`, 0-3 600. Default 300.",
+            "minimum": 0
+          },
+          "tcp": {
+            "type": "boolean",
+            "description": "A TCP connect check."
+          },
+          "timeout_s": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Seconds before one check fails, 1-60. Default 3.",
+            "minimum": 0
           }
         }
       },
@@ -2504,6 +2685,17 @@
             ],
             "description": "Why the job is in its current state, when there is something to tell the user, for example why a queued job\nis not being placed (§8 \"Offer cap\"). User-visible; never contains secrets."
           },
+          "service": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ServiceView",
+                "description": "The service view of a `kind = \"service\"` job (H2 §7.2): health, ports, idle and cap deadlines, the hub's model\npull and today's traffic. Left out for batch jobs."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "spec": {
             "$ref": "#/components/schemas/JobSpecView",
             "description": "The submitted spec, with the image normalized, built with [`JobSpecView::from_stored`]: `env` values are\n`\"<redacted>\"` and files carry no content (§7). Lenient: a field added by a newer server does not break\nolder clients."
@@ -2574,9 +2766,17 @@
         "type": "string",
         "description": "Identifies a job (`job_…`)."
       },
+      "JobKind": {
+        "type": "string",
+        "description": "What kind of job a spec describes (H2 §7.1): a batch job runs to completion (H1), a service keeps running and\nexposes ports. `batch` is the default, and is left out of serialized specs, so H1 peers see H1 bytes.",
+        "enum": [
+          "batch",
+          "service"
+        ]
+      },
       "JobSpec": {
         "type": "object",
-        "description": "A job specification: what to run and with which limits (§7).\n\n`Debug` never prints environment values or input file contents (§7: env values are never logged).\n\n**Strict** (request type): the `POST /v1/jobs` body, and what the agent parses a lease's job into (`LeaseJob::parse_strict`). Unknown fields are rejected, which catches typos and refuses a lease the agent would not fully understand (§6). Responses use the lenient twin, [`JobSpecView`].",
+        "description": "A job specification: what to run and with which limits (§7, H2 §7.1).\n\n`Debug` never prints environment values or input file contents (§7: env values are never logged).\n\n**Strict** (request type): the `POST /v1/jobs` body, and what the agent parses a lease's job into (`LeaseJob::parse_strict`). Unknown fields are rejected, which catches typos and refuses a lease the agent would not fully understand (§6). Responses use the lenient twin, [`JobSpecView`].",
         "required": [
           "image",
           "command",
@@ -2616,11 +2816,22 @@
               "string",
               "null"
             ],
-            "description": "Client-chosen key that makes the submission idempotent (§7). Scoped to the API key that submits it. It is\n**never returned**: no response type has it (see [`JobSpecView`])."
+            "description": "Client-chosen key that makes the submission idempotent (§7). Scoped to the principal that submits\nit, an API key or a device (H2 §5.6). It is **never returned**: no response type has it (see\n[`JobSpecView`])."
           },
           "image": {
             "type": "string",
             "description": "OCI image reference, for example `docker.io/library/python:3.12-slim`."
+          },
+          "inputs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BlobInput"
+            },
+            "description": "Blob inputs, 0-32, delivered read-only under `/inputs` (H2 §7.1, §7.5)."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/JobKind",
+            "description": "`batch` (default) or `service` (H2 §7.1). Left out when `batch`."
           },
           "name": {
             "type": [
@@ -2643,20 +2854,49 @@
           },
           "retry": {
             "$ref": "#/components/schemas/Retry",
-            "description": "Retry policy (only node loss consumes an attempt)."
+            "description": "Retry policy. For `batch`, only node loss consumes an attempt (default 2); for `service`, it counts\nconsecutive attempts that never became healthy (default 3)."
+          },
+          "service": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ServiceSpec",
+                "description": "The service block: required when `kind = \"service\"`, forbidden otherwise (H2 §7.1)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "template": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/TemplateRef",
+                "description": "Read-only: set by a template launch (H2 §7.6). A `POST /v1/jobs` that sends it gets\n`422 read_only_field`."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "timeout_s": {
             "type": "integer",
             "format": "int32",
-            "description": "Wall-clock limit in seconds. Default 3 600.",
+            "description": "Wall-clock limit in seconds. Every job has one (hard rule 3). Default 3 600 for `batch` (1-86 400) and\n2 592 000, 30 days, for `service` (60-2 592 000). (`serde(default)` here only marks it optional in the\nschema: deserialization goes through the wire type, which applies the default of the `kind`.)",
             "minimum": 0
+          },
+          "volumes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VolumeSpec"
+            },
+            "description": "Persistent volumes, 0-4 (H2 §7.1, §11.3): only for services and template launches."
           }
         },
         "additionalProperties": false
       },
       "JobSpecView": {
         "type": "object",
-        "description": "A job specification: what to run and with which limits (§7).\n\n`Debug` never prints environment values or input file contents (§7: env values are never logged).\n\n**Lenient and redacted** (response type): the `spec` of a [`Job`] in API responses (§7 \"Job representation in responses\"). Unknown fields are ignored, so an older CLI or SDK keeps reading jobs after the server adds a field (§6). `env` values are always `\"<redacted>\"` and `files` carry `{path, size, sha256}` with no content, and there is **no `idempotency_key`**: a response never carries it (§7). Build it with [`JobSpecView::from_stored`].",
+        "description": "A job specification: what to run and with which limits (§7, H2 §7.1).\n\n`Debug` never prints environment values or input file contents (§7: env values are never logged).\n\n**Lenient and redacted** (response type): the `spec` of a [`Job`] in API responses (§7 \"Job representation in responses\"). Unknown fields are ignored, so an older CLI or SDK keeps reading jobs after the server adds a field (§6). `env` values are always `\"<redacted>\"` and `files` carry `{path, size, sha256}` with no content, and there is **no `idempotency_key`**: a response never carries it (§7). Build it with [`JobSpecView::from_stored`].",
         "required": [
           "image",
           "command",
@@ -2695,6 +2935,17 @@
             "type": "string",
             "description": "OCI image reference, for example `docker.io/library/python:3.12-slim`."
           },
+          "inputs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BlobInputView"
+            },
+            "description": "Blob inputs, 0-32, delivered read-only under `/inputs` (H2 §7.1, §7.5)."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/JobKind",
+            "description": "`batch` (default) or `service` (H2 §7.1). Left out when `batch`."
+          },
           "name": {
             "type": [
               "string",
@@ -2716,13 +2967,42 @@
           },
           "retry": {
             "$ref": "#/components/schemas/RetryView",
-            "description": "Retry policy (only node loss consumes an attempt)."
+            "description": "Retry policy. For `batch`, only node loss consumes an attempt (default 2); for `service`, it counts\nconsecutive attempts that never became healthy (default 3)."
+          },
+          "service": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ServiceSpecView",
+                "description": "The service block: required when `kind = \"service\"`, forbidden otherwise (H2 §7.1)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "template": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/TemplateRefView",
+                "description": "Read-only: set by a template launch (H2 §7.6). A `POST /v1/jobs` that sends it gets\n`422 read_only_field`."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "timeout_s": {
             "type": "integer",
             "format": "int32",
-            "description": "Wall-clock limit in seconds. Default 3 600.",
+            "description": "Wall-clock limit in seconds. Every job has one (hard rule 3). Default 3 600 for `batch` (1-86 400) and\n2 592 000, 30 days, for `service` (60-2 592 000). (`serde(default)` here only marks it optional in the\nschema: deserialization goes through the wire type, which applies the default of the `kind`.)",
             "minimum": 0
+          },
+          "volumes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VolumeSpecView"
+            },
+            "description": "Persistent volumes, 0-4 (H2 §7.1, §11.3): only for services and template launches."
           }
         }
       },
@@ -2910,6 +3190,10 @@
           "created_at"
         ],
         "properties": {
+          "approval": {
+            "$ref": "#/components/schemas/NodeApproval",
+            "description": "`approved` (default, and every H1 node) or `pending_approval` (H2 §5.5): a pending node gets no lease until\nan `admin` approves it. Left out when `approved`."
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -2918,6 +3202,17 @@
           "draining": {
             "type": "boolean",
             "description": "Whether the node is draining (accepts no new jobs)."
+          },
+          "enrolled_by": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Principal",
+                "description": "The principal that minted the node's join token, as the hub recorded it; `null` for H1 nodes."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "free": {
             "$ref": "#/components/schemas/Capacity",
@@ -2957,11 +3252,26 @@
             "type": "string",
             "description": "The node's name, **derived by the server** from the reported hostname: sanitized and unique per account\n(`base`, `base-1`, …, compared case-insensitively). An explicit rename that collides is refused. Never used\nfor authentication (§5 \"Names\")."
           },
+          "node_phrase": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The node phrase (H2 §5.5): 6 words derived from the node's iroh NodeId, shown before approving it."
+          },
           "state": {
             "$ref": "#/components/schemas/NodeState",
             "description": "Connection state."
           }
         }
+      },
+      "NodeApproval": {
+        "type": "string",
+        "description": "Whether a node may get work (H2 §5.5 \"Node approval\").",
+        "enum": [
+          "approved",
+          "pending_approval"
+        ]
       },
       "NodeId": {
         "type": "string",
@@ -3152,6 +3462,17 @@
                 "detail"
               ],
               "properties": {
+                "actor_device_id": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/DeviceId",
+                      "description": "The device that acted, if any (H2 §5.6). At most one of `actor_key_id` and `actor_device_id` is set. Left\nout when `null`."
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
                 "actor_key_id": {
                   "oneOf": [
                     {
@@ -3311,6 +3632,17 @@
                   ],
                   "description": "Why the job is in its current state, when there is something to tell the user, for example why a queued job\nis not being placed (§8 \"Offer cap\"). User-visible; never contains secrets."
                 },
+                "service": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/ServiceView",
+                      "description": "The service view of a `kind = \"service\"` job (H2 §7.2): health, ports, idle and cap deadlines, the hub's model\npull and today's traffic. Left out for batch jobs."
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
                 "spec": {
                   "$ref": "#/components/schemas/JobSpecView",
                   "description": "The submitted spec, with the image normalized, built with [`JobSpecView::from_stored`]: `env` values are\n`\"<redacted>\"` and files carry no content (§7). Lenient: a field added by a newer server does not break\nolder clients."
@@ -3447,6 +3779,10 @@
                 "created_at"
               ],
               "properties": {
+                "approval": {
+                  "$ref": "#/components/schemas/NodeApproval",
+                  "description": "`approved` (default, and every H1 node) or `pending_approval` (H2 §5.5): a pending node gets no lease until\nan `admin` approves it. Left out when `approved`."
+                },
                 "created_at": {
                   "type": "string",
                   "format": "date-time",
@@ -3455,6 +3791,17 @@
                 "draining": {
                   "type": "boolean",
                   "description": "Whether the node is draining (accepts no new jobs)."
+                },
+                "enrolled_by": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Principal",
+                      "description": "The principal that minted the node's join token, as the hub recorded it; `null` for H1 nodes."
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 },
                 "free": {
                   "$ref": "#/components/schemas/Capacity",
@@ -3493,6 +3840,13 @@
                 "name": {
                   "type": "string",
                   "description": "The node's name, **derived by the server** from the reported hostname: sanitized and unique per account\n(`base`, `base-1`, …, compared case-insensitively). An explicit rename that collides is refused. Never used\nfor authentication (§5 \"Names\")."
+                },
+                "node_phrase": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "The node phrase (H2 §5.5): 6 words derived from the node's iroh NodeId, shown before approving it."
                 },
                 "state": {
                   "$ref": "#/components/schemas/NodeState",
@@ -3637,6 +3991,51 @@
           "wsl2"
         ]
       },
+      "Principal": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "An API key.",
+            "required": [
+              "id",
+              "kind"
+            ],
+            "properties": {
+              "id": {
+                "$ref": "#/components/schemas/KeyId",
+                "description": "An API key."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "key"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A paired device.",
+            "required": [
+              "id",
+              "kind"
+            ],
+            "properties": {
+              "id": {
+                "$ref": "#/components/schemas/DeviceId",
+                "description": "A paired device."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "device"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Who authenticated a request (H2 §5.5): an API key (H1) or a paired device. JSON `{\"kind\": \"key\", \"id\": \"…\"}` or\n`{\"kind\": \"device\", \"id\": \"dev_…\"}`, as `GET /v1/whoami`'s `principal`.\n\n[`Display`](fmt::Display) and [`FromStr`](std::str::FromStr) use the `key:<id>` and `device:<id>` labels of\n`GET /v1/usage?group_by=principal` (H2 §12)."
+      },
       "Problem": {
         "type": "object",
         "description": "An RFC 9457 `application/problem+json` error body, with a stable `code`.",
@@ -3752,6 +4151,14 @@
           }
         }
       },
+      "RestartPolicy": {
+        "type": "string",
+        "description": "What happens to a service when its node is lost (H2 §7.2).",
+        "enum": [
+          "never",
+          "on_node_loss"
+        ]
+      },
       "Retry": {
         "type": "object",
         "description": "Retry policy.\n\n**Strict** (request type): the `POST /v1/jobs` body, and what the agent parses a lease's job into (`LeaseJob::parse_strict`). Unknown fields are rejected, which catches typos and refuses a lease the agent would not fully understand (§6). Responses use the lenient twin, [`JobSpecView`].",
@@ -3759,7 +4166,7 @@
           "max_attempts": {
             "type": "integer",
             "format": "int32",
-            "description": "Attempts in total, 1-5. Default 2. Only node loss consumes an attempt.",
+            "description": "Attempts in total, 1-5. Default 2 for `batch` (only node loss consumes an attempt) and 3 for `service`\n(consecutive attempts that never became healthy, H2 §7.2).",
             "minimum": 0
           }
         },
@@ -3772,7 +4179,7 @@
           "max_attempts": {
             "type": "integer",
             "format": "int32",
-            "description": "Attempts in total, 1-5. Default 2. Only node loss consumes an attempt.",
+            "description": "Attempts in total, 1-5. Default 2 for `batch` (only node loss consumes an attempt) and 3 for `service`\n(consecutive attempts that never became healthy, H2 §7.2).",
             "minimum": 0
           }
         }
@@ -3830,7 +4237,12 @@
           "jobs:write",
           "jobs:read",
           "nodes:read",
-          "nodes:write"
+          "nodes:write",
+          "services:connect",
+          "templates:launch",
+          "blobs:write",
+          "nodes:invite",
+          "nodes:join"
         ]
       },
       "ServerInfo": {
@@ -3846,6 +4258,35 @@
           "address": {
             "type": "string",
             "description": "The server address `p2pc_srv_…` (§10): the NodeId and the relays, for `p2pc login`."
+          },
+          "api_version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The REST API generation (H2 §7.3): 1 for H1, [`API_VERSION_H2`] for H2. An absent value means 1, and 1 is\nleft out, so an H1 server's response is unchanged.",
+            "minimum": 0
+          },
+          "hub_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The hub's display name (H2 §7.3, `PATCH /v1/server`)."
+          },
+          "max_blob_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The largest blob upload, in MiB (H2 §7.5).",
+            "minimum": 0
+          },
+          "min_web_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The oldest web app build this hub accepts (H2 §14.3)."
           },
           "node_id": {
             "type": "string",
@@ -3863,6 +4304,332 @@
             "description": "The server version (semver)."
           }
         }
+      },
+      "ServiceHealth": {
+        "type": "string",
+        "description": "The health of a running service (H2 §7.2).",
+        "enum": [
+          "starting",
+          "healthy",
+          "unhealthy"
+        ]
+      },
+      "ServicePort": {
+        "type": "object",
+        "description": "One exposed port of a service (H2 §7.1).\n\n**Strict** (request type): the `POST /v1/jobs` body, and what the agent parses a lease's job into (`LeaseJob::parse_strict`). Unknown fields are rejected, which catches typos and refuses a lease the agent would not fully understand (§6). Responses use the lenient twin, [`JobSpecView`].",
+        "required": [
+          "port",
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "`[a-z][a-z0-9-]{0,31}`, unique."
+          },
+          "port": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The TCP port inside the container, 1-65 535, unique.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "ServicePortView": {
+        "type": "object",
+        "description": "One exposed port of a service (H2 §7.1).\n\n**Lenient and redacted** (response type): the `spec` of a [`Job`] in API responses (§7 \"Job representation in responses\"). Unknown fields are ignored, so an older CLI or SDK keeps reading jobs after the server adds a field (§6). `env` values are always `\"<redacted>\"` and `files` carry `{path, size, sha256}` with no content, and there is **no `idempotency_key`**: a response never carries it (§7). Build it with [`JobSpecView::from_stored`].",
+        "required": [
+          "port",
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "`[a-z][a-z0-9-]{0,31}`, unique."
+          },
+          "port": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The TCP port inside the container, 1-65 535, unique.",
+            "minimum": 0
+          }
+        }
+      },
+      "ServiceSetup": {
+        "type": "object",
+        "description": "The hub's model pull of a template service, `service.setup` (H2 §7.2, §7.6).",
+        "required": [
+          "state"
+        ],
+        "properties": {
+          "completed_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "MiB downloaded so far.",
+            "minimum": 0
+          },
+          "reason": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SetupFailure",
+                "description": "Why it failed, when `state` is `failed`."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "state": {
+            "$ref": "#/components/schemas/SetupState",
+            "description": "`pulling`, `done` or `failed`."
+          },
+          "total_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "MiB to download, once the service reported it.",
+            "minimum": 0
+          },
+          "tries": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Tries so far (at most 2 per attempt).",
+            "minimum": 0
+          }
+        }
+      },
+      "ServiceSpec": {
+        "type": "object",
+        "description": "The service block of a `kind = \"service\"` job (H2 §7.1).\n\n**Strict** (request type): the `POST /v1/jobs` body, and what the agent parses a lease's job into (`LeaseJob::parse_strict`). Unknown fields are rejected, which catches typos and refuses a lease the agent would not fully understand (§6). Responses use the lenient twin, [`JobSpecView`].",
+        "required": [
+          "ports"
+        ],
+        "properties": {
+          "health": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/HealthCheck",
+                "description": "The health check. Without it, the service is `healthy` as soon as a connection to its first port\nsucceeds through the bridge."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "idle_timeout_s": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "`null` (never) or 300-604 800 seconds without an open port connection and without traffic, measured\nby the hub. Default 3 600 when absent.",
+            "minimum": 0
+          },
+          "ports": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ServicePort"
+            },
+            "description": "The ports the service listens on inside its container, 1-8. The shim forwards no other port."
+          },
+          "restart": {
+            "$ref": "#/components/schemas/RestartPolicy",
+            "description": "What a node loss does (default `on_node_loss`)."
+          }
+        },
+        "additionalProperties": false
+      },
+      "ServiceSpecView": {
+        "type": "object",
+        "description": "The service block of a `kind = \"service\"` job (H2 §7.1).\n\n**Lenient and redacted** (response type): the `spec` of a [`Job`] in API responses (§7 \"Job representation in responses\"). Unknown fields are ignored, so an older CLI or SDK keeps reading jobs after the server adds a field (§6). `env` values are always `\"<redacted>\"` and `files` carry `{path, size, sha256}` with no content, and there is **no `idempotency_key`**: a response never carries it (§7). Build it with [`JobSpecView::from_stored`].",
+        "required": [
+          "ports"
+        ],
+        "properties": {
+          "health": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/HealthCheckView",
+                "description": "The health check. Without it, the service is `healthy` as soon as a connection to its first port\nsucceeds through the bridge."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "idle_timeout_s": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "`null` (never) or 300-604 800 seconds without an open port connection and without traffic, measured\nby the hub. Default 3 600 when absent.",
+            "minimum": 0
+          },
+          "ports": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ServicePortView"
+            },
+            "description": "The ports the service listens on inside its container, 1-8. The shim forwards no other port."
+          },
+          "restart": {
+            "$ref": "#/components/schemas/RestartPolicy",
+            "description": "What a node loss does (default `on_node_loss`)."
+          }
+        }
+      },
+      "ServiceTraffic": {
+        "type": "object",
+        "description": "A service's traffic for one UTC day, recorded and not billed (H2 §12 `service_traffic`).",
+        "required": [
+          "day"
+        ],
+        "properties": {
+          "bytes_in": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bytes from clients to the service.",
+            "minimum": 0
+          },
+          "bytes_out": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bytes from the service to clients.",
+            "minimum": 0
+          },
+          "connections": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Port connections opened.",
+            "minimum": 0
+          },
+          "day": {
+            "type": "string",
+            "format": "date-time",
+            "description": "00:00 UTC of the day the totals are for."
+          }
+        }
+      },
+      "ServiceView": {
+        "type": "object",
+        "description": "The `service` member of `GET /v1/jobs/{id}` for a service (H2 §7.2). Lenient, and every field defaults, so a\nnewer server may add fields and an older one may leave some out.",
+        "properties": {
+          "cap_deadline": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When today's cap reservation runs out (H2 §12); `null` for an uncapped principal."
+          },
+          "deadline": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When `timeout_s` ends the current attempt."
+          },
+          "health": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ServiceHealth",
+                "description": "The health of the running attempt; `null` while the service is not running."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "health_since": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Since when `health` has had its value."
+          },
+          "idle_deadline": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the idle timeout stops the service; `null` while a connection is open or when `idle_timeout_s` is\n`null`."
+          },
+          "last_activity_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Last byte forwarded in either direction (updated at most every 10 s)."
+          },
+          "open_connections": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Port connections open now.",
+            "minimum": 0
+          },
+          "ports": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ServicePortView"
+            },
+            "description": "The exposed ports, from the spec."
+          },
+          "restarts_24h": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Node-loss restarts in the last 24 h (at most [`MAX_NODE_LOSS_RESTARTS_PER_24H`]).",
+            "minimum": 0
+          },
+          "setup": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ServiceSetup",
+                "description": "The hub's model pull (H2 §7.6); `null` for a job without one."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "traffic": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ServiceTraffic",
+                "description": "Today's traffic totals (H2 §12)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "SetupFailure": {
+        "type": "string",
+        "description": "Why a model pull failed (H2 §7.6 \"Reading\").",
+        "enum": [
+          "error_line",
+          "bad_line",
+          "eof",
+          "stream_broken",
+          "deadline"
+        ]
+      },
+      "SetupState": {
+        "type": "string",
+        "description": "The state of the hub's model pull for a template service (H2 §7.2, §7.6).",
+        "enum": [
+          "pulling",
+          "done",
+          "failed"
+        ]
       },
       "Sha256Digest": {
         "type": "string",
@@ -3885,6 +4652,61 @@
           "ok": {
             "type": "boolean",
             "description": "Whether the smoke container ran correctly."
+          }
+        }
+      },
+      "TemplateRef": {
+        "type": "object",
+        "description": "The template a job was launched from (H2 §7.6). Read-only: only a template launch sets it.\n\n**Strict** (request type): the `POST /v1/jobs` body, and what the agent parses a lease's job into (`LeaseJob::parse_strict`). Unknown fields are rejected, which catches typos and refuses a lease the agent would not fully understand (§6). Responses use the lenient twin, [`JobSpecView`].",
+        "required": [
+          "id",
+          "version"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The template's id."
+          },
+          "pull": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The model the hub pulls at launch (the template's `pull` parameter), `null` without one."
+          },
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The template's version, from 1.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "TemplateRefView": {
+        "type": "object",
+        "description": "The template a job was launched from (H2 §7.6). Read-only: only a template launch sets it.\n\n**Lenient and redacted** (response type): the `spec` of a [`Job`] in API responses (§7 \"Job representation in responses\"). Unknown fields are ignored, so an older CLI or SDK keeps reading jobs after the server adds a field (§6). `env` values are always `\"<redacted>\"` and `files` carry `{path, size, sha256}` with no content, and there is **no `idempotency_key`**: a response never carries it (§7). Build it with [`JobSpecView::from_stored`].",
+        "required": [
+          "id",
+          "version"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The template's id."
+          },
+          "pull": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The model the hub pulls at launch (the template's `pull` parameter), `null` without one."
+          },
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The template's version, from 1.",
+            "minimum": 0
           }
         }
       },
@@ -3972,6 +4794,12 @@
             "description": "How many of `attempts` are server estimates ([`UsageRecord::estimated`]).",
             "minimum": 0
           },
+          "estimated_slices": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many ledger rows (slices, H2 §12) are server estimates, midnight slices of running services included.\nLeft out when 0, and absent from H1 servers.",
+            "minimum": 0
+          },
           "key": {
             "type": [
               "string",
@@ -4006,6 +4834,57 @@
             "format": "int64",
             "description": "CPU time actually used (cgroup stats), in milliseconds.",
             "minimum": 0
+          }
+        }
+      },
+      "VolumeSpec": {
+        "type": "object",
+        "description": "A persistent volume of a job (H2 §7.1, §11.3).\n\n**Strict** (request type): the `POST /v1/jobs` body, and what the agent parses a lease's job into (`LeaseJob::parse_strict`). Unknown fields are rejected, which catches typos and refuses a lease the agent would not fully understand (§6). Responses use the lenient twin, [`JobSpecView`].",
+        "required": [
+          "name",
+          "mount",
+          "max_mb"
+        ],
+        "properties": {
+          "max_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Size limit in MiB, 64-262 144.",
+            "minimum": 0
+          },
+          "mount": {
+            "type": "string",
+            "description": "Where it is mounted: absolute, under `/volumes/`."
+          },
+          "name": {
+            "type": "string",
+            "description": "`[a-z0-9][a-z0-9._-]{0,62}`, or `tpl:<template id>/<name>` (template launches only). A label, never\na path: the agent derives the directory from it."
+          }
+        },
+        "additionalProperties": false
+      },
+      "VolumeSpecView": {
+        "type": "object",
+        "description": "A persistent volume of a job (H2 §7.1, §11.3).\n\n**Lenient and redacted** (response type): the `spec` of a [`Job`] in API responses (§7 \"Job representation in responses\"). Unknown fields are ignored, so an older CLI or SDK keeps reading jobs after the server adds a field (§6). `env` values are always `\"<redacted>\"` and `files` carry `{path, size, sha256}` with no content, and there is **no `idempotency_key`**: a response never carries it (§7). Build it with [`JobSpecView::from_stored`].",
+        "required": [
+          "name",
+          "mount",
+          "max_mb"
+        ],
+        "properties": {
+          "max_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Size limit in MiB, 64-262 144.",
+            "minimum": 0
+          },
+          "mount": {
+            "type": "string",
+            "description": "Where it is mounted: absolute, under `/volumes/`."
+          },
+          "name": {
+            "type": "string",
+            "description": "`[a-z0-9][a-z0-9._-]{0,62}`, or `tpl:<template id>/<name>` (template launches only). A label, never\na path: the agent derives the directory from it."
           }
         }
       },
@@ -4062,6 +4941,17 @@
               "null"
             ],
             "description": "The key's label, if it has one."
+          },
+          "principal": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Principal",
+                "description": "Who the caller is, `{kind, id}` (H2 §5.5). `null` from an H1 server, whose callers are always the `key_id`\nkey. Left out when `null`."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "project_id": {
             "$ref": "#/components/schemas/ProjectId",

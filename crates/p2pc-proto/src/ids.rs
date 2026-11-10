@@ -344,3 +344,47 @@ mod tests {
         assert_eq!(serde_json::from_str::<KeyId>(&json).unwrap(), a);
     }
 }
+
+// H2 identifiers (H2 spec §5.2, §5.4, §5.5). Kept in one block at the end of the file, so that parallel H2 tasks
+// that add IDs merge trivially.
+
+prefixed_ulid!(
+    /// Identifies a paired device (`dev_…`, H2 §5.5): a principal like an API key, authenticated by its iroh NodeId.
+    DeviceId,
+    "dev_"
+);
+prefixed_ulid!(
+    /// Identifies a pairing ticket row (`ptk_…`, H2 §5.2), as listed and revoked by the admin API. Never the ticket.
+    PairingTicketId,
+    "ptk_"
+);
+prefixed_ulid!(
+    /// Identifies a join request (`jrq_…`, H2 §5.4).
+    JoinRequestId,
+    "jrq_"
+);
+
+#[cfg(test)]
+mod h2_tests {
+    use super::*;
+
+    const ULID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+
+    #[test]
+    fn h2_ids_round_trip_and_refuse_each_others_prefix() {
+        let device: DeviceId = format!("dev_{ULID}").parse().unwrap();
+        assert_eq!(device.to_string(), format!("dev_{ULID}"));
+        let ticket: PairingTicketId = format!("ptk_{ULID}").parse().unwrap();
+        assert_eq!(ticket.to_string(), format!("ptk_{ULID}"));
+        let request: JoinRequestId = format!("jrq_{ULID}").parse().unwrap();
+        assert_eq!(request.to_string(), format!("jrq_{ULID}"));
+        assert_eq!(serde_json::to_string(&device).unwrap(), format!("\"dev_{ULID}\""));
+        assert_eq!(
+            format!("ptk_{ULID}").parse::<DeviceId>(),
+            Err(IdError::WrongPrefix { expected: "dev_" })
+        );
+        assert!(format!("dev_{ULID}").parse::<JoinRequestId>().is_err());
+        assert!(format!("jtk_{ULID}").parse::<PairingTicketId>().is_err());
+        assert!(format!("dev_{}", ULID.to_lowercase()).parse::<DeviceId>().is_err());
+    }
+}

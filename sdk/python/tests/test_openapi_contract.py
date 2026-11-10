@@ -280,6 +280,22 @@ RESPONSES = [
     ("UsageTotals", "UsageTotals"),
     ("LogLine", "LogLine"),
     ("OutputFile", "OutputEntry"),
+    # H2 (spec §7.1, §7.2).
+    ("ServiceSpecView", "ServiceSpecView"),
+    ("ServicePortView", "ServicePortView"),
+    ("HealthCheckView", "HealthCheckView"),
+    ("VolumeSpecView", "VolumeSpecView"),
+    ("BlobInputView", "BlobInputView"),
+    ("TemplateRefView", "TemplateRefView"),
+    ("ServiceView", "ServiceView"),
+    ("ServiceSetup", "ServiceSetup"),
+    ("ServiceTraffic", "ServiceTraffic"),
+]
+# Members of a `oneOf` schema: (SDK model, OpenAPI schema, the member's `kind` value). The OpenAPI
+# names the union, not its members, so each member is found by its tag.
+VARIANTS = [
+    ("KeyPrincipal", "Principal", "key"),
+    ("DevicePrincipal", "Principal", "device"),
 ]
 # Pagination envelope and its item type.
 PAGES = [
@@ -304,6 +320,28 @@ def test_response_model_matches_openapi(schemas: dict[str, Any], model: str, sch
     assert drift(schemas, sdk_model(model), schema, request=False) == []
 
 
+def api_variant(schemas: dict[str, Any], name: str, tag: str) -> Schema:
+    members = [
+        alt for alt in schemas[name]["oneOf"] if alt["properties"]["kind"].get("enum") == [tag]
+    ]
+    assert len(members) == 1, f"{name} has no single member with kind {tag!r}"
+    return Schema(members[0], schemas)
+
+
+@pytest.mark.parametrize(("model", "schema", "tag"), VARIANTS, ids=[v[0] for v in VARIANTS])
+def test_union_member_matches_openapi(
+    schemas: dict[str, Any], model: str, schema: str, tag: str
+) -> None:
+    api = api_variant(schemas, schema, tag)
+    assert diff(sdk_schema(sdk_model(model)), api, f"{schema}[{tag}]", request=False) == []
+
+
+def test_union_members_cover_the_openapi_union(schemas: dict[str, Any]) -> None:
+    for schema in {v[1] for v in VARIANTS}:
+        tags = {alt["properties"]["kind"]["enum"][0] for alt in schemas[schema]["oneOf"]}
+        assert tags == {v[2] for v in VARIANTS if v[1] == schema}, schema
+
+
 @pytest.mark.parametrize(("item", "schema"), PAGES, ids=[p[1] for p in PAGES])
 def test_page_matches_openapi(schemas: dict[str, Any], item: str, schema: str) -> None:
     page = m.Page[sdk_model(item)]  # type: ignore[misc]
@@ -311,7 +349,9 @@ def test_page_matches_openapi(schemas: dict[str, Any], item: str, schema: str) -
 
 
 def test_every_sdk_model_is_covered_by_the_contract() -> None:
-    covered = {r[0] for r in REQUESTS} | {r[0] for r in RESPONSES} | INTERNAL
+    covered = (
+        {r[0] for r in REQUESTS} | {r[0] for r in RESPONSES} | {v[0] for v in VARIANTS} | INTERNAL
+    )
     defined = {
         name
         for name, obj in vars(m).items()
@@ -369,6 +409,25 @@ def test_checker_notices_a_nested_change(schemas: dict[str, Any]) -> None:
     assert any("spec" in p for p in drift_against(schemas, "Job", "Job", request=False))
 
 
+def test_checker_notices_a_change_in_a_union_member(schemas: dict[str, Any]) -> None:
+    def add_label(s: dict[str, Any]) -> None:
+        for alt in s["Principal"]["oneOf"]:
+            if alt["properties"]["kind"]["enum"] == ["key"]:
+                alt["properties"]["label"] = {"type": "string"}
+
+    schemas = mutated(schemas, add_label)
+    api = api_variant(schemas, "Principal", "key")
+    problems = diff(sdk_schema(sdk_model("KeyPrincipal")), api, "Principal[key]", request=False)
+    assert any("label" in p for p in problems)
+
+
+def test_checker_notices_a_change_in_the_service_view(schemas: dict[str, Any]) -> None:
+    schemas = mutated(
+        schemas, lambda s: s["ServiceView"]["properties"].update(replicas={"type": "integer"})
+    )
+    assert any("replicas" in p for p in drift_against(schemas, "Job", "Job", request=False))
+
+
 # --- enums, paths and parameters -----------------------------------------------------------
 def api_enum(schemas: dict[str, Any], name: str) -> set[str]:
     node = schemas[name]
@@ -387,6 +446,13 @@ def test_enums_match_openapi(schemas: dict[str, Any]) -> None:
     assert set(m.PLATFORMS) == api_enum(schemas, "Platform")
     assert set(m.LOG_STREAMS) == api_enum(schemas, "LogStream")
     assert set(p2pc.FIELD_ERROR_CODES) == api_enum(schemas, "ErrorCode")
+    # H2: the fields that carry these are plain strings, so the sets are the drift check.
+    assert set(m.JOB_KINDS) == api_enum(schemas, "JobKind")
+    assert set(m.RESTART_POLICIES) == api_enum(schemas, "RestartPolicy")
+    assert set(m.SERVICE_HEALTHS) == api_enum(schemas, "ServiceHealth")
+    assert set(m.SETUP_STATES) == api_enum(schemas, "SetupState")
+    assert set(m.SETUP_FAILURES) == api_enum(schemas, "SetupFailure")
+    assert set(m.NODE_APPROVALS) == api_enum(schemas, "NodeApproval")
 
 
 def test_problem_members_are_all_exposed_by_errors(schemas: dict[str, Any]) -> None:

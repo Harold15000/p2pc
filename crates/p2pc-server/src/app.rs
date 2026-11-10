@@ -293,6 +293,7 @@ pub async fn whoami(Authorized { principal: p, .. }: AnyKey) -> Json<WhoAmI> {
         daily_unit_cap: p.daily_unit_cap,
         allowed_images: p.allowed_images,
         expires_at: p.expires_at,
+        principal: None,
     })
 }
 
