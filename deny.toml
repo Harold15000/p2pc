@@ -19,6 +19,12 @@ ignore = [
   # paste 1.0.15: unmaintained, with no known vulnerability. It is a build-time proc-macro of netlink-packet-core,
   # pulled in by netwatch, which iroh 1.4 requires on Linux. Revisit when iroh drops it (T05, 05-11).
   { id = "RUSTSEC-2024-0436", reason = "paste: unmaintained, no vulnerability; build-time proc-macro via netwatch (iroh 1.4)" },
+  # libsqlite3-sys 0.37 (bundled SQLite < 3.54): uninitialized page-cache memory when a process opens a database with
+  # a sibling -wal file of a different page size that a less trusted party wrote. p2pc-server opens only its own
+  # database, in its state directory, owned by its service user: writing there already means owning the server. The
+  # fix (libsqlite3-sys >= 0.39) needs a sqlx-sqlite release that allows it; 0.9.0, the latest, caps it below 0.38.
+  # Remove this entry and upgrade as soon as sqlx releases it. Do not restore a backup from an untrusted source.
+  { id = "RUSTSEC-2026-0459", reason = "bundled SQLite WAL page-size bug; server opens only its own DB; fix blocked on a sqlx release" },
 ]
 
 [licenses]

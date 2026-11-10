@@ -48,7 +48,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-platform-verifier = "0.7.1"
 # The official Rust MCP SDK (Apache-2.0), for `p2pc mcp`. Only the server side and the stdio transport: no macros (the
 # tool schemas are written by hand), no HTTP transport and no OAuth. Tests add the `client` feature.
-rmcp = { version = "3.8.0", default-features = false, features = ["server", "transport-io"] }
+rmcp = { version = "3.9.0", default-features = false, features = ["server", "transport-io"] }
 # `min_agent_version` and agent versions (spec §6 "Compatibility"); already in the lock file through sqlx.
 semver = "1.0.28"
 # Safe syscall wrappers (statvfs, geteuid) so that crates keep `unsafe_code = "forbid"`.
