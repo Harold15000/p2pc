@@ -161,6 +161,24 @@ impl ApiError {
         Self::new(StatusCode::BAD_REQUEST, code, "Bad Request", detail)
     }
 
+    /// `422` with a specific code (H2 §7.7 `invalid_join_request`), without field details.
+    #[must_use]
+    pub fn unprocessable(code: &str, detail: impl Into<String>) -> Self {
+        Self::new(StatusCode::UNPROCESSABLE_ENTITY, code, "Unprocessable Content", detail)
+    }
+
+    /// `429` with a specific code: a per-principal or per-account limit is reached (H2 §5.4).
+    #[must_use]
+    pub fn too_many_requests(code: &str, detail: impl Into<String>) -> Self {
+        Self::new(StatusCode::TOO_MANY_REQUESTS, code, "Too Many Requests", detail)
+    }
+
+    /// `503` with a specific code: the server is not configured for this (H2 §5.2 `web_app_origin`).
+    #[must_use]
+    pub fn service_unavailable(code: &str, detail: impl Into<String>) -> Self {
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, code, "Service Unavailable", detail)
+    }
+
     /// `415 unsupported_media_type`.
     #[must_use]
     pub fn unsupported_media_type() -> Self {

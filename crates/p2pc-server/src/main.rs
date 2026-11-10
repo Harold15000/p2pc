@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use p2pc_proto::api::Scope;
+use p2pc_proto::ids::{DeviceId, ProjectId};
 use p2pc_server::clock::SystemClock;
 use p2pc_server::config::{CONFIG_FILE, Config};
 use p2pc_server::gateway::ServerIdentity;
@@ -35,7 +37,8 @@ enum Command {
         #[arg(long, value_name = "FILE")]
         config: Option<PathBuf>,
     },
-    /// Initialise the data dir and print the admin API key once.
+    /// Initialise the data dir and print the admin API key once. With `--owner-device`, register that device as the
+    /// owner instead, and print no API key.
     Init {
         /// Data dir. $P2PC_DATA_DIR takes precedence over this flag.
         #[arg(long, value_name = "DIR")]
@@ -43,6 +46,18 @@ enum Command {
         /// REST listen address written to `server.toml` (`bind`). Default: 127.0.0.1:7477.
         #[arg(long, value_name = "ADDR")]
         bind: Option<SocketAddr>,
+        /// The iroh NodeId of the owner device (the desktop app's own device key): it gets the `admin` scope, and no
+        /// API key is created.
+        #[arg(long, value_name = "NODE_ID")]
+        owner_device: Option<String>,
+        /// Label of the owner device.
+        #[arg(long, value_name = "TEXT", requires = "owner_device")]
+        label: Option<String>,
+    },
+    /// Offline device management (needs local access to the data dir; works while the server runs).
+    Devices {
+        #[command(subcommand)]
+        command: DevicesCommand,
     },
     /// Offline key management (needs local access to the data dir).
     Keys {
@@ -60,6 +75,47 @@ enum KeysCommand {
         #[arg(long, value_name = "DIR")]
         data_dir: Option<PathBuf>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum DevicesCommand {
+    /// Register a device by its iroh NodeId, audited as `device_added_offline`.
+    Add {
+        /// Data dir. $P2PC_DATA_DIR takes precedence over this flag.
+        #[arg(long, value_name = "DIR")]
+        data_dir: Option<PathBuf>,
+        /// The device's iroh NodeId (64 lowercase hex characters).
+        #[arg(long, value_name = "NODE_ID")]
+        node_id: String,
+        /// Comma-separated scopes, for example `admin` or `nodes:read,templates:launch`.
+        #[arg(long, value_name = "LIST", value_parser = parse_scopes)]
+        scopes: std::vec::Vec<Scope>,
+        /// The device's label.
+        #[arg(long, value_name = "TEXT")]
+        label: String,
+        /// The project (`prj_…`). Default: the `default` project.
+        #[arg(long, value_name = "PROJECT_ID")]
+        project: Option<ProjectId>,
+    },
+    /// Revoke a device, audited as `device_revoked_offline`. A running server closes its connections within 5 s.
+    Revoke {
+        /// Data dir. $P2PC_DATA_DIR takes precedence over this flag.
+        #[arg(long, value_name = "DIR")]
+        data_dir: Option<PathBuf>,
+        /// The device ID (`dev_…`).
+        #[arg(long, value_name = "DEVICE_ID")]
+        id: DeviceId,
+    },
+}
+
+/// A comma-separated scope list (`admin`, `nodes:read,templates:launch`).
+fn parse_scopes(text: &str) -> Result<std::vec::Vec<Scope>, String> {
+    text.split(',')
+        .map(|s| {
+            serde_json::from_value(serde_json::Value::String(s.trim().to_string()))
+                .map_err(|_| format!("unknown scope {:?}", s.trim()))
+        })
+        .collect()
 }
 
 fn main() -> ExitCode {
@@ -82,7 +138,29 @@ fn main() -> ExitCode {
 
 async fn run(command: Command) -> anyhow::Result<()> {
     match command {
-        Command::Init { data_dir, bind } => {
+        Command::Init {
+            data_dir,
+            bind,
+            owner_device: Some(node_id),
+            label,
+        } => {
+            logging::init("warn");
+            let dir = datadir::resolve_from_env(data_dir.as_deref())?;
+            let options = init::OwnerDeviceOptions { bind, node_id, label };
+            let out = init::init_owner_device(&dir, &options, &SystemClock).await?;
+            eprintln!("Initialised {}", out.data_dir.display());
+            eprintln!("Config: {}", out.config_path.display());
+            // Nothing secret: the device proves itself with its own key, which never leaves it.
+            println!("OWNER DEVICE: {}", out.device_id);
+            println!("SERVER ADDRESS: {}", out.server.address());
+            Ok(())
+        }
+        Command::Init {
+            data_dir,
+            bind,
+            owner_device: None,
+            ..
+        } => {
             logging::init("warn");
             let dir = datadir::resolve_from_env(data_dir.as_deref())?;
             let out = init::init_with(&dir, &init::InitOptions { bind }, &SystemClock).await?;
@@ -118,6 +196,37 @@ async fn run(command: Command) -> anyhow::Result<()> {
             let out = recover::recover(&dir, &SystemClock).await?;
             eprintln!("Recovered an unrestricted admin key for {}", out.account_id);
             println!("ADMIN API KEY (shown once): {}", out.admin_key.expose());
+            Ok(())
+        }
+        Command::Devices {
+            command:
+                DevicesCommand::Add {
+                    data_dir,
+                    node_id,
+                    scopes,
+                    label,
+                    project,
+                },
+        } => {
+            logging::init("warn");
+            let dir = datadir::resolve_from_env(data_dir.as_deref())?;
+            let add = recover::AddDevice {
+                node_id,
+                scopes,
+                label: Some(label),
+                project_id: project,
+            };
+            let row = recover::devices_add(&dir, &add, &SystemClock).await?;
+            println!("DEVICE: {}", row.device_id);
+            Ok(())
+        }
+        Command::Devices {
+            command: DevicesCommand::Revoke { data_dir, id },
+        } => {
+            logging::init("warn");
+            let dir = datadir::resolve_from_env(data_dir.as_deref())?;
+            recover::devices_revoke(&dir, id, &SystemClock).await?;
+            eprintln!("Revoked {id}");
             Ok(())
         }
         Command::Serve { config } => {
@@ -158,16 +267,77 @@ mod tests {
             Cli::try_parse_from(["p2pc-server", "init", "--data-dir", "/srv/p2pc"]).map(|c| c.command),
             Ok(Command::Init {
                 data_dir: Some(_),
-                bind: None
+                bind: None,
+                owner_device: None,
+                label: None,
             })
         ));
         assert!(matches!(
             Cli::try_parse_from(["p2pc-server", "init", "--bind", "192.0.2.1:7477"]).map(|c| c.command),
             Ok(Command::Init {
                 data_dir: None,
-                bind: Some(_)
+                bind: Some(_),
+                ..
             })
         ));
+        let node = "ab".repeat(32);
+        assert!(matches!(
+            Cli::try_parse_from(["p2pc-server", "init", "--owner-device", &node, "--label", "hub PC"])
+                .map(|c| c.command),
+            Ok(Command::Init {
+                owner_device: Some(_),
+                label: Some(_),
+                ..
+            })
+        ));
+        // A label without an owner device makes no sense.
+        assert!(Cli::try_parse_from(["p2pc-server", "init", "--label", "x"]).is_err());
+        let add = Cli::try_parse_from([
+            "p2pc-server",
+            "devices",
+            "add",
+            "--node-id",
+            &node,
+            "--scopes",
+            "nodes:read, templates:launch",
+            "--label",
+            "phone",
+        ])
+        .map(|c| c.command);
+        assert!(matches!(
+            add,
+            Ok(Command::Devices {
+                command: DevicesCommand::Add { ref scopes, project: None, .. }
+            }) if scopes == &[Scope::NodesRead, Scope::TemplatesLaunch]
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "p2pc-server",
+                "devices",
+                "add",
+                "--node-id",
+                &node,
+                "--scopes",
+                "root",
+                "--label",
+                "x"
+            ])
+            .is_err()
+        );
+        assert!(matches!(
+            Cli::try_parse_from([
+                "p2pc-server",
+                "devices",
+                "revoke",
+                "--id",
+                "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+            ])
+            .map(|c| c.command),
+            Ok(Command::Devices {
+                command: DevicesCommand::Revoke { .. }
+            })
+        ));
+        assert!(Cli::try_parse_from(["p2pc-server", "devices", "revoke", "--id", "nope"]).is_err());
         assert!(Cli::try_parse_from(["p2pc-server", "init", "--bind", "not-an-address"]).is_err());
         assert!(matches!(
             Cli::try_parse_from(["p2pc-server", "keys", "recover", "--data-dir", "/srv/p2pc"]).map(|c| c.command),

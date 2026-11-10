@@ -25,18 +25,18 @@ use tower_http::timeout::{RequestBodyTimeoutLayer, TimeoutLayer};
 use utoipa::IntoParams;
 
 use crate::audit_queue::AuthFailureQueue;
-use crate::auth::{AdminKey, AnyKey, Authorized, recheck_caller, require_api_key};
+use crate::auth::{AdminKey, AnyKey, Authorized, recheck_caller, require_api_key, require_device};
 use crate::clock::Clock;
 use crate::config::Config;
 use crate::error::{self, ApiError};
 use crate::extract::{ApiJson, ApiQuery};
 use crate::gateway::{NodeHub, ServerIdentity};
-use crate::jobs_api;
 use crate::node_directory::{EmptyNodeDirectory, NodeDirectory};
 use crate::nodes_api;
 use crate::store::audit::NewEvent;
 use crate::store::keys::{KeyCursor, MAX_DAILY_UNIT_CAP_MILLI, NewKey, Revoke};
 use crate::store::{self, Db, StoreError};
+use crate::{devices_api, jobs_api, join_requests_api};
 
 /// Default page size of list endpoints.
 pub const DEFAULT_PAGE_LIMIT: u32 = 50;
@@ -71,6 +71,8 @@ pub struct AppState {
     /// Staged and published outputs (T10b): the gateway's uploads, the scheduler's `OutputsFinalizer`, and the
     /// outputs endpoints.
     pub outputs: crate::outputs::OutputStore,
+    /// Live device connections (H2 §5.5): a revocation and the liveness sweep close them.
+    pub devices: crate::devices_api::DeviceSessions,
 }
 
 impl AppState {
@@ -107,6 +109,7 @@ impl AppState {
             hub: NodeHub::new(),
             nodes: Arc::new(EmptyNodeDirectory),
             kick: crate::scheduler::Kick::default(),
+            devices: crate::devices_api::DeviceSessions::default(),
         })
     }
 }
@@ -122,9 +125,30 @@ pub enum LoadError {
     Identity(#[from] crate::identity::IdentityError),
 }
 
-/// The full router with its layers.
+/// Which transport a router serves, and so how its requests are authenticated (H2 §5.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    /// The TCP REST listener and `p2pc/http/1`: API keys only.
+    Keys,
+    /// `p2pc/device/1`, served in-process: the device the transport attached, never a header.
+    Devices,
+}
+
+/// The full router with its layers, for the TCP REST listener and `p2pc/http/1`: every request is authenticated by
+/// API key ([`require_api_key`]). No header can turn a request into a device request (SI-H2-3).
 pub fn router(state: AppState) -> Router {
-    let authenticated = Router::new()
+    build(state, Transport::Keys)
+}
+
+/// The same API for requests of `p2pc/device/1` streams (H2 §6.3), which the device transport (T2-11) serves
+/// in-process after attaching a [`crate::auth::DeviceConnection`] to each request: authenticated by
+/// [`require_device`], with the same routes, limits and layers as [`router`].
+pub fn device_router(state: AppState) -> Router {
+    build(state, Transport::Devices)
+}
+
+fn build(state: AppState, transport: Transport) -> Router {
+    let authenticated: Router<AppState> = Router::new()
         .route("/v1/whoami", get(whoami))
         .route("/v1/keys", get(list_keys).post(create_key))
         .route("/v1/keys/{key_id}", delete(revoke_key))
@@ -135,6 +159,26 @@ pub fn router(state: AppState) -> Router {
             get(nodes_api::list_join_tokens).post(nodes_api::create_join_token),
         )
         .route("/v1/nodes/join-tokens/{id}", delete(nodes_api::revoke_join_token))
+        .route(
+            "/v1/nodes/join-requests",
+            get(join_requests_api::list_join_requests).post(join_requests_api::create_join_request),
+        )
+        .route(
+            "/v1/nodes/join-requests/{id}",
+            get(join_requests_api::get_join_request).delete(join_requests_api::reject_join_request),
+        )
+        .route(
+            "/v1/nodes/join-requests/{id}/reveal",
+            post(join_requests_api::reveal_join_request),
+        )
+        .route(
+            "/v1/nodes/join-requests/{id}/approve",
+            post(join_requests_api::approve_join_request),
+        )
+        .route(
+            "/v1/nodes/join-requests/{id}/token",
+            post(join_requests_api::join_request_token),
+        )
         .route("/v1/nodes", get(nodes_api::list_nodes))
         .route(
             "/v1/nodes/{id}",
@@ -143,13 +187,44 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/nodes/{id}/drain", post(nodes_api::drain_node))
         .route("/v1/nodes/{id}/resume", post(nodes_api::resume_node))
         .route("/v1/nodes/{id}/approve", post(nodes_api::approve_node))
+        .route(
+            "/v1/devices/pairing-tickets",
+            get(devices_api::list_pairing_tickets).post(devices_api::create_pairing_ticket),
+        )
+        .route(
+            "/v1/devices/pairing-tickets/{id}",
+            delete(devices_api::revoke_pairing_ticket),
+        )
+        .route("/v1/devices", get(devices_api::list_devices))
+        .route(
+            "/v1/devices/{id}",
+            get(devices_api::get_device).delete(devices_api::revoke_device),
+        )
         .route("/v1/jobs", get(jobs_api::list_jobs).post(jobs_api::create_job))
         .route("/v1/jobs/{id}", get(jobs_api::get_job))
         .route("/v1/jobs/{id}/cancel", post(jobs_api::cancel_job))
         .route("/v1/jobs/{id}/outputs", get(crate::artifacts_api::list_outputs))
         .route("/v1/estimate", post(jobs_api::estimate))
-        .route("/v1/usage", get(crate::usage_api::get_usage))
-        .route_layer(middleware::from_fn_with_state(state.clone(), require_api_key));
+        .route("/v1/usage", get(crate::usage_api::get_usage));
+    // Streaming routes opt out of the whole-request limit by being added here instead of to `bounded`. Each bounds
+    // itself with an idle limit (`http.keepalive_idle_ms`): no data taken or sent for that long ends the stream
+    // (§10, see `artifacts_api`). Logs in both modes (a 64 MiB page can outlast 30 s on a slow link) and downloads.
+    let streaming: Router<AppState> = Router::new()
+        .route("/v1/jobs/{id}/logs", get(crate::artifacts_api::get_logs))
+        .route(
+            "/v1/jobs/{id}/outputs/{*path}",
+            get(crate::artifacts_api::download_output),
+        );
+    let (authenticated, streaming) = match transport {
+        Transport::Keys => (
+            authenticated.route_layer(middleware::from_fn_with_state(state.clone(), require_api_key)),
+            streaming.route_layer(middleware::from_fn_with_state(state.clone(), require_api_key)),
+        ),
+        Transport::Devices => (
+            authenticated.route_layer(middleware::from_fn_with_state(state.clone(), require_device)),
+            streaming.route_layer(middleware::from_fn_with_state(state.clone(), require_device)),
+        ),
+    };
     let public = Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/openapi.json", get(openapi_json));
@@ -160,16 +235,6 @@ pub fn router(state: AppState) -> Router {
         StatusCode::REQUEST_TIMEOUT,
         http.request_timeout(),
     ));
-    // Streaming routes opt out of the whole-request limit by being added here instead of to `bounded`. Each bounds
-    // itself with an idle limit (`http.keepalive_idle_ms`): no data taken or sent for that long ends the stream
-    // (§10, see `artifacts_api`). Logs in both modes (a 64 MiB page can outlast 30 s on a slow link) and downloads.
-    let streaming: Router<AppState> = Router::new()
-        .route("/v1/jobs/{id}/logs", get(crate::artifacts_api::get_logs))
-        .route(
-            "/v1/jobs/{id}/outputs/{*path}",
-            get(crate::artifacts_api::download_output),
-        )
-        .route_layer(middleware::from_fn_with_state(state.clone(), require_api_key));
     let app = bounded
         .merge(streaming)
         // After routing, so `MatchedPath` is known: hands the route template to the request log (see `log_request`).

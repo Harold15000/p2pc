@@ -7,8 +7,8 @@
 //!   `&'static str` SQL there, so text built at run time (`format!`) does not even compile;
 //! - every function that reads or writes tenant data takes the principal's `account_id` and its SQL filters by it
 //!   (SI-7). The exceptions run before there is a REST principal: [`keys::lookup_for_auth`],
-//!   [`join_tokens::find_by_digest`], and the agent-protocol functions of [`nodes`], where the principal is the node
-//!   authenticated by iroh;
+//!   [`join_tokens::find_by_digest`], the device lookups of [`devices`] (`by_id_for_auth`, `live_by_iroh_node_id`,
+//!   `pair`), and the agent-protocol functions of [`nodes`], where the principal is the node authenticated by iroh;
 //! - timestamps are stored as INTEGER Unix seconds (UTC).
 
 pub mod accounts;
@@ -18,6 +18,7 @@ pub mod devices;
 // this crate.
 pub(crate) mod job_state;
 pub mod jobs;
+pub mod join_requests;
 pub mod join_tokens;
 pub mod keys;
 pub mod leases;

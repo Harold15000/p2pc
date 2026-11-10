@@ -116,6 +116,403 @@
         }
       }
     },
+    "/v1/devices": {
+      "get": {
+        "tags": [
+          "devices"
+        ],
+        "summary": "The account's devices, in pairing order, revoked ones included. For a device without `admin`, the list holds\nthat device alone.",
+        "operationId": "list_devices",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1-100 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "`next_cursor` of the previous page.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of devices (for a non-admin device: itself only).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_DeviceInfo"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An API key without the admin scope.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid `limit` or `cursor`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/devices/pairing-tickets": {
+      "get": {
+        "tags": [
+          "devices"
+        ],
+        "summary": "The account's pairing tickets, in creation order. Never contains a ticket or a code.",
+        "operationId": "list_pairing_tickets",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1-100 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "`next_cursor` of the previous page.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of pairing tickets.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_PairingTicketInfo"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller lacks the admin scope.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid `limit` or `cursor`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "devices"
+        ],
+        "summary": "Creates a one-time pairing ticket (H2 §5.2). The ticket and its link are in the response, once.",
+        "description": "The device it pairs gets the body's scopes (default: the phone profile), cap, image list, expiry and blob quota,\nnone of which may exceed the creator's (`403 escalation_denied`), and the creator's project.",
+        "operationId": "create_pairing_ticket",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreatePairingTicket"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The ticket (`p2pc_pair_…`) and its QR link, shown only this once.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PairingTicketCreated"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials (also when the caller was revoked or expired during the request).",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: the caller lacks the admin scope. `escalation_denied`: the ticket asks for more than the caller has (scopes, `daily_unit_cap`, `allowed_images`, `expires_at` through `device_expires_in_s`, `blobs_quota_mb`); `errors` lists the fields.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid body: `expires_in_s` 1-3600; `device_expires_in_s` above `expires_in_s` and representable.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`web_app_origin_unset`: the server has no `[devices] web_app_origin` to build the pairing link with.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/devices/pairing-tickets/{id}": {
+      "delete": {
+        "tags": [
+          "devices"
+        ],
+        "summary": "Revokes an unused pairing ticket (the desktop app does it when its QR screen closes). Idempotent; a consumed\nticket is left as it is (revoke its device instead).",
+        "operationId": "revoke_pairing_ticket",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The ticket's row ID (`ptk_…`).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Revoked (or already revoked, or consumed)."
+          },
+          "401": {
+            "description": "Missing or invalid credentials (also when the caller was revoked or expired during the request).",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller lacks the admin scope.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such ticket in this account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/devices/{id}": {
+      "get": {
+        "tags": [
+          "devices"
+        ],
+        "summary": "One device of the account: any device for an `admin`, itself for a device.",
+        "operationId": "get_device",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The device ID (`dev_…`).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The device.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeviceInfo"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An API key without the admin scope.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such device in this account, or another device than the calling non-admin device.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "devices"
+        ],
+        "summary": "Revokes a device (H2 §5.5): sets `revoked_at` and closes its live connections and service streams. Idempotent.",
+        "description": "An `admin` may revoke only a device it could have created (no escalation over its scopes, cap, image list,\nexpiry and blob quota); a device may revoke itself (\"Forget this cloud\"). The account's last live unrestricted\n`admin` principal cannot be revoked.",
+        "operationId": "revoke_device",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The device ID (`dev_…`).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Revoked (or already revoked)."
+          },
+          "401": {
+            "description": "Missing or invalid credentials (also when the caller was revoked or expired during the request).",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: an API key without the admin scope. `escalation_denied`: the device has more power than the calling admin; `errors` lists the fields.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such device in this account, or another device than the calling non-admin device.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`last_admin_device`: it is the account's last live unrestricted admin principal (admin, no expiry, cap, image list or blob quota). Recover with `p2pc-server devices add` or `keys recover`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/estimate": {
       "post": {
         "tags": [
@@ -1131,6 +1528,469 @@
         }
       }
     },
+    "/v1/nodes/join-requests": {
+      "get": {
+        "tags": [
+          "nodes"
+        ],
+        "summary": "The account's join requests for an `admin`, or the caller's own requests, in creation order.",
+        "operationId": "list_join_requests",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1-100 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "`next_cursor` of the previous page.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of join requests (for a non-admin caller: its own).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_JoinRequestInfo"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller has neither admin nor nodes:invite.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid `limit` or `cursor`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "nodes"
+        ],
+        "summary": "Opens a join request from an invite QR (H2 §5.4 step 3). It carries no secret and gives nothing yet.",
+        "operationId": "create_join_request",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateJoinRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The request, `awaiting_reveal`, with the hub nonce for `InviteOpen`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JoinRequestCreated"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller lacks the nodes:invite scope.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_join_request`: `invite_expires_at` not within (now, now + 15 min + 120 s], a NodeId that is not an Ed25519 public key, or a commitment that is not 32 bytes.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "`too_many_join_requests`: 4 open per account, 2 open per requester, or 6 created per requester in the last hour.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/nodes/join-requests/{id}": {
+      "get": {
+        "tags": [
+          "nodes"
+        ],
+        "summary": "One join request: any for an `admin`, its own for the requesting principal.",
+        "operationId": "get_join_request",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The request ID (`jrq_…`).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JoinRequestInfo"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such request visible to the caller.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "nodes"
+        ],
+        "summary": "Rejects (an `admin`) or withdraws (the requesting principal) an `awaiting_reveal` or `pending` request. Nothing is\nminted. Idempotent for a request already rejected.",
+        "operationId": "reject_join_request",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The request ID (`jrq_…`).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Rejected (or already rejected)."
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such request visible to the caller.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`join_request_closed`: the request is approved, delivered or expired.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/nodes/join-requests/{id}/approve": {
+      "post": {
+        "tags": [
+          "nodes"
+        ],
+        "summary": "Approves a `pending` join request (H2 §5.4 step 5): records the approving principal and mints nothing.",
+        "operationId": "approve_join_request",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The request ID (`jrq_…`).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The request, now `approved`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JoinRequestInfo"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller lacks the admin scope.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such request in this account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`join_request_closed`: the request is not `pending`, or was created 15 minutes ago or more.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/nodes/join-requests/{id}/reveal": {
+      "post": {
+        "tags": [
+          "nodes"
+        ],
+        "summary": "Reveals the listener nonce (H2 §5.4 step 4): the requesting principal only, once, while `awaiting_reveal` and\nwithin the 15 minutes. A nonce that matches the commitment makes the request `pending`; one that does not ends\nit `rejected` (`409 join_request_closed`), with no second try.",
+        "operationId": "reveal_join_request",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The request ID (`jrq_…`).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RevealJoinRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The request, now `pending`, with its approval phrase.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JoinRequestInfo"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such request opened by the caller.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`join_request_closed`: the nonce does not match the commitment (the request is now rejected), the request is not `awaiting_reveal`, or it was created 15 minutes ago or more.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`listener_nonce` is not 32 bytes of lowercase hex.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/nodes/join-requests/{id}/token": {
+      "post": {
+        "tags": [
+          "nodes"
+        ],
+        "summary": "Mints the join token of an approved request (H2 §5.4 step 6): the requesting principal only, once, within the\n15 minutes. The token lives 15 minutes, is single-use, is minted on behalf of the approving principal (reloaded\nhere: revoked or expired since, `409`), enrolls only the request's agent NodeId, and is returned once; only its\nhash is stored.",
+        "operationId": "join_request_token",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The request ID (`jrq_…`).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The join token (`p2pc_join_…`), shown only this once.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JoinRequestToken"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such request opened by the caller.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`join_request_closed`: not `approved`, already delivered, created 15 minutes ago or more, or the approving principal is no longer live.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/nodes/join-tokens": {
       "get": {
         "tags": [
@@ -1208,6 +2068,7 @@
           "nodes"
         ],
         "summary": "Creates a single-use join token. The token is in the response, once.",
+        "description": "`admin` principals mint tokens as in H1. A `nodes:join` principal (H2 §5.4) mints tokens of at most 900 s, and\nthe node such a token enrolls starts `pending_approval`. `pre_approved` (`admin` only, at most 900 s) makes the\nnode start `approved`; without it, a token minted by an `admin` **device** also gives a `pending_approval` node,\nwhile a token of an `admin` API key enrolls as in H1 (H2 §5.5).",
         "operationId": "create_join_token",
         "requestBody": {
           "content": {
@@ -1241,7 +2102,7 @@
             }
           },
           "403": {
-            "description": "The key lacks the admin scope.",
+            "description": "The caller lacks the admin or nodes:join scope, or asks for `pre_approved` without admin.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1251,7 +2112,7 @@
             }
           },
           "422": {
-            "description": "Invalid `label` or `ttl_s` (1-86400, default 900).",
+            "description": "Invalid `label` or `ttl_s` (1-86400, default 900; at most 900 for a nodes:join caller or with `pre_approved`).",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1422,6 +2283,69 @@
           },
           "403": {
             "description": "The key lacks the nodes:write scope.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such node in this account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/nodes/{id}/approve": {
+      "post": {
+        "tags": [
+          "nodes"
+        ],
+        "summary": "Approves a `pending_approval` node (H2 §5.5): from then on the scheduler may offer it leases. Idempotent: approving\nan approved node changes nothing and is not audited again. `admin` only.",
+        "description": "The node is told `NodeApproved{}` when it is connected and declared the `approval` capability; an agent without\nit simply starts getting leases.",
+        "operationId": "approve_node",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The node ID (`node_…`).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The node, now approved.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Node"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid key (also when the caller was revoked or expired during the request).",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller lacks the admin scope.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1737,11 +2661,12 @@
         "tags": [
           "auth"
         ],
-        "summary": "Who the presented key is, and its limits. `daily_unit_cap: null` means the key is uncapped; `p2pc mcp` refuses\nsuch a key. Never contains the secret.",
+        "summary": "Who the caller is, and its limits. `daily_unit_cap: null` means the caller is uncapped; `p2pc mcp` refuses such a\nkey. Never contains the secret.",
+        "description": "`principal` names the caller, `{kind, id}` (H2 §5.5). `key_id` stays: the key for an API key, `null` for a device.",
         "operationId": "whoami",
         "responses": {
           "200": {
-            "description": "The key's account, project, ID, scopes and limits (`label`, `daily_unit_cap`, `allowed_images`, `expires_at`; `null` means no limit). Never the secret.",
+            "description": "The caller's account, project, ID, scopes and limits (`label`, `daily_unit_cap`, `allowed_images`, `expires_at`; `null` means no limit), and `principal` (`{kind, id}`, H2 §5.5). `key_id` is `null` for a device. Never the secret.",
             "content": {
               "application/json": {
                 "schema": {
@@ -2098,6 +3023,36 @@
         },
         "additionalProperties": false
       },
+      "CreateJoinRequest": {
+        "type": "object",
+        "description": "Body of `POST /v1/nodes/join-requests` (H2 §5.4, §7.3), copied from the invite QR. NodeIds, the commitment and\nthe nonces are 32 bytes, written as 64 lowercase hex characters (as [`ServerInfo::node_id`]). Validate with\n[`CreateJoinRequest::validate`]; the hub also checks that both NodeIds are Ed25519 points.",
+        "required": [
+          "listener_node_id",
+          "iroh_node_id",
+          "invite_expires_at",
+          "listener_commitment"
+        ],
+        "properties": {
+          "invite_expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "The invite's expiry, from the QR."
+          },
+          "iroh_node_id": {
+            "type": "string",
+            "description": "The joining PC's agent NodeId: the join token will be bound to it."
+          },
+          "listener_commitment": {
+            "type": "string",
+            "description": "`BLAKE3(\"p2pc-join-commit-v1\" || listener nonce)`, from the QR."
+          },
+          "listener_node_id": {
+            "type": "string",
+            "description": "The joining PC's invite listener NodeId."
+          }
+        },
+        "additionalProperties": false
+      },
       "CreateJoinToken": {
         "type": "object",
         "description": "Body of `POST /v1/nodes/join-tokens`.",
@@ -2125,9 +3080,178 @@
         },
         "additionalProperties": false
       },
+      "CreatePairingTicket": {
+        "type": "object",
+        "description": "Body of `POST /v1/devices/pairing-tickets` (H2 §5.2), `admin` only. Validate with\n[`CreatePairingTicket::validate`] and check it against its creator with\n[`check_limits_no_escalation`](crate::validate::check_limits_no_escalation).",
+        "properties": {
+          "allowed_images": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The device's image allowlist."
+          },
+          "blobs_quota_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The most blob bytes, in MiB, the device may hold a claim on (H2 §7.5).",
+            "minimum": 0
+          },
+          "daily_unit_cap": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Units",
+                "description": "The device's daily cap in milli-units."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "device_expires_in_s": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The device's life in seconds, counted from the ticket's creation; more than the ticket's validity. Absent:\nthe device never expires.",
+            "minimum": 0
+          },
+          "expires_in_s": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The ticket's validity in seconds, 1-3 600. Default 600.",
+            "minimum": 0
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Label of the device it pairs."
+          },
+          "scopes": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/Scope"
+            },
+            "description": "The device's scopes. Default: the phone profile ([`PHONE_PROFILE`])."
+          }
+        },
+        "additionalProperties": false
+      },
       "DeviceId": {
         "type": "string",
         "description": "Identifies a paired device (`dev_…`, H2 §5.5): a principal like an API key, authenticated by its iroh NodeId."
+      },
+      "DeviceInfo": {
+        "type": "object",
+        "description": "A paired device, as `GET /v1/devices` lists it (H2 §7.3). Never contains key material: a device is\nauthenticated by its iroh NodeId.",
+        "required": [
+          "id",
+          "scopes",
+          "created_at",
+          "paired_by"
+        ],
+        "properties": {
+          "allowed_images": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Its image allowlist."
+          },
+          "blobs_quota_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Its blob quota, in MiB.",
+            "minimum": 0
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When it paired."
+          },
+          "daily_unit_cap": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Units",
+                "description": "Its daily cap."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When it expires, if it does."
+          },
+          "id": {
+            "$ref": "#/components/schemas/DeviceId",
+            "description": "Device ID."
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its label."
+          },
+          "last_seen_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Last request (written at most once a minute)."
+          },
+          "paired_by": {
+            "$ref": "#/components/schemas/Principal",
+            "description": "The principal that created its pairing ticket."
+          },
+          "platform": {
+            "type": "string",
+            "description": "The platform hint the device sent when it paired (at most 64 bytes, free text)."
+          },
+          "revoked_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When it was revoked. Revoked rows are kept."
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Scope"
+            },
+            "description": "Its scopes."
+          }
+        }
       },
       "Egress": {
         "type": "object",
@@ -3020,6 +4144,117 @@
           "lost"
         ]
       },
+      "JoinRequestCreated": {
+        "type": "object",
+        "description": "Response of `POST /v1/nodes/join-requests` (`201`, H2 §5.4).",
+        "required": [
+          "id",
+          "expires_at",
+          "hub_nonce"
+        ],
+        "properties": {
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "15 minutes after its creation."
+          },
+          "hub_nonce": {
+            "type": "string",
+            "description": "The hub's 32-byte nonce, 64 lowercase hex, which the phone sends in `InviteOpen`."
+          },
+          "id": {
+            "$ref": "#/components/schemas/JoinRequestId",
+            "description": "The request's ID."
+          }
+        }
+      },
+      "JoinRequestId": {
+        "type": "string",
+        "description": "Identifies a join request (`jrq_…`, H2 §5.4)."
+      },
+      "JoinRequestInfo": {
+        "type": "object",
+        "description": "A join request as `GET /v1/nodes/join-requests` lists it (H2 §7.3).",
+        "required": [
+          "id",
+          "requested_by",
+          "listener_node_id",
+          "iroh_node_id",
+          "state",
+          "created_at",
+          "expires_at"
+        ],
+        "properties": {
+          "approval_phrase": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The 6-word approval phrase; `null` while `awaiting_reveal`."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Creation time."
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "15 minutes after creation."
+          },
+          "id": {
+            "$ref": "#/components/schemas/JoinRequestId",
+            "description": "Request ID."
+          },
+          "iroh_node_id": {
+            "type": "string",
+            "description": "The joining PC's agent NodeId (64 lowercase hex)."
+          },
+          "listener_node_id": {
+            "type": "string",
+            "description": "The joining PC's invite listener NodeId (64 lowercase hex)."
+          },
+          "requested_by": {
+            "$ref": "#/components/schemas/Principal",
+            "description": "The principal that opened it."
+          },
+          "state": {
+            "$ref": "#/components/schemas/JoinRequestState",
+            "description": "Its state."
+          }
+        }
+      },
+      "JoinRequestState": {
+        "type": "string",
+        "description": "The state of a join request (H2 §5.4, §7.3).",
+        "enum": [
+          "awaiting_reveal",
+          "pending",
+          "approved",
+          "rejected",
+          "expired",
+          "delivered"
+        ]
+      },
+      "JoinRequestToken": {
+        "type": "object",
+        "description": "Response of `POST /v1/nodes/join-requests/{id}/token` (H2 §7.3): returned once. `Debug` redacts the token.",
+        "required": [
+          "join_token",
+          "expires_at"
+        ],
+        "properties": {
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When it expires."
+          },
+          "join_token": {
+            "type": "string",
+            "description": "The join token, bound to the request's agent NodeId. Single-use."
+          }
+        }
+      },
       "JoinTokenId": {
         "type": "string",
         "description": "Identifies a join token row (`jtk_…`), as listed and revoked by the admin API (§5). Never the token itself."
@@ -3521,6 +4756,123 @@
           }
         }
       },
+      "Page_DeviceInfo": {
+        "type": "object",
+        "description": "A cursor-paginated list (`limit` ≤ 100).",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "description": "A paired device, as `GET /v1/devices` lists it (H2 §7.3). Never contains key material: a device is\nauthenticated by its iroh NodeId.",
+              "required": [
+                "id",
+                "scopes",
+                "created_at",
+                "paired_by"
+              ],
+              "properties": {
+                "allowed_images": {
+                  "type": [
+                    "array",
+                    "null"
+                  ],
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Its image allowlist."
+                },
+                "blobs_quota_mb": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "int64",
+                  "description": "Its blob quota, in MiB.",
+                  "minimum": 0
+                },
+                "created_at": {
+                  "type": "string",
+                  "format": "date-time",
+                  "description": "When it paired."
+                },
+                "daily_unit_cap": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Units",
+                      "description": "Its daily cap."
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "expires_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time",
+                  "description": "When it expires, if it does."
+                },
+                "id": {
+                  "$ref": "#/components/schemas/DeviceId",
+                  "description": "Device ID."
+                },
+                "label": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Its label."
+                },
+                "last_seen_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time",
+                  "description": "Last request (written at most once a minute)."
+                },
+                "paired_by": {
+                  "$ref": "#/components/schemas/Principal",
+                  "description": "The principal that created its pairing ticket."
+                },
+                "platform": {
+                  "type": "string",
+                  "description": "The platform hint the device sent when it paired (at most 64 bytes, free text)."
+                },
+                "revoked_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time",
+                  "description": "When it was revoked. Revoked rows are kept."
+                },
+                "scopes": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Scope"
+                  },
+                  "description": "Its scopes."
+                }
+              }
+            },
+            "description": "The items of this page."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pass as `cursor` to get the next page. `None` on the last page."
+          }
+        }
+      },
       "Page_Job": {
         "type": "object",
         "description": "A cursor-paginated list (`limit` ≤ 100).",
@@ -3658,6 +5010,78 @@
                 "status": {
                   "$ref": "#/components/schemas/JobStatus",
                   "description": "Current state."
+                }
+              }
+            },
+            "description": "The items of this page."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pass as `cursor` to get the next page. `None` on the last page."
+          }
+        }
+      },
+      "Page_JoinRequestInfo": {
+        "type": "object",
+        "description": "A cursor-paginated list (`limit` ≤ 100).",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "description": "A join request as `GET /v1/nodes/join-requests` lists it (H2 §7.3).",
+              "required": [
+                "id",
+                "requested_by",
+                "listener_node_id",
+                "iroh_node_id",
+                "state",
+                "created_at",
+                "expires_at"
+              ],
+              "properties": {
+                "approval_phrase": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "The 6-word approval phrase; `null` while `awaiting_reveal`."
+                },
+                "created_at": {
+                  "type": "string",
+                  "format": "date-time",
+                  "description": "Creation time."
+                },
+                "expires_at": {
+                  "type": "string",
+                  "format": "date-time",
+                  "description": "15 minutes after creation."
+                },
+                "id": {
+                  "$ref": "#/components/schemas/JoinRequestId",
+                  "description": "Request ID."
+                },
+                "iroh_node_id": {
+                  "type": "string",
+                  "description": "The joining PC's agent NodeId (64 lowercase hex)."
+                },
+                "listener_node_id": {
+                  "type": "string",
+                  "description": "The joining PC's invite listener NodeId (64 lowercase hex)."
+                },
+                "requested_by": {
+                  "$ref": "#/components/schemas/Principal",
+                  "description": "The principal that opened it."
+                },
+                "state": {
+                  "$ref": "#/components/schemas/JoinRequestState",
+                  "description": "Its state."
                 }
               }
             },
@@ -3911,6 +5335,279 @@
               "null"
             ],
             "description": "Pass as `cursor` to get the next page. `None` on the last page."
+          }
+        }
+      },
+      "Page_PairingTicketInfo": {
+        "type": "object",
+        "description": "A cursor-paginated list (`limit` ≤ 100).",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "description": "A pairing ticket as `GET /v1/devices/pairing-tickets` lists it (H2 §5.2). Never contains the ticket or its code.",
+              "required": [
+                "id",
+                "scopes",
+                "created_by",
+                "created_at",
+                "expires_at"
+              ],
+              "properties": {
+                "allowed_images": {
+                  "type": [
+                    "array",
+                    "null"
+                  ],
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "The device's image allowlist."
+                },
+                "blobs_quota_mb": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "int64",
+                  "description": "The device's blob quota, in MiB.",
+                  "minimum": 0
+                },
+                "consumed_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time",
+                  "description": "When a `Pair` consumed it."
+                },
+                "created_at": {
+                  "type": "string",
+                  "format": "date-time",
+                  "description": "Creation time."
+                },
+                "created_by": {
+                  "$ref": "#/components/schemas/Principal",
+                  "description": "The principal that created it."
+                },
+                "daily_unit_cap": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Units",
+                      "description": "The device's daily cap."
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "device_expires_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time",
+                  "description": "When the device it pairs expires, if it does."
+                },
+                "device_id": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/DeviceId",
+                      "description": "The device it created."
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "expires_at": {
+                  "type": "string",
+                  "format": "date-time",
+                  "description": "Expiry."
+                },
+                "id": {
+                  "$ref": "#/components/schemas/PairingTicketId",
+                  "description": "Row ID."
+                },
+                "label": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Label of the device it pairs."
+                },
+                "revoked_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time",
+                  "description": "When it was revoked unused."
+                },
+                "scopes": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Scope"
+                  },
+                  "description": "The device's scopes."
+                }
+              }
+            },
+            "description": "The items of this page."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pass as `cursor` to get the next page. `None` on the last page."
+          }
+        }
+      },
+      "PairingTicketCreated": {
+        "type": "object",
+        "description": "Response of `POST /v1/devices/pairing-tickets` (H2 §5.2): returned once. `Debug` redacts `ticket` and `url`\n(the URL carries the ticket in its fragment).",
+        "required": [
+          "id",
+          "ticket",
+          "url",
+          "expires_at"
+        ],
+        "properties": {
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the ticket expires."
+          },
+          "id": {
+            "$ref": "#/components/schemas/PairingTicketId",
+            "description": "The ticket's row ID, for listing and revoking."
+          },
+          "ticket": {
+            "type": "string",
+            "description": "The ticket, `p2pc_pair_…`. Single-use. A secret: shown once."
+          },
+          "url": {
+            "type": "string",
+            "description": "`https://<web app origin>/pair#<ticket>`, for the QR code."
+          }
+        }
+      },
+      "PairingTicketId": {
+        "type": "string",
+        "description": "Identifies a pairing ticket row (`ptk_…`, H2 §5.2), as listed and revoked by the admin API. Never the ticket."
+      },
+      "PairingTicketInfo": {
+        "type": "object",
+        "description": "A pairing ticket as `GET /v1/devices/pairing-tickets` lists it (H2 §5.2). Never contains the ticket or its code.",
+        "required": [
+          "id",
+          "scopes",
+          "created_by",
+          "created_at",
+          "expires_at"
+        ],
+        "properties": {
+          "allowed_images": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The device's image allowlist."
+          },
+          "blobs_quota_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The device's blob quota, in MiB.",
+            "minimum": 0
+          },
+          "consumed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When a `Pair` consumed it."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Creation time."
+          },
+          "created_by": {
+            "$ref": "#/components/schemas/Principal",
+            "description": "The principal that created it."
+          },
+          "daily_unit_cap": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Units",
+                "description": "The device's daily cap."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "device_expires_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the device it pairs expires, if it does."
+          },
+          "device_id": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DeviceId",
+                "description": "The device it created."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Expiry."
+          },
+          "id": {
+            "$ref": "#/components/schemas/PairingTicketId",
+            "description": "Row ID."
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Label of the device it pairs."
+          },
+          "revoked_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When it was revoked unused."
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Scope"
+            },
+            "description": "The device's scopes."
           }
         }
       },
@@ -4183,6 +5880,20 @@
             "minimum": 0
           }
         }
+      },
+      "RevealJoinRequest": {
+        "type": "object",
+        "description": "Body of `POST /v1/nodes/join-requests/{id}/reveal` (H2 §5.4 step 4). `Debug` redacts the nonce.",
+        "required": [
+          "listener_nonce"
+        ],
+        "properties": {
+          "listener_nonce": {
+            "type": "string",
+            "description": "The listener's 32-byte nonce, 64 lowercase hex."
+          }
+        },
+        "additionalProperties": false
       },
       "SandboxCapability": {
         "type": "object",
@@ -5046,7 +6757,11 @@
     },
     {
       "name": "nodes",
-      "description": "Join tokens (admin) and enrolled nodes."
+      "description": "Join tokens, join requests and enrolled nodes."
+    },
+    {
+      "name": "devices",
+      "description": "Pairing tickets and paired devices (H2 §5)."
     },
     {
       "name": "jobs",

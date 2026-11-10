@@ -8,17 +8,18 @@
 use std::sync::OnceLock;
 
 use p2pc_proto::api::{
-    ApiKeyInfo, AuditEvent, AuditKind, Capacity, CpuInfo, CreateApiKey, CreateJoinToken, Estimate, GpuInfo, GpuStatus,
-    GpuStatusKind, Health, Inventory, Job, JobAttempt, JobSpec, JobSpecView, JobStatus, JoinTokenInfo,
-    JoinTokenResponse, LogLine, LogStream, NewApiKey, Node, NodeState, OutputEntry, Page, Platform, Problem,
-    SandboxCapability, SandboxClass, Scope, ServerInfo, SmokeResult, UsageGroupBy, UsageReport, UsageTotals, WhoAmI,
-    Wsl2Health,
+    ApiKeyInfo, AuditEvent, AuditKind, Capacity, CpuInfo, CreateApiKey, CreateJoinRequest, CreateJoinToken,
+    CreatePairingTicket, DeviceInfo, Estimate, GpuInfo, GpuStatus, GpuStatusKind, Health, Inventory, Job, JobAttempt,
+    JobSpec, JobSpecView, JobStatus, JoinRequestCreated, JoinRequestInfo, JoinRequestState, JoinRequestToken,
+    JoinTokenInfo, JoinTokenResponse, LogLine, LogStream, NewApiKey, Node, NodeApproval, NodeState, OutputEntry, Page,
+    PairingTicketCreated, PairingTicketInfo, Platform, Principal, Problem, RevealJoinRequest, SandboxCapability,
+    SandboxClass, Scope, ServerInfo, SmokeResult, UsageGroupBy, UsageReport, UsageTotals, WhoAmI, Wsl2Health,
 };
 use p2pc_proto::validate::{ErrorCode, FieldError};
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
-use crate::{app, artifacts_api, jobs_api, nodes_api, usage_api};
+use crate::{app, artifacts_api, devices_api, jobs_api, join_requests_api, nodes_api, usage_api};
 
 /// Name of the security scheme.
 pub const BEARER: &str = "bearer";
@@ -50,6 +51,19 @@ pub const BEARER: &str = "bearer";
         nodes_api::resume_node,
         nodes_api::delete_node,
         nodes_api::approve_node,
+        join_requests_api::create_join_request,
+        join_requests_api::list_join_requests,
+        join_requests_api::get_join_request,
+        join_requests_api::reveal_join_request,
+        join_requests_api::approve_join_request,
+        join_requests_api::join_request_token,
+        join_requests_api::reject_join_request,
+        devices_api::create_pairing_ticket,
+        devices_api::list_pairing_tickets,
+        devices_api::revoke_pairing_ticket,
+        devices_api::list_devices,
+        devices_api::get_device,
+        devices_api::revoke_device,
         jobs_api::create_job,
         jobs_api::list_jobs,
         jobs_api::get_job,
@@ -107,6 +121,21 @@ pub const BEARER: &str = "bearer";
         UsageGroupBy,
         UsageTotals,
         UsageReport,
+        Principal,
+        NodeApproval,
+        CreatePairingTicket,
+        PairingTicketCreated,
+        PairingTicketInfo,
+        Page<PairingTicketInfo>,
+        DeviceInfo,
+        Page<DeviceInfo>,
+        CreateJoinRequest,
+        JoinRequestCreated,
+        RevealJoinRequest,
+        JoinRequestState,
+        JoinRequestInfo,
+        Page<JoinRequestInfo>,
+        JoinRequestToken,
     )),
     modifiers(&BearerAuth),
     security(("bearer" = [])),
@@ -116,7 +145,8 @@ pub const BEARER: &str = "bearer";
         (name = "keys", description = "API keys (admin)."),
         (name = "audit", description = "Append-only audit log (admin)."),
         (name = "server", description = "The server's iroh identity."),
-        (name = "nodes", description = "Join tokens (admin) and enrolled nodes."),
+        (name = "nodes", description = "Join tokens, join requests and enrolled nodes."),
+        (name = "devices", description = "Pairing tickets and paired devices (H2 §5)."),
         (name = "jobs", description = "Submit, list, inspect, cancel and estimate jobs."),
         (name = "usage", description = "The usage ledger: finished attempts and the units they cost."),
     )
