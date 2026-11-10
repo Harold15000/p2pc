@@ -7,9 +7,19 @@
 //!          → egress socket (if asked) → pull if missing (phase "pulling") → size cap → podman create → delete env file
 //! start:   podman start --attach (logs and exit code) → log pump
 //! wait:    exit, or timeout / cancel (SIGTERM, grace, SIGKILL), or disk limit (SIGKILL); then cgroup counters
+//!          services also: health checks (a failure stops them with SIGTERM, grace, SIGKILL) and usage samples
 //! collect: podman rm -f, then the SI-9 walk of outputs/
 //! cleanup: podman rm -f, remove the cgroup, remove the job dir; also run by the guard on errors and panics
 //! ```
+//!
+//! **Services** (H2 §7.2, §11) are the same sandbox, with the same fixed argv, that lives longer: up to their
+//! `timeout_s` of at most 30 days, enforced as H1 enforces a batch job's. While one runs, `wait` also runs its health
+//! checks through the configured [`HealthProbe`] (one at a time, each bounded by its `timeout_s`) and reports every
+//! change of its health ([`SandboxEvent::Health`]); a service still `starting` after its start period, or failing
+//! `failure_threshold` checks in a row after it was healthy, is stopped with the cancel sequence and ends
+//! `error="health_check_failed"`. Its usage is sampled from the lease cgroup once a minute ([`SandboxEvent::Usage`]),
+//! and its logs are not capped in total (the executor keeps the most recent 64 MiB, H2 §11.4). A node without a probe
+//! refuses services as `invalid_job`.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -21,24 +31,27 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use p2pc_proto::api::{Egress as JobEgress, JobSpec, Outputs, Placement, Platform, Resources, Retry, SmokeResult};
+use p2pc_proto::api::{
+    Egress as JobEgress, JobKind, JobSpec, Outputs, Placement, Platform, Resources, Retry, SmokeResult,
+};
 use p2pc_proto::ids::{AccountId, LeaseId};
-use p2pc_proto::protocol::{LeaseRejectReason, Outcome, Usage};
-use p2pc_proto::validate::{ImageRef, Limits};
+use p2pc_proto::protocol::{HealthState, LeaseRejectReason, MAX_NODE_MEMORY_MB, Outcome, Usage};
+use p2pc_proto::validate::{H2Features, ImageRef, Limits, SpecContext};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, MissedTickBehavior, Sleep};
+use tokio::time::{Instant, Interval, MissedTickBehavior, Sleep};
 
 use super::argv::{self, ArgvParams, CONTAINER_PREFIX, GpuDevice};
 use super::cgroup::{CgroupStats, Cgroups};
 use super::disk::{self, FreeSpace, Statvfs, TreeUsage};
 use super::engine::{Attached, ContainerState, Engine, ExitFuture, StopSignal};
+use super::health::{HealthMachine, HealthPolicy, HealthProbe, ProbeTarget, Step};
 use super::jobdir::{JOBS_DIR, JobDir};
 use super::logs::{self, LogSummary};
 use super::outputs::{self, CollectedOutputs};
 use super::{
-    CancelHandle, DISK_CHECK_INTERVAL, Egress, EgressRequest, Finished, GpuRef, LeaseContext, NoEgress, Phase,
-    STOP_GRACE, Sandbox, SandboxError, SandboxEvent, error_code, run_lease,
+    CancelHandle, DISK_CHECK_INTERVAL, Egress, EgressRequest, Finished, GpuRef, HealthChange, LeaseContext, NoEgress,
+    Phase, STOP_GRACE, Sandbox, SandboxError, SandboxEvent, UsageSample, error_code, run_lease,
 };
 use crate::config::Runtime;
 
@@ -47,6 +60,8 @@ const MIB: u64 = 1024 * 1024;
 pub const DEFAULT_MAX_IMAGE_MB: u64 = 20 * 1024;
 /// Default image of the smoke container: tiny, and it has `true`.
 pub const DEFAULT_SMOKE_IMAGE: &str = "docker.io/library/busybox:1.36.1";
+/// The shortest interval between two usage samples of a service (H2 §11.4: at most once a minute).
+pub const USAGE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// What the driver needs to know about the node.
 #[derive(Debug, Clone)]
@@ -84,6 +99,12 @@ pub struct DriverConfig {
     /// Whether the egress gate is open (T10e): [`KnownPublicAddrs`] refuses to start a proxy while it is `false`. The
     /// default is `false`: closed until the node says its public addresses are known.
     pub egress_ready: watch::Receiver<p2pc_net::EgressGate>,
+    /// Runs the health checks of services (H2 §11.2: the ingress bridge, T2-21). `None`, the default: the node
+    /// cannot check a service, so service leases are refused as `invalid_job`.
+    pub health_probe: Option<Arc<dyn HealthProbe>>,
+    /// How often a service's usage is sampled from its lease cgroup for the heartbeat (H2 §11.4: at most once a
+    /// minute). Shorter values are raised to [`USAGE_INTERVAL`].
+    pub usage_interval: Duration,
 }
 
 impl DriverConfig {
@@ -107,6 +128,8 @@ impl DriverConfig {
             smoke_image: DEFAULT_SMOKE_IMAGE.into(),
             public_addrs: watch::channel(Vec::new()).1,
             egress_ready: watch::channel(p2pc_net::EgressGate::Closed).1,
+            health_probe: None,
+            usage_interval: USAGE_INTERVAL,
         }
     }
 }
@@ -421,7 +444,36 @@ pub struct PodmanJob<E: Engine, C: Cgroups, S> {
     pump: Option<JoinHandle<LogSummary>>,
     started_at: Option<Instant>,
     egress: Option<S>,
+    /// A service's health policy and probe; `None` for a batch job.
+    service: Option<ServiceRun>,
     guard: Guard<E, C>,
+}
+
+/// What `wait` needs to watch a service (H2 §7.2).
+struct ServiceRun {
+    policy: HealthPolicy,
+    probe: Arc<dyn HealthProbe>,
+}
+
+/// One health check in flight.
+type CheckFuture = Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
+
+impl ServiceRun {
+    /// Starts one check of `target`, failed when it takes longer than the policy's timeout.
+    fn check(&self, target: &ProbeTarget) -> CheckFuture {
+        let (probe, target, check, timeout) = (
+            Arc::clone(&self.probe),
+            target.clone(),
+            self.policy.check.clone(),
+            self.policy.timeout,
+        );
+        Box::pin(async move {
+            match tokio::time::timeout(timeout, probe.check(&target, &check)).await {
+                Ok(result) => result,
+                Err(_) => Err(format!("no answer within {} s", timeout.as_secs())),
+            }
+        })
+    }
 }
 
 impl<E: Engine, C: Cgroups, S> fmt::Debug for PodmanJob<E, C, S> {
@@ -432,6 +484,7 @@ impl<E: Engine, C: Cgroups, S> fmt::Debug for PodmanJob<E, C, S> {
             .field("name", &self.name)
             .field("dir", &self.dir)
             .field("started", &self.started_at.is_some())
+            .field("service", &self.service.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -468,6 +521,8 @@ enum Stop {
     Cancelled,
     Disk,
     Floor,
+    /// A service's health check failed (H2 §7.2).
+    Health,
     /// The exit future failed.
     Lost,
 }
@@ -489,6 +544,39 @@ async fn armed(timer: &mut Option<Pin<Box<Sleep>>>) {
     match timer {
         Some(t) => t.await,
         None => std::future::pending().await,
+    }
+}
+
+/// The next tick of the interval if it is set; never resolves otherwise.
+async fn ticking(interval: &mut Option<Interval>) {
+    match interval {
+        Some(i) => {
+            i.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// The result of the check in flight; never resolves when there is none.
+async fn in_flight(check: &mut Option<CheckFuture>) -> Result<(), String> {
+    match check {
+        Some(c) => c.await,
+        None => std::future::pending().await,
+    }
+}
+
+/// An interval whose first tick comes one `period` after `start`; a late tick delays the next ones.
+fn every(start: Instant, period: Duration) -> Interval {
+    let mut i = tokio::time::interval_at(start + period, period);
+    i.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    i
+}
+
+/// A usage sample from the lease cgroup's counters (MiB, within the protocol's bound).
+fn usage_sample(stats: &CgroupStats) -> UsageSample {
+    UsageSample {
+        used_cpu_ms: stats.cpu_usage_usec / 1000,
+        max_rss_mb: (stats.memory_peak_bytes / MIB).min(MAX_NODE_MEMORY_MB),
     }
 }
 
@@ -880,9 +968,27 @@ impl<E: Engine, C: Cgroups, X: Egress> Sandbox for PodmanDriver<E, C, X> {
             gpu,
             ..
         } = lease;
-        if job.validate(&Limits::agent()).is_err() {
+        // A lease's job was accepted by the hub (`Stored`). Services are understood only with a health probe; volumes
+        // and blob inputs not at all yet (H2 §6.1: a job this agent does not understand is `invalid_job`).
+        let limits = Limits {
+            h2: H2Features {
+                services: self.cfg.health_probe.is_some(),
+                ..H2Features::default()
+            },
+            ..Limits::agent()
+        };
+        if job.validate_in(&limits, SpecContext::Stored).is_err() {
             return Err(reject(LeaseRejectReason::InvalidJob));
         }
+        let service = match (job.kind, &job.service, &self.cfg.health_probe) {
+            (JobKind::Batch, None, _) => None,
+            (JobKind::Service, Some(block), Some(probe)) => Some(ServiceRun {
+                policy: HealthPolicy::of(block).ok_or(reject(LeaseRejectReason::InvalidJob))?,
+                probe: Arc::clone(probe),
+            }),
+            // The validation already refused these.
+            _ => return Err(reject(LeaseRejectReason::InvalidJob)),
+        };
         if !self.cfg.ready {
             return Err(reject(LeaseRejectReason::UnsupportedSandbox));
         }
@@ -993,6 +1099,7 @@ impl<E: Engine, C: Cgroups, X: Egress> Sandbox for PodmanDriver<E, C, X> {
             pump: None,
             started_at: None,
             egress,
+            service,
             guard,
         })
     }
@@ -1009,7 +1116,26 @@ impl<E: Engine, C: Cgroups, X: Egress> Sandbox for PodmanDriver<E, C, X> {
         job.started_at = Some(Instant::now());
         *job.exit.get_mut().unwrap_or_else(PoisonError::into_inner) = Some(exit);
         let _ = job.events.send(SandboxEvent::Started).await;
-        job.pump = Some(tokio::spawn(logs::pump(stdout, stderr, job.events.clone())));
+        // A service is `starting` from its start (H2 §7.2).
+        if job.service.is_some() {
+            let starting = HealthChange {
+                state: HealthState::Starting,
+                detail: None,
+            };
+            let _ = job.events.send(SandboxEvent::Health(starting)).await;
+        }
+        // H2 §11.4: a service's logs are not capped in total; the executor keeps its most recent 64 MiB.
+        let cap = if job.service.is_some() {
+            u64::MAX
+        } else {
+            logs::LOG_CAP_BYTES
+        };
+        job.pump = Some(tokio::spawn(logs::pump_with_cap(
+            stdout,
+            stderr,
+            job.events.clone(),
+            cap,
+        )));
         Ok(())
     }
 
@@ -1036,6 +1162,24 @@ impl<E: Engine, C: Cgroups, X: Egress> Sandbox for PodmanDriver<E, C, X> {
 
         // Set when the exit future failed: the container may still run, and nothing will tell us when it ends.
         let mut exit_lost = false;
+
+        // A service's health checks and usage samples (nothing of it for a batch job).
+        let target = ProbeTarget {
+            lease_id: job.lease_id,
+            job_dir: job.dir.root().to_path_buf(),
+        };
+        let mut health = job.service.as_ref().map(|s| HealthMachine::new(s.policy.limits));
+        let mut health_tick = job.service.as_ref().map(|s| every(started, s.policy.interval));
+        let mut start_period_end: Option<Pin<Box<Sleep>>> = job
+            .service
+            .as_ref()
+            .and_then(|s| s.policy.limits)
+            .map(|l| Box::pin(tokio::time::sleep_until(started + l.start_period)));
+        let mut checking: Option<CheckFuture> = None;
+        let mut usage_tick = job
+            .service
+            .as_ref()
+            .map(|_| every(started, self.cfg.usage_interval.max(USAGE_INTERVAL)));
 
         let code = loop {
             if stop.is_none() && *cancel.borrow_and_update() {
@@ -1098,6 +1242,42 @@ impl<E: Engine, C: Cgroups, X: Egress> Sandbox for PodmanDriver<E, C, X> {
                 }
                 // Still no exit after SIGKILL and the grace: Podman lost track of it.
                 () = armed(&mut give_up) => break None,
+                () = ticking(&mut health_tick),
+                    if stop.is_none() && checking.is_none() && health.as_ref().is_some_and(HealthMachine::wants_checks) =>
+                {
+                    checking = job.service.as_ref().map(|s| s.check(&target));
+                }
+                () = armed(&mut start_period_end), if stop.is_none() => {
+                    start_period_end = None;
+                    // Still starting: one more check now decides (unless one is under way, which then decides).
+                    if health.as_mut().is_some_and(HealthMachine::start_period_ended) && checking.is_none() {
+                        checking = job.service.as_ref().map(|s| s.check(&target));
+                    }
+                }
+                result = in_flight(&mut checking), if stop.is_none() => {
+                    checking = None;
+                    let step = health.as_mut().map_or(Step::Stay, |h| h.record(result));
+                    let (report, failed) = match step {
+                        Step::Stay => (None, None),
+                        Step::Report(state, detail) => (Some((state, detail)), None),
+                        Step::Stop(state, detail) => (state.map(|s| (s, Some(detail.clone()))), Some(detail)),
+                    };
+                    if let Some((state, detail)) = report {
+                        tracing::info!(lease = %job.lease_id, ?state, detail = ?detail, "service health changed");
+                        let _ = job.events.send(SandboxEvent::Health(HealthChange { state, detail })).await;
+                    }
+                    if let Some(detail) = failed {
+                        // `detail` comes from the container's answer: logged escaped.
+                        tracing::warn!(lease = %job.lease_id, detail = ?detail, "the service's health check failed; stopping it");
+                        stop = Some(Stop::Health);
+                        self.terminate(job, &mut escalate).await;
+                    }
+                }
+                () = ticking(&mut usage_tick), if stop.is_none() => {
+                    stats = stats.max(cgroups.stats(&job.lease_id));
+                    // Cumulative values: a sample the executor has no room for is replaced by the next one.
+                    let _ = job.events.try_send(SandboxEvent::Usage(usage_sample(&stats)));
+                }
             }
         };
         let wall = started.elapsed();
@@ -1138,6 +1318,7 @@ impl<E: Engine, C: Cgroups, X: Egress> Sandbox for PodmanDriver<E, C, X> {
             (Some(Stop::Cancelled), _) => (Outcome::Cancelled, None, None),
             (Some(Stop::Disk), _) => (Outcome::Error, None, Some(error_code::DISK_LIMIT)),
             (Some(Stop::Floor), _) => (Outcome::Error, None, Some(error_code::DISK_FLOOR)),
+            (Some(Stop::Health), _) => (Outcome::Error, None, Some(error_code::HEALTH_CHECK_FAILED)),
             // Exit 137 alone is not an OOM: only the cgroup counter or Podman's flag say so (§9 "Memory").
             (None, _) if oom => (Outcome::Error, code, Some(error_code::MEMORY_LIMIT)),
             (None, Some(c)) => (Outcome::Exited, Some(c), None),

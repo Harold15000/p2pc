@@ -40,6 +40,13 @@
 //!
 //! **Start.** No checkpointing in v0.1 (§9): before the first `Hello`, [`Executor::startup`] removes the containers,
 //! job directories and lease cgroups a previous process left, and the executor reports `running: []`.
+//!
+//! **Services** (H2 §6.1, §7.2, §11.4) run through the same path; the driver enforces their wall-clock limit (up to
+//! 30 days) and their health. Each health change the driver reports becomes a `ServiceHealth` in the run's queue,
+//! after `JobStarted` and in order with the logs, stamped with the executor's clock. Every `Heartbeat` repeats the
+//! last state in `running[].health`, and each usage sample (taken by the driver at most once a minute) goes into the
+//! next heartbeat's `used_cpu_ms` and `max_rss_mb`, once. A stale run reports neither. A service's log queue is the
+//! ring of [`outbox`], which keeps its most recent 64 MiB. `Hello.running` keeps H1's entries.
 
 pub mod capacity;
 pub mod outbox;
@@ -56,9 +63,11 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use p2pc_proto::api::OutputFile;
+use p2pc_proto::api::{JobKind, OutputFile};
 use p2pc_proto::ids::{AccountId, LeaseId};
-use p2pc_proto::protocol::{AgentMsg, LeaseRejectReason, LogData, MAX_RUNNING_LEASES, Outcome, RunningLease};
+use p2pc_proto::protocol::{
+    AgentMsg, HealthState, LeaseRejectReason, LogData, MAX_RUNNING_LEASES, Outcome, RunningLease, ServiceHealth,
+};
 use time::OffsetDateTime;
 use tokio::sync::{Notify, mpsc, watch};
 
@@ -69,7 +78,7 @@ use crate::connection::lease::{LEASE_LOST, LeaseDecision, LeaseHandler, LeaseOff
 use crate::connection::{BoxFuture, Uplink};
 use crate::sandbox::{
     CancelHandle, CollectedOutputs, Finished, GpuRef, LeaseContext, Phase, PodmanDriver, Sandbox, SandboxError,
-    SandboxEvent, SweepReport,
+    SandboxEvent, SweepReport, UsageSample,
 };
 
 /// Longest [`LeaseSupervisor::stop_all`] waits for the runs it stopped to be cleaned up: SIGTERM, the 10 s grace,
@@ -132,6 +141,10 @@ struct Run {
     started_at: Option<OffsetDateTime>,
     /// Becomes true when the run task is over (capacity released).
     done: watch::Receiver<bool>,
+    /// A service's last reported health (`Heartbeat.running[].health`); `None` for a batch run.
+    health: Option<HealthState>,
+    /// A service's latest usage sample, not yet put in a heartbeat.
+    usage: Option<UsageSample>,
 }
 
 #[derive(Debug, Default)]
@@ -180,6 +193,8 @@ struct Inner<S> {
     /// Woken (one permit, kept if nobody waits) each time a run releases its resources.
     released: Notify,
     log_cap: AtomicUsize,
+    /// A service run's log ring: its cap and its segment, in raw bytes.
+    service_ring: (AtomicU64, AtomicU64),
     /// Log chunks every finished run dropped (its [`outbox::Drops`]), in total.
     dropped_log_chunks: AtomicU64,
 }
@@ -343,6 +358,10 @@ where
                 status_changed: Arc::new(Notify::new()),
                 released: Notify::new(),
                 log_cap: AtomicUsize::new(outbox::LOG_QUEUE_BYTES),
+                service_ring: (
+                    AtomicU64::new(outbox::SERVICE_LOG_RING_BYTES),
+                    AtomicU64::new(outbox::LOG_SEGMENT_BYTES),
+                ),
                 dropped_log_chunks: AtomicU64::new(0),
             }),
         }
@@ -352,6 +371,14 @@ where
     #[must_use]
     pub fn with_log_cap(self, cap: usize) -> Self {
         self.inner.log_cap.store(cap, Ordering::Relaxed);
+        self
+    }
+
+    /// The same, with another log ring for service runs: `cap` raw bytes in segments of `segment` (tests).
+    #[must_use]
+    pub fn with_service_log_ring(self, cap: u64, segment: u64) -> Self {
+        self.inner.service_ring.0.store(cap, Ordering::Relaxed);
+        self.inner.service_ring.1.store(segment, Ordering::Relaxed);
         self
     }
 
@@ -493,7 +520,14 @@ where
             retire(run);
         }
         let cancel = CancelHandle::new();
-        let run_outbox = Arc::new(RunOutbox::with_cap(self.inner.log_cap.load(Ordering::Relaxed)));
+        // H2 §11.4: a service keeps its most recent logs in a ring; a batch run keeps H1's queue.
+        let run_outbox = Arc::new(match offer.job.kind {
+            JobKind::Service => RunOutbox::ring(
+                self.inner.service_ring.0.load(Ordering::Relaxed),
+                self.inner.service_ring.1.load(Ordering::Relaxed),
+            ),
+            JobKind::Batch => RunOutbox::with_cap(self.inner.log_cap.load(Ordering::Relaxed)),
+        });
         let (done_tx, done_rx) = watch::channel(false);
         let now = self.inner.clock.now();
         state.runs.insert(
@@ -508,6 +542,8 @@ where
                 started_at: None,
                 done: done_rx,
                 holds: true,
+                health: None,
+                usage: None,
             },
         );
         let ctx = LeaseContext {
@@ -571,6 +607,23 @@ where
         }
         SandboxEvent::Phase(Phase::Pulling) => inner.update(&key, |r| r.phase = RunPhase::Pulling),
         SandboxEvent::Phase(Phase::Creating) => inner.update(&key, |r| r.phase = RunPhase::Creating),
+        SandboxEvent::Health(change) => {
+            let since = inner.clock.now();
+            outbox.push(AgentMsg::ServiceHealth(ServiceHealth {
+                lease_id,
+                epoch,
+                state: change.state,
+                since,
+                detail: change.detail,
+            }));
+            inner.update(&key, |r| r.health = Some(change.state));
+        }
+        // Read by the next heartbeat; the status file does not show it, so no rewrite.
+        SandboxEvent::Usage(sample) => {
+            if let Some(run) = inner.lock().runs.get_mut(&key) {
+                run.usage = Some(sample);
+            }
+        }
     };
 
     let mut outputs = CollectedOutputs::default();
@@ -679,7 +732,7 @@ async fn finish<S>(key: LeaseKey, outbox: Arc<RunOutbox>, sender: tokio::task::J
             epoch = key.1,
             dropped_chunks = drops.chunks,
             dropped_bytes = drops.bytes,
-            "log chunks dropped: more than 8 MiB queued while the server could not take them"
+            "log chunks dropped: more were queued than the run keeps (8 MiB, or a service's 64 MiB ring) while the server could not take them"
         );
     }
     drop(guard);
@@ -743,13 +796,27 @@ where
 
     /// Every run that still holds resources, stale or silenced ones included: their container and directory are real
     /// until the cleanup ends.
+    ///
+    /// For a service that is not stale, the entry also carries its last health and, once per sample (the driver
+    /// samples at most once a minute), its usage so far (H2 §6.1, §11.4). This list is built for one `Heartbeat`
+    /// each time: a sample goes into the first one built after it, and only that one.
     fn holding(&self) -> Vec<RunningLease> {
-        let state = self.inner.lock();
+        let mut state = self.inner.lock();
         let mut holding: Vec<RunningLease> = state
             .runs
-            .iter()
+            .iter_mut()
             .filter(|(_, r)| r.holds)
-            .map(|((lease_id, epoch), _)| RunningLease::new(*lease_id, *epoch))
+            .map(|((lease_id, epoch), r)| {
+                let mut lease = RunningLease::new(*lease_id, *epoch);
+                if r.listed {
+                    lease.health = r.health;
+                    if let Some(sample) = r.usage.take() {
+                        lease.used_cpu_ms = Some(sample.used_cpu_ms);
+                        lease.max_rss_mb = Some(sample.max_rss_mb);
+                    }
+                }
+                lease
+            })
             .collect();
         holding.sort_by_key(|r| (r.lease_id.to_string(), r.epoch));
         holding

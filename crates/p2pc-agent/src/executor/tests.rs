@@ -63,6 +63,8 @@ struct Script {
     links: Vec<(&'static str, PathBuf)>,
     /// `cleanup` waits for a permit on it (the container removal and the directory deletion take a while).
     cleanup_gate: Option<Arc<tokio::sync::Notify>>,
+    /// Events `start` sends after the logs (a service's health changes and usage samples).
+    events: Vec<SandboxEvent>,
 }
 
 #[derive(Debug)]
@@ -176,6 +178,9 @@ impl Sandbox for FakeSandbox {
                 marker: false,
             };
             let _ = job.events.send(SandboxEvent::Log(chunk)).await;
+        }
+        for event in &job.script.events {
+            let _ = job.events.send(event.clone()).await;
         }
         Ok(())
     }
@@ -1869,4 +1874,223 @@ async fn a_fenced_cancel_during_cleanup_does_not_free_the_resources_early() {
     assert!(w.exec.holding().is_empty());
     assert_eq!(w.held(), 0);
     w.idle().await;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Services (H2 §6.1, §11.4).
+
+fn service_job() -> JobSpec {
+    serde_json::from_value(json!({
+        "kind": "service",
+        "name": "chat",
+        "image": "docker.io/ollama/ollama:0.5.7",
+        "command": ["/bin/ollama", "serve"],
+        "resources": {"cpu": 1.0, "memory_mb": 512, "disk_mb": 1024},
+        "service": {"ports": [{"port": 11434, "name": "api"}]},
+    }))
+    .unwrap()
+}
+
+fn health(state: p2pc_proto::protocol::HealthState, detail: Option<&str>) -> SandboxEvent {
+    SandboxEvent::Health(crate::sandbox::HealthChange {
+        state,
+        detail: detail.map(String::from),
+    })
+}
+
+fn usage(used_cpu_ms: u64, max_rss_mb: u64) -> SandboxEvent {
+    SandboxEvent::Usage(crate::sandbox::UsageSample {
+        used_cpu_ms,
+        max_rss_mb,
+    })
+}
+
+impl Session {
+    async fn next(&mut self) -> AgentMsg {
+        tokio::time::timeout(Duration::from_secs(600), self.msgs.recv())
+            .await
+            .expect("no message")
+            .expect("the session ended")
+    }
+}
+
+/// Every health change becomes a `ServiceHealth` (after `JobStarted`, stamped with the executor's clock), and each
+/// heartbeat repeats the last state. Each usage sample (at most one a minute, from the driver) goes into the next
+/// heartbeat only. `Hello` keeps H1's list, and a batch lease gets none of these fields.
+#[tokio::test(start_paused = true)]
+async fn a_service_reports_its_health_and_each_usage_sample_once() {
+    use p2pc_proto::protocol::{HealthState, ServiceHealth};
+    let w = world();
+    let mut session = connect(&w.uplink, &w.journal, accept_all());
+    let later = now() + time::Duration::minutes(5);
+    *w.clock.0.lock().unwrap() = later;
+    w.sandbox.set_default(Script {
+        hang_in_wait: true,
+        ..Script::default()
+    });
+    let id = LeaseId::generate();
+    w.sandbox.script(
+        (id, 1),
+        Script {
+            hang_in_wait: true,
+            events: vec![
+                health(HealthState::Starting, None),
+                health(HealthState::Healthy, None),
+                usage(1500, 300),
+            ],
+            ..Script::default()
+        },
+    );
+    assert_eq!(w.lease(w.offer(id, 1, service_job())).await, LeaseDecision::Accept);
+    let batch = w.run(1).await;
+    // In order, for the service: JobStarted, then its two health changes.
+    let mut service_msgs = Vec::new();
+    while service_msgs.len() < 3 {
+        match session.next().await {
+            AgentMsg::JobStarted { lease_id, .. } if lease_id == batch => {}
+            m => service_msgs.push(m),
+        }
+    }
+    assert!(matches!(service_msgs[0], AgentMsg::JobStarted { lease_id, .. } if lease_id == id));
+    let reported: Vec<ServiceHealth> = service_msgs[1..]
+        .iter()
+        .map(|m| match m {
+            AgentMsg::ServiceHealth(h) => h.clone(),
+            other => panic!("not ServiceHealth: {other:?}"),
+        })
+        .collect();
+    let expected = |state| ServiceHealth {
+        lease_id: id,
+        epoch: 1,
+        state,
+        since: later,
+        detail: None,
+    };
+    assert_eq!(
+        reported,
+        [expected(HealthState::Starting), expected(HealthState::Healthy)]
+    );
+    for h in &reported {
+        assert_eq!(AgentMsg::ServiceHealth(h.clone()).validate(), Ok(()));
+    }
+    w.settle().await;
+    let service_entry = |r: &[RunningLease]| r.iter().find(|l| l.lease_id == id).copied().unwrap();
+    // The first heartbeat carries the sample; the next ones only the state, until a new sample comes.
+    let first = w.exec.holding();
+    assert_eq!(
+        service_entry(&first),
+        RunningLease {
+            health: Some(HealthState::Healthy),
+            used_cpu_ms: Some(1500),
+            max_rss_mb: Some(300),
+            ..RunningLease::new(id, 1)
+        }
+    );
+    assert_eq!(
+        first.iter().find(|l| l.lease_id == batch),
+        Some(&RunningLease::new(batch, 1))
+    );
+    let second = w.exec.holding();
+    assert_eq!(
+        service_entry(&second),
+        RunningLease {
+            health: Some(HealthState::Healthy),
+            ..RunningLease::new(id, 1)
+        }
+    );
+    // `Hello.running` keeps H1's entries.
+    assert!(
+        w.exec
+            .running()
+            .iter()
+            .all(|l| *l == RunningLease::new(l.lease_id, l.epoch))
+    );
+    // Stopping a service is the H1 cancel sequence.
+    w.exec.cancel(id, 1, "stopped".into()).await;
+    w.exec.cancel(batch, 1, "user".into()).await;
+    let msgs = session.until_finished().await;
+    assert_eq!(outcome_of(msgs.last().unwrap()).0, Outcome::Cancelled);
+    session.until_finished().await;
+    w.idle().await;
+}
+
+/// A stale service run (a newer epoch replaced it) is still held until its cleanup ends, but its health and usage
+/// are no longer reported: the server fences that epoch.
+#[tokio::test(start_paused = true)]
+async fn a_stale_service_run_reports_no_health() {
+    use p2pc_proto::protocol::HealthState;
+    let w = world();
+    let _session = connect(&w.uplink, &w.journal, accept_all());
+    let gate = Arc::new(tokio::sync::Notify::new());
+    w.sandbox.set_default(Script {
+        hang_in_wait: true,
+        events: vec![health(HealthState::Starting, None), usage(10, 1)],
+        cleanup_gate: Some(gate.clone()),
+        ..Script::default()
+    });
+    let id = LeaseId::generate();
+    assert_eq!(w.lease(w.offer(id, 1, service_job())).await, LeaseDecision::Accept);
+    w.settle().await;
+    w.exec.cancel(id, 2, "stale_epoch".into()).await;
+    w.settle().await;
+    assert_eq!(w.exec.holding(), [RunningLease::new(id, 1)], "held, without H2 fields");
+    gate.notify_one();
+    w.idle().await;
+}
+
+/// H2 §11.4: a service keeps the most recent log bytes, in whole segments. While the server cannot take them, the
+/// oldest segment goes first, and one marker, numbered with the first dropped `seq`, records the dropped range.
+#[tokio::test(start_paused = true)]
+async fn a_service_keeps_its_most_recent_logs_in_a_ring() {
+    let w = world();
+    // Room for 40 bytes, in segments of 10 bytes: two chunks of 5 bytes each.
+    let exec = w.exec.clone().with_service_log_ring(40, 10);
+    w.sandbox.set_default(Script {
+        hang_in_wait: true,
+        logs: (0..12).map(|i| (LogStream::Stdout, vec![b'a' + i; 5])).collect(),
+        ..Script::default()
+    });
+    let id = LeaseId::generate();
+    assert_eq!(exec.lease(w.offer(id, 1, service_job())).await, LeaseDecision::Accept);
+    w.settle().await;
+    // Only now does a session come.
+    let mut session = connect(&w.uplink, &w.journal, accept_all());
+    let mut got = Vec::new();
+    while got.len() < 10 {
+        got.push(session.next().await);
+    }
+    let kinds: Vec<String> = got.iter().map(kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            "job_started 1",
+            "log 1 0",
+            "log 1 4",
+            "log 1 5",
+            "log 1 6",
+            "log 1 7",
+            "log 1 8",
+            "log 1 9",
+            "log 1 10",
+            "log 1 11"
+        ]
+    );
+    let AgentMsg::LogChunk { stream, data_b64, .. } = &got[1] else {
+        panic!()
+    };
+    assert_eq!(*stream, LogStream::Stderr);
+    let marker = String::from_utf8(data_encoding::BASE64.decode(data_b64.as_str().as_bytes()).unwrap()).unwrap();
+    assert!(marker.contains("0-3") && marker.contains("20 bytes"), "{marker}");
+    let AgentMsg::LogChunk { data_b64, .. } = &got[2] else {
+        panic!()
+    };
+    assert_eq!(
+        data_encoding::BASE64.decode(data_b64.as_str().as_bytes()).unwrap(),
+        vec![b'e'; 5],
+        "the kept chunks are intact"
+    );
+    exec.cancel(id, 1, "stopped".into()).await;
+    session.until_finished().await;
+    w.idle().await;
+    assert_eq!(exec.dropped_log_chunks(), 4);
 }
