@@ -1,6 +1,6 @@
 # Milestone 2 · P2PC Desktop App and Phone Access (v0.2): specification
 
-- **Status:** draft for review (spec v2, 2026-11-10: v1 plus the fixes of its second review). Implementation starts
+- **Status:** draft for review (spec v3, 2026-11-10: v2 plus the fixes of its third review). Implementation starts
   when the architect marks it accepted. The one hard-rule exception it proposes (persistent volumes, §4.3) takes
   effect only through a separate change after that (§4.3, O-16).
 - **Owner:** the P2PC architect. Only the architect changes this file. Implementers who find a problem report it in
@@ -90,13 +90,13 @@ user.
   candidate (§18, open item O-7).
 - **Resumable uploads, multi-GPU jobs, GPU sharing between jobs, Windows or macOS guests, VMs.**
 - **Code signing of the beta installer.** The beta is unsigned (§14.4). A public H2 release requires signing.
-- **Telemetry and phoning home.** No usage, crash or diagnostic data goes to the P2PC project; crash and diagnostic
-  data stay on the PC unless the user exports them. The hub makes no request to the project, and the web app none
-  beyond loading its own files from the origin the user opened. Apart from the node image download of the install the
-  user started (§8.3), the app makes exactly two kinds of request to project-run servers on its own, the update check
-  (§14.1) and the web app verification fetch (§9.6), and only if the user turned them on (first run, §8.2, or
-  Settings), as hard rule 6 requires; they carry no identifier of the user or the cloud. Relays carry the user's own
-  end-to-end encrypted traffic (§10) and are not reports to the project.
+- **Telemetry and phoning home.** No usage, crash or diagnostic data goes to the P2PC project; crash and diagnostic data
+  stay on the PC unless the user exports them. The hub makes no request to the project, and the web app none beyond
+  loading its own files from the origin the user opened. Apart from the node image download of the install the user
+  started (§8.3), the app makes exactly two kinds of request to project-run servers on its own, the update check (§14.1,
+  template bundles included) and the web app verification fetch (§9.6), and only if the user turned them on (first run,
+  §8.2, or Settings), as hard rule 6 requires; they carry no identifier of the user or the cloud. Relays carry the
+  user's own end-to-end encrypted traffic (§10) and are not reports to the project.
 
 ## 4. Architecture
 
@@ -150,7 +150,8 @@ the agent's ingress socket → the shim inside the container → `127.0.0.1:1143
     (§8.5). The hub's state lives in `/var/lib/p2pc-server` inside the distro. P2PC installs no Windows service and
     no firewall rule on the Windows host, and adds no listening TCP port reachable from the LAN: the hub's REST binds
     the distro's loopback, which WSL's `localhostForwarding` also exposes on the Windows host's own loopback (§8.5).
-    The app's iroh endpoints bind UDP sockets, as every iroh endpoint does (§10.4).
+    The app's iroh endpoints bind UDP sockets, as every iroh endpoint does (§10.4), and so does the hub's, which
+    accepts incoming connections as H1's server does (§10.5).
   - *Alternatives.* (a) `p2pc-server` as a native Windows service: needs administrator rights, a Windows build of the
     server and a second set of hardening; rejected for the "Windows host stays untouched" rule. (b) A second,
     hub-only distro: doubles the image and the upgrade path, and the WSL VM is shared anyway (H1 §9.0); rejected.
@@ -171,8 +172,9 @@ the agent's ingress socket → the shim inside the container → `127.0.0.1:1143
 liveness rule (SI-13), the scheduler's fit and offer-cap rules, the sandbox's fixed arguments (extended only; the one
 proposed change to its mount rule is the "Sandbox and hard rules" row below), the egress proxy and its deny ranges,
 API keys, join token semantics (their table changes only in who may create a token, below), the audit table's
-append-only rules, the REST error format, the CLI exit codes, the MCP server, and every existing endpoint's request
-and response shape. The Linux installers are unchanged.
+append-only rules, the REST error format, the CLI exit codes, the MCP server's existing tools, and every existing
+endpoint's request and response shape (responses may grow, H1 §7; what `GET /v1/usage` counts once a ledger row is a
+slice is defined in §12). The Linux installers are unchanged.
 
 **Changes (all additive unless marked):**
 
@@ -182,17 +184,18 @@ and response shape. The Linux installers are unchanged.
 | JobSpec rules for services | **Changed, for `kind = "service"` only** (batch jobs keep H1's rules exactly): `timeout_s` has the range 60-2,592,000 and defaults to the maximum (H1: 1-86,400, default 3,600); out of range is `422 out_of_range`, as in H1, never clamped. `retry.max_attempts` defaults to 3 (H1: 2) and counts consecutive attempts that never became healthy, under a cap of 5 node-loss restarts in 24 h (H1: every attempt consumed by node loss). | §7.1, §7.2 |
 | Job states | Unchanged words. A service's `running` adds `health` (`starting`, `healthy`, `unhealthy`). Stopping a service ends it `cancelled` with a `reason`. | §7.2 |
 | Principals | **Changed.** A request is authenticated by an API key **or** by a paired device. Every place that reads `key_id` reads a `principal` that is one of the two. Storage: `jobs`, `usage_records` and `join_tokens` get a nullable `key_id` (H1: `NOT NULL`) plus a nullable `device_id`, with a `CHECK` that exactly one is set; job idempotency becomes unique per principal through two partial unique indexes; `audit_events` gains `actor_device_id`. SQLite cannot relax `NOT NULL` or add a `CHECK` in place, so this is a forward-only table rebuild (§5.6), not an additive column. | §5.5, §5.6 |
-| Scopes | New: `services:connect`, `templates:launch`, `blobs:write`, `nodes:join`, `nodes:invite`. `admin` covers them. | §5.5 |
+| Scopes | New: `services:connect`, `templates:launch`, `blobs:write`, `nodes:join`, `nodes:invite`. `admin` covers them. A principal with `templates:launch` also gets the narrow **template view** of jobs (state, logs, outputs, ports and cancel of its own template jobs and of `singleton` template instances); `jobs:read`, `jobs:write` and `services:connect` keep H1's project-wide meaning. | §5.5 |
 | Node enrollment | **Changed.** A node enrolled with a join token minted by a non-`admin` principal starts `pending_approval` and gets no lease until an `admin` principal approves it. Tokens minted by `admin` principals enroll as in H1. A join token minted for an approved join request is bound to the joining agent's NodeId and enrolls no other (`join_tokens.bound_iroh_node_id`, §5.4). | §5.4, §5.5 |
 | Sandbox and hard rules | **Proposed change, not in force with this spec.** Hard rule 3 (CONTRIBUTING) and H1 §9 ("never … host paths beyond the three per-job directories") would gain exactly one exception, recorded in ADR-015 (**Proposed**): **persistent volumes**. A volume is a directory the agent creates itself, per account, named by a hash of the volume name (never a path taken from the JobSpec); it is mounted only into service jobs and template jobs of that account, is size-limited (`max_mb`, H1's fail-closed measurement), is checked without following links before every mount, and is deleted without following links. **The exception takes effect only when the architect accepts this spec after E11, through a separate change that amends CONTRIBUTING hard rule 3 and H1 §9's "Never" line together and marks ADR-015 Accepted.** Until then hard rule 3 and H1 §9 stand unchanged, no code may mount a volume, and T2-22 (agent volumes) is blocked (§17, O-16). Nothing else in hard rule 3 changes and services need no exception from it: every job, services included, has a finite wall-clock limit (`timeout_s`, at most 30 days). | §7.1, §11.1, §11.3 |
 | Phoning home (hard rule 6) | The app's daily update check and its web app verification fetch are **opt-in**: an explicit yes/no at first run with nothing preselected, and a Settings toggle. Without it the app checks for updates and verifies the web app only when the user clicks "Check for updates" or "Verify web app". | §3, §8.2, §9.6, §14.1 |
 | Agent protocol | New messages and server-opened streams behind the agent capabilities `service_jobs`, `volumes`, `blob_inputs`, `leave`, `approval` in `Hello.features`. No new ALPN. | §6.1 |
 | New ALPNs | `p2pc/pair/1` and `p2pc/device/1` on the hub; `p2pc/invite/1` on a joining PC's app. | §6 |
 | `init` | `p2pc-server init --owner-device <NodeId>` registers a device instead of printing an API key (the H1 form still works). New offline command `p2pc-server devices add`. | §5.3 |
-| Usage ledger | **Changed.** H1 keeps one row per finished attempt, keyed `UNIQUE (job_id, attempt)` and `lease_id UNIQUE`. H2 keeps one row per finished **slice**, keyed `UNIQUE (job_id, attempt, slice_start)`: a service attempt is split at every 00:00 UTC, and a batch attempt stays one slice. Rows gain the principal columns (§5.6), `kind`, `template_id`, `slice_start`, `slice_end`, `last_slice` and `charge_day`. The table is rebuilt (forward-only) with its append-only triggers. H1 property test 6 ("exactly one row per finished attempt") becomes "exactly one row per finished slice". | §5.6, §12 |
+| Usage ledger | **Changed.** H1 keeps one row per finished attempt, keyed `UNIQUE (job_id, attempt)` and `lease_id UNIQUE`. H2 keeps one row per finished **slice**, keyed `UNIQUE (job_id, attempt, slice_start)`: a service attempt is split at every 00:00 UTC, and a batch attempt stays one slice. Rows gain the principal columns (§5.6), `kind`, `template_id`, `slice_start`, `slice_end`, `last_slice` and `charge_day`. The table is rebuilt (forward-only) with its append-only triggers. H1 property test 6 ("exactly one row per finished attempt") becomes "exactly one row per finished slice". `GET /v1/usage` keeps its shape; its `attempts` counts last slices, and grouping by key leaves device rows out (§12). | §5.6, §12 |
 | Daily caps | **Changed.** The cap query counts ledger rows by their `charge_day` (the UTC day each slice is charged to) instead of by `jobs.created_at`, plus open reservations, never counting a reservation and the rows written against it twice. A batch slice is charged to its job's creation day, so batch jobs keep H1's numbers exactly. A capped principal's service is charged one UTC day at a time (a daily reservation) instead of by its whole `timeout_s` at creation, and is stopped when the day's cap is reached. | §12 |
 | WSL image | Ships `p2pc-server`; `p2pc-node-run` becomes `p2pc-run` (agent, and hub when enabled); the upgrade carries `/var/lib/p2pc-server` too. | §8.5 |
 | Agent config | Share limits can change at run time (`p2pc-agent share set`), sent as `InventoryUpdate`. | §8.2 |
+| MCP server | One new tool, `p2pc_blob_put`, which reads a local file only from one upload directory, never through a symbolic link (SI-H2-21). `p2pc_run` takes blob digests, never local paths. The H1 tools are unchanged. | §7.8 |
 | `install.ps1` | Kept for developers. The app does not call it; `p2pc-wsl` reimplements its install, upgrade and uninstall rules with the same checks and the same state layout, and a parity test pins them (§8.3). | §8.3 |
 
 ## 5. Identities, pairing and devices
@@ -247,10 +250,10 @@ A device key is never derived from, or sent to, anything else. Losing it means p
 4. The device stores `device_id`, the hub NodeId and relays, and from then on uses `p2pc/device/1` (§6.3).
 5. The desktop app that showed the QR polls `GET /v1/devices` and shows "Paired: iPhone (Safari) — not you? Revoke".
 
-**Before pairing** the hub accepts `p2pc/pair/1` from any NodeId, so it is unauthenticated surface. It gets the H1 §6
-"Before `Join`" limits, counted **separately** from the agent ALPN: at most 32 connections at once and 8 pending
-`Pair`s; one `Pair` per connection, within 10 s; a frame limit of 4 KiB. Beyond the connection limits a new connection
-closes with no detail.
+**Before pairing** the hub accepts `p2pc/pair/1` from any NodeId, so it is unauthenticated surface; it serves that ALPN
+only while a pairing ticket is open (§10.5). It gets the H1 §6 "Before `Join`" limits, counted **separately** from the
+agent ALPN: at most 32 connections at once and 8 pending `Pair`s; one `Pair` per connection, within 10 s; a frame limit
+of 4 KiB. Beyond the connection limits a new connection closes with no detail.
 
 **The limits shed load; they never lock the owner out.** A flood can fill the connection slots and delay a valid
 `Pair` (the device retries with backoff while its ticket is valid), but the hub never refuses a request with a valid
@@ -344,17 +347,46 @@ would need a rendezvous service to resolve it, which H2 does not have (D4). So:
   `nodes:invite` (open a join request that an `admin` must approve, §5.4), `nodes:join` (create a join token valid at
   most 15 minutes, whose node starts `pending_approval`, §5.4). `admin` covers all of them. `jobs:write` already
   allows services and blob inputs.
+- **Template view.** `jobs:read` (H1) reads every job of the project, with its logs and outputs, and
+  `services:connect` opens a port of any service of the project, including a developer's own `p2pc service run`
+  service. Neither is in the default phone profile. A principal with `templates:launch` instead gets a narrow view,
+  checked in the job routes themselves (one function, used by every route below):
+  - **Visible jobs:** the template jobs (`template` set) that this principal launched, and every instance of a
+    `singleton` template in its account and project, whoever launched it (a singleton is shared, §7.6). No other job
+    is visible: `GET /v1/jobs` leaves it out, and every route on it answers `404` as for an unknown id (H1 SI-7 style).
+  - **State:** `GET /v1/jobs` and `GET /v1/jobs/{id}` on visible jobs (H1 redaction of `env` and `files` applies).
+  - **Logs and outputs:** `GET /v1/jobs/{id}/logs` and `GET /v1/jobs/{id}/outputs[/{path}]` only on the template jobs
+    this principal launched; on a singleton instance launched by someone else, `404`.
+  - **Ports:** `POST /v1/jobs/{id}/ports/{port}/connect` on a visible template service (§7.4).
+  - **Cancel:** `POST /v1/jobs/{id}/cancel` on a visible job (§7.2).
+
+  A principal that also holds `jobs:read`, `jobs:write` or `services:connect` keeps H1's project-wide rule for that
+  route; the template view only adds to a principal without them. `GET /v1/usage`, `POST /v1/estimate` and
+  `GET /v1/blobs` keep `jobs:read`.
 - **Profiles** (presets for the UI; the API takes scope lists):
 
   | Profile | Scopes | Used by |
   |---|---|---|
   | Owner | `admin` | The desktop app on the hub PC (created by `init --owner-device`). |
-  | Phone (default) | `jobs:read`, `nodes:read`, `templates:launch`, `services:connect`, `blobs:write`, `nodes:invite` | Phones and browsers paired from the app. |
-  | Developer device | Phone + `jobs:write`, `nodes:join` | Opt-in in the app's pairing screen ("allow running any container and adding PCs"). |
+  | Phone (default) | `nodes:read`, `templates:launch`, `blobs:write`, `nodes:invite` | Phones and browsers paired from the app. |
+  | Developer device | Phone + `jobs:read`, `jobs:write`, `services:connect`, `nodes:join` | Opt-in in the app's pairing screen ("allow running any container, reading every job's logs and outputs, opening any service and adding PCs"). |
 
-  The default phone profile cannot submit arbitrary JobSpecs or mint join tokens: a stolen, unlocked phone or an XSS
-  in the web app can launch only vetted templates (§7.6), read job state, open services and ask for a PC to join,
-  which the hub PC must approve. That bounds what an attacker with a device key can run on the owner's PCs.
+  The default phone profile cannot submit arbitrary JobSpecs, read the jobs, logs or outputs of developer jobs or of
+  other devices' template jobs, open a non-template service, or mint join tokens. A stolen, unlocked phone or an XSS
+  in the web app can, until the device is revoked:
+  - launch vetted templates (§7.6) and read the state, logs and outputs of the template jobs it launched;
+  - see the state of the shared `singleton` instances, open their ports and stop them. For the beta that is the
+    private chat: the attacker can chat with the owner's model and, through Ollama's own API, pull other models from
+    the template's fixed egress hosts into its volume or delete models from it (the UI needs `/api/pull`; the bridge
+    does not filter the service's API). Chat history is not on the hub (§9.4), so other devices' conversations are
+    not exposed;
+  - see the PCs and volumes (`nodes:read`);
+  - upload blobs, check whether the account holds a blob of a given digest (`HEAD`), and delete unreferenced blobs
+    (`blobs:write`);
+  - ask for a PC to join, which the hub PC must approve (§5.4).
+
+  That is everything it can reach; SI-H2-18 pins it with a negative test per route. It bounds what an attacker with a
+  device key can run on, or read from, the owner's PCs.
 - **No escalation** (H1 §5) applies to devices: a pairing ticket's scopes, cap and expiry are a subset of its
   creator's. Only `admin` principals create pairing tickets in H2.
 - **Revocation.** `DELETE /v1/devices/{id}` (`admin`) sets `revoked_at`, closes every live `p2pc/device/1` connection of
@@ -473,7 +505,8 @@ New agent capabilities in `Hello.features`. The hub sends a lease that needs one
   stop rules switch off its supervisor. Sent by `p2pc-agent leave`, which the app runs on uninstall (§8.7).
 
 **Changed agent → hub messages (additive):** `Heartbeat.running[]` gains `health` for service leases and, at most once a
-minute, `used_cpu_ms` (cumulative, from the lease cgroup) for service leases, used by the daily split (§12).
+minute, `used_cpu_ms` (cumulative, from the lease cgroup) and `max_rss_mb` (the attempt's peak so far, from the lease
+cgroup) for service leases, used by the daily split (§12).
 `Inventory` gains `volumes_mb` (the disk share for volumes, apart from `offered.disk_mb`, §11.3) and `owner_paused`
 (bool, §8.4): while it is true the scheduler treats the node as draining, and the agent rejects new leases with
 `draining`. Both come with `share_update`; an agent without it sends neither.
@@ -509,8 +542,9 @@ connection.
   lease: at most 64 concurrent port streams (`too_many_connections` beyond that). QUIC stream limits are set so that
   the control stream and uploads can always open (the port budget is below the connection's stream limit).
 - **Port stream end.** A clean end of either side is propagated as a QUIC stream finish; a reset as a reset. Idle port
-  streams are **not** timed out by the hub (a chat may idle for minutes); the service's `idle_timeout_s` (§7.1) ends
-  the whole service instead.
+  streams are **not** timed out on the agent connection (a chat may idle for minutes); the service's `idle_timeout_s`
+  (§7.1) ends the whole service instead. The client side of a port connection opened by a device has its own idle
+  limit (§6.3).
 - **Blob integrity.** The agent hashes what it receives and refuses a mismatch (`error="input_integrity"`, a
   `start_failed`-class error, H1 §9 "Podman failures are not job exits").
 
@@ -527,9 +561,20 @@ connection, frame limit 4 KiB, 10 s deadline.
 - A request on a device stream that carries an `Authorization` header gets `400 unexpected_authorization`: mixing two
   principals on one request is refused, so a confused client cannot run as an API key over a device connection.
 - **Same limits as the REST listener** (H1 §10 "Slow clients": 10 s headers, 30 s body and request, 60 s keep-alive
-  idle; streaming routes and port connections excluded), plus: at most 32 concurrent streams per device connection and
-  2 connections per device NodeId; device streams count against their own budget (default 96), which with the H1
-  tunnel budget stays **below** the REST connection cap. The hub refuses to start with a config that breaks this.
+  idle; streaming routes and port connections excluded from the request limit), plus the device budget below. The
+  hub refuses to start with a config that breaks any of its relations.
+  - **Per device:** at most 2 connections per device NodeId and at most 16 concurrent streams per device across them
+    (`device_streams_per_device`). A stream is one HTTP/1.1 connection, so an upgraded port connection or a log follow
+    holds one for its life.
+  - **Total:** device streams count against their own budget (`device_stream_budget`, default 96), which with the H1
+    tunnel budget stays **below** the REST connection cap.
+  - **Reserved for `admin`:** 32 of the 96 (`device_stream_admin_reserve`) are usable only by devices with the `admin`
+    scope, so paired phones, together, hold at most 64 and can never take the slots of the hub PC's app, which is how
+    a device gets revoked. The reserve must be at least `device_streams_per_device`, and below the budget.
+  - **Idle limits:** a streaming route keeps H1's 60 s idle limit; an upgraded port connection on `p2pc/device/1`
+    closes after `device_port_idle_s` (default 600 s) with no byte in either direction (the web app opens a new one
+    per chat request). A misbehaving phone that leaves streams open therefore gives them back within 10 minutes, and
+    within 5 s of its revocation (§5.5).
 - **The hub checks the device at connection time and on every request.** A revocation is seen at the next request,
   and the hub also closes the connection actively (§5.5).
 - **Why HTTP and not new messages:** one API for every client, one OpenAPI document, and the device gets every
@@ -637,10 +682,12 @@ The Lease frame limit (1 MiB, H1 §6) still applies to the whole job; blob input
 - **Waiting for the same node.** A requeued service with a volume prefers the node that holds the volume (§11.3): when
   that node is eligible but offline or busy, the scheduler waits up to `volume_affinity_wait_s` (default 900 s) before
   placing it elsewhere with an empty volume. `reason` says so while it waits.
-- **Who can stop a service.** `POST /v1/jobs/{id}/cancel` needs `jobs:write`, **or** `templates:launch` when the job
-  was launched from a template, in the caller's account and project, and either by the same principal or from a
-  `singleton` template. A singleton instance is shared by every launcher (a launch returns the running instance,
-  §7.6), so any principal that may launch it may also stop it.
+- **Who can stop a service.** `POST /v1/jobs/{id}/cancel` keeps H1's rule for `jobs:write`, unchanged: any job of the
+  caller's account and project. H2 adds one path for a principal without `jobs:write`: with `templates:launch` it may
+  cancel the jobs of its template view (§5.5), that is, a template job it launched itself or an instance of a
+  `singleton` template in its account and project. The restriction to its own launches applies only to this
+  `templates:launch` path, never to `jobs:write`. A singleton instance is shared by every launcher (a launch returns
+  the running instance, §7.6), so any principal that may launch it may also stop it.
 - **`GET /v1/jobs/{id}`** adds, for services, `service: {health, health_since, ports:[{port, name}], open_connections,
   last_activity_at, idle_deadline, deadline, cap_deadline, restarts_24h}`; `idle_deadline` is `null` while a
   connection is open or when `idle_timeout_s` is `null`; `deadline` is when `timeout_s` ends the current attempt;
@@ -651,14 +698,14 @@ The Lease frame limit (1 MiB, H1 §6) still applies to the whole job; blob input
 
 | Method and path | Scope | Notes |
 |---|---|---|
-| `POST /v1/jobs/{id}/ports/{port}/connect` | services:connect | HTTP/1.1 upgrade to a raw byte stream into the service (§7.4). |
+| `POST /v1/jobs/{id}/ports/{port}/connect` | services:connect, or templates:launch for a template service of its template view (§5.5) | HTTP/1.1 upgrade to a raw byte stream into the service (§7.4). |
 | `POST /v1/blobs` | blobs:write | Upload one blob (§7.5). |
 | `HEAD /v1/blobs/{sha256}` | blobs:write or jobs:read | `200` with `Content-Length` if the caller's account has it, else `404`. |
 | `GET /v1/blobs` | jobs:read | `{sha256, size, created_at, referenced_by, expires_at}`, cursor pagination. |
 | `DELETE /v1/blobs/{sha256}` | blobs:write | `409 blob_in_use` while a non-terminal job references it. |
 | `GET /v1/volumes` | nodes:read | `{name, node_id, size_mb, max_mb, last_used_at, in_use_by}` from the latest `VolumeReport`s. |
 | `DELETE /v1/volumes/{node_id}/{name}` | admin | Sends `VolumeDelete`. `409 volume_in_use`; `503 node_offline` (the deletion is not queued). |
-| `GET /v1/templates` | jobs:read or templates:launch | The loaded template bundle (§7.6), with `bundle_version`. |
+| `GET /v1/templates` | jobs:read or templates:launch | The loaded template bundle (§7.6), with `bundle_version`; an empty list and `bundle_error` when no bundle can be loaded. |
 | `POST /v1/templates/{id}/launch` | templates:launch | `{params, idempotency_key?}` → `201` with `Job`, or `200` with the running instance of a `singleton` template. |
 | `POST /v1/devices/pairing-tickets`, `GET …`, `DELETE …/{id}` | admin | §5.2. `POST` returns `{ticket, url, expires_at}` once. |
 | `GET /v1/devices`, `GET /v1/devices/{id}` | admin, or the device itself | `{id, label, platform, scopes, created_at, last_seen_at, revoked_at, paired_by}`. For a non-`admin` device, `GET /v1/devices` is filtered to that device alone (a one-item list), and `GET /v1/devices/{id}` of any other device gets `404`, as an unknown id. |
@@ -670,7 +717,7 @@ The Lease frame limit (1 MiB, H1 §6) still applies to the whole job; blob input
 | `POST /v1/nodes/join-requests/{id}/token` | the requesting device | Only when `approved`: mints the join token (15 min, single use, bound to the request's `iroh_node_id`) on behalf of the approving principal, stores only its hash, returns `{join_token, expires_at}` once and sets `delivered`. Otherwise `409 join_request_closed`. |
 | `DELETE /v1/nodes/join-requests/{id}` | admin, or the requesting device | Reject or withdraw a `pending` request. |
 | `POST /v1/nodes/{id}/approve` | admin | Approves a `pending_approval` node (idempotent); audited `node_approved` (§5.5). |
-| `GET /v1/server` | any principal | H1 fields plus `api_version` (integer, 2 for H2), `min_web_version`, `hub_name`. |
+| `GET /v1/server` | any principal | H1 fields plus `api_version` (integer, 2 for H2), `min_web_version`, `hub_name`, `max_blob_mb` (§7.5). |
 | `PATCH /v1/server` | admin | `{hub_name}` (1-64 printable characters). |
 
 No endpoint returns blob contents: the hub is not a file store.
@@ -686,9 +733,11 @@ No endpoint returns blob contents: the hub is not a file store.
   agent answered `PortOpenAck{ok:false}`; the agent's `reason` is in `detail`).
 - **The same endpoint serves every client:** devices over `p2pc/device/1`, API keys over TCP REST or `p2pc/http/1`
   (H1 tunnel) and behind a TLS reverse proxy that passes upgrades. One code path, one authorization check
-  (SI-H2-5).
-- **Limits.** The upgraded connection leaves the H1 whole-request limit; it has no idle limit of its own (§6.1). At most
-  64 open connections per service and 16 per principal per service. Bytes are counted per service per UTC day
+  (SI-H2-5): `services:connect` for any service of the caller's project, or `templates:launch` for a template service
+  of the caller's template view (§5.5); any other job answers `404`.
+- **Limits.** The upgraded connection leaves the H1 whole-request limit. On the TCP listener and `p2pc/http/1` it has
+  no idle limit of its own (§6.1); on `p2pc/device/1` it closes after `device_port_idle_s` without traffic (§6.3). At
+  most 64 open connections per service and 16 per principal per service. Bytes are counted per service per UTC day
   (§12), never logged.
 - **Idle accounting.** The hub, which relays every byte, updates `last_activity_at` at most once every 10 s per
   service, and sends `Cancel{reason:"idle_timeout"}` when `idle_timeout_s` has passed with no open connection and no
@@ -705,10 +754,10 @@ No endpoint returns blob contents: the hub is not a file store.
 - **Upload.** `POST /v1/blobs` with `Content-Length` (required; chunked uploads get `411`), `X-P2PC-SHA256: <64 hex>`
   (required) and the raw bytes as the body. Answers `201 {sha256, size, created_at, expires_at}`, or `200` with the
   same body when the account already has it (the body is still read and discarded, or the client may `HEAD` first).
-- **Checks before reading the body:** `Content-Length <= max_blob_mb` (default 2,048 MiB, `413 too_large`); then,
-  with `checked_add`, the account's stored bytes plus in-flight reservations plus this size `<= blobs_quota_mb`
-  (default 20,480 MiB, `507 quota_exceeded`). The reservation is taken in the same short transaction and released on
-  every exit path.
+- **Checks before reading the body:** `Content-Length <= max_blob_mb` (default 2,048 MiB, `413 too_large`); then, with
+  `checked_add`, the account's stored bytes plus in-flight reservations plus this size `<= blobs_quota_mb` (default
+  20,480 MiB; on the hub PC the app sets it at "Create my cloud" from the disk arithmetic of §8.2;
+  `507 quota_exceeded`). The reservation is taken in the same short transaction and released on every exit path.
 - **Writing.** The body streams to `<data>/blobs/staging/<random>` while hashing. A short body, a hash mismatch
   (`422 digest_mismatch`) or a broken connection deletes the staging file. On success: `fsync`, rename to
   `<data>/blobs/<account_id>/sha256/<aa>/<bb>/<hex>`, then insert the row (two short transactions with no I/O under
@@ -746,25 +795,50 @@ No endpoint returns blob contents: the hub is not a file store.
 - **A template** is a vetted JobSpec plus a UI entry. It is data: `templates/<id>.toml` in the repository, reviewed like
   code. Fields: `id`, `version`, `title`, `description`, `kind`, `ui` (`chat`, `transcribe` or `none`), `singleton`
   (bool), `requirements` (`gpu = "required" | "preferred" | "none"`, `min_vram_mb`), `params` (typed: `enum` with
-  values, `int` with bounds, `bool`), `resources` (default, min and max), the `spec` (a JobSpec), `licenses` (the image
-  and model licenses, shown in the UI), and `download_mb` (an estimate of the first-run download, shown before launch).
+  values, `int` with bounds, `bool`, `blob`; each with one `target`, below), `resources` (default, min and max), the
+  `spec` (a JobSpec), `licenses` (the image and model licenses, shown in the UI), and `download_mb` (an estimate of
+  the first-run download, shown before launch).
+- **Parameter targets.** A parameter reaches the job in exactly one of these ways, named by its `target`:
+  - `env:<NAME>` or `argv:<index>`: a **whole** env value or a **whole** argv element of the template's `spec`;
+  - `field:<JobSpec field>`, only for an `int` parameter and only for a field of this closed list:
+    `service.idle_timeout_s` and `timeout_s`. The template's bounds for the parameter must lie inside the field's
+    JobSpec range (§7.1) for the template's `kind`, and the launch checks the value's type and the template's bounds
+    (`422 invalid_params` outside them) before the normal JobSpec validation runs on the result;
+  - `input:<path>`, only for a `blob` parameter: one `inputs` entry `{path, blob}` at the path fixed by the template;
+    the digest must exist in the caller's account (`422 unknown_blob`, §7.1).
+
+  The only other field the hub sets at launch is `resources.gpu`, from `requirements.gpu` (placement hints, below).
 - **Rules every template MUST meet** (checked by a test over the whole bundle):
   - the image is pinned by `@sha256:` digest;
-  - parameters reach the job only as **whole env values or whole argv elements**, never interpolated into a shell
-    string or a path; enum values come from the template;
+  - parameters reach the job only through the targets above: whole env values, whole argv elements, a listed JobSpec
+    field within the template's bounds, or an `inputs` entry at a fixed path; never interpolated into a shell string
+    or a path; enum values come from the template;
   - egress is a fixed list in the template; volumes use the `tpl:<id>/` namespace;
   - the spec sets a finite `timeout_s` (for a batch template, one that fits the daily caps the template is meant for);
   - every field passes the normal JobSpec validation.
 - **Bundle.** CI compiles `templates/*.toml` into `templates.json` and signs it with the release key (minisign,
   §5.1). The hub embeds the bundle of its own release. It may load a newer bundle from `<data>/templates/` (put there
-  by the desktop app's updater, §14), only if the signature verifies against the embedded public key, its
-  `bundle_version` is higher than the embedded one and its `min_hub_version` is at most the hub's version. Otherwise it
-  logs why and keeps the embedded bundle. This lets a security fix move an image digest without a hub release.
-- **Launch.** `POST /v1/templates/{id}/launch` validates `params` against the template (unknown parameter → `422`),
-  builds the JobSpec, sets `template: {id, version}` and creates the job with the caller as principal. Caps, image
-  allowlists and placement apply as for any job. For a `singleton` template, a launch while an instance is `queued`,
-  `assigned` or `running` returns that instance (`200`); any principal with `templates:launch` in that account and
-  project may also stop it (§7.2).
+  by the desktop app's updater, §14.1). This lets a security fix move an image digest without a hub release, so the
+  hub also refuses to go back (anti-rollback):
+  - **High-water mark.** The hub stores, in its database, the `bundle_version` and SHA-256 of the highest bundle it
+    has ever loaded (`template_bundle_state`, §13), written in the same step that makes the bundle current. A hub
+    upgrade whose embedded bundle is above the mark raises it at start.
+  - **Loading a bundle file** requires all of: the signature verifies against the embedded public key; its
+    `bundle_version` is higher than the embedded one (the embedded floor); it is not lower than the mark, and a bundle
+    equal to the mark has the recorded SHA-256 (the same bundle loaded again at start); its `min_hub_version` is at
+    most the hub's version. Otherwise the hub logs why and ignores the file.
+  - **What it serves.** The highest of the valid bundle file and the embedded bundle, as long as it is not below the
+    mark. If neither reaches the mark (the file at the mark was deleted or damaged), the hub serves no template:
+    `GET /v1/templates` returns an empty list with `bundle_error`, a launch gets `503 templates_unavailable`, and the
+    desktop app's next update check fetches the current bundle again (§14.1). An older bundle is never served.
+  - The hub reads `<data>/templates/` at start and every 60 s; a bundle that becomes current is audited as
+    `template_bundle_loaded` with its version.
+- **Launch.** `POST /v1/templates/{id}/launch` validates `params` against the template (unknown parameter, wrong type or
+  out of bounds → `422 invalid_params`), builds the JobSpec through the parameter targets, sets
+  `template: {id, version}` and creates the job with the caller as principal. Caps, image allowlists and placement
+  apply as for any job. For a `singleton` template, a launch while an instance is `queued`, `assigned` or `running`
+  returns that instance (`200`); any principal with `templates:launch` in that account and project may also stop it
+  (§7.2).
 - **Launch by a capped principal** (one with a `daily_unit_cap`). The launch is checked against the cap before the job
   exists, and refused with H1's `402 cap_exceeded` and a `detail` that names the template, the units it needs and
   the units left today, so the UI can say "Your daily limit does not allow <template>". A batch template passes when
@@ -778,8 +852,8 @@ No endpoint returns blob contents: the hub is not a file store.
 
 | Template | Kind | What | Status |
 |---|---|---|---|
-| `private-chat` | service, singleton, `ui = "chat"` | Ollama (MIT [S12]) with its API on port 11434, models in `tpl:private-chat/models` (20 GiB cap), `idle_timeout_s` a parameter (15 min to 24 h, default 1 h), `timeout_s` 30 days (the maximum; after it the chat UI offers "Restart"). Parameter `model`: an enum of small models whose licenses allow this use; default **a model of at most ~4 B parameters with an Apache-2.0 or MIT license (H)**, chosen in E11 by quality, size (about 2.5 GiB **(H)**) and VRAM (fits 6 GiB **(H)**). Ollama follows `HTTPS_PROXY` for downloads [S12], which the shim sets (H1 §9). | E11 pins the image digest, the model list and the egress hosts. |
-| `transcribe` | batch, `ui = "transcribe"` | whisper.cpp (MIT; upstream publishes `ghcr.io/ggml-org/whisper.cpp:main-cuda` with ffmpeg included [S13]) with a fixed script (`/inputs/.template/transcribe.sh`, shipped as an inline `files` entry of the template, so it is read-only in the container): convert the input with ffmpeg, run the model, write `transcript.txt`, `.srt` and `.vtt` to `/outputs`. Parameters: `language` (enum, default `auto`), `model` (`base`, `small` default, `medium`). Models in `tpl:transcribe/models` (5 GiB cap). | E11 chooses the image (an upstream image with ffmpeg and CUDA, or our own build published by digest) and the model download hosts. |
+| `private-chat` | service, singleton, `ui = "chat"` | Ollama (MIT [S12]) with its API on port 11434, models in `tpl:private-chat/models` (20 GiB cap), `idle_timeout_s` an `int` parameter with target `field:service.idle_timeout_s` (900-86,400 s, default 3,600, inside the field's 300-604,800 range), `timeout_s` 30 days (the maximum; after it the chat UI offers "Restart"). Parameter `model`: an enum of small models whose licenses allow this use; default **a model of at most ~4 B parameters with an Apache-2.0 or MIT license (H)**, chosen in E11 by quality, size (about 2.5 GiB **(H)**) and VRAM (fits 6 GiB **(H)**). Ollama follows `HTTPS_PROXY` for downloads [S12], which the shim sets (H1 §9). | E11 pins the image digest, the model list and the egress hosts. |
+| `transcribe` | batch, `ui = "transcribe"` | whisper.cpp (MIT; upstream publishes `ghcr.io/ggml-org/whisper.cpp:main-cuda` with ffmpeg included [S13]) with a fixed script (`/inputs/.template/transcribe.sh`, shipped as an inline `files` entry of the template, so it is read-only in the container): convert the input with ffmpeg, run the model, write `transcript.txt`, `.srt` and `.vtt` to `/outputs`. Parameters: `audio` (`blob`, target `input:/inputs/audio`), `language` (enum, default `auto`, target `env:LANGUAGE`), `model` (`base`, `small` default, `medium`; target `env:MODEL`). Models in `tpl:transcribe/models` (5 GiB cap). | E11 chooses the image (an upstream image with ffmpeg and CUDA, or our own build published by digest) and the model download hosts. |
 
 The chat UI is part of the web app (§9.4): it talks to Ollama's HTTP API (`/api/tags`, `/api/pull` with streamed
 progress, `/api/chat` with `stream: true`) through §7.4. Nothing of a third-party web UI is loaded into the phone.
@@ -789,9 +863,10 @@ progress, `/api/chat` with `stream: true`) through §7.4. Nothing of a third-par
 `invalid_ticket`, `not_paired`, `unexpected_authorization`, `last_admin_device`, `service_not_running`,
 `service_not_ready`, `port_not_exposed`, `too_many_connections`, `node_unreachable`, `unknown_blob`,
 `inputs_exceed_disk`, `digest_mismatch`, `quota_exceeded`, `blob_in_use`, `volume_in_use`, `volumes_not_allowed`,
-`node_offline`, `read_only_field`, `unknown_template`, `invalid_params`, `join_request_closed`. Every one is in the
-OpenAPI document with its HTTP status. H1's `last_admin_key` stays, unchanged, for keys (§5.5), and H1's
-`cap_exceeded` serves template launches too (§7.6).
+`node_offline`, `read_only_field`, `unknown_template`, `invalid_params`, `templates_unavailable`,
+`join_request_closed`. Every one is in the OpenAPI document with its HTTP status. H1's `last_admin_key` stays,
+unchanged, for keys (§5.5), and H1's `cap_exceeded` serves template launches too (§7.6). The MCP tool error
+`path_not_allowed` (§7.8) is not an API error.
 
 ### 7.8 Clients (CLI, SDK, MCP)
 
@@ -817,8 +892,35 @@ output) apply to every new command.
     `p2pc nodes ls` shows `approval`.
 - **Python SDK.** `client.blobs.put(path)`, `client.jobs.run(..., inputs={"/inputs/x": blob})`,
   `client.services.run(...)`, `client.services.connect(job, port)`, `client.templates.list()/launch(...)`.
-- **MCP.** `p2pc_run` accepts `inputs` with blob digests; a new tool `p2pc_blob_put` uploads a local file. No service
-  tools in H2.
+- **MCP.** `p2pc_run` accepts `inputs` with blob digests only, never a local path. A new tool `p2pc_blob_put` uploads
+  a local file. No service tools in H2. H1 treats the agent behind MCP as steerable by untrusted job output (H1 §7
+  "Job output is data"), so a prompt-injected agent must not be able to upload `~/.ssh/*` or the CLI's credentials as
+  a blob and then send them out through a job with egress. `p2pc_blob_put` therefore reads only from one directory
+  (SI-H2-21):
+  - **The upload directory.** `p2pc mcp --upload-dir <dir>`, default `~/p2pc-uploads`. At start `p2pc mcp` creates it
+    with mode 0700 if it is missing. It refuses to start when the directory is a symbolic link, is not a directory
+    owned by the user, or grants group or other access; and when it is the user's home directory itself, or is,
+    contains or lies inside the p2pc config and credentials directory.
+  - **Paths.** The tool takes a path relative to the upload directory; an absolute path is accepted only when it lies
+    lexically under the upload directory, and is then handled as the relative rest. Empty, `.` and `..` components,
+    and any component that starts with `.` (hidden files and directories), are refused before anything is opened.
+  - **No symbolic link anywhere.** The tool opens the upload directory with `O_NOFOLLOW | O_DIRECTORY` and each
+    component below it with `openat(O_NOFOLLOW)` (`O_DIRECTORY` for the intermediate ones), so no link is followed in
+    any component. Where the platform has no `openat` (Windows), it canonicalizes the path, re-checks that the result
+    is under the canonical upload directory, and refuses the path if any component is a symbolic link or another
+    reparse point.
+  - **Regular files only.** Before opening the last component, an `fstatat(AT_SYMLINK_NOFOLLOW)` must show a regular
+    file; it is then opened with `O_NOFOLLOW | O_NONBLOCK` (so a FIFO swapped in cannot block), and `fstat` on the
+    descriptor must show a regular file with the same device and inode. FIFOs, sockets, devices and directories are
+    refused.
+  - **Size.** The size from `fstat` must be at most the hub's `max_blob_mb` (from `GET /v1/server`, §7.3). The hash
+    and the upload read the same descriptor, never the path again, and the upload stops with an error if the file
+    yields more bytes than that size.
+  - **Errors** are the tool error `path_not_allowed` with the rule that failed. The tool never returns file contents.
+
+  The same rule, through the same function, applies wherever the CLI reads a local file on an agent's behalf; in H2
+  `p2pc_blob_put` is the only such place. The interactive `p2pc blobs put` and `p2pc run --input` read the path the
+  user typed, as any CLI command does.
 
 ## 8. Desktop app
 
@@ -846,11 +948,31 @@ output) apply to every new command.
 | 1 | **Welcome** | What P2PC does and does not do, in five lines: it runs only what you start, nothing is visible on your network, you can stop or uninstall at any time, no account, no telemetry. Then one explicit choice with **nothing preselected**: "Check for updates and verify the web app automatically: Yes / No" (§14.1, §9.6; hard rule 6). "Start" stays disabled until the user picks one; Settings has the same toggle. The beta testers' guide asks testers to choose "Yes". | — |
 | 2 | **Checks** | Windows build ≥ 22000 (Windows 10 21H2+ works for H1 but is not supported by the beta app); virtualization on in the firmware; WSL present and ≥ 2.0; WSL default version 2; ≥ 20 GiB free on the profile's drive; NVIDIA driver present (warning only). These are `install.ps1`'s checks (H1 deploy README), same thresholds (its `-MinFreeGB 20` counts in units of 2^30 bytes, so GiB). In the background the node image download starts (§8.3). | 15 s |
 | 2a | **Install WSL** (only if missing or too old) | Explains why, then runs `wsl.exe --install --no-distribution` **elevated** (one UAC prompt) [S6]. If the Virtual Machine Platform had to be enabled, asks for the **one reboot** and registers a `HKCU\…\RunOnce` entry so the app reopens at step 2 after it. | 1-2 min + reboot |
-| 3 | **Share** | Three controls: CPU cores (1 … the WSL VM's processors), RAM (1 GiB … the WSL VM's memory, which WSL caps at 50 % of the host's RAM by default [S7]; the app never edits `.wslconfig`, H1 §9.0), GPU on/off (only if the node reports an offerable GPU), and one "Disk space for P2PC" control: the share `D` (default 90 GiB, at most free space − 20 GiB) is split with one formula, jobs `offered.disk_mb = min(50 GiB, D / 2)` and volumes `volumes_mb = D − that`; the default gives 45 GiB for jobs and 45 GiB for volumes. A "Keep this PC awake while sharing" switch (§8.6). Meanwhile the image is verified and imported (`wsl --import … --version 2`). | 30-90 s (import < 1 min, H1 deploy README) |
+| 3 | **Share** | Three controls: CPU cores (1 … the WSL VM's processors), RAM (1 GiB … the WSL VM's memory, which WSL caps at 50 % of the host's RAM by default [S7]; the app never edits `.wslconfig`, H1 §9.0), GPU on/off (only if the node reports an offerable GPU), and one "Disk space for P2PC" control, the share `D` for jobs and volumes (disk arithmetic below). A "Keep this PC awake while sharing" switch (§8.6). Meanwhile the image is verified and imported (`wsl --import … --version 2`). | 30-90 s (import < 1 min, H1 deploy README) |
 | 4 | **Create or join** | "Create my cloud" (first PC) or "Join my cloud" (§5.4). Create: writes `hub.enabled`, runs `p2pc-server init --owner-device <the app's device NodeId> --hub-name "My cloud"`, starts the hub, makes a join token over the app's own device connection and joins the local agent through stdin. | 15-30 s |
 | 5 | **Add my phone** | A QR code with a pairing ticket (phone profile, 10 min), the web app URL as text, and "Skip for now". Shows "Paired: <platform>" when it happens. | 30-60 s |
 | — | **Ready** | "Your cloud is ready", the PC list, the phone list, and (hub PC) the sentence of §8.6. | — |
 
+- **Disk arithmetic.** P2PC's disk use on a PC has four parts, all on the profile's drive (the distro's virtual disk):
+  - `D`, the share of step 3, split with one formula: jobs `offered.disk_mb = min(50 GiB, D / 2)` and volumes
+    `volumes_mb = D − that`;
+  - `I`, the node's container image store: an allowance of 16 GiB **(H)** for the template images (CUDA builds of
+    Ollama and whisper.cpp) plus a few job images; E11 measures the template images and fixes `I`. H1's per-image size
+    cap still applies, and H1's disk floor protects the owner's disk if images grow past `I`;
+  - `B`, on the hub PC only, the hub's blob quota (`blobs_quota_mb`, §7.5);
+  - the 20 GiB floor of step 2, which stays free.
+
+  So `D ≤ free − 20 GiB − I − B`, and the control's default is `min(90 GiB, that)`. Step 3 does not yet know whether
+  the PC will host the hub, so it computes with `B = 0`; "Create my cloud" (step 4) then sets `blobs_quota_mb` to
+  `min(20 GiB, free − 20 GiB − I − D)`, and when that is under 4 GiB (twice the largest blob) it goes back to step 3
+  and asks for a smaller share.
+  - **Minimum for the templates.** Both templates need `D ≥ 50 GiB`: that gives 25 GiB for volumes (20 GiB for
+    `private-chat`'s models plus 5 GiB for `transcribe`'s, §7.6) and 25 GiB for jobs. The Share control marks 50 GiB;
+    below it, the app says "The AI chat and transcription may not run on this PC" (the scheduler finds the node
+    ineligible for a volume that does not fit, §11.3). Step 2 keeps `install.ps1`'s 20 GiB check for the distro and adds
+    a warning when free space is under `20 GiB + I + 50 GiB` (86 GiB with the default `I`; 106 GiB on a PC meant to be
+    the hub, with the default `B`).
+  - With the defaults, a PC needs `90 + 16 + 20 = 126` GiB free for the default share, and the hub PC 146 GiB.
 - **Budget.** On the reference PC (§16) with WSL already installed, steps 1-5 fit in about 3-4 minutes **(H)**: image
   download ≈ 430 MB (H1 deploy README) ≈ 35 s at 100 Mbit/s, import < 1 min, distro start ≈ 1 s (E1: 0.78 s), hub init
   and join a few seconds. E10 measures it, including the WSL-install path.
@@ -1037,10 +1159,10 @@ AC-H2-9 checks the result with a before/after inventory of the user profile, `HK
 |---|---|
 | `/pair` | Reads the ticket from the fragment, clears it, pairs (§5.3), or explains the iOS steps (§9.3). Also "Scan pairing code" (camera, bundled QR decoder). |
 | `/invite` | Phone-assisted join of a PC (§5.4): sends the join request, waits for the approval on the hub PC, shows the hub phrase, then hands over the join token. |
-| `/` (home) | Hub name and online state; PCs (name, online, sharing or paused, GPU); running services; shortcuts to the templates. |
+| `/` (home) | Hub name and online state; PCs (name, online, sharing or paused, GPU); running template services of its template view (§5.5); shortcuts to the templates. |
 | `/chat` | The private chat (§9.4). |
 | `/transcribe` | Upload, launch, follow, read the transcript (§9.4). |
-| `/jobs` | Read-only list of recent jobs and their state. |
+| `/jobs` | Read-only list of the recent jobs it can see and their state: with the default profile, the template jobs this device launched and the shared `singleton` instances (template view, §5.5). |
 | `/settings` | This device (label, scopes, "Forget this cloud" = self-revoke and wipe), versions (web app, hub, API), relay in use, "How to verify this app" (§9.6). |
 
 ### 9.3 Device key storage in the browser
@@ -1145,9 +1267,11 @@ that load it. Mitigations, none of them complete:
 3. **A self-hosted copy.** The desktop app's `web_app_origin` setting changes the origin that pairing QR codes point
    to. Keys are bound to the origin (browser storage is per origin), so moving means pairing again.
 4. **Bounded device power** (§5.5): a stolen device key with the default phone profile can launch vetted templates,
-   open services, read job state, upload blobs and open join requests, which do nothing until an `admin` approves them
-   on the hub PC. It cannot run arbitrary containers, mint join tokens or create pairing tickets, and no PC it helps
-   enroll gets work without that approval (SI-H2-19).
+   read the state, logs and outputs of the template jobs it launched, use and stop the shared chat service (including
+   its model pulls and deletions through Ollama's API), upload, check and delete unreferenced blobs, and open join
+   requests, which do nothing until an `admin` approves them on the hub PC. It cannot run arbitrary containers, read
+   developer jobs or other devices' template jobs, open a non-template service, mint join tokens or create pairing
+   tickets, and no PC it helps enroll gets work without that approval (SI-H2-18, SI-H2-19).
 5. **The service worker** caches the app shell only; it never intercepts or caches API traffic (there is no HTTP API
    traffic in the browser: it all goes through iroh). Its updates are subject to the same host risk; the app shows the
    version it runs in Settings.
@@ -1210,7 +1334,8 @@ A chat needs well under 100 kbit/s; a blob upload is bounded by the relay (§7.5
 ### 10.4 Exposure
 
 - **Address hygiene is unchanged** (H1 §10, E4) for the hub, the agents and the desktop app's native endpoint: no port
-  mapping, default-route addresses only, no third-party address discovery.
+  mapping, default-route addresses only, no third-party address discovery. §10.5 covers what the hub's endpoint
+  accepts.
 - **What listens.** No TCP port reachable from the LAN: the app opens no TCP listener, and the hub's REST binds the
   distro's loopback, which `localhostForwarding` also exposes on the Windows host's own loopback, never on its LAN
   addresses (§8.5). The app's iroh endpoints bind UDP sockets, as the agent's endpoint already does in H1: the device
@@ -1220,6 +1345,38 @@ A chat needs well under 100 kbit/s; a blob upload is bounded by the relay (§7.5
   user gives, because its connections are outbound or relayed (E10 records the prompt; the beta guide explains it).
   Service ports exist only on the container's loopback (§11.2). On the internet, the project's footprint is the static
   host and the relay. SI-H2-10 and SI-H2-11 test it.
+
+### 10.5 The hub's iroh endpoint
+
+On the hub PC, the hub's iroh endpoint is the one P2PC endpoint that accepts incoming connections. It does so as H1's
+server already does, but now by default on a home PC, so its exposure is stated here.
+
+- **Where it binds.** One UDP socket inside the distro, on the WSL side. With WSL's default NAT networking the WSL VM
+  sits behind the Windows host's NAT, so nothing on the LAN or the internet can send it an unsolicited packet: a peer
+  reaches it only through a relay, or directly once iroh's hole punching, coordinated through that relay, has opened
+  the path from inside. The hub keeps H1's address hygiene (no port mapping, default-route addresses only, §10.4) and
+  binds no TCP port beyond the loopback REST listener (§8.5).
+- **Mirrored networking.** With `networkingMode=mirrored` (an opt-in in `.wslconfig`, which the app never edits) the
+  socket sits on the host's own addresses, so a LAN peer that knows the port can send to it directly; what it accepts is
+  the same set below. `p2pc-wsl` detects mirrored mode (for example with `wslinfo --networking-mode` run in the distro),
+  the app warns, and `p2pc-agent doctor` says so. E10 records whether the Hyper-V firewall drops unsolicited inbound UDP
+  in that mode.
+- **What it accepts from any NodeId** (unauthenticated surface), per ALPN:
+  - `p2pc/agent/1`: only `Join` with a valid join token, under H1's "Before `Join`" limits (H1 §6: 64 connections,
+    16 pending `Join`s, 10 s, 10 failures a minute per NodeId and 60 in total);
+  - `p2pc/http/1`: HTTP requests that each need an API key (H1 §10), inside H1's tunnel budget (128 streams) and slow
+    client limits, and refused with H1's same `401` without one;
+  - `p2pc/pair/1`: one `Pair` with a pairing ticket, under the limits of §5.3 (32 connections, 8 pending, 10 s, 4 KiB,
+    failures counted per NodeId and per ticket-hash prefix). **It is served only while a pairing ticket is open**
+    (unexpired and unrevoked; a consumed ticket stays open until its expiry, for the idempotent retry of §5.2).
+    Otherwise the hub removes it from the endpoint's accepted ALPNs, so the TLS handshake fails before any message, and
+    adds it back when a ticket is created; if E12 shows the ALPN list cannot change at run time, the hub closes every
+    `p2pc/pair/1` connection at once, before reading a frame;
+  - `p2pc/device/1`: nothing from a NodeId that is not a live device: the connection is closed with `not_paired`
+    right after the handshake (§5.5).
+- **Hard rule 4.** The rule is about nodes, which only connect outbound. The hub is the server: on the hub PC the
+  local agent still only dials out, and the hub listens only through the UDP socket iroh already needs, reachable as
+  above and with every ALPN behind a ticket, a token, a key or a paired NodeId. SI-H2-11 probes it.
 
 ## 11. Sandbox additions
 
@@ -1278,9 +1435,20 @@ implemented before the separate change that puts it in force (O-16); T2-22 waits
 - **Who may mount.** The agent mounts a volume only into a lease whose job is `kind = "service"` or carries `template`,
   and only from the directory of that job's account; anything else is rejected as `invalid_job` (the hub already
   refuses it with `422 volumes_not_allowed`, §7.1).
-- **One holder at a time.** A volume is mounted by at most one lease; the agent takes an exclusive lock and rejects a
-  second lease (`insufficient_capacity`, with the reason logged). The scheduler knows holders from `VolumeReport` and
-  does not offer such a lease.
+- **One holder at a time.** A volume is mounted by at most one container. The agent takes an exclusive lock for a
+  lease and rejects a second lease while it is held (`insufficient_capacity`, with the reason logged). The scheduler
+  knows holders from `VolumeReport` and does not offer such a lease.
+  - **The lock lasts as long as the container, not the lease.** It is taken before `podman run` and released only
+    when Podman confirms that the lease's container is gone: `podman rm` succeeded, or `podman container exists` on
+    its name reports it absent. A lease that ends, is cancelled or is lost keeps the lock until then; if the removal
+    fails, the lock stays, the volume is reported `in_use_by` that lease, and the agent retries the removal at every
+    sweep.
+  - **It survives agent restarts.** The lock is persisted: `meta.json` records the holder (lease id and container
+    name) with a write-to-temporary, `fsync` and `rename` before `podman run`, and clears it only after the
+    confirmation above. At start the agent treats every recorded holder as held; its orphan sweep removes the
+    containers of leases it no longer runs (the `p2pc` labels, §11.1), confirms each one absent the same way, and only
+    then clears their locks. No walk and no mount of a volume happens before the lock is free and the sweep has
+    finished for it.
 - **Size.** Measured every 60 s with H1's fail-closed disk measurement (larger of apparent and allocated size, entry
   budget, three failures count as over). Over `max_mb` → the lease stops with `error="volume_limit"`.
 - **Budget.** `volumes_mb` (the share of §8.2) covers every volume on the node. Placement of a lease needs
@@ -1298,8 +1466,9 @@ implemented before the separate change that puts it in force (O-16); T2-22 waits
   through it would reach its other name) refuses the mount: the lease fails before start with
   `error="volume_unsafe"` (a `start_failed`-class error, H1 §9 "Podman failures are not job exits") and the volume is
   kept for the owner to delete (`VolumeDelete`), never repaired in place. The walk uses H1's entry budget of the disk
-  measurement; over it the mount is refused the same way. The walk runs while no container holds the volume (one
-  holder at a time, above), so nothing can change the tree between the walk and the mount. E11 confirms that the
+  measurement; over it the mount is refused the same way. The walk runs only after the lock is free (no container
+  of an earlier lease exists, as Podman confirmed, even across an agent restart; "One holder at a time", above) and
+  is taken for the new lease, so nothing can change the tree between the walk and the mount. E11 confirms that the
   template images write no links into their volumes.
 - **Deletion** walks the tree with `openat(O_NOFOLLOW)` and `unlinkat`, never following a link (SI-H2-9).
 - **Namespace.** `tpl:` volumes are created only by template launches (§7.1), so an arbitrary image cannot read or
@@ -1315,8 +1484,9 @@ implemented before the separate change that puts it in force (O-16); T2-22 waits
 - **Liveness.** SI-13 holds for services: a partitioned agent stops them after `agent_lease_ttl_s`, and the hub then
   requeues them per `restart`. A hub restart shorter than that keeps them running (H1 "Server restart").
 - **Disk polling, the disk floor, image pulls** (`IfNotPresent`, shared pulls, the size cap) are unchanged.
-- **Usage reports.** For services the agent adds `used_cpu_ms` (cumulative, from the lease cgroup) to each
-  `Heartbeat.running[]` entry, at most once a minute, for the daily split (§12).
+- **Usage reports.** For services the agent adds `used_cpu_ms` (cumulative) and `max_rss_mb` (the attempt's peak so
+  far), both from the lease cgroup, to each `Heartbeat.running[]` entry, at most once a minute, for the daily split
+  (§12).
 
 ### 11.5 Residual sandbox risks added by H2
 
@@ -1346,6 +1516,22 @@ implemented before the separate change that puts it in force (O-16); T2-22 waits
     watchdog, cancel on an unreachable node) gets H1's estimate, cut into slices the same way.
 
   `GET /v1/usage` and the caps count the same rows (H1 rule), so a week-long chat service shows up day by day.
+- **`GET /v1/usage` over slices and principals.** The response keeps H1's shape (fields may only be added) and its
+  selection (rows that ended in `[from, to)`). With slices and device principals each field means:
+  - the sums (`reserved_cpu_ms`, `reserved_gpu_ms`, `used_cpu_ms`, `units`) add every selected row, slices included;
+    `max_rss_mb` is the maximum over the selected rows;
+  - `attempts` counts finished attempts: the selected rows with `last_slice = 1` (H1 counted every row, which is the
+    same for batch jobs, whose only row is their last slice). A running service's midnight slices add to the sums but
+    not to `attempts`;
+  - `estimated_attempts` keeps its H1 meaning, how many of `attempts` are server estimates: selected rows with
+    `last_slice = 1` and `estimated = 1`. The additive `estimated_slices` counts every selected row with
+    `estimated = 1`, so a midnight slice estimated for lack of reports is visible too;
+  - `group_by=key` groups rows by `key_id` and leaves device rows out of the groups; `group_by=device` groups by
+    `device_id` and leaves key rows out; `group_by=template` leaves out rows with no template. A group is never null:
+    a row whose grouping column is NULL is filtered out in the query, never decoded. `group_by=job`, `node` and `kind`
+    cover every row. The response's `total` always covers every selected row, so with devices in use the `key`
+    groups may add up to less than the total; `group_by=principal` (new) covers every row, labelled `key:<id>` or
+    `device:<id>`.
 - **Ledger columns and key.** `usage_records` is rebuilt (§5.6) with:
   - the principal: `key_id` or `device_id`, exactly one (§5.6);
   - `kind` (`batch` or `service`) and `template_id` (nullable);
@@ -1356,7 +1542,9 @@ implemented before the separate change that puts it in force (O-16); T2-22 waits
     whose cap admitted the job, as H1 charges it;
   - `started_at` keeps the attempt's start, and `ended_at` is the slice's end (`= slice_end`), so H1's
     `CHECK (ended_at >= started_at)` holds and `GET /v1/usage` keeps H1's selection (rows that ended in `[from, to)`);
-    `estimated_attempts` keeps its name and counts estimated rows, as in H1.
+  - `max_rss_mb`: for a last slice, the agent's final report, as in H1; for a midnight slice, the latest
+    `Heartbeat.running[].max_rss_mb` of the attempt (its peak so far, §11.4), so never below the slice's own peak;
+    with no report, 0 and the slice is `estimated = 1`, as H1's estimates record it.
 
   The key `UNIQUE (job_id, attempt, slice_start)` replaces H1's `UNIQUE (job_id, attempt)`. `lease_id` stays
   `NOT NULL REFERENCES leases (id)` but is no longer `UNIQUE`, since every slice of an attempt names its lease. A
@@ -1369,8 +1557,8 @@ implemented before the separate change that puts it in force (O-16); T2-22 waits
   services; a finished attempt has exactly one `last_slice = 1` row and a running one has none; a running service
   attempt has one row for each midnight it crossed and none for its current slice. The property test drives the clock
   across midnights. T2-16 changes the test together with the code.
-- **Grouping.** `GET /v1/usage?group_by=` gains `device`, `kind` and `template`, and each group keeps
-  `estimated_attempts`.
+- **Grouping.** `GET /v1/usage?group_by=` gains `device`, `principal`, `kind` and `template` (above), and each group
+  keeps `estimated_attempts` and gains `estimated_slices`.
 - **The cap query.** A principal P's cap for the UTC day D is checked against `spent(P, D)`, which replaces H1's
   `spent_between` (`crates/p2pc-server/src/store/leases.rs`, which counts jobs by `created_at`). In milli-units, it is
   the sum of:
@@ -1413,7 +1601,8 @@ implemented before the separate change that puts it in force (O-16); T2-22 waits
   - New tables (additive migrations): `devices`, `pairing_tickets`, `join_requests`, `blobs` (with the GC tombstone
     `deleting_at`), `blob_refs`, `volume_reports`, `service_state` (health, last activity, consecutive unhealthy
     attempts, node-loss restart times of the last 24 h, and the day's cap reservation as `cap_day` and
-    `cap_reserved_units`, §12), `service_traffic`, and the node columns `approval` and `enrolled_by`.
+    `cap_reserved_units`, §12), `service_traffic`, `template_bundle_state` (one row: the high-water `bundle_version`
+    and its SHA-256, §7.6), and the node columns `approval` and `enrolled_by`.
   - Rebuilt tables (one forward-only migration that keeps every append-only trigger, §5.6): `jobs`, `usage_records`
     (principal and slice columns, the new key, §12), `join_tokens` and `audit_events`.
   - Blobs: `<data>/blobs/<account_id>/sha256/<aa>/<bb>/<hex>` (per account, §7.5), staging in
@@ -1446,6 +1635,16 @@ implemented before the separate change that puts it in force (O-16); T2-22 waits
     last check, and after 30 days without one the app shows a local reminder, sending nothing.
 - **When.** The app downloads in the background and installs when the user agrees or at the next start; never in the
   middle of the first run.
+- **Template bundles** (§7.6) travel the same way and are part of the update check, not a third kind of request: each
+  release publishes `templates.json` and its minisign signature on GitHub Releases, and a bundle-only release (a
+  security fix that moves an image digest) publishes them alone. The channel's `templates-latest.json` names the current
+  bundle's URL and `bundle_version`. The app on the hub PC fetches it in the same check, under the same opt-in
+  (automatically only when the user said yes; otherwise on "Check for updates"), carrying no identifier. When the named
+  version is above the hub's current one (`GET /v1/templates`), or the hub serves none, it downloads the bundle and its
+  signature, verifies the signature against the public key compiled into the app, and copies both into the distro's
+  `<data>/templates/` through `wsl.exe`. The hub verifies again and applies §7.6's anti-rollback rule; the app's own
+  check only saves a useless copy. Like `latest.json`, `templates-latest.json` is not signed, so a stale or hostile
+  endpoint can at most withhold a bundle or offer an older one, which the hub refuses.
 
 ### 14.2 The distro (agent, hub, image)
 
@@ -1466,7 +1665,7 @@ implemented before the separate change that puts it in force (O-16); T2-22 waits
 | hub ↔ agent | agent ≥ hub's `min_agent_version` (H1); hub ≥ the image's `min_server_version`; an agent newer than its hub sends only what the hub knows (H1) | `agent_too_old` exit 6 (H1); the joined PC waits (§14.2) |
 | app ↔ distro | the app manages exactly the image version it pins; it never downgrades a distro | a distro newer than the app (another tool upgraded it) → the app updates itself first |
 | web app ↔ hub | `GET /v1/server` returns `api_version` and `min_web_version` | web app too old → it reloads to update; hub too old for a feature → "Update the P2PC app on your hub PC" |
-| template bundle ↔ hub | `min_hub_version` (§7.6) | the hub keeps its embedded bundle |
+| template bundle ↔ hub | `min_hub_version` and the high-water `bundle_version` (§7.6) | the hub ignores the bundle and keeps the highest bundle it may serve; below the high-water mark it serves none (`templates_unavailable`) |
 | device protocol | ALPN `p2pc/device/1` (and `/pair/1`, `/invite/1`); a breaking change takes `/2` and the hub serves both for one release | a phone on `/1` after the hub dropped it → "Update the web app" |
 
 ### 14.4 Windows code signing
@@ -1499,36 +1698,40 @@ H1's SI-1 to SI-13 stay in force and keep their tests.
 | SI-H2-1 | No secret appears in logs, `Debug` output, errors, audit events, the app's logs or the browser console: device keys, pairing tickets, invite codes, join tokens, API keys. A test scans the outputs of every pairing, invite and join path. |
 | SI-H2-2 | Pairing tickets are single-use and expire, checked against the hub's row, never the payload. Two concurrent `Pair`s for one ticket create exactly one device; a retry from the same NodeId is idempotent while its device is live; a retry from the same NodeId after that device was revoked gets `invalid_ticket` and creates nothing; every failure is the same `invalid_ticket`. Tests: the concurrent pair, the retry, the retry after revocation (by an `admin` and by the device itself), a retry from another NodeId. |
 | SI-H2-3 | A device principal exists only on `p2pc/device/1`. No request on the TCP listener or `p2pc/http/1` can carry one (no header, no query parameter); a device stream with an `Authorization` header gets `400`. |
-| SI-H2-4 | Revoking a device closes its live connections and its open service streams within 5 s, and later connections get the same `not_paired` as a NodeId never paired. Tested with an injectable clock and a real in-process hub. |
-| SI-H2-5 | Opening a service port requires `services:connect`, the job's account and project, a `running` service and a listed port, through one code path for every transport. Cross-account and unlisted-port negative tests. |
+| SI-H2-4 | Revoking a device closes its live connections and its open service streams within 5 s, and later connections get the same `not_paired` as a NodeId never paired. Paired non-`admin` devices cannot keep the owner from revoking: with every non-`admin` device at its per-device stream cap and the non-`admin` share of the device budget full (§6.3), an `admin` device still opens streams from its reserve and revokes; an idle device port connection closes after `device_port_idle_s`. Tested with an injectable clock and a real in-process hub. |
+| SI-H2-5 | Opening a service port requires `services:connect` (or `templates:launch` for a template service of the caller's template view, §5.5), the job's account and project, a `running` service and a listed port, through one code path for every transport. Cross-account, unlisted-port and template-view negative tests: a phone-profile device gets `404` on a `p2pc service run` service and on another device's non-singleton template service. |
 | SI-H2-6 | `PortOpen` and `BlobFetch` are fenced by `(lease_id, epoch)` on the hub and on the agent; a stale one is refused. |
 | SI-H2-7 | The agent never connects to a socket path inside a job's directories except its own `ingress.sock`, which it created in the read-only mount; the shim refuses unlisted ports. Tests: a symlink planted where a socket could be, an unlisted port, a fake shim. |
 | SI-H2-8 | Blobs are per account, in the database and on disk: `HEAD`, upload deduplication and `inputs` never see another account's blobs; the file lives under `<data>/blobs/<account_id>/`, and the lock is keyed by `(account_id, digest)`. The declared size is checked before the body is read, with `checked_add` against the quota; the hash is verified on upload and again on the node. Tests (with two accounts in the store, although H2 serves one): the same digest uploaded in both, then GC and `DELETE` in one, leave the other's file and row intact and readable by its job; concurrent upload in one account and GC in the other do not wait on each other's lock. |
-| SI-H2-9 | Volumes follow the one proposed hard-rule exception of §4.3 and nothing more, and only once it is in force (O-16): a volume directory is created by the agent, per account and named by hash, never taken from the JobSpec; it is mounted only into a service or template job of its account; before every mount the agent recreates or verifies the directory chain and walks the tree without following links, refusing any symlink, any entry that is not a directory or a regular file, and any regular file with more than one link; `tpl:` volumes are created only by template launches; size limits hold; deletion never follows a link. Tests: a batch non-template job with `volumes` (`422` at the hub, `invalid_job` at the agent), a cross-account lease, names with `/`, `..` and NUL, a symlink planted inside a volume before deletion, **a symlink (to a file and to a directory outside the volume), a FIFO and a hard-linked file planted inside a volume before it is mounted again with `:U` or `:idmap`** (the mount is refused with `volume_unsafe`, and the link's target keeps its owner), a symlink replacing `data/` or `<hash>/` itself, a golden argv test of the `-v` arguments. |
+| SI-H2-9 | Volumes follow the one proposed hard-rule exception of §4.3 and nothing more, and only once it is in force (O-16): a volume directory is created by the agent, per account and named by hash, never taken from the JobSpec; it is mounted only into a service or template job of its account; before every mount the agent recreates or verifies the directory chain and walks the tree without following links, refusing any symlink, any entry that is not a directory or a regular file, and any regular file with more than one link; `tpl:` volumes are created only by template launches; size limits hold; deletion never follows a link. Tests: a batch non-template job with `volumes` (`422` at the hub, `invalid_job` at the agent), a cross-account lease, names with `/`, `..` and NUL, a symlink planted inside a volume before deletion, **a symlink (to a file and to a directory outside the volume), a FIFO and a hard-linked file planted inside a volume before it is mounted again with `:U` or `:idmap`** (the mount is refused with `volume_unsafe`, and the link's target keeps its owner), a symlink replacing `data/` or `<hash>/` itself, a golden argv test of the `-v` arguments; **the one-holder lock**: a lease that ends while `podman rm` fails keeps the lock and a second lease is rejected; an agent restarted with an orphaned container still holding the volume walks and mounts nothing until its sweep has removed the container and Podman reports it absent. |
 | SI-H2-10 | A service container keeps `--network=none` (golden argv test) and its ports are reachable only through the bridge: a scan from the distro's network namespace, the Windows host and another LAN machine finds them closed. |
-| SI-H2-11 | P2PC adds no listener reachable from the LAN. TCP: the hub's REST is not reachable from another machine, and the desktop app opens no TCP listener. UDP: the app's only sockets are its iroh endpoints; the device endpoint accepts no incoming connection, and the invite listener exists only during a join and serves only `p2pc/invite/1`. Tests: socket enumeration of the app process (no TCP listener; UDP sockets only from its iroh endpoints), a TCP scan and a UDP probe of the Windows host from the LAN machine, and an incoming QUIC connection to the device endpoint that is refused. |
+| SI-H2-11 | P2PC adds no listener reachable from the LAN. TCP: the hub's REST is not reachable from another machine, and the desktop app opens no TCP listener. UDP: the app's only sockets are its iroh endpoints; the device endpoint accepts no incoming connection, and the invite listener exists only during a join and serves only `p2pc/invite/1`. The hub's endpoint accepts only what §10.5 lists, and serves `p2pc/pair/1` only while a pairing ticket is open. Tests: socket enumeration of the app process (no TCP listener; UDP sockets only from its iroh endpoints), a TCP scan and a UDP probe of the Windows host from the LAN machine (with NAT networking, no reply from the hub's socket), an incoming QUIC connection to the device endpoint that is refused, and probes of the hub's endpoint from an unknown NodeId through a relay: `p2pc/pair/1` with no ticket open fails at the handshake (or closes before a frame), `p2pc/device/1` gets `not_paired`, `p2pc/http/1` without a key gets `401`, and `p2pc/agent/1` without a valid `Join` is closed. |
 | SI-H2-12 | The web app and the desktop UI never turn untrusted text into HTML: a lint rule bans `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write`, `eval` and `new Function`; a DOM test feeds model output with `<script>`, `<img onerror>` and `javascript:` links and checks they render inert. The deployed header files contain the CSP of §9.5 (a test parses them). |
-| SI-H2-13 | Every template image is pinned by digest, and parameters reach the job only as whole env values or argv elements. A test runs over the bundle; a property test feeds shell metacharacters as parameter values and checks the resulting JobSpec. |
-| SI-H2-14 | The hub loads a template bundle only with a valid release signature, a higher `bundle_version` and a satisfied `min_hub_version`; fixtures for each failure. |
+| SI-H2-13 | Every template image is pinned by digest, and parameters reach the job only through the targets of §7.6: whole env values, whole argv elements, a field of the closed list (`service.idle_timeout_s`, `timeout_s`) within the template's bounds, which lie inside the JobSpec range, or an `inputs` entry at the template's fixed path. A test runs over the bundle (the shipped `private-chat` and `transcribe` pass it; a fixture with a `field:` target outside the list, or with bounds outside the JobSpec range, fails); a property test feeds shell metacharacters as parameter values and checks the resulting JobSpec; out-of-type and out-of-bounds values get `422 invalid_params`. |
+| SI-H2-14 | The hub loads a template bundle only with a valid release signature, a `bundle_version` above the embedded one and not below its persisted high-water mark (equal only with the recorded SHA-256), and a satisfied `min_hub_version`, and it never serves a bundle below the mark. Fixtures for each failure, plus: a validly signed bundle below the mark (the rollback case) is refused, also after a hub restart; a different bundle with the mark's version is refused; with the file at the mark deleted, the hub serves no template (`503 templates_unavailable`) rather than the older embedded bundle. |
 | SI-H2-15 | The app's updater refuses an artifact with a bad signature, without a signed version, or with a signed version not greater than its own. |
 | SI-H2-16 | An invite code is single-use; the hub phrase is a pure function of (hub NodeId, listener NodeId, code), the approval phrase of (agent NodeId, listener NodeId, invite expiry) and the node phrase of (node NodeId), each with test vectors; the app joins only after the explicit confirmation. The hub PC's approval screens show the phrase, the source device as recorded at pairing and the request or enrollment time; `approve` of a join request created more than 15 minutes ago gets `409 join_request_closed`; a join token of a join request enrolls only its bound agent NodeId (another NodeId gets H1's invalid-token answer and the token stays unused); one device cannot hold more than 2 open join requests or create more than 6 an hour (`429`). |
 | SI-H2-17 | `p2pc/pair/1` and `p2pc/invite/1` enforce their pre-auth limits (connections, pending exchanges, deadline, 4 KiB frames, failure rates); their decoders are fuzzed or property-tested. The limits never lock the owner out: with failure counters over their limits from other NodeIds and other ticket-hash prefixes, a `Pair` with a valid ticket that gets a connection slot still pairs (§5.3). |
-| SI-H2-18 | No escalation for devices: pairing tickets carry a subset of the creator's power (scopes, `daily_unit_cap`, image allowlist, expiry); a device's cap is enforced against its own principal (§12), never against the key or device that paired it; `nodes:join` creates tokens of at most 900 s and nothing else; `nodes:invite` creates only join requests; only `admin` creates pairing tickets; the last unrestricted `admin` principal cannot be revoked (`409 last_admin_key` for a key, `409 last_admin_device` for a device); a non-`admin` device sees only itself: `GET /v1/devices` returns a one-item list and `GET /v1/devices/{id}` of another device gets `404`. |
+| SI-H2-18 | No escalation for devices: pairing tickets carry a subset of the creator's power (scopes, `daily_unit_cap`, image allowlist, expiry); a device's cap is enforced against its own principal (§12), never against the key or device that paired it; `nodes:join` creates tokens of at most 900 s and nothing else; `nodes:invite` creates only join requests; only `admin` creates pairing tickets; the last unrestricted `admin` principal cannot be revoked (`409 last_admin_key` for a key, `409 last_admin_device` for a device); a non-`admin` device sees only itself: `GET /v1/devices` returns a one-item list and `GET /v1/devices/{id}` of another device gets `404`. **The default phone profile reaches only what §5.5 lists**, pinned by a negative test per route with a phone-profile device in a project that also holds a developer batch job, a `p2pc service run` service, another device's `transcribe` job and a `private-chat` instance launched by the owner: `POST /v1/jobs` gets `403`; `GET /v1/jobs` lists only its own template jobs and the singleton instance; `GET /v1/jobs/{id}`, `…/logs`, `…/outputs` and `…/outputs/{path}` of the developer jobs and of the other device's job get `404`; logs and outputs of the owner's singleton instance get `404`; `…/ports/{port}/connect` on the developer service gets `404`; `…/cancel` of the developer jobs and the other device's job gets `404` (and with `jobs:write`, H1's project-wide cancel still works); `GET /v1/usage`, `POST /v1/estimate`, `GET /v1/blobs`, `POST /v1/nodes/join-tokens`, `POST /v1/devices/pairing-tickets`, node drain, resume and delete, key and audit routes get `403`. |
 | SI-H2-19 | No PC gets work without an `admin`'s approval. The default phone profile has no `nodes:join`. A node enrolled with a token minted by a non-`admin` principal is `pending_approval`, and the scheduler never offers it a lease until an `admin` principal approves it; a join request yields a token only after an `admin` approval, only to the requesting device and only once. Tests: a property test over the scheduler with pending and approved nodes (no lease ever reaches a pending one); approval by a non-`admin` principal gets `403`; a `nodes:join` device's token gives a pending node; a join request's token call before approval, after delivery and from another device gets `409` or `404`; the phone profile's scope list is pinned by a test. |
-| SI-H2-20 | Ledger and caps stay exact with two kinds of principal and daily slices (§5.6, §12). Every row of `jobs`, `usage_records` and `join_tokens` names exactly one principal (`CHECK`); idempotency deduplicates per principal for keys and for devices alike; the ledger stays append-only after the rebuild; `spent(P, D)` never counts a service's reservation and the slices written against it twice, and gives H1's numbers for batch jobs. Tests: inserts with both or neither principal column set fail; two submissions with one idempotency key from one device give one job, and from two devices or from a device and a key give two; `UPDATE` and `DELETE` on `usage_records` fail after the migration; the migration test of §5.6; a property test with an injectable clock over batch and service jobs of key and device principals crossing midnights (reservations, slices, requeues, cancels), checking after every step that `spent(P, D)` equals the reference sum of §12, that a service's rows for a day exceed that day's `cap_reserved_units` only by an estimated slice of an attempt the hub could not reach at `cap_deadline` (up to the end it observed), and that ledger invariant 6 (one row per finished slice) holds; H1's cap tests pass unchanged. |
+| SI-H2-20 | Ledger and caps stay exact with two kinds of principal and daily slices (§5.6, §12). Every row of `jobs`, `usage_records` and `join_tokens` names exactly one principal (`CHECK`); idempotency deduplicates per principal for keys and for devices alike; the ledger stays append-only after the rebuild; `spent(P, D)` never counts a service's reservation and the slices written against it twice, and gives H1's numbers for batch jobs. Tests: inserts with both or neither principal column set fail; two submissions with one idempotency key from one device give one job, and from two devices or from a device and a key give two; `UPDATE` and `DELETE` on `usage_records` fail after the migration; the migration test of §5.6; a property test with an injectable clock over batch and service jobs of key and device principals crossing midnights (reservations, slices, requeues, cancels), checking after every step that `spent(P, D)` equals the reference sum of §12, that a service's rows for a day exceed that day's `cap_reserved_units` only by an estimated slice of an attempt the hub could not reach at `cap_deadline` (up to the end it observed), and that ledger invariant 6 (one row per finished slice) holds; H1's cap tests pass unchanged. `GET /v1/usage` over the same histories: `attempts` counts last slices only (a service that crossed three midnights is one attempt), `estimated_attempts` and `estimated_slices` match the reference, `group_by=key` with device rows present returns key groups only and never fails to decode, `group_by=principal` covers every row, and a midnight slice's `max_rss_mb` is the attempt's peak so far. |
+| SI-H2-21 | The MCP tool `p2pc_blob_put` reads only regular, non-hidden files inside the configured upload directory, of at most `max_blob_mb`, through no symbolic link in any component, from one descriptor (§7.8). `p2pc mcp` creates the directory 0700 and refuses an unsafe one. Tests (each refused with `path_not_allowed` and nothing uploaded): `../` traversal and a `..` component in the middle; an absolute path outside the directory (`/etc/passwd`, the CLI's credentials file); a symbolic link inside the directory to a file outside it, one to a directory outside it used as a middle component, and the upload directory itself replaced by a link; a hidden file and a file under a hidden directory; a FIFO (the call does not block), a socket and a device node; a sparse file over `max_blob_mb`; a file that grows during the upload. Start-up tests: an upload directory with group or other access, one that is the home directory, and one that contains the credentials directory are refused. |
 
 ### 15.2 Threat model additions
 
 | Threat | Mitigation | Residual |
 |---|---|---|
-| Stolen, unlocked phone | Bounded scopes (§5.5); revocation in ≤ 5 s; devices listed with `last_seen_at`; no `nodes:join` in the default profile, and every PC approved on the hub PC against a check phrase (SI-H2-16, SI-H2-19); at most 2 open join requests per device | Until revoked: open the chat (read and write), launch templates, read job state, upload blobs, and open join requests that the owner must approve on the hub PC. |
+| Stolen, unlocked phone | Bounded scopes and the template view (§5.5, SI-H2-18); revocation in ≤ 5 s; devices listed with `last_seen_at`; no `nodes:join` in the default profile, and every PC approved on the hub PC against a check phrase (SI-H2-16, SI-H2-19); at most 2 open join requests per device | Until revoked: use the shared chat service (chat with the owner's model, pull models from the template's egress hosts into its volume or delete them, stop it), launch templates and read the state, logs and outputs of the template jobs it launched, see the PCs, upload blobs, test whether a blob of a known digest exists and delete unreferenced ones, and open join requests that the owner must approve on the hub PC. Not: developer jobs, other devices' template jobs, non-template services, chat history of other devices. |
+| Misbehaving or many paired phones | Per-device stream cap, a share of the device budget reserved for `admin` devices, idle limits on device port connections (§6.3, SI-H2-4) | They can slow each other down; not the hub PC's app. |
+| Prompt-injected agent behind MCP | `p2pc_blob_put` reads only regular, non-hidden files inside one upload directory, through no symbolic link (§7.8, SI-H2-21); H1's capped key and image allowlist | Files the user put in the upload directory can be uploaded and used as job inputs. |
 | XSS in the web app | CSP, Trusted Types, no HTML sinks, no third-party code, SRI | A bug in our own code can still leak the device key. |
 | Malicious or compromised static host | Reproducible build, signed manifest, the desktop app's verification, self-hosted copy (§9.6) | Targeted tampering of one client is not detected. |
 | Malicious or compromised relay | End-to-end encryption [S1] | Sees NodeIds, timing and volume; can drop traffic. |
 | Photographed pairing QR | 10-minute, single-use ticket; the app shows each new device | A race inside the window. |
 | Photographed invite QR | Hub phrase and approval phrase (§5.4); the join request's token is bound to the agent NodeId of the QR | A user who confirms without comparing. |
 | Container escape | H1 sandbox; owner's jobs only (SI-1); digest-pinned templates | Now also reaches the hub (D1, §11.5). |
-| Compromised upstream template image | Digest pinning, reviewed bumps, signed bundle | Trust in upstream at pin time. |
+| Compromised upstream template image | Digest pinning, reviewed bumps, signed bundle, and the hub's anti-rollback high-water mark, so a stale or hostile update endpoint cannot bring back a replaced digest (§7.6, SI-H2-14) | Trust in upstream at pin time; an endpoint can withhold a fix (the 14-day notice of §14.1 makes a frozen endpoint visible). |
+| Unauthenticated peers at the hub's iroh endpoint | Reachable only through a relay or hole punching under WSL NAT; every ALPN behind a token, a ticket, a key or a paired NodeId; H1's and §5.3's pre-auth limits; `p2pc/pair/1` served only while a ticket is open (§10.5, SI-H2-11) | Pre-auth parsing bugs; with mirrored networking, LAN peers reach the same surface directly. |
 | The hub relays service bytes in clear | It is the owner's own machine | A compromised hub sees chats. |
 | Loss of the hub PC | Joined PCs give up after 14 days unreachable (`hub_gone`, §8.8); uninstalling the hub removes the other nodes first (§8.7) | The cloud is gone; pair and join again (O-12). |
 | Fake installer (unsigned beta) | Published hash, official links only | Users may be tricked until signing (O-1). |
@@ -1537,7 +1740,7 @@ H1's SI-1 to SI-13 stay in force and keep their tests.
 ## 16. Beta acceptance criteria
 
 **Lab.** (a) A clean Windows 11 VM with nested virtualization, from a snapshot, for install and uninstall; (b) the
-**reference PC**: Windows 11, an NVIDIA GPU with at least 6 GiB of VRAM, an SSD with at least 130 GiB free, 100 Mbit/s
+**reference PC**: Windows 11, an NVIDIA GPU with at least 6 GiB of VRAM, an SSD with at least 150 GiB free, 100 Mbit/s
 down; it is the hub; (c) a second Windows 11 PC (a laptop) as a joined node; (d) an iPhone with current iOS Safari and
 an Android phone with current Chrome, on 4G/5G with Wi-Fi off; (e) a Linux machine on the same LAN for scans. Scripted
 criteria live in `tests/acceptance-h2/`; **manual** ones have a written protocol there and a filled-in result sheet in
@@ -1562,32 +1765,39 @@ the release PR.
 
 Checked against the limits: a 30 MB audio file is well under `max_blob_mb` (2 GiB) and the template's `disk_mb`
 (4 GiB); with the §8.2 formula the default 90 GiB disk share gives jobs `min(50 GiB, 90 GiB / 2)` = 45 GiB and volumes
-90 − 45 = 45 GiB, which holds the two template volumes (20 GiB + 5 GiB = 25 GiB); and the reference PC's free space
-allows the default share (90 GiB + the 20 GiB floor of §8.2 = 110 GiB ≤ 130 GiB).
+90 − 45 = 45 GiB, which holds the two template volumes (20 GiB + 5 GiB = 25 GiB, also within the 50 GiB minimum share
+of §8.2); and the reference PC's free space allows the default share on the hub PC with the full blob quota (§8.2
+"Disk arithmetic": 90 GiB share + 16 GiB images **(H)** + 20 GiB blobs + the 20 GiB floor = 146 GiB ≤ 150 GiB).
 
 ## 17. Work breakdown
 
-Each task is one PR of 1-3 days **(H)**. "Depends" lists the tasks that must be merged first. Tasks in different lanes
-touch disjoint files, so up to six workers run in parallel once T2-00 to T2-02 land. The experiments (§18) run first,
-in throwaway `spikes/` directories, and their results amend this spec before the tasks that depend on them start.
+Each task is one PR of 1-3 days **(H)**. "Depends" lists the tasks that must be merged first. Tasks that can run at the
+same time (in different lanes, or in one lane with no dependency path between them) touch disjoint files, so up to six
+workers run in parallel once T2-00 to T2-02 land. Files that several server tasks need are ordered by dependencies:
+T2-10 writes every H2 migration of §13 and every new server config key of §5-§12 (with defaults and start-up checks), so
+later server tasks add neither; `app.rs` (the router), `jobs_api.rs`, `store/jobs.rs` and `conn.rs` are edited only by
+tasks on one dependency chain (T2-10 → T2-12 → T2-13 → T2-14 → T2-15). In `apps/web`, the shell (T2-31) loads every page
+under `apps/web/src/desktop/` by directory convention, so T2-43 and T2-44 only add files there. The experiments (§18)
+run first, in throwaway `spikes/` directories, and their results amend this spec before the tasks that depend on them
+start.
 
 | Task | Title | Depends | Touches | Notes |
 |---|---|---|---|---|
 | T2-00 | Workspace scaffold for H2 | — | root `Cargo.toml`, `deny.toml`, CI workflow, new empty crates `p2pc-device`, `p2pc-wsl`, `apps/desktop`, `apps/web`, `templates/`, `deploy/relay`, `deploy/web` | So that no later task edits the root files. Windows CI runner for `p2pc-wsl` and the app. |
 | T2-01 | Proto: JobSpec extension | T2-00 | `p2pc-proto` `api.rs`, `validate/` | §7.1 table, states and `service` view types, blobs, volumes, templates, devices, errors; proptests. |
-| T2-02 | Proto: protocol additions | T2-00 | `p2pc-proto` `protocol.rs`, new `pair.rs`, `device.rs`, `invite.rs`, `lib.rs` (ALPN constants) | §6: capabilities, new messages, stream headers, pairing, invite (the QR payload with the agent NodeId), the three check phrase functions (hub, approval, node; §5.4, §5.5) with vectors; decoder fuzzing (SI-H2-17). |
+| T2-02 | Proto: protocol additions | T2-00 | `p2pc-proto` `protocol.rs`, new `pair.rs`, `device.rs`, `invite.rs`, `lib.rs` (ALPN constants) | §6: capabilities, new messages (`Heartbeat.running[]` with `used_cpu_ms` and `max_rss_mb`), stream headers, pairing, invite (the QR payload with the agent NodeId), the three check phrase functions (hub, approval, node; §5.4, §5.5) with vectors; decoder fuzzing (SI-H2-17). |
 | **Server lane** | | | | |
-| T2-10 | Server: devices and principals | T2-01, T2-02 | `p2pc-server` `auth.rs`, `store/devices.rs`, `store/jobs.rs` (principal columns and idempotency), `store/join_tokens.rs`, `store/audit.rs`, new `devices_api.rs`, migrations, `init.rs`, `recover.rs` | §5.2, §5.5, §5.6: principals, scopes, pairing tickets REST (retry after revocation), revocation (`last_admin_device`), `GET /v1/devices` filtered for non-`admin` devices, `init --owner-device`, `devices add`, `whoami`, audit; **the §5.6 rebuild migration** of `jobs`, `usage_records` (the slice columns and key of §12 too, so the ledger is rebuilt once), `join_tokens` and `audit_events`, with its migration test; join requests (limits, 15-minute approval rule, approval phrase, tokens bound to the agent NodeId) and node approval with the node phrase (§5.4, §5.5, SI-H2-2, SI-H2-16, SI-H2-18, SI-H2-19, SI-H2-20). |
-| T2-11 | Server: `p2pc/pair/1` and `p2pc/device/1` | T2-10 | `gateway/pair.rs`, `gateway/device.rs`, `gateway/limits.rs`, `gateway/mod.rs` | In-process HTTP serving with the device principal, limits that never lock out a valid ticket, active close on revocation (SI-H2-3/4/17). |
-| T2-12 | Server: service jobs | T2-10 | `scheduler/`, `jobs_api.rs`, `store/leases.rs`, `store/jobs.rs` | §7.2: restart policy and its 5-per-24-h cap, affinity wait, health from agents, idle cancel, cancel by template launcher and of singleton instances, `kind` filter, capabilities in placement, no lease to `pending_approval` nodes (SI-H2-19). |
-| T2-13 | Server: service ports | T2-11, T2-12 | new `ports_api.rs`, `gateway/ports.rs`, `conn.rs` | §7.4 upgrade endpoint and hub-opened `PortOpen` streams, idle accounting, traffic counters (SI-H2-5/6). |
-| T2-14 | Server: blobs | T2-01, T2-02 | new `blobs_api.rs`, `store/blobs.rs`, `gc.rs`, `gateway/blob_fetch.rs` | §7.5 (with the tombstone GC) and `BlobFetch` (SI-H2-8). |
-| T2-15 | Server: templates and volumes API | T2-12, T2-50 | new `templates.rs`, `templates_api.rs`, `volumes_api.rs` | §7.6 bundle loading and launch (cap check for capped principals), §7.3 volumes (SI-H2-13/14). |
-| T2-16 | Server: metering additions | T2-10, T2-12 | `units.rs`, `usage_api.rs`, `store/leases.rs` (`insert_usage`, `spent_between` replaced by `spent(P, D)`), `store/usage.rs`, `scheduler/tests/props.rs` | §12: service slices at 00:00 UTC (and the catch-up at start), `charge_day`, new groups, the cap query `spent(P, D)` per principal and per slice day, the daily reservation of services and `cap_reached`; invariant 6 of the scheduler property test becomes "exactly one row per finished slice"; the cap property test of SI-H2-20. |
+| T2-10 | Server: devices and principals | T2-01, T2-02 | `p2pc-server` `auth.rs`, `store/devices.rs`, `store/jobs.rs` (principal columns and idempotency), `store/join_tokens.rs`, `store/audit.rs`, new `devices_api.rs`, migrations (every H2 table of §13), `config.rs` (every new key), `app.rs`, `init.rs`, `recover.rs` | §5.2, §5.5, §5.6: principals, scopes, pairing tickets REST (retry after revocation), revocation (`last_admin_device`), `GET /v1/devices` filtered for non-`admin` devices, `init --owner-device`, `devices add`, `whoami`, audit; **the §5.6 rebuild migration** of `jobs`, `usage_records` (the slice columns and key of §12 too, so the ledger is rebuilt once), `join_tokens` and `audit_events`, with its migration test; join requests (limits, 15-minute approval rule, approval phrase, tokens bound to the agent NodeId) and node approval with the node phrase (§5.4, §5.5, SI-H2-2, SI-H2-16, SI-H2-18, SI-H2-19, SI-H2-20). |
+| T2-11 | Server: `p2pc/pair/1` and `p2pc/device/1` | T2-10 | `gateway/pair.rs`, `gateway/device.rs`, `gateway/limits.rs`, `gateway/mod.rs`, `gateway/endpoint.rs` | In-process HTTP serving with the device principal, limits that never lock out a valid ticket, the device stream budget (per-device cap, `admin` reserve, idle limit of device port connections, §6.3), `p2pc/pair/1` served only while a ticket is open (§10.5), active close on revocation (SI-H2-3/4/11/17). |
+| T2-12 | Server: service jobs | T2-10 | `scheduler/`, `jobs_api.rs`, `store/leases.rs`, `store/jobs.rs` | §7.2: restart policy and its 5-per-24-h cap, affinity wait, health from agents, idle cancel, the template view of the job routes (§5.5) and the cancel rule (H1's for `jobs:write`; the template view for `templates:launch`), `kind` filter, capabilities in placement, no lease to `pending_approval` nodes (SI-H2-18, SI-H2-19). |
+| T2-13 | Server: service ports | T2-11, T2-12 | new `ports_api.rs`, `gateway/ports.rs`, `conn.rs`, `app.rs` | §7.4 upgrade endpoint (with the template-view check) and hub-opened `PortOpen` streams, idle accounting, traffic counters (SI-H2-5/6). |
+| T2-14 | Server: blobs | T2-12, T2-13 | new `blobs_api.rs`, `store/blobs.rs`, `gateway/blob_fetch.rs`; `gc.rs`, `jobs_api.rs` and `store/jobs.rs` (the blob check and reference insert in the job-creation transaction), `conn.rs` (the dispatcher for agent-opened streams), `app.rs` | §7.5 (with the tombstone GC), blob `inputs` at job creation, `BlobFetch` (SI-H2-8). |
+| T2-15 | Server: templates and volumes API | T2-14, T2-50 | new `templates.rs`, `templates_api.rs`, `volumes_api.rs`, `app.rs` | §7.6 bundle loading with the anti-rollback high-water mark, parameter targets, launch (cap check for capped principals), §7.3 volumes (SI-H2-13/14). |
+| T2-16 | Server: metering additions | T2-10, T2-12 | `units.rs`, `usage_api.rs`, `store/leases.rs` (`insert_usage`, `usage_report`, `spent_between` replaced by `spent(P, D)`), `store/usage.rs`, `scheduler/tests/props.rs` | §12: service slices at 00:00 UTC (and the catch-up at start) with their `max_rss_mb`, `charge_day`, new groups, `GET /v1/usage` over slices and principals (`attempts` from last slices, `estimated_slices`, no null group), the cap query `spent(P, D)` per principal and per slice day, the daily reservation of services and `cap_reached`; invariant 6 of the scheduler property test becomes "exactly one row per finished slice"; the cap property test of SI-H2-20. |
 | **Agent lane** | | | | |
-| T2-20 | Agent: service lifecycle | T2-02 | `p2pc-agent` `executor/`, `sandbox/driver.rs`, `sandbox/engine.rs` | Services with H1's wall-clock enforcement up to 30 days, health state machine, `ServiceHealth`, log ring, `used_cpu_ms` in heartbeats. |
+| T2-20 | Agent: service lifecycle | T2-02 | `p2pc-agent` `executor/`, `sandbox/driver.rs`, `sandbox/engine.rs` | Services with H1's wall-clock enforcement up to 30 days, health state machine, `ServiceHealth`, log ring, `used_cpu_ms` and `max_rss_mb` in heartbeats. |
 | T2-21 | Shim and agent: ingress bridge and port streams | T2-20 | `p2pc-shim`, agent new `sandbox/ingress.rs`, `connection/streams.rs` | §11.2 and the stream dispatcher for hub-opened streams (SI-H2-7). |
-| T2-22 | Agent: volumes | T2-21, **O-16** | agent new `volumes.rs`, `sandbox/engine.rs` (argv), `inventory.rs` | **Blocked** until the separate change of §4.3 puts the hard-rule exception in force (O-16). §11.3, `VolumeReport`, `VolumeDelete`, budget, eviction, GC, the no-follow check before every mount, mounts only into service or template jobs of the account (SI-H2-9). Uses E11's `:U` vs `:idmap` result and its answer on whether `:U` follows links. |
+| T2-22 | Agent: volumes | T2-21, **O-16** | agent new `volumes.rs`, `sandbox/engine.rs` (argv), `inventory.rs` | **Blocked** until the separate change of §4.3 puts the hard-rule exception in force (O-16). §11.3, `VolumeReport`, `VolumeDelete`, budget, eviction, GC, the persisted one-holder lock released only when Podman confirms the container gone (across agent restarts, after the orphan sweep), the no-follow check before every mount, mounts only into service or template jobs of the account (SI-H2-9). Uses E11's `:U` vs `:idmap` result and its answer on whether `:U` follows links. |
 | T2-23 | Agent: blob fetch, share changes, pause, leave | T2-21 | agent new `blobs.rs`, `config.rs`, `main.rs` (subcommands), `connection/session.rs` | `BlobFetch` client, `share set`, `owner_paused`, `leave`, `approval` (`Welcome.pending_approval`, `NodeApproved`), `status --json` additions (`iroh_node_id` before enrollment, the node phrase). |
 | **Device and web lane** | | | | |
 | T2-30 | `p2pc-device` crate | T2-02, E9 | `crates/p2pc-device` | Pairing and invite clients, device connection, HTTP/1.1 over streams, `open_port`; native and `wasm32` builds in CI; a native test client for AC-H2-7. |
@@ -1599,30 +1809,31 @@ in throwaway `spikes/` directories, and their results amend this spec before the
 | T2-40 | `p2pc-wsl`: checks, download, import, task | T2-00 | `crates/p2pc-wsl` (`checks.rs`, `image.rs`, `import.rs`, `task.rs`) | §8.3 first half. |
 | T2-41 | WSL image: hub in the distro | — | `deploy/wsl/` (`build-rootfs.sh`, `p2pc-run`, `test-distro.sh`, `install.ps1` upgrade list) | §8.5: `p2pc-server` in the image, `p2pc-run`, `hub.enabled`, upgrade carries `/var/lib/p2pc-server`. |
 | T2-42 | Tauri app shell | T2-00 | `apps/desktop` (`src-tauri` core, tray, single instance, autostart, capabilities, DPAPI key) | §8.1, §8.4 states, §8.9. Embeds a placeholder UI until T2-31 lands. |
-| T2-43 | First run | T2-40, T2-41, T2-42, T2-10 | `apps/desktop` `setup/` module and the setup pages in `apps/web/src/desktop/` | §8.2 steps 1-5 (including the opt-in choice of step 1), `setup.json` resume, §8.8 errors. |
+| T2-43 | First run | T2-40, T2-41, T2-42, T2-10 | `apps/desktop` `setup/` module and the setup pages in `apps/web/src/desktop/` | §8.2 steps 1-5 (including the opt-in choice of step 1, the disk arithmetic and the hub's blob quota at "Create my cloud"), `setup.json` resume, §8.8 errors, the mirrored-networking warning (§10.5). |
 | T2-44 | Join flow | T2-43, T2-30 | `apps/desktop` `invite/` module, `apps/web/src/desktop/join` | §5.4 PC side (relay-only invite listener, QR with the agent NodeId, approval phrase shown next to it), invite text, hub phrase (SI-H2-16); on the hub PC, approving join requests and pending nodes with the approval and node phrases, the source device and the time; `join_pending` with the node phrase and `hub_gone` (§8.8). |
-| T2-45 | `p2pc-wsl` upgrade and uninstall; app updater | T2-43 | `crates/p2pc-wsl` (`upgrade.rs`, `uninstall.rs`), `apps/desktop` `update/`, `uninstall/`, NSIS hooks | §8.3 second half, §8.7 (the hub deletes the other nodes first), §14.1-§14.2 (opt-in automatic checks), web app verification (§9.6), parity test with `install.ps1` (SI-H2-15). |
+| T2-45 | `p2pc-wsl` upgrade and uninstall; app updater | T2-43 | `crates/p2pc-wsl` (`upgrade.rs`, `uninstall.rs`), `apps/desktop` `update/`, `uninstall/`, NSIS hooks | §8.3 second half, §8.7 (the hub deletes the other nodes first), §14.1-§14.2 (opt-in automatic checks, template bundle delivery), web app verification (§9.6), parity test with `install.ps1` (SI-H2-15). |
 | **Infrastructure and clients lane** | | | | |
 | T2-50 | Templates data and bundle | T2-01, E11 | `templates/`, `scripts/templates-bundle` | The two templates, bundle compiler and signer, bundle tests (SI-H2-13). |
 | T2-51 | Relay deployment and relay-map rules | E12 | `deploy/relay/`, `p2pc-net` (relay-map validation), `p2pc-agent` `doctor.rs` | §10.2-§10.3. |
 | T2-52 | Release pipeline | T2-45, T2-34, T2-50 | `.github/workflows/`, `scripts/release/` | Tauri artifacts and `latest.json` per channel, signed versions, image hash pinning, signed web manifest and template bundle. |
 | T2-53 | CLI and client additions | T2-01 | `p2pc-cli` commands, `p2pc-client` | §7.8 CLI (including `nodes approve`); tested against the mock server, which learns the new endpoints. |
-| T2-54 | Python SDK and MCP additions | T2-53 | `sdk/python`, `p2pc-cli/src/mcp` | §7.8 SDK and MCP. |
+| T2-54 | Python SDK and MCP additions | T2-53 | `sdk/python`, `p2pc-cli/src/mcp` | §7.8 SDK and MCP, including the upload-directory rule of `p2pc_blob_put` (SI-H2-21). |
 | **Closing** | | | | |
 | T2-60 | Acceptance suite and docs | all | `tests/acceptance-h2/`, `docs/` | §16, the beta guide, the self-hosting guide, OpenAPI drift. |
 | T2-61 | Security pass | all | `docs/security/residual-risks.md`, `SECURITY.md` | §11.5 and §15.2 into the residual risks; internal pentest (AC-H2-11). |
 
 Lanes once T2-01 and T2-02 land:
-- server: T2-10 → T2-11 and T2-12 (both edit after T2-10's principal storage) → T2-13; T2-12 → T2-16; T2-14; then
-  T2-15;
+- server: T2-10 → T2-11 and T2-12 (both edit after T2-10's principal storage) → T2-13 → T2-14 → T2-15 (after T2-50
+  too); T2-12 → T2-16, beside T2-13 to T2-15;
 - agent: T2-20 → T2-21 → T2-23; T2-22 after T2-21 once O-16 is closed (the hard-rule change, §4.3). Until then the
   templates cannot keep their models (both use volumes), so the beta needs O-16 closed;
 - device and web: T2-30 → T2-31 → T2-32 / T2-33 → T2-34;
 - desktop: T2-41 and T2-40 (start at once, no proto dependency) → T2-42 → T2-43 → T2-44 → T2-45;
 - infrastructure and clients: T2-53 → T2-54; T2-51 after E12; T2-50 after E11; T2-52 last.
 
-Critical path **(H)**: T2-00 (1 d) → T2-01/T2-02 (3 d) → T2-10 (3 d) → T2-11 (3 d) → T2-13 (3 d) → T2-60 (3 d), about 16
-working days plus review rounds; the desktop lane (T2-40 → T2-45) is about 14 days and runs beside it. That is
+Critical path **(H)**: T2-00 (1 d) → T2-01/T2-02 (3 d) → T2-10 (3 d) → T2-11 or T2-12 (3 d) → T2-13 (3 d) → T2-14
+(3 d) → T2-15 (2 d) → T2-60 (3 d), about 21 working days plus review rounds; the desktop lane (T2-40 → T2-45) is about
+14 days and runs beside it. That is
 consistent with a beta in 4-6 weeks only if E9, E10 and E11 pass without a design change.
 
 ## 18. Open items and experiments
@@ -1632,9 +1843,9 @@ consistent with a beta in 4-6 weeks only if E9, E10 and E11 pass without a desig
 | Experiment | What to measure | Pass | Fail means |
 |---|---|---|---|
 | **E9** · iroh WASM in mobile Safari and Chrome Android | WASM size (target ≤ 3 MB compressed **(H)**); pairing through the browser; relay-only connection through n0 and through a plain-HTTP `iroh-relay` behind a TLS PaaS; connect time (p50/p95); chat stream overhead per token; 50 MB upload time on 4G; what happens when the tab goes to the background (how long until the WebSocket drops, reconnect time on return); key persistence across browser restart; iOS Safari vs home-screen storage isolation and Android tab → installed app; hyper's HTTP/1.1 client over an iroh stream in WASM; whether iroh can use a non-extractable WebCrypto key. | Pairing and a streamed chat work on both phones; reconnect ≤ 5 s after returning; 50 MB upload ≤ 2 min on 4G through our relay **(H)**. | A native shell (for example Capacitor) around the same web app, or WebTransport; the spec changes §9 before T2-30. |
-| **E10** · Tauri 2 first run on a clean Windows 11 VM | Time to ready with and without WSL; reboots; UAC prompts; the `wsl --install --no-distribution` path (inbox, Store, already present, too old); SmartScreen and Defender behaviour on the unsigned installer; WebView2 presence; whether the hub's REST is reachable on Windows' loopback through `localhostForwarding`, and never from the LAN; the Windows firewall prompt on the app's first iroh (UDP) bind, for the device endpoint and the invite listener, and what each answer changes; whether the invite listener works relay-only with `direct_addresses = "none"` (§5.4); sleep and resume; the uninstall inventory. | AC-H2-1 targets met: ≤ 5 min (reboot excluded), ≤ 1 reboot, ≤ 1 UAC. | Revisit step order, bundling the image in the installer, or the WSL install path. |
-| **E11** · GPU service in Podman inside the WSL2 distro | Ollama image size and pull time; start to healthy with cached image and model; GPU visible (CUDA, not CPU fallback); the port reachable only through the ingress bridge; model download size, time and **the exact hosts** the egress allowlist needs (Ollama's registry and its CDN; Hugging Face for whisper models); Ollama through `HTTPS_PROXY`; `:U` vs `:idmap` on a model volume; **whether `:U` follows symbolic links** (a link planted in the volume to a file and to a directory outside it, then a remount: the targets' owners must not change), and that the template images write no symlinks, FIFOs or hard links into their volumes (§11.3); VRAM and tokens/s of candidate default models; whisper.cpp speed on a 30-minute file; that the images load only GGUF. Its volume measurements run in a throwaway `spikes/` directory, never in product code (§17), and feed the decision of O-16. | Healthy ≤ 60 s with cached model **(H)**; downloads work through the egress proxy; no port reachable except through the bridge. | Change the template's image, model or command; a pre-pull step by the agent. |
-| **E12** · relay map (proposed by this spec) | `iroh-relay` in plain-HTTP mode on Railway with native and browser clients; home-relay selection with a mixed map (our HTTP relay plus n0's relays); QUIC address discovery through n0 while relaying through ours; the egress gate opening on a WSL2 node with the production map; relay throughput and cost per GB on the PaaS. | AC-H2-13 passes. | A relay on a host with UDP (and TLS) for production, or n0's paid relays. |
+| **E10** · Tauri 2 first run on a clean Windows 11 VM | Time to ready with and without WSL; reboots; UAC prompts; the `wsl --install --no-distribution` path (inbox, Store, already present, too old); SmartScreen and Defender behaviour on the unsigned installer; WebView2 presence; whether the hub's REST is reachable on Windows' loopback through `localhostForwarding`, and never from the LAN; the Windows firewall prompt on the app's first iroh (UDP) bind, for the device endpoint and the invite listener, and what each answer changes; whether the invite listener works relay-only with `direct_addresses = "none"` (§5.4); whether the hub's UDP socket gets any unsolicited packet from the LAN under NAT networking, and under mirrored networking whether the Hyper-V firewall drops it (§10.5); sleep and resume; the uninstall inventory. | AC-H2-1 targets met: ≤ 5 min (reboot excluded), ≤ 1 reboot, ≤ 1 UAC. | Revisit step order, bundling the image in the installer, or the WSL install path. |
+| **E11** · GPU service in Podman inside the WSL2 distro | Ollama and whisper.cpp image sizes on disk (they fix the image allowance `I` of §8.2) and pull time; start to healthy with cached image and model; GPU visible (CUDA, not CPU fallback); the port reachable only through the ingress bridge; model download size, time and **the exact hosts** the egress allowlist needs (Ollama's registry and its CDN; Hugging Face for whisper models); Ollama through `HTTPS_PROXY`; `:U` vs `:idmap` on a model volume; **whether `:U` follows symbolic links** (a link planted in the volume to a file and to a directory outside it, then a remount: the targets' owners must not change), and that the template images write no symlinks, FIFOs or hard links into their volumes (§11.3); VRAM and tokens/s of candidate default models; whisper.cpp speed on a 30-minute file; that the images load only GGUF. Its volume measurements run in a throwaway `spikes/` directory, never in product code (§17), and feed the decision of O-16. | Healthy ≤ 60 s with cached model **(H)**; downloads work through the egress proxy; no port reachable except through the bridge. | Change the template's image, model or command; a pre-pull step by the agent. |
+| **E12** · relay map (proposed by this spec) | `iroh-relay` in plain-HTTP mode on Railway with native and browser clients; home-relay selection with a mixed map (our HTTP relay plus n0's relays); QUIC address discovery through n0 while relaying through ours; the egress gate opening on a WSL2 node with the production map; whether the hub's endpoint can drop and re-add `p2pc/pair/1` from its accepted ALPNs at run time (§10.5); relay throughput and cost per GB on the PaaS. | AC-H2-13 passes. | A relay on a host with UDP (and TLS) for production, or n0's paid relays. |
 
 ### 18.2 Open items
 
