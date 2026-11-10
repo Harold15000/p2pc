@@ -23,6 +23,7 @@ humantime.workspace = true
 # `tunnel`: profiles whose server is an address `p2pc_srv_…`, and `p2pc proxy` (spec §10).
 p2pc-client = { version = "0.1.0", path = "../p2pc-client", features = ["tunnel"] }
 p2pc-proto = { version = "0.1.0", path = "../p2pc-proto" }
+qrcode = { version = "0.14", default-features = false }
 rmcp.workspace = true
 rpassword.workspace = true
 serde.workspace = true
