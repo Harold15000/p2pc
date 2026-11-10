@@ -1,6 +1,6 @@
 # Milestone 2 · P2PC Desktop App and Phone Access (v0.2): specification
 
-- **Status:** draft for review (spec v7, 2026-11-10: v6 plus the fixes of its seventh review). Implementation starts
+- **Status:** draft for review (spec v8, 2026-11-10: v7 plus the fixes of its eighth review). Implementation starts
   when the architect marks it accepted. The two hard-rule exceptions it proposes (persistent volumes, ADR-015; inbound
   iroh connections on the hub PC, ADR-016; both in §4.3) take effect only through one separate change after that
   (O-16); until then the tasks that need them are blocked (§17).
@@ -189,7 +189,7 @@ slice is defined in §12). The Linux installers are unchanged.
 | Job states | Unchanged words. A service's `running` adds `health` (`starting`, `healthy`, `unhealthy`). Stopping a service ends it `cancelled` with a `reason`. | §7.2 |
 | Principals | **Changed.** A request is authenticated by an API key **or** by a paired device. Every place that reads `key_id` reads a `principal` that is one of the two. Storage: `jobs`, `usage_records` and `join_tokens` get a nullable `key_id` (H1: `NOT NULL`) plus a nullable `device_id`, with a `CHECK` that exactly one is set; job idempotency becomes unique per principal through two partial unique indexes; `audit_events` gains `actor_device_id`. SQLite cannot relax `NOT NULL` or add a `CHECK` in place, so this is a forward-only table rebuild (§5.6), not an additive column. | §5.5, §5.6 |
 | Scopes | New: `services:connect`, `templates:launch`, `blobs:write`, `nodes:join`, `nodes:invite`. `admin` covers them. A principal with `templates:launch` also gets the narrow **template view** of jobs (state, logs, outputs, ports and cancel of its own template jobs and of `singleton` template instances); `jobs:read`, `jobs:write` and `services:connect` keep H1's project-wide meaning. | §5.5 |
-| Node enrollment | **Changed.** A node enrolled with a join token minted by a non-`admin` principal starts `pending_approval` and gets no lease until an `admin` principal approves it. Tokens minted by `admin` API keys enroll as in H1. A token minted by an `admin` **device** (the hub PC's "Copy invite") also starts its node `pending_approval`, unless it was minted with the `pre_approved` option, which only the hub PC's app uses: for its own node at first run (§8.2 step 4) and as the explicit option of "Copy invite" (15 minutes, single use; `join_tokens.pre_approved`). A join token minted for an approved join request is bound to the joining agent's NodeId and enrolls no other (`join_tokens.bound_iroh_node_id`, §5.4). | §5.4, §5.5 |
+| Node enrollment | **Changed.** A node enrolled with a join token minted by a non-`admin` principal starts `pending_approval` and gets no lease until an `admin` principal approves it. Tokens minted by `admin` API keys enroll as in H1. A token minted by an `admin` **device** (the hub PC's "Copy invite") also starts its node `pending_approval`, unless it was minted with the `pre_approved` option, which only the hub PC's app uses: for its own node at first run (§8.2 step 4) and as the explicit option of "Copy invite" (15 minutes, single use; `join_tokens.pre_approved`). A join token minted for an approved join request is bound to the joining agent's NodeId and enrolls no other (`join_tokens.bound_iroh_node_id`, §5.4). The stored rule: a node is created `approved` iff its token has `pre_approved = 1`, or a `bound_iroh_node_id`, or was created by an `admin` API key; otherwise `pending_approval` (§5.5). | §5.4, §5.5 |
 | Sandbox and hard rules | **Proposed change, not in force with this spec.** Hard rule 3 (CONTRIBUTING) and H1 §9 ("never … host paths beyond the three per-job directories") would gain exactly one exception, recorded in ADR-015 (**Proposed**): **persistent volumes**. A volume is a directory the agent creates itself, per account, named by a hash of the volume name (never a path taken from the JobSpec); it is mounted only into service jobs and template jobs of that account, is size-limited (`max_mb`, H1's fail-closed measurement), is checked without following links before every mount, and is deleted without following links. **The exception takes effect only when the architect accepts this spec after E11, through a separate change that amends CONTRIBUTING hard rule 3 and H1 §9's "Never" line together and marks ADR-015 Accepted** (the same change puts the listening exception below in force, O-16). Until then hard rule 3 and H1 §9 stand unchanged, no code may mount a volume, and T2-22 (agent volumes) is blocked (§17, O-16). Nothing else in hard rule 3 changes and services need no exception from it: every job, services included, has a finite wall-clock limit (`timeout_s`, at most 30 days). | §7.1, §11.1, §11.3 |
 | Phoning home (hard rule 6) | The app's daily update check and its web app verification fetch are **opt-in**: an explicit yes/no at first run with nothing preselected, and a Settings toggle. Without it the app checks for updates and verifies the web app only when the user clicks "Check for updates" or "Verify web app". | §3, §8.2, §9.6, §14.1 |
 | Listening (hard rule 4, H1 §10) | **Proposed change, not in force with this spec.** Hard rule 4 (CONTRIBUTING: "nodes never listen on the network") and H1 §10 ("nodes never listen on a TCP or UDP port that is reachable from outside, beyond what iroh needs for outbound QUIC") would gain exactly one bounded exception, recorded in ADR-016 (**Proposed**): **the hub PC accepts inbound iroh connections**. The hub PC is also a node, and H2 does not read the rules as covering agents only. On that PC, only while the hub is enabled, the hub's own iroh endpoint accepts incoming QUIC on the UDP sockets `p2pc-net` binds for that endpoint under H1's address hygiene, with every ALPN behind a ticket, a token, a key or a paired NodeId and under pre-auth limits; on a PC that is joining, the app's relay-only invite listener (no IP transport) accepts the two `p2pc/invite/1` exchanges of one join (open, then hand-over, both from one phone) while the invite is valid. Nothing else listens beyond the loopback REST listener, and every agent still only dials out (§10.5). **The exception takes effect only through the same separate change as the volume exception (O-16), which amends CONTRIBUTING hard rules 3 and 4, H1 §9 and H1 §10 together and marks ADR-015 and ADR-016 Accepted.** Until then hard rule 4 and H1 §10 stand unchanged, no code may make a P2PC process on a node PC accept an inbound connection, and the tasks that do (T2-11, T2-41, T2-43, T2-44) are blocked (§17, O-16). | §5.4, §10.5, O-16 |
@@ -221,12 +221,17 @@ A device key is never derived from, or sent to, anything else. Losing it means p
 ### 5.2 Pairing tickets
 
 - **Created by** `POST /v1/devices/pairing-tickets` (`admin` scope). Body:
-  `{label?, scopes?, daily_unit_cap?, allowed_images?, expires_in_s?}`. The default scopes are the **phone profile**
+  `{label?, scopes?, daily_unit_cap?, allowed_images?, expires_in_s?, device_expires_in_s?, blobs_quota_mb?}`. The
+  default scopes are the **phone profile**
   (§5.5). `expires_in_s` defaults to 600 and is at most 3,600. `daily_unit_cap` and `allowed_images` have H1's meaning
   and no-escalation rule as for API keys (H1 §5): if the creator has a cap, the ticket must carry one at or below it,
   and if the creator has an image list, the ticket's list must be made only of its patterns, else
-  `403 escalation_denied`. The device row stores both, and they bind the device as its own principal (§5.5, §12). The
-  desktop app's pairing screen offers an optional daily limit. A paired device takes its ticket creator's project:
+  `403 escalation_denied`. `device_expires_in_s` (optional; absent: the device never expires) sets the device's
+  `expires_at`, counted from the ticket's creation; if the creator has an `expires_at`, the ticket must set one at or
+  before it (H1 §5: a longer life is more power), else `403 escalation_denied`. `blobs_quota_mb` (optional) caps the
+  bytes of the device's own blobs (§7.5); a creator that has one may set only one at or below it. The device row
+  stores all of these, and they bind the device as its own principal (§5.5, §12). The desktop app's pairing screen
+  offers an optional daily limit. A paired device takes its ticket creator's project:
   `pairing_tickets` and `devices` store `(project_id, account_id)` with the same composite foreign key as `api_keys`.
 - **Format.** `p2pc_pair_<base32 payload>`, in the H1 join-token style. The payload holds the hub NodeId, the hub's
   relay URLs, a 16-byte random code and the expiry. The hub stores only SHA-256 of the code.
@@ -374,7 +379,9 @@ would need a rendezvous service to resolve it, which H2 does not have (D4). So:
   6. The phone polls `GET /v1/nodes/join-requests/{id}` until the request is `approved`, then calls
      `POST /v1/nodes/join-requests/{id}/token` (the requesting device only). That call mints the join token (15
      minutes, single use, on behalf of the approving principal, **bound to the request's agent NodeId**), stores only
-     its hash (hard rule 5) and returns it **once**; the request becomes `delivered`. Like `approve`, the call is
+     its hash (hard rule 5) and returns it **once**; the request becomes `delivered`. The hub reloads the approving
+     principal in the minting transaction and refuses with `409 join_request_closed` if it is no longer live (revoked
+     or expired; H1 §5 re-checks power at the point of use). Like `approve`, the call is
      refused for a request created more than 15 minutes ago (`409 join_request_closed`), checked against the row's
      `created_at` on the hub's clock, whatever state the expiry sweep has left it in, so how long a token can be
      minted never depends on when the sweep runs. The hub refuses a `Join` with a bound token from any other NodeId
@@ -461,30 +468,40 @@ would need a rendezvous service to resolve it, which H2 does not have (D4). So:
   in the web app can, until the device is revoked:
   - launch vetted templates (§7.6) and read the state, logs and outputs of the template jobs it launched;
   - see the state of the shared `singleton` instances, open their ports and stop them. For the beta that is the
-    private chat: the attacker can chat with the owner's model and, through Ollama's own API, pull other models from
-    the template's fixed egress hosts into its volume or delete models from it (the UI needs `/api/pull`; the bridge
-    does not filter the service's API). Chat history is not on the hub (§9.4), so other devices' conversations are
-    not exposed;
+    private chat: the attacker can chat with the owner's model and use Ollama's whole API, which the bridge does not
+    filter (the UI needs `/api/pull`): pull any model published on the template's registry (`/api/pull`), write
+    arbitrary model files into the volume with no egress (`POST /api/blobs/:digest`, `POST /api/create`), and
+    overwrite or delete models, the default one included (`/api/copy`, `/api/create` under an existing name,
+    `DELETE /api/delete`). This is an **accepted residual risk** of the beta: attacker-chosen GGUF files reach the
+    model parser inside the GPU container (§11.5), and a poisoned model stays in the volume **after the device is
+    revoked**, until the model reset offered on revocation (below). Chat history is not on the hub (§9.4), so other
+    devices' conversations are not exposed;
   - see the PCs and volumes (`nodes:read`);
   - upload blobs, check whether the account holds a blob of a given digest (`HEAD`), and delete unreferenced blobs
-    (`blobs:write`);
+    that it uploaded (`blobs:write`, §7.5);
   - ask for a PC to join, which the hub PC must approve (§5.4).
 
   That is everything it can reach; SI-H2-18 pins it with a negative test per route. It bounds what an attacker with a
   device key can run on, or read from, the owner's PCs.
-- **No escalation** (H1 §5) applies to devices: a pairing ticket's scopes, cap and expiry are a subset of its
-  creator's. Only `admin` principals create pairing tickets in H2.
+- **No escalation** (H1 §5 `check_no_escalation`) applies to devices: a pairing ticket's scopes, cap, image list,
+  device expiry and blob quota are within its creator's (§5.2). Only `admin` principals create pairing tickets in H2.
 - **Revocation.** `DELETE /v1/devices/{id}` (`admin`) sets `revoked_at`, closes every live `p2pc/device/1` connection of
-  that NodeId and every service stream it opened, within 5 s (SI-H2-4). A device can revoke itself ("Forget this
-  cloud" in the web app). The hub refuses to revoke the last live unrestricted `admin` principal, device or key (H1
-  "Last admin key", extended to devices): revoking such a key keeps H1's `409 last_admin_key`, unchanged, and
-  revoking such a device gets the new `409 last_admin_device`. The offline `devices add` and `keys recover` remain the
-  way back. The offline `p2pc-server devices revoke` (§5.3) revokes the same way when the app cannot get a device
-  connection; a running hub notices a revocation written by another process because it re-reads, every 2 s, the
-  `revoked_at` of the devices that hold live connections, and then closes them as for `DELETE`, so the 5 s of
-  SI-H2-4 hold for it too.
-- **Unknown or revoked device.** A `p2pc/device/1` connection from a NodeId that is not a live device gets the same
-  close code (`not_paired`) whether it was never paired, revoked or belongs to nothing. Revoked rows are kept.
+  that NodeId and every service stream it opened, within 5 s (SI-H2-4). As for keys (H1 §5), an `admin` principal may
+  revoke only a device it could have created (`check_no_escalation` applied to the device's scopes, cap, image list and
+  expiry), else `403 escalation_denied`. A device can revoke itself ("Forget this cloud" in the web app). The hub
+  refuses to revoke the last live unrestricted `admin` principal, device or key (H1 "Last admin key", extended to
+  devices; an unrestricted device, like a key, has no `expires_at`, no `daily_unit_cap` and no `allowed_images`):
+  revoking such a key keeps H1's `409 last_admin_key`, unchanged, and revoking such a device gets the new `409
+  last_admin_device`. The offline `devices add` and `keys recover` remain the way back. The offline `p2pc-server devices
+  revoke` (§5.3) revokes the same way when the app cannot get a device connection; a running hub notices a revocation
+  written by another process because it re-reads, every 2 s, the `revoked_at` of the devices that hold live connections,
+  and then closes them as for `DELETE`, so the 5 s of SI-H2-4 hold for it too.
+- **Model reset.** Revoking a device with `templates:launch` also offers "Reset the private chat's models": the app
+  stops the `private-chat` instance and deletes its `tpl:private-chat/models` volume on every node that reports it
+  (`DELETE /v1/volumes/{node_id}/{name}`, §7.3), so the next launch downloads the default model again.
+- **Unknown or revoked device.** A device is live while it is neither revoked nor past its `expires_at`. A
+  `p2pc/device/1` connection from a NodeId that is not a live device gets the same close code (`not_paired`) whether
+  it was never paired, revoked, expired or belongs to nothing. Revoked and expired rows are kept.
 - **`last_seen_at`** is written at most once a minute, as H1 `last_used_at`.
 - **Node approval.** A node row records `enrolled_by` (the principal that minted its join token) and `approval`
   (`approved` or `pending_approval`).
@@ -494,7 +511,9 @@ would need a rendezvous service to resolve it, which H2 does not have (D4). So:
     created `approved`, as in H1, only from tokens that already carry an `admin`'s approval: tokens minted by `admin`
     API keys (H1 behaviour, unchanged), tokens of approved join requests (§5.4) and tokens minted with `pre_approved`
     (the hub PC's own node at first run and pre-approved invite texts, §5.4). A token minted by an `admin` device
-    without `pre_approved` (the default "Copy invite") gives a `pending_approval` node too.
+    without `pre_approved` (the default "Copy invite") gives a `pending_approval` node too. The stored rule is: a
+    node is created `approved` iff its token has `pre_approved = 1`, or has a `bound_iroh_node_id` (only tokens of
+    approved join requests do, §5.6), or was created by an `admin` API key; otherwise `pending_approval`.
   - Only an `admin` principal approves: `POST /v1/nodes/{id}/approve` (idempotent), audited as `node_approved`. The
     desktop app on the hub PC shows "New PC waiting: Approve / Remove" with what the owner can check, since the name
     is whatever the node reported: the principal that minted its token (as recorded by the hub), the enrollment time,
@@ -702,15 +721,14 @@ first phone that opens it:
   - **Per device:** at most 2 connections per device NodeId and at most 16 concurrent streams per device across them
     (`device_streams_per_device`). A stream is one HTTP/1.1 connection, so an upgraded port connection or a log follow
     holds one for its life.
-  - **Total:** device streams count against their own budget (`device_stream_budget`, default 96), **separate from
-    H1's REST connection cap**: H1's cap (256) and its tunnel budget (128, below the cap) apply unchanged to TCP
-    connections and `p2pc/http/1` streams, device streams never count against that cap, and TCP connections or
-    `p2pc/http/1` streams never take a device slot. The hub's open HTTP connections are thus bounded by the REST cap
-    plus the device budget (352 by default). This matters on the hub PC: the TCP listener is reachable from every
-    process on the Windows host's loopback (§8.5), and unauthenticated TCP connections cost nothing, so local
-    processes may fill the TCP cap, but they cannot take the device slots that the owner's app needs to revoke a
-    phone, and paired phones cannot take the slots of local API-key clients. Every TCP request still needs an API key
-    (H1 §10).
+  - **Total:** device streams count against their own budget (`device_stream_budget`, default 96), **separate from H1's
+    REST connection cap**: H1's cap (256) and its tunnel budget (128, below the cap) apply unchanged to TCP connections
+    and `p2pc/http/1` streams, device streams never count against that cap, and TCP connections or `p2pc/http/1` streams
+    never take a device slot. The hub's open HTTP connections are thus bounded by the REST cap plus the device budget
+    (352 by default). This matters on the hub PC: the TCP listener is reachable from every process on the Windows host's
+    loopback and in the user's other WSL2 distros (§8.5), and unauthenticated TCP connections cost nothing, so local
+    processes may fill the TCP cap, but they cannot take the device slots that the owner's app needs to revoke a phone,
+    and paired phones cannot take the slots of local API-key clients. Every TCP request still needs an API key (H1 §10).
   - **Reserved for `admin`:** 32 of the 96 (`device_stream_admin_reserve`) are usable only by devices with the `admin`
     scope, so paired phones, together, hold at most 64 and can never take the slots of the hub PC's app, which is how
     a device gets revoked. The reserve must be at least `device_streams_per_device`, and below the budget.
@@ -855,20 +873,20 @@ The Lease frame limit (1 MiB, H1 §6) still applies to the whole job; blob input
 | `POST /v1/blobs` | blobs:write | Upload one blob (§7.5). |
 | `HEAD /v1/blobs/{sha256}` | blobs:write or jobs:read | `200` with `Content-Length` if the caller's account has it, else `404`. |
 | `GET /v1/blobs` | jobs:read | `{sha256, size, created_at, referenced_by, expires_at}`, cursor pagination. |
-| `DELETE /v1/blobs/{sha256}` | blobs:write | `409 blob_in_use` while a non-terminal job references it. |
+| `DELETE /v1/blobs/{sha256}` | blobs:write | Only a blob the caller uploaded, unless the caller is `admin` (else `403`, §7.5). `409 blob_in_use` while a non-terminal job references it. |
 | `GET /v1/volumes` | nodes:read | `{name, node_id, size_mb, max_mb, last_used_at, in_use_by}` from the latest `VolumeReport`s. |
 | `DELETE /v1/volumes/{node_id}/{name}` | admin | Sends `VolumeDelete`. `{name}` is one percent-encoded path segment: a `tpl:` name is sent as `tpl%3Aprivate-chat%2Fmodels`, and the hub decodes the segment once and validates the result with §7.1's name rule (`404` for an unknown volume). `409 volume_in_use`; `503 node_offline` (the deletion is not queued). A route test and a CLI test (`p2pc volumes rm`) cover a `tpl:` name. |
 | `GET /v1/templates` | jobs:read or templates:launch | The loaded template bundle (§7.6), with `bundle_version`; an empty list and `bundle_error` when no bundle can be loaded. |
 | `POST /v1/templates/{id}/launch` | templates:launch | `{params, idempotency_key?}` → `201` with `Job`, or `200` with the running instance of a `singleton` template. |
-| `POST /v1/devices/pairing-tickets`, `GET …`, `DELETE …/{id}` | admin | §5.2 (body `{label?, scopes?, daily_unit_cap?, allowed_images?, expires_in_s?}`). `POST` returns `{ticket, url, expires_at}` once. |
-| `GET /v1/devices`, `GET /v1/devices/{id}` | admin, or the device itself | `{id, label, platform, scopes, daily_unit_cap, allowed_images, created_at, last_seen_at, revoked_at, paired_by}`. For a non-`admin` device, `GET /v1/devices` is filtered to that device alone (a one-item list), and `GET /v1/devices/{id}` of any other device gets `404`, as an unknown id. |
-| `DELETE /v1/devices/{id}` | admin, or the device itself | Revoke (§5.5). |
+| `POST /v1/devices/pairing-tickets`, `GET …`, `DELETE …/{id}` | admin | §5.2 (body `{label?, scopes?, daily_unit_cap?, allowed_images?, expires_in_s?, device_expires_in_s?, blobs_quota_mb?}`). `POST` returns `{ticket, url, expires_at}` once. |
+| `GET /v1/devices`, `GET /v1/devices/{id}` | admin, or the device itself | `{id, label, platform, scopes, daily_unit_cap, allowed_images, blobs_quota_mb, expires_at, created_at, last_seen_at, revoked_at, paired_by}`. For a non-`admin` device, `GET /v1/devices` is filtered to that device alone (a one-item list), and `GET /v1/devices/{id}` of any other device gets `404`, as an unknown id. |
+| `DELETE /v1/devices/{id}` | admin, or the device itself | Revoke (§5.5); an `admin` principal that could not have created the device gets `403 escalation_denied`. |
 | `POST /v1/nodes/join-tokens` | admin, or nodes:join | H1, plus `nodes:join` with `expires_in_s <= 900`, and an optional `pre_approved` (bool, `admin` only, else `403`; with it `expires_in_s <= 900`, else `422 out_of_range`). The node starts `pending_approval` (§5.5) when the token's minter is a non-`admin` principal, or an `admin` device without `pre_approved`; tokens of `admin` API keys enroll as in H1. |
 | `POST /v1/nodes/join-requests` | nodes:invite | `{listener_node_id, iroh_node_id, invite_expires_at, listener_commitment}` → `201 {id, expires_at, hub_nonce}` (15 min), state `awaiting_reveal`. `422 invalid_join_request` when `invite_expires_at` is not within `(now, now + 15 min + 120 s]`, a NodeId is not a valid Ed25519 public key or the commitment is not 32 bytes. `429` beyond 4 open per account, 2 open per device or 6 created per device per hour. §5.4. |
 | `POST /v1/nodes/join-requests/{id}/reveal` | the requesting device | `{listener_nonce}`, only while `awaiting_reveal` and created at most 15 minutes ago: a nonce that matches the commitment sets `pending` (`200`); one that does not sets `rejected` and gets `409 join_request_closed`, as does a call in any other state (a second reveal included) or after 15 minutes. §5.4 step 4. |
 | `GET /v1/nodes/join-requests`, `GET /v1/nodes/join-requests/{id}` | admin, or the requesting device (its own requests only; the list is filtered to them) | `{id, requested_by, listener_node_id, iroh_node_id, approval_phrase, state, created_at, expires_at}`, `state` one of `awaiting_reveal`, `pending`, `approved`, `rejected`, `expired`, `delivered`; `approval_phrase` is `null` while `awaiting_reveal`. |
 | `POST /v1/nodes/join-requests/{id}/approve` | admin | Records the approval; mints nothing. `409 join_request_closed` unless `pending` and created at most 15 minutes ago. |
-| `POST /v1/nodes/join-requests/{id}/token` | the requesting device | Only when `approved` and created at most 15 minutes ago (on the hub's clock, whatever state the expiry sweep has left it in): mints the join token (15 min, single use, bound to the request's `iroh_node_id`) on behalf of the approving principal, stores only its hash, returns `{join_token, expires_at}` once and sets `delivered`. Otherwise `409 join_request_closed`. |
+| `POST /v1/nodes/join-requests/{id}/token` | the requesting device | Only when `approved` and created at most 15 minutes ago (on the hub's clock, whatever state the expiry sweep has left it in): mints the join token (15 min, single use, bound to the request's `iroh_node_id`) on behalf of the approving principal, reloaded in the minting transaction (`409 join_request_closed` if it is revoked or expired), stores only its hash, returns `{join_token, expires_at}` once and sets `delivered`. Otherwise `409 join_request_closed`. |
 | `DELETE /v1/nodes/join-requests/{id}` | admin, or the requesting device | Reject or withdraw an `awaiting_reveal` or `pending` request. |
 | `POST /v1/nodes/{id}/approve` | admin | Approves a `pending_approval` node (idempotent); audited `node_approved` (§5.5). |
 | `GET /v1/server` | any principal | H1 fields plus `api_version` (integer, 2 for H2), `min_web_version`, `hub_name`, `max_blob_mb` (§7.5). |
@@ -913,7 +931,10 @@ No endpoint returns blob contents: the hub is not a file store.
 - **Checks before reading the body:** `Content-Length <= max_blob_mb` (default 2,048 MiB, `413 too_large`); then, with
   `checked_add`, the account's stored bytes plus in-flight reservations plus this size `<= blobs_quota_mb` (default
   20,480 MiB; on the hub PC the app sets it at "Create my cloud" from the disk arithmetic of §8.2;
-  `507 quota_exceeded`). The reservation is taken in the same short transaction and released on every exit path.
+  `507 quota_exceeded`); for a device with `blobs_quota_mb` (§5.2), the same sum over the blobs it uploaded and its
+  own reservations must also fit that quota (`507 quota_exceeded`); and at most 2 uploads per principal are in
+  progress at once (`429 too_many_uploads`). The reservation is taken in the same short transaction and released on
+  every exit path. The blob row records the principal of the upload that created it (the two columns of §5.6).
 - **Writing.** The body streams to `<data>/blobs/staging/<random>` while hashing. A short body, a hash mismatch
   (`422 digest_mismatch`) or a broken connection deletes the staging file. On success: `fsync`, rename to
   `<data>/blobs/<account_id>/sha256/<aa>/<bb>/<hex>`, then insert the row (two short transactions with no I/O under
@@ -937,7 +958,8 @@ No endpoint returns blob contents: the hub is not a file store.
   2. **File**: delete it, outside any database transaction.
   3. **Row**: delete it.
 
-  `DELETE /v1/blobs/{sha256}` runs the same three steps at once for an unreferenced blob of the caller's account.
+  `DELETE /v1/blobs/{sha256}` runs the same three steps at once for an unreferenced blob of the caller's account
+  that the caller uploaded; an `admin` may delete any, and any other caller gets `403`.
   An upload of a digest with a tombstone waits until step 3 has run for it, then stores the blob as new. A lock in the
   hub keyed by **`(account_id, digest)`** makes this safe: the GC (or the `DELETE`) holds it from before step 1 until
   step 3, and an upload holds it from its check of the row (deduplication or tombstone) until its rename and row
@@ -1211,9 +1233,11 @@ output) apply to every new command.
 - **Hub listener.** REST binds `127.0.0.1:7477` inside the distro (H1 default). With WSL's default NAT networking,
   `localhostForwarding` (on by default) makes ports bound to localhost in the WSL VM reachable from Windows as
   `localhost:<port>` [S7], on the Windows host's own loopback only, where every local process (other Windows users'
-  sessions included) can reach it. That is acceptable because every REST request needs an API key (H1 §10), devices
-  never use TCP, and device streams have a budget of their own that TCP connections cannot take (§6.3); but it MUST
-  NOT be reachable from the LAN (SI-H2-11 tests it from a second machine). E10 records what Windows' loopback exposes.
+  sessions included) can reach it. Every other WSL2 distro of the user, Docker Desktop's included, shares the VM's
+  network namespace (H1 §9.0, E1) and reaches `127.0.0.1:7477` directly. That is acceptable because every REST request
+  needs an API key (H1 §10), devices never use TCP, and device streams have a budget of their own that TCP connections
+  cannot take (§6.3); but it MUST NOT be reachable from the LAN (SI-H2-11 tests it from a second machine). E10 records
+  what Windows' loopback exposes.
 - **Sleep.** When Windows sleeps the WSL VM is suspended: nodes go offline and, on the hub PC, the whole cloud
   disappears for the phone. H1 leases recover as lost and requeued (U6). Clocks may jump after resume (H1 note on WSL
   clocks); every timer uses monotonic clocks, as H1 requires.
@@ -1358,8 +1382,8 @@ and the handling of a failed-upgrade backup.
 - **Losing the key** (storage cleared, phone reset) means pairing again; the old device stays listed until revoked, and
   the desktop app shows its `last_seen_at`.
 - **A stolen phone** is handled by revocation from the desktop app (U8, SI-H2-4). The device scopes (§5.5) bound what
-  the thief can do until then. A screen lock is the user's first defence; an app-level PIN or passkey unlock is H3
-  (O-9).
+  the thief can do until then, except a poisoned chat model, which outlives revocation until the model reset (§5.5). A
+  screen lock is the user's first defence; an app-level PIN or passkey unlock is H3 (O-9).
 
 ### 9.4 Template UIs
 
@@ -1708,10 +1732,12 @@ implemented before the separate change that puts it in force (O-16); T2-22 waits
 - The hub shares the distro with the jobs (D1). A container escape reaches the hub's database, blobs and identity, on
   top of the node identity it already reached in H1.
 - Volumes outlive jobs (§11.3). A compromised service can leave files in its volume that a later job of the same
-  account and volume name reads; for templates those are model files, read as data (below).
+  account and volume name reads; for templates those are model files, read as data (below). A template-view
+  principal can also write arbitrary model files into the private chat's volume through Ollama's API (§5.5).
 - Templates run third-party images (Ollama, whisper.cpp) with egress to model hosts. They are pinned by digest and
   reviewed, but they are not our code.
-- Model files come from the internet. The default models are GGUF files read as data **(H: E11 confirms that the
+- Model files come from the internet, or from any template-view principal (§5.5), so the parser also sees
+  attacker-chosen files. The default models are GGUF files read as data **(H: E11 confirms that the
   chosen images load only GGUF and do not execute code from model files)**.
 - These go into `docs/security/residual-risks.md` (task T2-61).
 
@@ -1813,12 +1839,13 @@ implemented before the separate change that puts it in force (O-16); T2-22 waits
 ## 13. Storage
 
 - **Hub data dir.** In app mode `/var/lib/p2pc-server` inside the hub PC's distro (0700, root); otherwise H1 §12.
-  - New tables (additive migrations): `devices` and `pairing_tickets` (both with `daily_unit_cap` and `allowed_images`,
-    §5.2), `join_requests` (with the listener commitment, the hub nonce and the revealed listener nonce, §5.4), `blobs`
-    (with the GC tombstone `deleting_at`), `blob_refs`, `volume_reports`, `service_state` (health, last activity,
-    consecutive unhealthy attempts, node-loss restart times of the last 24 h, and the day's cap reservation as `cap_day`
-    and `cap_reserved_units`, §12), `service_traffic`, `template_bundle_state` (one row: the high-water `bundle_version`
-    and its SHA-256, §7.6), and the node columns `approval` and `enrolled_by`.
+  - New tables (additive migrations): `devices` and `pairing_tickets` (both with `daily_unit_cap`, `allowed_images`, the
+    device expiry and `blobs_quota_mb`, §5.2), `join_requests` (with the listener commitment, the hub nonce and the
+    revealed listener nonce, §5.4), `blobs` (with the GC tombstone `deleting_at` and the uploader's principal, §7.5),
+    `blob_refs`, `volume_reports`, `service_state` (health, last activity, consecutive unhealthy attempts, node-loss
+    restart times of the last 24 h, and the day's cap reservation as `cap_day` and `cap_reserved_units`, §12),
+    `service_traffic`, `template_bundle_state` (one row: the high-water `bundle_version` and its SHA-256, §7.6), and the
+    node columns `approval` and `enrolled_by`.
   - Rebuilt tables (one forward-only migration that keeps every append-only trigger, §5.6): `jobs`, `usage_records`
     (principal and slice columns, the new key, §12), `join_tokens` and `audit_events`.
   - Blobs: `<data>/blobs/<account_id>/sha256/<aa>/<bb>/<hex>` (per account, §7.5), staging in
@@ -1862,9 +1889,10 @@ implemented before the separate change that puts it in force (O-16); T2-22 waits
   (automatically only when the user said yes; otherwise on "Check for updates"), carrying no identifier. When the named
   version is above the hub's current one (`GET /v1/templates`), or the hub serves none, it downloads the bundle and its
   signature, verifies the signature against the public key compiled into the app, and copies both into the distro's
-  `<data>/templates/` through `wsl.exe`. The hub verifies again and applies §7.6's anti-rollback rule; the app's own
-  check only saves a useless copy. Like `latest.json`, `templates-latest.json` is not signed, so a stale or hostile
-  endpoint can at most withhold a bundle or offer an older one, which the hub refuses.
+  `<data>/templates/` through `wsl.exe` with byte-exact pipes, as the upgrade does (§8.3): each file goes to the stdin
+  of a command run inside the distro, never through `/mnt/c` or `\\wsl$`. The hub verifies again and applies §7.6's
+  anti-rollback rule; the app's own check only saves a useless copy. Like `latest.json`, `templates-latest.json` is not
+  signed, so a stale or hostile endpoint can at most withhold a bundle or offer an older one, which the hub refuses.
 
 ### 14.2 The distro (agent, hub, image)
 
@@ -1918,7 +1946,7 @@ H1's SI-1 to SI-13 stay in force and keep their tests.
 | SI-H2-1 | No secret appears in logs, `Debug` output, errors, audit events, the app's logs or the browser console: device keys, pairing tickets, invite codes, listener nonces before their reveal, join tokens, API keys. A test scans the outputs of every pairing, invite and join path. |
 | SI-H2-2 | Pairing tickets are single-use and expire, checked against the hub's row, never the payload. Two concurrent `Pair`s for one ticket create exactly one device; a retry from the same NodeId is idempotent while its device is live; a retry from the same NodeId after that device was revoked gets `invalid_ticket` and creates nothing; every failure is the same `invalid_ticket`. Tests: the concurrent pair, the retry, the retry after revocation (by an `admin` and by the device itself), a retry from another NodeId. |
 | SI-H2-3 | A device principal exists only on `p2pc/device/1`. No request on the TCP listener or `p2pc/http/1` can carry one (no header, no query parameter); a device stream with an `Authorization` header gets `400`. |
-| SI-H2-4 | Revoking a device closes its live connections and its open service streams within 5 s, and later connections get the same `not_paired` as a NodeId never paired. Paired non-`admin` devices cannot keep the owner from revoking: with every non-`admin` device at its per-device stream cap and the non-`admin` share of the device budget full (§6.3), an `admin` device still opens streams from its reserve and revokes; an idle device port connection closes after `port_idle_s`. With the 32 pre-check slots of `p2pc/device/1` held full by unknown NodeIds, the hub PC's app still revokes a phone through the offline `p2pc-server devices revoke` while the hub runs, and the hub closes that phone's connections and service streams within 5 s. Device streams and the TCP REST listener have separate budgets (§6.3): with the TCP listener's connection cap held full by unauthenticated loopback connections, an `admin` device still opens streams and revokes, and with the whole device budget in use, a TCP client with an API key still gets a connection. Tested with an injectable clock and a real in-process hub. |
+| SI-H2-4 | Revoking a device closes its live connections and its open service streams within 5 s, and later connections get the same `not_paired` as a NodeId never paired. Paired non-`admin` devices cannot keep the owner from revoking: with every non-`admin` device at its per-device stream cap and the non-`admin` share of the device budget full (§6.3), an `admin` device still opens streams from its reserve and revokes; an idle device port connection closes after `port_idle_s`. With the 32 pre-check slots of `p2pc/device/1` held full by unknown NodeIds, the hub PC's app still revokes a phone through the offline `p2pc-server devices revoke` while the hub runs, and the hub closes that phone's connections and service streams within 5 s. Device streams and the TCP REST listener have separate budgets (§6.3): with the TCP listener's connection cap held full by unauthenticated loopback connections (from the Windows host or another WSL2 distro), an `admin` device still opens streams and revokes, and with the whole device budget in use, a TCP client with an API key still gets a connection. Tested with an injectable clock and a real in-process hub. |
 | SI-H2-5 | Opening a service port requires `services:connect` (or `templates:launch` for a template service of the caller's template view, §5.5), the job's account and project, a `running` service and a listed port, through one code path for every transport. Cross-account, unlisted-port and template-view negative tests: a phone-profile device gets `404` on a `p2pc service run` service and on another device's non-singleton template service. |
 | SI-H2-6 | `PortOpen` and `BlobFetch` are fenced by `(lease_id, epoch)` on the hub and on the agent; a stale one is refused. |
 | SI-H2-7 | The agent never connects to a socket path inside a job's directories except its own `ingress.sock`, which it created in the read-only mount; the shim refuses unlisted ports. The agent reads only the status line of a health check response, at most 1 KiB (§11.2). Tests: a symlink planted where a socket could be, an unlisted port, a fake shim, a health check answered with an endless status line or an endless body (the check fails or passes on the status line alone, and the agent reads no more than 1 KiB). |
@@ -1932,8 +1960,8 @@ H1's SI-1 to SI-13 stay in force and keep their tests.
 | SI-H2-15 | The app's updater refuses an artifact with a bad signature, without a signed version, or with a signed version not greater than its own. |
 | SI-H2-16 | An invite code is single-use; the hub phrase is a pure function of (hub NodeId, listener NodeId, code), the approval phrase of (hub NodeId, agent NodeId, listener nonce, hub nonce) and the node phrase of (node NodeId), each 6 words (66 bits) with test vectors; the app joins only after the explicit confirmation. **Join requests resist an offline search** (§5.4 steps 3-5): the hub draws the hub nonce only after the request, with its agent NodeId and listener commitment, is stored; it computes and shows the approval phrase only after a reveal that matches the commitment; the listener reveals its nonce once, to the first phone with the valid code, and accepts `Invite` only from that phone. Tests: vectors for each rejected input of `POST /v1/nodes/join-requests` (`invite_expires_at` equal to now, in the past, and 1 s beyond now + 15 min + 120 s; a `listener_node_id` and an `iroh_node_id` of 32 bytes that do not decode to a curve point, and of the wrong length; a commitment of the wrong length), each `422 invalid_join_request` with no row created; two requests with identical inputs get different hub nonces and different phrases; `approve` of an `awaiting_reveal` request gets `409` and the hub PC shows no phrase for it; a reveal that does not match the commitment gets `409`, sets `rejected` and allows no second reveal; on the listener, a second phone's `InviteOpen` or `Invite` gets `already_open`, a repeated `InviteOpen` with another hub nonce gets `already_open`, an `Invite` before any `InviteOpen` gets `invalid_code`, and an `Invite` whose join token names another hub than the `InviteOpen` gets `hub_mismatch` and is not joined. The hub PC's approval screens show the phrase, the source device as recorded at pairing and the request or enrollment time; `approve` and `token` of a join request created more than 15 minutes ago get `409 join_request_closed`, also while the expiry sweep has not run (an injected clock with the sweep stopped, for a `pending` and for an `approved` request); a join token of a join request enrolls only its bound agent NodeId (another NodeId gets H1's invalid-token answer and the token stays unused); one device cannot hold more than 2 open join requests or create more than 6 an hour (`429`). |
 | SI-H2-17 | `p2pc/pair/1` and `p2pc/invite/1` enforce their pre-auth limits (connections, pending exchanges, deadline, 4 KiB frames, failure rates: §5.3 and §6.2), and `p2pc/device/1` its limits before the device check (§6.3: 32 unchecked connections, 5 s, 10 `not_paired` a minute per NodeId); their decoders are fuzzed or property-tested. The limits never lock the owner out: with failure counters over their limits from other NodeIds and other ticket-hash prefixes, a `Pair` with a valid ticket that gets a connection slot still pairs (§5.3), an `Invite` with the valid code still gets `InviteAck` (§6.2), and a live device still connects (§6.3). The same holds for `p2pc/agent/1` (§6.1, T2-17): with H1's 60-a-minute total of failed `Join`s reached by other NodeIds, a `Join` with a valid token from a fresh NodeId that gets a slot still enrolls, and a NodeId over its own 10 a minute is still refused without the token lookup. **The aggregate failure cap** (§5.3) holds on every one of these ALPNs: with failures spread over fresh NodeIds and every ticket-hash or token-hash prefix, beyond 60 a minute no failure gets a detailed answer or is logged or audited one by one (one aggregated audit event a minute counts them), while a valid credential that gets a slot still succeeds. |
-| SI-H2-18 | No escalation for devices: pairing tickets carry a subset of the creator's power (scopes, `daily_unit_cap`, image allowlist, expiry), set through the ticket's body (§5.2; tests: a ticket from a capped creator without a cap, with a higher cap, or with an image pattern not in the creator's list gets `403 escalation_denied`, and a device paired with a cap and a list is refused a job beyond them); a device's cap is enforced against its own principal (§12), never against the key or device that paired it; `nodes:join` creates tokens of at most 900 s and nothing else; `nodes:invite` creates only join requests; only `admin` creates pairing tickets; the last unrestricted `admin` principal cannot be revoked (`409 last_admin_key` for a key, `409 last_admin_device` for a device); a non-`admin` device sees only itself: `GET /v1/devices` returns a one-item list and `GET /v1/devices/{id}` of another device gets `404`. **The default phone profile reaches only what §5.5 lists**, pinned by a negative test per route with a phone-profile device in a project that also holds a developer batch job, a `p2pc service run` service, another device's `transcribe` job and a `private-chat` instance launched by the owner: `POST /v1/jobs` gets `403`; `GET /v1/jobs` lists only its own template jobs and the singleton instance; `GET /v1/jobs/{id}`, `…/logs`, `…/outputs` and `…/outputs/{path}` of the developer jobs and of the other device's job get `404`; logs and outputs of the owner's singleton instance get `404`; `…/ports/{port}/connect` on the developer service gets `404`; `…/cancel` of the developer jobs and the other device's job gets `404` (and with `jobs:write`, H1's project-wide cancel still works); `GET /v1/usage`, `POST /v1/estimate`, `GET /v1/blobs`, `POST /v1/nodes/join-tokens`, `POST /v1/devices/pairing-tickets`, node drain, resume and delete, key and audit routes get `403`. |
-| SI-H2-19 | No PC gets work without an `admin`'s approval. The default phone profile has no `nodes:join`. A node enrolled with a token minted by a non-`admin` principal is `pending_approval`, and the scheduler never offers it a lease until an `admin` principal approves it; a join request yields a token only after an `admin` approval, only to the requesting device and only once. An invite text minted by an `admin` device gives a pending node unless it was minted with `pre_approved`, which only an `admin` principal may set, for at most 900 s. Tests: a property test over the scheduler with pending and approved nodes (no lease ever reaches a pending one); approval by a non-`admin` principal gets `403`; a `nodes:join` device's token gives a pending node; an `admin` device's token gives a pending node without `pre_approved` and an approved one with it; `pre_approved` from a non-`admin` principal gets `403` and with `expires_in_s` over 900 gets `422`; an `admin` API key's token gives an approved node (H1); first-run step 4 run against a real hub enrolls the hub PC's own node `approved`, and that node gets a lease; a join request's token call before approval, after delivery and from another device gets `409` or `404`; the phone profile's scope list is pinned by a test. |
+| SI-H2-18 | No escalation for devices: pairing tickets carry a subset of the creator's power (scopes, `daily_unit_cap`, image allowlist, expiry, device expiry, `blobs_quota_mb`), set through the ticket's body (§5.2; tests: a ticket from a capped creator without a cap, with a higher cap, or with an image pattern not in the creator's list gets `403 escalation_denied`, and a device paired with a cap and a list is refused a job beyond them; a ticket from an expiring key with no `device_expires_in_s`, or with one beyond the key's `expires_at`, gets `403 escalation_denied`; a device past its `expires_at` gets `not_paired`); a device's cap is enforced against its own principal (§12), never against the key or device that paired it; `nodes:join` creates tokens of at most 900 s and nothing else; `nodes:invite` creates only join requests; only `admin` creates pairing tickets; the last unrestricted `admin` principal cannot be revoked (`409 last_admin_key` for a key, `409 last_admin_device` for a device); a restricted `admin` principal revoking an unrestricted device gets `403 escalation_denied`; a non-`admin` device sees only itself: `GET /v1/devices` returns a one-item list and `GET /v1/devices/{id}` of another device gets `404`. **The default phone profile reaches only what §5.5 lists**, pinned by a negative test per route with a phone-profile device in a project that also holds a developer batch job, a `p2pc service run` service, another device's `transcribe` job and a `private-chat` instance launched by the owner: `POST /v1/jobs` gets `403`; `GET /v1/jobs` lists only its own template jobs and the singleton instance; `GET /v1/jobs/{id}`, `…/logs`, `…/outputs` and `…/outputs/{path}` of the developer jobs and of the other device's job get `404`; logs and outputs of the owner's singleton instance get `404`; `…/ports/{port}/connect` on the developer service gets `404`; `…/cancel` of the developer jobs and the other device's job gets `404` (and with `jobs:write`, H1's project-wide cancel still works); `GET /v1/usage`, `POST /v1/estimate`, `GET /v1/blobs`, `POST /v1/nodes/join-tokens`, `POST /v1/devices/pairing-tickets`, node drain, resume and delete, key and audit routes get `403`; `DELETE /v1/blobs/{sha256}` of a blob the owner uploaded gets `403`, a third concurrent upload gets `429 too_many_uploads`, and an upload beyond the device's `blobs_quota_mb` gets `507`. The private chat's port forwards Ollama's whole API, as §5.5 accepts. |
+| SI-H2-19 | No PC gets work without an `admin`'s approval. The default phone profile has no `nodes:join`. A node enrolled with a token minted by a non-`admin` principal is `pending_approval`, and the scheduler never offers it a lease until an `admin` principal approves it; a join request yields a token only after an `admin` approval, only to the requesting device and only once. An invite text minted by an `admin` device gives a pending node unless it was minted with `pre_approved`, which only an `admin` principal may set, for at most 900 s. Tests: a property test over the scheduler with pending and approved nodes (no lease ever reaches a pending one); approval by a non-`admin` principal gets `403`; a `nodes:join` device's token gives a pending node; an `admin` device's token gives a pending node without `pre_approved` and an approved one with it; `pre_approved` from a non-`admin` principal gets `403` and with `expires_in_s` over 900 gets `422`; an `admin` API key's token gives an approved node (H1); first-run step 4 run against a real hub enrolls the hub PC's own node `approved`, and that node gets a lease; a join request's token call before approval, after delivery, after the approving principal was revoked, and from another device gets `409` or `404`; the phone profile's scope list is pinned by a test. |
 | SI-H2-20 | Ledger and caps stay exact with two kinds of principal and daily slices (§5.6, §12). Every row of `jobs`, `usage_records` and `join_tokens` names exactly one principal (`CHECK`); idempotency deduplicates per principal for keys and for devices alike; the ledger stays append-only after the rebuild; `spent(P, D)` never counts a service's reservation and the slices written against it twice, and gives H1's numbers for batch jobs. Tests: inserts with both or neither principal column set fail; two submissions with one idempotency key from one device give one job, and from two devices or from a device and a key give two; `UPDATE` and `DELETE` on `usage_records` fail after the migration; the migration test of §5.6; a property test with an injectable clock over batch and service jobs of key and device principals crossing midnights (reservations, slices, requeues, cancels), checking after every step that `spent(P, D)` equals the reference sum of §12, that a service's rows for a day exceed that day's `cap_reserved_units` only by an estimated slice of an attempt the hub could not reach at `cap_deadline` (up to the end it observed), and that ledger invariant 6 (one row per finished slice) holds; H1's cap tests pass unchanged. `GET /v1/usage` over the same histories: `attempts` counts last slices only (a service that crossed three midnights is one attempt), `estimated_attempts` and `estimated_slices` match the reference, `group_by=key` with device rows present returns key groups only and never fails to decode, `group_by=principal` covers every row, and a midnight slice's `max_rss_mb` is the attempt's peak so far. |
 | SI-H2-21 | The MCP tool `p2pc_blob_put` reads only regular, non-hidden files inside the configured upload directory, of at most `max_blob_mb`, through no symbolic link in any component, from one descriptor (§7.8). `p2pc mcp` creates the directory 0700 and refuses an unsafe one. Tests (each refused with `path_not_allowed` and nothing uploaded): `../` traversal and a `..` component in the middle; an absolute path outside the directory (`/etc/passwd`, the CLI's credentials file); a symbolic link inside the directory to a file outside it, one to a directory outside it used as a middle component, and the upload directory itself replaced by a link; a hidden file and a file under a hidden directory; a FIFO (the call does not block), a socket and a device node; a sparse file over `max_blob_mb`; a file that grows during the upload. Start-up tests: an upload directory with group or other access, one that is the home directory, and one that contains the credentials directory are refused. |
 | SI-H2-22 | The desktop app's web app verification (§9.6) accepts a deployed build only with a manifest signed by the release key and a `web_version` at or above its persisted high-water mark, which starts at its own release's web build version and never goes down; a newer valid build is a notice, never the tampering warning. Tests with test-signed fixtures: the app's own build (verified); a newer valid build (verified, a notice, the mark rises); then the previous build, validly signed (the rollback warning, also after an app restart); a missing manifest, a bad signature and a manifest signed with another key (the unsigned warning offering a self-hosted copy; "Not verified: self-built copy" when `web_app_origin` is not the official origin); a valid manifest with one changed file (the red tampering warning); a valid build whose `min_hub_version` is above the local hub (the update-the-hub notice). |
@@ -1942,9 +1970,9 @@ H1's SI-1 to SI-13 stay in force and keep their tests.
 
 | Threat | Mitigation | Residual |
 |---|---|---|
-| Stolen, unlocked phone | Bounded scopes and the template view (§5.5, SI-H2-18); revocation in ≤ 5 s; devices listed with `last_seen_at`; no `nodes:join` in the default profile, and every PC approved on the hub PC against a check phrase (SI-H2-16, SI-H2-19); at most 2 open join requests per device | Until revoked: use the shared chat service (chat with the owner's model, pull models from the template's egress hosts into its volume or delete them, stop it), launch templates and read the state, logs and outputs of the template jobs it launched, see the PCs, upload blobs, test whether a blob of a known digest exists and delete unreferenced ones, and open join requests that the owner must approve on the hub PC. Not: developer jobs, other devices' template jobs, non-template services, chat history of other devices. |
+| Stolen, unlocked phone | Bounded scopes and the template view (§5.5, SI-H2-18); revocation in ≤ 5 s; devices listed with `last_seen_at`; no `nodes:join` in the default profile, and every PC approved on the hub PC against a check phrase (SI-H2-16, SI-H2-19); at most 2 open join requests per device | Until revoked: use the shared chat service (chat with the owner's model, use Ollama's whole API: pull any registry model, write arbitrary model files, overwrite or delete models; stop it), launch templates and read the state, logs and outputs of the template jobs it launched, see the PCs, upload blobs, test whether a blob of a known digest exists and delete unreferenced ones it uploaded, and open join requests that the owner must approve on the hub PC. **After** revocation: a model it wrote or replaced stays in the chat's volume until the model reset (§5.5), and attacker-chosen GGUF files reach the model parser (§11.5). Not: developer jobs, other devices' template jobs, non-template services, chat history of other devices. |
 | Misbehaving or many paired phones | Per-device stream cap, a share of the device budget reserved for `admin` devices, idle limits on device port connections (§6.3, SI-H2-4) | They can slow each other down; not the hub PC's app. |
-| Local processes on the hub PC (other Windows sessions too) at the loopback REST listener | API key on every request (H1 §10); device streams have their own budget, outside the TCP connection cap (§6.3, SI-H2-4) | They can fill the TCP cap and delay API-key clients on that PC; never the devices, nor the owner's revocation. |
+| Local processes on the hub PC (other Windows sessions too) and the user's other WSL2 distros (Docker Desktop's too) at the loopback REST listener | API key on every request (H1 §10); device streams have their own budget, outside the TCP connection cap (§6.3, SI-H2-4) | They can fill the TCP cap and delay API-key clients on that PC; never the devices, nor the owner's revocation. |
 | Prompt-injected agent behind MCP | `p2pc_blob_put` reads only regular, non-hidden files inside one upload directory, through no symbolic link (§7.8, SI-H2-21); H1's capped key and image allowlist | Files the user put in the upload directory can be uploaded and used as job inputs. |
 | XSS in the web app | CSP, Trusted Types, no HTML sinks, no third-party code, SRI | A bug in our own code can still leak the device key. |
 | Malicious or compromised static host | Reproducible build; a signed, versioned manifest for every web build at the origin; the desktop app's verification with its anti-rollback mark (SI-H2-22); self-hosted copy (§9.6) | Targeted tampering of one client is not detected; a host can withhold a newer build. |
