@@ -2531,6 +2531,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "p2pc-device"
+version = "0.1.0"
+
+[[package]]
 name = "p2pc-net"
 version = "0.1.0"
 dependencies = [
@@ -2611,6 +2615,10 @@ dependencies = [
  "signal-hook",
  "tempfile",
 ]
+
+[[package]]
+name = "p2pc-wsl"
+version = "0.1.0"
 
 [[package]]
 name = "papaya"

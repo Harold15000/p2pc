@@ -6,6 +6,11 @@ changes; they are listed under **Changed** or **Removed**.
 
 ## [Unreleased]
 
+### Added
+
+- H2 workspace scaffold: empty crates `p2pc-device` and `p2pc-wsl`, and placeholder directories `apps/desktop`,
+  `apps/web`, `templates/`, `deploy/relay` and `deploy/web`. No behaviour change.
+
 ### Security
 
 - RUSTSEC-2026-0462: upgraded `rmcp` to 3.9.0 (unbounded response buffering in its Streamable HTTP clients).
