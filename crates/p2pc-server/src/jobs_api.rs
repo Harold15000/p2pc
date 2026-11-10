@@ -154,7 +154,7 @@ pub async fn create_job(
     let job_id = JobId::generate();
     // Reads (the caller, an earlier job with the key, the day's reservations), then writes: IMMEDIATE (see
     // `store::begin_immediate`). It also serializes concurrent submissions, so "look up the key, then insert" cannot
-    // race; the unique index on `(key_id, idempotency_key)` is the backstop.
+    // race; the unique indexes on `(key_id, idempotency_key)` and `(device_id, idempotency_key)` are the backstop.
     let mut tx = store::begin_immediate(&state.db).await?;
     // One `now`, read once the write lock is held.
     let now = state.clock.now();
@@ -166,11 +166,10 @@ pub async fn create_job(
         return Err(ApiError::image_not_allowed(&prepared.spec.image));
     }
     // A replay is answered before the cap: the job already exists and is already counted. Idempotency keys are
-    // scoped to the API key (§7): only this key's own jobs can answer, so a replay by another key is just a new job
-    // and says nothing about anyone else's.
+    // scoped to the principal (§7, H2 §5.6): only this key's or device's own jobs can answer, so a replay by another
+    // principal is just a new job and says nothing about anyone else's.
     if let Some(key) = &prepared.spec.idempotency_key
-        && let Some(existing) =
-            jobs::find_by_idempotency_key(&mut tx, p.account_id, p.project_id, p.key_id, key).await?
+        && let Some(existing) = jobs::find_by_idempotency_key(&mut tx, p.account_id, p.project_id, p.id, key).await?
     {
         return if existing.spec_hash == prepared.hash {
             job_response(StatusCode::OK, &existing)
@@ -179,14 +178,14 @@ pub async fn create_job(
         };
     }
     if let Some(cap) = caller.daily_unit_cap {
-        let reserved = spent_today(&mut tx, p.account_id, p.key_id, now).await?;
+        let reserved = spent_today(&mut tx, p.account_id, p.id, now).await?;
         check_cap(cap, reserved, units).map_err(|c| ApiError::cap_exceeded(c.cap, c.reserved, c.estimate))?;
     }
     let new = NewJob {
         job_id,
         account_id: p.account_id,
         project_id: p.project_id,
-        key_id: p.key_id,
+        principal: p.id,
         spec: prepared.spec,
         files_meta,
         spec_hash: prepared.hash,
@@ -195,7 +194,7 @@ pub async fn create_job(
     let row = jobs::insert(&mut tx, &new, now).await?;
     tx.commit().await?;
     // The ID and the key only: never the spec.
-    tracing::info!(job_id = %row.job_id, key_id = %p.key_id, "job created");
+    tracing::info!(job_id = %row.job_id, principal = %p.id, "job created");
     state.kick.kick();
     job_response(StatusCode::CREATED, &row)
 }
@@ -343,7 +342,7 @@ pub async fn cancel_job(
         JobStatus::Assigned | JobStatus::Running => {
             // Only the first request sets the time; asking again changes nothing.
             if jobs::request_cancel(&mut tx, p.account_id, p.project_id, id, now).await? {
-                tracing::info!(job_id = %id, key_id = %p.key_id, "job cancel requested");
+                tracing::info!(job_id = %id, principal = %p.id, "job cancel requested");
             }
             jobs::get(&mut tx, p.account_id, p.project_id, id)
                 .await?
@@ -400,7 +399,7 @@ pub async fn estimate(
     let submitted = match &prepared.spec.idempotency_key {
         Some(key) => {
             let mut conn = state.db.acquire().await?;
-            jobs::find_by_idempotency_key(&mut conn, p.account_id, p.project_id, p.key_id, key)
+            jobs::find_by_idempotency_key(&mut conn, p.account_id, p.project_id, p.id, key)
                 .await?
                 .filter(|j| j.spec_hash == prepared.hash && j.status == JobStatus::Queued)
         }

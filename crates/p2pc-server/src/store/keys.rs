@@ -315,8 +315,9 @@ impl KeyRow {
 /// Revokes a key of `account_id` (sets `revoked_at`; the row is never deleted).
 ///
 /// A single `UPDATE` refuses to revoke the account's last live **unrestricted** admin key (see
-/// [`KeyRow::is_unrestricted_admin`]), so no sequence of revocations, concurrent or not, can leave the account with
-/// only limited admin keys that may expire or be capped. Who may revoke what (§5 no-escalation) is the caller's
+/// [`KeyRow::is_unrestricted_admin`]) when no unrestricted `admin` device remains either (H2 §5.5: the last live
+/// unrestricted `admin` principal, device or key), so no sequence of revocations, concurrent or not, can leave the
+/// account with only limited admin principals that may expire or be capped. Who may revoke what (§5 no-escalation) is the caller's
 /// check.
 pub async fn revoke(
     conn: &mut Conn,
@@ -333,7 +334,11 @@ pub async fn revoke(
                            WHERE other.account_id = ?2 AND other.key_id <> ?3 AND other.revoked_at IS NULL \
                              AND other.expires_at IS NULL AND other.daily_unit_cap IS NULL \
                              AND other.allowed_images IS NULL \
-                             AND EXISTS (SELECT 1 FROM json_each(other.scopes) WHERE value = 'admin')))",
+                             AND EXISTS (SELECT 1 FROM json_each(other.scopes) WHERE value = 'admin')) \
+                OR EXISTS (SELECT 1 FROM devices AS d \
+                           WHERE d.account_id = ?2 AND d.revoked_at IS NULL AND d.expires_at IS NULL \
+                             AND d.daily_unit_cap IS NULL AND d.allowed_images IS NULL AND d.blobs_quota_mb IS NULL \
+                             AND EXISTS (SELECT 1 FROM json_each(d.scopes) WHERE value = 'admin')))",
     )
     .bind(ts(now))
     .bind(account_id.to_string())

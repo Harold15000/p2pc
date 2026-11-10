@@ -49,6 +49,7 @@ pub const BEARER: &str = "bearer";
         nodes_api::drain_node,
         nodes_api::resume_node,
         nodes_api::delete_node,
+        nodes_api::approve_node,
         jobs_api::create_job,
         jobs_api::list_jobs,
         jobs_api::get_job,

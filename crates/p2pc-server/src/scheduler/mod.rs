@@ -818,7 +818,13 @@ impl Scheduler {
         wall_ms: u64,
         now: OffsetDateTime,
     ) -> Result<UsageRecord> {
-        let key_id = leases::job_key(tx, lease.job_id).await?;
+        // `UsageRecord` (p2pc-proto) still names the principal by a key ID. `insert_usage` takes the principal (key or
+        // device) from the job's own row and never stores this field (H2 §5.6), so a device's job carries a random
+        // stand-in here that goes nowhere. T2-16 replaces the ledger row type.
+        let key_id = leases::job_principal(tx, lease.job_id)
+            .await?
+            .key_id()
+            .unwrap_or_else(p2pc_proto::ids::KeyId::generate);
         let started = lease.started_at.or(lease.accepted_at).unwrap_or(lease.offered_at);
         let wall_ms = u128::from(wall_ms);
         let cpu_milli = u128::from(fit::cpu_milli(lease.reserved.cpu));

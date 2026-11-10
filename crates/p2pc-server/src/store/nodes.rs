@@ -8,8 +8,10 @@
 //!   authenticated connection) are keyed by the node itself: on the agent protocol the principal **is** the node,
 //!   whose iroh NodeId iroh's TLS authenticated.
 
-use p2pc_proto::api::{Capacity, Inventory, Node, NodeState};
+use p2pc_proto::api::{Capacity, Inventory, Node, NodeApproval, NodeState, Principal};
 use p2pc_proto::ids::{AccountId, JoinTokenId, NodeId, ProjectId};
+use p2pc_proto::invite::node_phrase;
+use p2pc_proto::pair::EndpointKey;
 use time::OffsetDateTime;
 
 use super::{Conn, StoreError, from_ts, from_ts_opt, parse_col, ts};
@@ -95,6 +97,10 @@ pub struct NodeRow {
     pub created_at: OffsetDateTime,
     /// Soft-deletion time.
     pub deleted_at: Option<OffsetDateTime>,
+    /// `approved` or `pending_approval` (H2 §5.5).
+    pub approval: NodeApproval,
+    /// The principal that minted the token that enrolled it; `None` for H1 nodes.
+    pub enrolled_by: Option<Principal>,
 }
 
 impl NodeRow {
@@ -114,7 +120,19 @@ impl NodeRow {
         node.draining = self.draining;
         node.free = offered(&self.inventory);
         node.last_seen = self.last_seen_at;
+        node.approval = self.approval;
+        node.enrolled_by = self.enrolled_by;
+        node.node_phrase = self.node_phrase();
         node
+    }
+
+    /// The node phrase (H2 §5.5): 6 words derived from the node's iroh NodeId, which the hub PC shows before
+    /// approving it and the joined PC shows too. `None` only if the stored NodeId is not 64 hex characters, which the
+    /// table's CHECK forbids.
+    #[must_use]
+    pub fn node_phrase(&self) -> Option<String> {
+        let key: EndpointKey = self.iroh_node_id.parse().ok()?;
+        Some(node_phrase(&key).to_string())
     }
 }
 
@@ -142,36 +160,61 @@ pub struct NewNode {
     pub token_id: JoinTokenId,
 }
 
-type Row = (
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    i64,
-    Option<i64>,
-    String,
-    i64,
-    Option<i64>,
-);
+/// The raw columns of `nodes`, in the order of `select_nodes!`.
+#[derive(sqlx::FromRow)]
+struct Row {
+    id: String,
+    account_id: String,
+    project_id: String,
+    iroh_node_id: String,
+    name: String,
+    hostname: String,
+    inventory: String,
+    agent_version: String,
+    features: String,
+    state: String,
+    draining: i64,
+    last_seen_at: Option<i64>,
+    enrolled_via_token_id: String,
+    created_at: i64,
+    deleted_at: Option<i64>,
+    approval: String,
+    enrolled_by_key_id: Option<String>,
+    enrolled_by_device_id: Option<String>,
+}
 
 macro_rules! select_nodes {
     ($tail:literal) => {
         concat!(
             "SELECT id, account_id, project_id, iroh_node_id, name, hostname, inventory, agent_version, features, \
-             state, draining, last_seen_at, enrolled_via_token_id, created_at, deleted_at FROM nodes ",
+             state, draining, last_seen_at, enrolled_via_token_id, created_at, deleted_at, approval, \
+             enrolled_by_key_id, enrolled_by_device_id FROM nodes ",
             $tail
         )
     };
 }
 
 fn decode(row: Row) -> Result<NodeRow, StoreError> {
-    let (id, account, project, iroh, name, host, inv, ver, feat, state, drain, seen, token, created, deleted) = row;
+    let Row {
+        id,
+        account_id: account,
+        project_id: project,
+        iroh_node_id: iroh,
+        name,
+        hostname: host,
+        inventory: inv,
+        agent_version: ver,
+        features: feat,
+        state,
+        draining: drain,
+        last_seen_at: seen,
+        enrolled_via_token_id: token,
+        created_at: created,
+        deleted_at: deleted,
+        approval,
+        enrolled_by_key_id: by_key,
+        enrolled_by_device_id: by_device,
+    } = row;
     Ok(NodeRow {
         id: parse_col(&id, "nodes.id")?,
         account_id: parse_col(&account, "nodes.account_id")?,
@@ -188,6 +231,19 @@ fn decode(row: Row) -> Result<NodeRow, StoreError> {
         enrolled_via_token_id: parse_col(&token, "nodes.enrolled_via_token_id")?,
         created_at: from_ts(created, "nodes.created_at")?,
         deleted_at: from_ts_opt(deleted, "nodes.deleted_at")?,
+        approval: match approval.as_str() {
+            "approved" => NodeApproval::Approved,
+            "pending_approval" => NodeApproval::PendingApproval,
+            _ => return Err(StoreError::Corrupt("nodes.approval")),
+        },
+        enrolled_by: match (by_key, by_device) {
+            (None, None) => None,
+            (k, d) => Some(super::jobs::principal_cols(
+                k.as_deref(),
+                d.as_deref(),
+                "nodes.enrolled_by",
+            )?),
+        },
     })
 }
 
@@ -251,11 +307,24 @@ pub async fn unique_name(conn: &mut Conn, account_id: AccountId, hostname: &str)
 }
 
 /// Inserts a node, `offline` until its connection is registered, and returns the row.
+///
+/// Its `approval` and `enrolled_by` come from the token row `node.token_id` (H2 §5.5), in the same statement: the
+/// node is `approved` iff the token has `pre_approved = 1`, or a `bound_iroh_node_id` (only tokens of approved join
+/// requests have one), or was minted by an API key with the `admin` scope (H1 behaviour); otherwise it is
+/// `pending_approval`, and the scheduler offers it no lease until an `admin` approves it. `enrolled_by` is the
+/// token's minter.
 pub async fn insert(conn: &mut Conn, node: &NewNode, now: OffsetDateTime) -> Result<NodeRow, StoreError> {
     let name = unique_name(conn, node.account_id, &node.inventory.hostname).await?;
-    sqlx::query(
+    let done = sqlx::query(
         "INSERT INTO nodes (id, account_id, project_id, iroh_node_id, name, hostname, inventory, agent_version, \
-         state, last_seen_at, enrolled_via_token_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'offline', ?, ?, ?)",
+         state, last_seen_at, enrolled_via_token_id, created_at, approval, enrolled_by_key_id, enrolled_by_device_id) \
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'offline', ?9, ?10, ?11, \
+                CASE WHEN t.pre_approved = 1 OR t.bound_iroh_node_id IS NOT NULL \
+                          OR EXISTS (SELECT 1 FROM api_keys k, json_each(k.scopes) s \
+                                     WHERE k.key_id = t.created_by_key_id AND s.value = 'admin') \
+                     THEN 'approved' ELSE 'pending_approval' END, \
+                t.created_by_key_id, t.created_by_device_id \
+         FROM join_tokens t WHERE t.id = ?10 AND t.account_id = ?2",
     )
     .bind(node.id.to_string())
     .bind(node.account_id.to_string())
@@ -269,8 +338,30 @@ pub async fn insert(conn: &mut Conn, node: &NewNode, now: OffsetDateTime) -> Res
     .bind(node.token_id.to_string())
     .bind(ts(now))
     .execute(&mut *conn)
-    .await?;
+    .await?
+    .rows_affected();
+    if done != 1 {
+        return Err(StoreError::Corrupt("nodes.enrolled_via_token_id"));
+    }
     by_id(conn, node.id).await?.ok_or(StoreError::Corrupt("nodes"))
+}
+
+/// Approves a live node of `account_id` (H2 §5.5, `POST /v1/nodes/{id}/approve`). Idempotent: `Some(true)` when this
+/// call changed it, `Some(false)` when it already was approved, `None` when no live node of that account has that id.
+pub async fn approve(conn: &mut Conn, account_id: AccountId, id: NodeId) -> Result<Option<bool>, StoreError> {
+    let done = sqlx::query(
+        "UPDATE nodes SET approval = 'approved' \
+         WHERE account_id = ? AND id = ? AND deleted_at IS NULL AND approval = 'pending_approval'",
+    )
+    .bind(account_id.to_string())
+    .bind(id.to_string())
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+    if done == 1 {
+        return Ok(Some(true));
+    }
+    Ok(get(conn, account_id, id).await?.map(|_| false))
 }
 
 /// Re-enrolls the live node `id` of `account_id` with a new join token (§5 "Re-enrolling the same machine"): the

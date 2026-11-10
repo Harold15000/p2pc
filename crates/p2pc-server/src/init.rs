@@ -198,6 +198,7 @@ async fn create_database(db_path: &Path, clock: &dyn Clock) -> Result<(ApiKey, A
     let event = NewEvent {
         kind: AuditKind::KeyCreated,
         actor_key_id: None,
+        actor_device_id: None,
         subject_id: Some(admin_key.key_id().to_string()),
         detail: serde_json::Map::from_iter([
             ("scopes".to_string(), serde_json::json!([Scope::Admin])),

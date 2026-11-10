@@ -32,8 +32,8 @@
 //!
 //! Events never contain a secret: callers pass key IDs, never keys, and `detail` holds only metadata.
 
-use p2pc_proto::api::{AuditEvent, AuditKind, audit_detail_has_secret};
-use p2pc_proto::ids::{AccountId, AuditEventId, KeyId};
+use p2pc_proto::api::{AuditEvent, AuditKind, Principal, audit_detail_has_secret};
+use p2pc_proto::ids::{AccountId, AuditEventId, DeviceId, KeyId};
 use serde_json::{Map, Value};
 use time::OffsetDateTime;
 
@@ -65,10 +65,31 @@ pub struct NewEvent {
     pub kind: AuditKind,
     /// The key that did it.
     pub actor_key_id: Option<KeyId>,
+    /// The device that did it (H2 §5.6). At most one of the two actors is set.
+    pub actor_device_id: Option<DeviceId>,
     /// What it happened to.
     pub subject_id: Option<String>,
     /// Non-secret details.
     pub detail: Map<String, Value>,
+}
+
+impl NewEvent {
+    /// An event acted by `actor` (a key, a device, or nobody for the offline commands and the protocol side).
+    #[must_use]
+    pub fn new(
+        kind: AuditKind,
+        actor: Option<Principal>,
+        subject_id: Option<String>,
+        detail: Map<String, Value>,
+    ) -> Self {
+        Self {
+            kind,
+            actor_key_id: actor.and_then(|a| a.key_id()),
+            actor_device_id: actor.and_then(|a| a.device_id()),
+            subject_id,
+            detail,
+        }
+    }
 }
 
 /// An event with its position in the log, which list cursors use.
@@ -88,18 +109,22 @@ pub async fn append(
     event: &NewEvent,
     now: OffsetDateTime,
 ) -> Result<AuditEventId, StoreError> {
-    if event.kind == AuditKind::AuthFailed || audit_detail_has_secret(&event.detail) {
+    if event.kind == AuditKind::AuthFailed
+        || audit_detail_has_secret(&event.detail)
+        || (event.actor_key_id.is_some() && event.actor_device_id.is_some())
+    {
         return Err(StoreError::Corrupt("audit_events.kind/detail"));
     }
     let id = AuditEventId::generate();
     sqlx::query(
-        "INSERT INTO audit_events (event_id, at, account_id, actor_key_id, kind, subject_id, detail) \
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO audit_events (event_id, at, account_id, actor_key_id, actor_device_id, kind, subject_id, \
+         detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(id.to_string())
     .bind(ts(now))
     .bind(account_id.to_string())
     .bind(event.actor_key_id.map(|k| k.to_string()))
+    .bind(event.actor_device_id.map(|d| d.to_string()))
     .bind(kind_name(event.kind))
     .bind(event.subject_id.clone())
     .bind(Value::Object(event.detail.clone()).to_string())
@@ -141,7 +166,16 @@ pub async fn record_auth_failure(
     Ok(())
 }
 
-type Row = (i64, String, i64, Option<String>, String, Option<String>, String);
+type Row = (
+    i64,
+    String,
+    i64,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<String>,
+    String,
+);
 
 /// `account_id`'s events, newest first, optionally of one kind, older than sequence number `before`, at most
 /// `limit`.
@@ -153,7 +187,7 @@ pub async fn list(
     limit: u32,
 ) -> Result<Vec<StoredEvent>, StoreError> {
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT seq, event_id, at, actor_key_id, kind, subject_id, detail FROM audit_events \
+        "SELECT seq, event_id, at, actor_key_id, actor_device_id, kind, subject_id, detail FROM audit_events \
          WHERE account_id = ?1 AND (?2 IS NULL OR kind = ?2) AND (?3 IS NULL OR seq < ?3) \
          ORDER BY seq DESC LIMIT ?4",
     )
@@ -164,7 +198,7 @@ pub async fn list(
     .fetch_all(&mut *conn)
     .await?;
     rows.into_iter()
-        .map(|(seq, id, at, actor, kind, subject, detail)| {
+        .map(|(seq, id, at, actor, device, kind, subject, detail)| {
             let detail = match serde_json::from_str(&detail) {
                 Ok(Value::Object(map)) => map,
                 _ => return Err(StoreError::Corrupt("audit_events.detail")),
@@ -176,7 +210,9 @@ pub async fn list(
                     at: from_ts(at, "audit_events.at")?,
                     kind: parse_kind(&kind).ok_or(StoreError::Corrupt("audit_events.kind"))?,
                     actor_key_id: actor.map(|a| parse_col(&a, "audit_events.actor_key_id")).transpose()?,
-                    actor_device_id: None,
+                    actor_device_id: device
+                        .map(|d| parse_col(&d, "audit_events.actor_device_id"))
+                        .transpose()?,
                     subject_id: subject,
                     detail,
                 },
@@ -222,9 +258,9 @@ mod tests {
             AuditKind::KeyRecovered,
             AuditKind::NodeReenrolled,
         ];
-        // The latest definition of the table's CHECK (rebuilt when a kind is added).
-        let schema = include_str!("../../migrations/20261106130000_audit_node_reenrolled.sql");
-        for kind in all {
+        // The latest definition of the table's CHECK (rebuilt when a kind is added): every H1 and H2 kind.
+        let schema = include_str!("../../migrations/20261110130000_h2_principals_rebuild.sql");
+        for kind in all.into_iter().chain(AuditKind::ALL) {
             let name = kind_name(kind);
             assert_eq!(parse_kind(&name), Some(kind));
             // Every kind is allowed by the table's CHECK.
@@ -256,23 +292,40 @@ mod tests {
         let event = |kind| NewEvent {
             kind,
             actor_key_id: None,
+            actor_device_id: None,
             subject_id: Some("node_x".into()),
             detail: obj(json!({"name": "box"})),
         };
-        for kind in [AuditKind::NodeEnrolled, AuditKind::NodeDeleted] {
-            append(&mut conn, account, &event(kind), T).await.unwrap();
+        // The H1 schema of that time, written without the H2 `actor_device_id` column that `append` now writes.
+        let h1_append = |kind: &'static str| {
+            sqlx::query(
+                "INSERT INTO audit_events (event_id, at, account_id, kind, subject_id, detail) \
+                 VALUES (?, ?, ?, ?, 'node_x', '{\"name\":\"box\"}')",
+            )
+            .bind(AuditEventId::generate().to_string())
+            .bind(ts(T))
+            .bind(account.to_string())
+            .bind(kind)
+        };
+        for kind in ["node_enrolled", "node_deleted"] {
+            h1_append(kind).execute(&mut conn).await.unwrap();
         }
         record_auth_failure(&mut conn, account, "unknown", T, 3).await.unwrap();
         let rows = "SELECT seq, event_id, kind, detail FROM audit_events ORDER BY seq";
         let before: Vec<(i64, String, String, String)> = sqlx::query_as(rows).fetch_all(&mut conn).await.unwrap();
         // Before it, the new kind is refused by the table's CHECK.
-        assert!(
-            append(&mut conn, account, &event(AuditKind::NodeReenrolled), T)
-                .await
-                .is_err()
-        );
+        assert!(h1_append("node_reenrolled").execute(&mut conn).await.is_err());
         let rebuild = crate::store::MIGRATOR.iter().find(|m| m.version == REBUILD).unwrap();
         sqlx::raw_sql(rebuild.sql.clone()).execute(&mut conn).await.unwrap();
+        let after: Vec<(i64, String, String, String)> = sqlx::query_as(rows).fetch_all(&mut conn).await.unwrap();
+        assert_eq!(after, before);
+        // The later migrations (the H2 rebuild among them, each in a transaction as sqlx runs them), so the current
+        // `append` can write.
+        for m in crate::store::MIGRATOR.iter().filter(|m| m.version > REBUILD) {
+            let mut tx = sqlx::Connection::begin(&mut conn).await.unwrap();
+            sqlx::raw_sql(m.sql.clone()).execute(&mut *tx).await.unwrap();
+            tx.commit().await.unwrap();
+        }
         let after: Vec<(i64, String, String, String)> = sqlx::query_as(rows).fetch_all(&mut conn).await.unwrap();
         assert_eq!(after, before);
         let added = append(&mut conn, account, &event(AuditKind::NodeReenrolled), T)
@@ -314,6 +367,7 @@ mod tests {
         let event = NewEvent {
             kind: AuditKind::KeyCreated,
             actor_key_id: None,
+            actor_device_id: None,
             subject_id: Some("abcdefgh2345".into()),
             detail: obj(json!({"scopes": ["admin"]})),
         };

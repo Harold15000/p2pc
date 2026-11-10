@@ -16,7 +16,7 @@ use p2pc_proto::api::{
 };
 use p2pc_proto::auth::{ApiKey, Secret, SecretHash, hash_secret};
 use p2pc_proto::ids::{AccountId, KeyId};
-use p2pc_proto::validate::{ErrorCode, check_no_escalation};
+use p2pc_proto::validate::{ErrorCode, PrincipalLimits, check_limits_no_escalation};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use time::OffsetDateTime;
@@ -142,6 +142,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/nodes/{id}/drain", post(nodes_api::drain_node))
         .route("/v1/nodes/{id}/resume", post(nodes_api::resume_node))
+        .route("/v1/nodes/{id}/approve", post(nodes_api::approve_node))
         .route("/v1/jobs", get(jobs_api::list_jobs).post(jobs_api::create_job))
         .route("/v1/jobs/{id}", get(jobs_api::get_job))
         .route("/v1/jobs/{id}/cancel", post(jobs_api::cancel_job))
@@ -272,29 +273,42 @@ pub async fn openapi_json() -> Response {
     resp
 }
 
-/// Who the presented key is, and its limits. `daily_unit_cap: null` means the key is uncapped; `p2pc mcp` refuses
-/// such a key. Never contains the secret.
+/// Who the caller is, and its limits. `daily_unit_cap: null` means the caller is uncapped; `p2pc mcp` refuses such a
+/// key. Never contains the secret.
+///
+/// `principal` names the caller, `{kind, id}` (H2 §5.5). `key_id` stays: the key for an API key, `null` for a device.
 #[utoipa::path(
     get,
     path = "/v1/whoami",
     tag = "auth",
     responses(
-        (status = 200, description = "The key's account, project, ID, scopes and limits (`label`, `daily_unit_cap`, `allowed_images`, `expires_at`; `null` means no limit). Never the secret.", body = WhoAmI),
+        (status = 200, description = "The caller's account, project, ID, scopes and limits (`label`, `daily_unit_cap`, `allowed_images`, `expires_at`; `null` means no limit), and `principal` (`{kind, id}`, H2 §5.5). `key_id` is `null` for a device. Never the secret.", body = WhoAmI),
         (status = 401, description = "Missing or invalid key.", content_type = "application/problem+json", body = Problem),
     )
 )]
-pub async fn whoami(Authorized { principal: p, .. }: AnyKey) -> Json<WhoAmI> {
-    Json(WhoAmI {
+pub async fn whoami(Authorized { principal: p, .. }: AnyKey) -> Json<Value> {
+    // `WhoAmI.key_id` is not optional in `p2pc-proto` yet, while H2 §5.5 says it is `null` for a device. The body is
+    // built from the shared type (so its shape and formats stay H1's), and a device's `key_id` is then set to `null`:
+    // the stand-in ID below never reaches the response.
+    let key_id = p.key_id().unwrap_or_else(KeyId::generate);
+    let who = WhoAmI {
         account_id: p.account_id,
         project_id: p.project_id,
-        key_id: p.key_id,
+        key_id,
         scopes: p.scopes,
         label: p.label,
         daily_unit_cap: p.daily_unit_cap,
         allowed_images: p.allowed_images,
         expires_at: p.expires_at,
-        principal: None,
-    })
+        principal: Some(p.id),
+    };
+    let mut body = serde_json::to_value(&who).unwrap_or(Value::Null);
+    if p.id.key_id().is_none()
+        && let Some(map) = body.as_object_mut()
+    {
+        map.insert("key_id".to_string(), Value::Null);
+    }
+    Json(body)
 }
 
 /// `limit` and `cursor`.
@@ -329,10 +343,16 @@ pub(crate) fn bad_cursor() -> ApiError {
     )
 }
 
-/// The §5 "No escalation" rule for a key-creation request, with `p2pc-proto`'s [`check_no_escalation`]: `403
-/// escalation_denied` listing every field that exceeds the creator.
+/// The §5 "No escalation" rule for a key-creation request by a key: `403 escalation_denied` listing every field that
+/// exceeds the creator. See [`ensure_limits_no_escalation`], which serves every principal.
 pub fn ensure_no_escalation(creator: &ApiKeyInfo, request: &CreateApiKey) -> Result<(), ApiError> {
-    check_no_escalation(creator, request).map_err(|denied| ApiError::escalation_denied(&denied))
+    ensure_limits_no_escalation(&creator.into(), &request.into())
+}
+
+/// The §5 "No escalation" rule for any principal (H2 §5.2, §5.5), with `p2pc-proto`'s [`check_limits_no_escalation`]:
+/// `403 escalation_denied` listing every field of `asked` that exceeds `creator`.
+pub fn ensure_limits_no_escalation(creator: &PrincipalLimits, asked: &PrincipalLimits) -> Result<(), ApiError> {
+    check_limits_no_escalation(creator, asked).map_err(|denied| ApiError::escalation_denied(&denied))
 }
 
 /// Validates a key-creation body at `now`: the `p2pc-proto` rules, a storable `daily_unit_cap`, and an `expires_at`
@@ -414,14 +434,14 @@ pub async fn create_key(
     // creator that expired while waiting for the lock is refused, and so is an `expires_at` that has passed.
     let creator = recheck_caller(&mut tx, &state, &p, now).await?;
     check_new_key(&body, now)?;
-    ensure_no_escalation(&creator.info(), &body)?;
+    ensure_limits_no_escalation(&creator.limits(), &PrincipalLimits::from(&body))?;
     let row = store::keys::insert(&mut tx, p.account_id, &new, now).await?;
-    let event = NewEvent {
-        kind: AuditKind::KeyCreated,
-        actor_key_id: Some(p.key_id),
-        subject_id: Some(row.key_id.to_string()),
-        detail: detail(serde_json::json!({ "scopes": row.scopes, "project_id": row.project_id })),
-    };
+    let event = NewEvent::new(
+        AuditKind::KeyCreated,
+        Some(p.id),
+        Some(row.key_id.to_string()),
+        detail(serde_json::json!({ "scopes": row.scopes, "project_id": row.project_id })),
+    );
     store::audit::append(&mut tx, p.account_id, &event, now).await?;
     tx.commit().await?;
     tracing::info!(key_id = %row.key_id, "API key created");
@@ -513,17 +533,12 @@ pub async fn revoke_key(
     let target = store::keys::get(&mut tx, p.account_id, key_id)
         .await?
         .ok_or_else(ApiError::not_found)?;
-    if target.key_id != p.key_id {
-        ensure_no_escalation(&caller.info(), &as_request(&target))?;
+    if p.key_id() != Some(target.key_id) {
+        ensure_limits_no_escalation(&caller.limits(), &PrincipalLimits::from(&as_request(&target)))?;
     }
     match store::keys::revoke(&mut tx, p.account_id, key_id, now).await? {
         Revoke::Revoked => {
-            let event = NewEvent {
-                kind: AuditKind::KeyRevoked,
-                actor_key_id: Some(p.key_id),
-                subject_id: Some(key_id.to_string()),
-                detail: Map::new(),
-            };
+            let event = NewEvent::new(AuditKind::KeyRevoked, Some(p.id), Some(key_id.to_string()), Map::new());
             store::audit::append(&mut tx, p.account_id, &event, now).await?;
             tx.commit().await?;
             tracing::info!(%key_id, "API key revoked");

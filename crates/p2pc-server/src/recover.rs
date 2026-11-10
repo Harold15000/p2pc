@@ -73,6 +73,7 @@ async fn recover_in(db: &store::Db, clock: &dyn Clock) -> Result<RecoverOutcome,
     let event = NewEvent {
         kind: AuditKind::KeyRecovered,
         actor_key_id: None,
+        actor_device_id: None,
         subject_id: Some(admin_key.key_id().to_string()),
         detail: serde_json::Map::from_iter([
             ("scopes".to_string(), serde_json::json!([Scope::Admin])),

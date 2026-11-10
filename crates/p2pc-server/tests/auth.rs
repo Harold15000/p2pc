@@ -30,6 +30,8 @@ async fn a_valid_key_authenticates() {
             "daily_unit_cap": null,
             "allowed_images": null,
             "expires_at": null,
+            // H2 §5.5: who the caller is (responses may grow, H1 §7).
+            "principal": {"kind": "key", "id": app.admin_key.key_id().to_string()},
         })
     );
 }
@@ -157,12 +159,13 @@ fn principal_with(scopes: &[Scope]) -> p2pc_server::auth::Principal {
     p2pc_server::auth::Principal {
         account_id: p2pc_proto::ids::AccountId::generate(),
         project_id: p2pc_proto::ids::ProjectId::generate(),
-        key_id: KeyId::generate(),
+        id: p2pc_proto::api::Principal::Key(KeyId::generate()),
         scopes: scopes.to_vec(),
         daily_unit_cap: None,
         allowed_images: None,
         label: None,
         expires_at: None,
+        blobs_quota_mb: None,
     }
 }
 
