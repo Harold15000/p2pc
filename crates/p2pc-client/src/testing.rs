@@ -697,6 +697,42 @@ pub mod fixtures {
         job
     }
 
+    /// A `service` job in `status` that exposes port 8080 as `web`. A running one has a service view with `health`.
+    ///
+    /// The spec is read from JSON, like the hub's own, so that fields added to the shared types keep their defaults
+    /// (CONTRIBUTING rule 7).
+    #[must_use]
+    pub fn service_job(id: JobId, status: JobStatus, health: Option<p2pc_proto::api::ServiceHealth>) -> Job {
+        let spec: JobSpec = serde_json::from_value(serde_json::json!({
+            "kind": "service",
+            "name": "fixture service",
+            "image": "docker.io/library/python:3.12-slim",
+            "command": ["python", "-m", "http.server", "8080"],
+            "resources": {"cpu": 1.0, "memory_mb": 2048},
+            "service": {"ports": [{"port": 8080, "name": "web"}]},
+        }))
+        .expect("a valid service spec");
+        let mut job = Job::new(
+            id,
+            ProjectId::generate(),
+            status,
+            u32::from(status != JobStatus::Queued),
+            JobSpecView::from_stored(&spec).expect("a valid spec"),
+            Units::from_milli(1000),
+            t0(),
+        );
+        job.name = Some("fixture service".into());
+        job.finished_at = status.is_terminal().then(t0);
+        if status == JobStatus::Running {
+            let mut view = p2pc_proto::api::ServiceView::default();
+            view.health = health;
+            view.ports =
+                serde_json::from_value(serde_json::json!([{"port": 8080, "name": "web"}])).expect("a valid port view");
+            job.service = Some(view);
+        }
+        job
+    }
+
     /// An online node with 4 vCPUs, 8 GiB and no GPU.
     #[must_use]
     pub fn node(id: NodeId, name: &str) -> Node {

@@ -14,6 +14,7 @@ pub mod mcp;
 pub mod proxy;
 pub mod results;
 pub mod run;
+pub mod service;
 pub mod templates;
 pub mod tokens;
 pub mod usage;

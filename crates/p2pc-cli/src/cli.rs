@@ -74,6 +74,8 @@ pub enum Command {
     Templates(TemplatesArgs),
     /// List the paired devices (a phone, a laptop), revoke one, or pair a new one.
     Devices(DevicesArgs),
+    /// Run a long-lived service on your machines, reach its ports from here, list and stop services.
+    Service(ServiceArgs),
     /// Print a shell completion script.
     Completion(CompletionArgs),
     /// Show a job's logs, or follow them live.
@@ -98,6 +100,108 @@ pub enum Command {
     /// For example `claude mcp add p2pc -- p2pc mcp --profile agent`. It refuses a key that has the `admin` scope or
     /// no daily cap, unless you say otherwise. Logs go to stderr; stdout carries only the protocol.
     Mcp(McpArgs),
+}
+
+/// `p2pc service`.
+#[derive(Debug, Args)]
+pub struct ServiceArgs {
+    /// What to do.
+    #[command(subcommand)]
+    pub command: ServiceCommand,
+}
+
+/// `p2pc service <subcommand>`.
+#[derive(Debug, Subcommand)]
+pub enum ServiceCommand {
+    /// Start a service and print its job ID.
+    ///
+    /// A service keeps running and exposes ports (reach them with `p2pc service connect`). The options of `p2pc run`
+    /// apply; --timeout defaults to 30 days, the longest a service may run. A service stops on `p2pc service stop`,
+    /// when it has been idle for --idle, or when its time is up.
+    Run(ServiceRunArgs),
+    /// Forward a local port to a port of a running service, until the service ends.
+    ///
+    /// Each local TCP connection opens one connection to the service through the hub. It exits when the service ends:
+    /// 0 if it was stopped or exited cleanly, otherwise the code of how it ended (75 lost, 124 timed out, the service's
+    /// own exit code, or 125). Ctrl-C exits 130 and SIGTERM 0. It listens on loopback unless --allow-non-loopback.
+    Connect(ServiceConnectArgs),
+    /// Stop a service (the same as `p2pc cancel`).
+    Stop(JobIdArg),
+    /// List the services.
+    #[command(visible_alias = "ls")]
+    List(ServiceListArgs),
+}
+
+/// How a service reacts to losing its machine (H2 §7.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RestartArg {
+    /// The first loss of the machine ends the service.
+    Never,
+    /// Start it again on another machine (up to the retry limits).
+    OnNodeLoss,
+}
+
+/// `p2pc service run`.
+#[derive(Debug, Args)]
+pub struct ServiceRunArgs {
+    /// What to run: the options of `p2pc run`.
+    #[command(flatten)]
+    pub job: JobArgs,
+    /// A port the service listens on: `PORT` or `PORT:NAME` (the name defaults to `port-PORT`). At least one; at most
+    /// 8. Repeatable.
+    #[arg(long = "port", required = true, value_name = "PORT[:NAME]")]
+    pub ports: Vec<String>,
+    /// Check the service's health with an HTTP GET of this path on the first port (only the status line is read).
+    #[arg(long, value_name = "PATH", conflicts_with = "health_tcp")]
+    pub health_http: Option<String>,
+    /// Check the service's health by connecting to its first port.
+    #[arg(long)]
+    pub health_tcp: bool,
+    /// Stop the service after this long without a connection or traffic (300s to 7d, default 1h).
+    #[arg(long, value_parser = parse::parse_duration_secs, value_name = "DURATION", conflicts_with = "no_idle")]
+    pub idle: Option<u32>,
+    /// Never stop the service for being idle (the time limit of --timeout still applies).
+    #[arg(long)]
+    pub no_idle: bool,
+    /// What to do when the machine is lost (default: on-node-loss).
+    #[arg(long, value_enum, value_name = "never|on-node-loss")]
+    pub restart: Option<RestartArg>,
+    /// A persistent volume: `NAME:MOUNT[:SIZE]`, for example `data:/volumes/data:4G` (SIZE as --mem; default 1G). The
+    /// mount is under /volumes. Repeatable, at most 4.
+    #[arg(long = "volume", value_name = "NAME:MOUNT[:SIZE]")]
+    pub volumes: Vec<String>,
+    /// Wait until the service is healthy before returning (exit 125 or its code if it ends first).
+    #[arg(long)]
+    pub wait_ready: bool,
+}
+
+/// `p2pc service connect`.
+#[derive(Debug, Args)]
+pub struct ServiceConnectArgs {
+    /// The service's job ID, `job_…`.
+    #[arg(value_name = "JOB_ID")]
+    pub id: JobId,
+    /// The port of the service to reach (one of the ports it exposes).
+    #[arg(long, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
+    pub port: u16,
+    /// Where to listen locally (default: 127.0.0.1 and a free port, which is printed).
+    #[arg(long, default_value = "127.0.0.1:0", value_name = "ADDR:PORT")]
+    pub listen: std::net::SocketAddr,
+    /// Allow a --listen address that is not loopback. This lets that network reach the service, which has no
+    /// authentication of its own here.
+    #[arg(long)]
+    pub allow_non_loopback: bool,
+}
+
+/// `p2pc service list`.
+#[derive(Debug, Args)]
+pub struct ServiceListArgs {
+    /// How many services to show, 1 to 100.
+    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=100), conflicts_with = "all")]
+    pub limit: u32,
+    /// Fetch every page.
+    #[arg(long)]
+    pub all: bool,
 }
 
 /// `p2pc devices`.

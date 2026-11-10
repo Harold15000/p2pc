@@ -112,7 +112,7 @@ pub async fn run(ctx: &mut Ctx<'_, '_>, args: ProxyArgs) -> Result<u8, CliError>
 }
 
 /// The signal's future, or one that never completes.
-async fn signal_or_never(signal: Option<crate::app::Interrupt<'_>>) {
+pub(crate) async fn signal_or_never(signal: Option<crate::app::Interrupt<'_>>) {
     match signal {
         Some(signal) => signal.await,
         None => std::future::pending().await,

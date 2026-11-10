@@ -9,8 +9,7 @@ use std::time::Duration;
 
 use p2pc_client::Client;
 use p2pc_proto::api::{
-    BlobInput, DEFAULT_DISK_MB, DEFAULT_MAX_ATTEMPTS, DEFAULT_TIMEOUT_S, Egress, InputFile, Job, JobSpec, Outputs,
-    Placement, Resources, Retry,
+    BlobInput, DEFAULT_DISK_MB, Egress, InputFile, Job, JobKind, JobSpec, Outputs, Placement, Resources, Retry,
 };
 use p2pc_proto::ids::JobId;
 use p2pc_proto::validate::{H2Features, Limits};
@@ -105,6 +104,15 @@ async fn submit(client: &Client, spec: &mut JobSpec, args: &JobArgs) -> Result<(
 
 /// Builds and validates the job spec from the flags. `env` answers `--env KEY`; files are read from disk.
 pub fn build_spec(args: &JobArgs, env: Env) -> Result<JobSpec, CliError> {
+    let spec = draft_spec(args, env, JobKind::Batch)?;
+    spec.validate(&local_limits())?;
+    Ok(spec)
+}
+
+/// The spec of the flags for a job of `kind`, **not yet validated**: the caller adds what its command adds (a service's
+/// ports and health check, say) and validates the whole. `--timeout` and `--retries` default to what the spec says for
+/// the kind (§7.1): an hour and 1 retry for a batch job, 30 days and 3 attempts for a service.
+pub(crate) fn draft_spec(args: &JobArgs, env: Env, kind: JobKind) -> Result<JobSpec, CliError> {
     let limits = local_limits();
 
     let mut vars: BTreeMap<String, String> = BTreeMap::new();
@@ -164,7 +172,7 @@ pub fn build_spec(args: &JobArgs, env: Env) -> Result<JobSpec, CliError> {
             gpu: args.gpu,
             disk_mb: args.disk.unwrap_or(DEFAULT_DISK_MB),
         },
-        timeout_s: args.timeout.unwrap_or(DEFAULT_TIMEOUT_S),
+        timeout_s: args.timeout.unwrap_or(kind.default_timeout_s()),
         egress: Egress {
             // Domains are lowercase in the API; accept what people type.
             allow: args.egress.iter().map(|d| d.trim().to_ascii_lowercase()).collect(),
@@ -176,16 +184,17 @@ pub fn build_spec(args: &JobArgs, env: Env) -> Result<JobSpec, CliError> {
             ..Placement::default()
         },
         retry: Retry {
-            max_attempts: args.retries.map_or(DEFAULT_MAX_ATTEMPTS, |n| n.saturating_add(1)),
+            max_attempts: args
+                .retries
+                .map_or(kind.default_max_attempts(), |n| n.saturating_add(1)),
         },
         idempotency_key: args.idempotency_key.clone(),
-        kind: p2pc_proto::api::JobKind::Batch,
+        kind,
         service: None,
         volumes: Vec::new(),
         inputs: Vec::new(),
         template: None,
     };
-    spec.validate(&limits)?;
     Ok(spec)
 }
 
