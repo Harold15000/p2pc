@@ -21,6 +21,7 @@ pub async fn list(ctx: &mut Ctx<'_, '_>, args: JobsArgs) -> Result<u8, CliError>
             node_id: args.node,
             limit: Some(limit),
             cursor,
+            ..JobListParams::default()
         };
         async move { client.list_jobs(&params).await }
     })

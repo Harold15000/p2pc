@@ -56,7 +56,8 @@ pub enum Command {
     Status(JobIdArg),
     /// Cancel a job.
     Cancel(JobIdArg),
-    /// List machines, or show, drain, resume and remove one.
+    /// List machines, or show, approve, drain, resume and remove one. Also `p2pc nodes`.
+    #[command(visible_alias = "nodes")]
     Machines(MachinesArgs),
     /// Create, list and revoke join tokens for new machines.
     #[command(name = "join-token")]
@@ -308,8 +309,17 @@ pub struct MachinesArgs {
 /// `p2pc machines <subcommand>`.
 #[derive(Debug, Subcommand)]
 pub enum MachinesCommand {
+    /// List the machines, with whether each one is approved (the same as giving no subcommand).
+    #[command(visible_alias = "list")]
+    Ls,
     /// Show one machine's inventory and state.
     Show(MachineArg),
+    /// Approve a machine that waits for approval (admin only): print its node phrase and ask for confirmation.
+    ///
+    /// A machine enrolled with a token that a phone or a developer device minted gets no job until an admin approves
+    /// it. Compare the phrase with the one the machine itself shows (`p2pc-agent status`, or the PC's app) before you
+    /// say yes: it proves that the machine you approve is the machine you are looking at.
+    Approve(MachineApprove),
     /// Stop sending new jobs to a machine. Running jobs finish.
     Drain(MachineArg),
     /// Send jobs to a drained machine again.
@@ -324,6 +334,17 @@ pub struct MachineArg {
     /// The machine's name or ID (`node_…`).
     #[arg(value_name = "ID_OR_NAME")]
     pub target: String,
+}
+
+/// `p2pc nodes approve`.
+#[derive(Debug, Args)]
+pub struct MachineApprove {
+    /// The machine's name or ID.
+    #[arg(value_name = "ID_OR_NAME")]
+    pub target: String,
+    /// Do not ask for confirmation (the phrase is still printed). Required when there is no terminal.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 }
 
 /// `p2pc machines rm`.
