@@ -36,11 +36,13 @@ pub mod testing;
 mod transfer;
 #[cfg(feature = "tunnel")]
 pub mod tunnel;
+mod upload;
 
 pub use client::{
     Client, ClientBuilder, DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, DOWNLOAD_TIMEOUT, FOLLOW_TIMEOUT,
-    IDEMPOTENCY_HEADER, JobListParams, ListParams, MAX_RESPONSE_BYTES, fetch_all, generate_idempotency_key,
-    whole_seconds,
+    IDEMPOTENCY_HEADER, JobListParams, ListParams, MAX_RESPONSE_BYTES, PORT_UPGRADE_PROTOCOL, PortStream,
+    TemplateLaunch, UPLOAD_FLOOR_BYTES_PER_S, UPLOAD_MAX_TIMEOUT, UPLOAD_MIN_TIMEOUT, fetch_all,
+    generate_idempotency_key, whole_seconds,
 };
 pub use error::{ApiError, BuildError, Error, LocalError, NetworkError, NetworkKind, UnexpectedResponse};
 pub use logs::{FollowOptions, LogFollow};

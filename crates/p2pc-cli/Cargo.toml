@@ -23,10 +23,13 @@ humantime.workspace = true
 # `tunnel`: profiles whose server is an address `p2pc_srv_…`, and `p2pc proxy` (spec §10).
 p2pc-client = { version = "0.1.0", path = "../p2pc-client", features = ["tunnel"] }
 p2pc-proto = { version = "0.1.0", path = "../p2pc-proto" }
+qrcode = { version = "0.14", default-features = false }
 rmcp.workspace = true
 rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# The SHA-256 of a blob before it is uploaded (spec 7.5 requires it in the request).
+sha2.workspace = true
 # The credentials file is written through a temporary file that is created with mode 0600.
 tempfile.workspace = true
 thiserror.workspace = true
@@ -38,7 +41,6 @@ tracing-subscriber.workspace = true
 url.workspace = true
 
 [dev-dependencies]
-sha2.workspace = true
 assert_cmd.workspace = true
 p2pc-client = { version = "0.1.0", path = "../p2pc-client", features = ["test-util", "tunnel"] }
 predicates.workspace = true

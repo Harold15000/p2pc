@@ -4,6 +4,8 @@
 
 pub mod audit;
 pub mod auth;
+pub mod blobs;
+pub mod devices;
 pub mod jobs;
 pub mod keys;
 pub mod logs;
@@ -12,8 +14,11 @@ pub mod mcp;
 pub mod proxy;
 pub mod results;
 pub mod run;
+pub mod service;
+pub mod templates;
 pub mod tokens;
 pub mod usage;
+pub mod volumes;
 
 use std::io::Write;
 

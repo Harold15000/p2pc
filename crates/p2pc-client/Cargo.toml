@@ -47,6 +47,7 @@ tokio = { workspace = true, features = ["time", "rt", "fs", "io-util"] }
 tracing.workspace = true
 ulid.workspace = true
 url.workspace = true
+http-body = "1.0.1"
 
 [dev-dependencies]
 # The mock server and fixtures of `testing`, for the integration tests of this very crate.

@@ -21,6 +21,7 @@ pub async fn list(ctx: &mut Ctx<'_, '_>, args: JobsArgs) -> Result<u8, CliError>
             node_id: args.node,
             limit: Some(limit),
             cursor,
+            ..JobListParams::default()
         };
         async move { client.list_jobs(&params).await }
     })
@@ -106,6 +107,7 @@ fn job_details(job: &Job, now: OffsetDateTime) -> String {
     if let Some(hint) = crate::outcome::disk_limit_hint(job, "`--disk <MiB>`") {
         rows.push(("hint", hint));
     }
+    rows.extend(crate::commands::service::service_rows(job, now));
     rows.push(("estimated units", job.estimated_units.to_string()));
     rows.push(("created", when(job.created_at)));
     if let Some(at) = job.started_at {

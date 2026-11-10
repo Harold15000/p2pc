@@ -23,6 +23,7 @@ use time::OffsetDateTime;
 use crate::cli::{Cli, Command};
 use crate::commands;
 use crate::config::{ConfigError, Env, Flags, Os, Server, Store, config_dir, resolve_target};
+use crate::follow::PollSchedule;
 use crate::outcome::{EXIT_CANNOT_RUN, EXIT_OK};
 
 /// The Ctrl-C signal, as a future that completes when it arrives.
@@ -62,6 +63,9 @@ pub struct Host<'a> {
     pub retry: RetryPolicy,
     /// How the tunnel to a server address is set up. The default is the spec's; tests bind loopback.
     pub tunnel: TunnelSettings,
+    /// How often a command that watches a job (`p2pc service connect`, `p2pc service run --wait-ready`) asks for its
+    /// state. The default is the spec's (1 s, backing off to 5 s); tests make the waits short.
+    pub poll: PollSchedule,
 }
 
 /// How the iroh endpoint of a tunnel binds, and what it knows of the server beyond its address.
@@ -279,6 +283,11 @@ async fn dispatch(ctx: &mut Ctx<'_, '_>, command: Command) -> Result<u8, CliErro
         Command::JoinToken(a) => commands::tokens::run(ctx, a).await,
         Command::Keys(a) => commands::keys::run(ctx, a).await,
         Command::Audit(a) => commands::audit::run(ctx, a).await,
+        Command::Volumes(a) => commands::volumes::run(ctx, a).await,
+        Command::Blobs(a) => commands::blobs::run(ctx, a).await,
+        Command::Templates(a) => commands::templates::run(ctx, a).await,
+        Command::Devices(a) => commands::devices::run(ctx, a).await,
+        Command::Service(a) => commands::service::run(ctx, a).await,
         Command::Completion(a) => commands::completion(ctx, a),
         Command::Logs(a) => commands::logs::run(ctx, a).await,
         Command::Results(a) => commands::results::run(ctx, a).await,
@@ -423,6 +432,7 @@ mod tests {
                 now: OffsetDateTime::UNIX_EPOCH,
                 retry: RetryPolicy::none(),
                 tunnel: TunnelSettings::default(),
+                poll: PollSchedule::default(),
             };
             {
                 let mut ctx = Ctx {

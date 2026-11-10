@@ -212,6 +212,7 @@ impl Cli {
                 // No waiting between retries: the tests would otherwise sleep.
                 retry: RetryPolicy::immediate(3),
                 tunnel: self.tunnel.clone(),
+                poll: fast_poll(),
             };
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -224,6 +225,119 @@ impl Cli {
             stdout: String::from_utf8(stdout).expect("utf-8 stdout"),
             stderr: String::from_utf8(stderr).expect("utf-8 stderr"),
         }
+    }
+}
+
+/// Waits of a few milliseconds between polls of a job: the tests would otherwise sleep for seconds.
+pub fn fast_poll() -> p2pc_cli::follow::PollSchedule {
+    let wait = std::time::Duration::from_millis(5);
+    p2pc_cli::follow::PollSchedule {
+        initial: wait,
+        max: wait,
+        reconnect_max: wait,
+        give_up_after: std::time::Duration::from_secs(30),
+    }
+}
+
+/// Sends stderr lines to a test as they are written.
+struct Lines {
+    buf: Vec<u8>,
+    tx: tokio::sync::mpsc::UnboundedSender<String>,
+    all: std::sync::Arc<std::sync::Mutex<String>>,
+}
+
+impl std::io::Write for Lines {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        while let Some(end) = self.buf.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = self.buf.drain(..=end).collect();
+            let line = String::from_utf8_lossy(&line).trim_end().to_string();
+            self.all.lock().unwrap().push_str(&format!("{line}\n"));
+            let _ = self.tx.send(line);
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The two ways to stop a running command: Ctrl-C (SIGINT) and SIGTERM.
+pub struct Signals {
+    pub ctrl_c: tokio::sync::oneshot::Sender<()>,
+    pub sigterm: tokio::sync::oneshot::Sender<()>,
+}
+
+impl Cli {
+    /// Runs `p2pc <args>` in process next to `test`, which gets the stderr lines as they are written and the signal
+    /// triggers: for a command that keeps running (`p2pc service connect`). Returns what the command produced and what
+    /// `test` returned. Everything shares one current-thread runtime, so nothing here needs a sleep to stay in step:
+    /// the test waits for the line that says the command is ready.
+    pub fn run_alongside<T>(
+        &self,
+        args: &[&str],
+        test: impl AsyncFnOnce(tokio::sync::mpsc::UnboundedReceiver<String>, Signals) -> T,
+    ) -> (Out, T) {
+        let argv: Vec<OsString> = std::iter::once("p2pc")
+            .chain(args.iter().copied())
+            .map(OsString::from)
+            .collect();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let all = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let mut err = Lines {
+            buf: Vec::new(),
+            tx,
+            all: all.clone(),
+        };
+        let mut stdout = Vec::new();
+        let mut stdin = Cursor::new(Vec::new());
+        let env = |name: &str| self.env.get(name).cloned();
+        let prompt = |_: &str| Ok(String::new());
+        let (ctrl_c, ctrl_c_rx) = tokio::sync::oneshot::channel::<()>();
+        let (sigterm, sigterm_rx) = tokio::sync::oneshot::channel::<()>();
+        let interrupt: Interrupt<'_> = Box::pin(async move {
+            if ctrl_c_rx.await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        });
+        let terminate: Interrupt<'_> = Box::pin(async move {
+            if sigterm_rx.await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let (code, value) = {
+            let mut host = Host {
+                env: &env,
+                out: &mut stdout,
+                err: &mut err,
+                stdin: &mut stdin,
+                stdin_is_tty: false,
+                stdout_is_tty: self.out_tty,
+                stderr_is_tty: false,
+                prompt_secret: &prompt,
+                interrupt: Some(interrupt),
+                terminate: Some(terminate),
+                now: OffsetDateTime::from_unix_timestamp_nanos(1_700_000_100_123_456_789).expect("timestamp"),
+                retry: RetryPolicy::immediate(3),
+                tunnel: self.tunnel.clone(),
+                poll: fast_poll(),
+            };
+            runtime.block_on(async { tokio::join!(app::run(&argv, &mut host), test(rx, Signals { ctrl_c, sigterm })) })
+        };
+        let stderr = all.lock().unwrap().clone();
+        (
+            Out {
+                code,
+                stdout: String::from_utf8(stdout).expect("utf-8 stdout"),
+                stderr,
+            },
+            value,
+        )
     }
 }
 

@@ -40,6 +40,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
+use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey};
@@ -509,7 +510,12 @@ impl Tunnel {
             // One request per stream: the server ends the stream when the response is out.
             headers.insert(CONNECTION, HeaderValue::from_static("close"));
         }
-        let body = Full::new(Bytes::from(request.body.unwrap_or_default()));
+        let body: BoxBody<Bytes, std::io::Error> = match request.upload {
+            Some(file) => file.boxed(),
+            None => Full::new(Bytes::from(request.body.unwrap_or_default()))
+                .map_err(|never| match never {})
+                .boxed(),
+        };
         let http_request = builder
             .body(body)
             .map_err(|_| Error::Local(LocalError::new("the request is not valid")))?;
@@ -552,6 +558,70 @@ impl Tunnel {
         Ok(Response::from_tunnel(status, content_length, body))
     }
 
+    /// Sends a request that asks to switch protocols (`Connection: Upgrade`) on a stream of its own. On `101` the
+    /// stream is handed over as it is: raw bytes both ways. Any other answer is returned as a response, for the caller
+    /// to turn into the hub's error.
+    pub(crate) async fn upgrade(&self, request: TunnelRequest<'_>) -> Result<Upgrade, Error> {
+        let deadline = Instant::now() + request.timeout;
+        let mut builder = hyper::Request::builder()
+            .method(request.method)
+            .uri(request.path_and_query);
+        if let Some(headers) = builder.headers_mut() {
+            *headers = request.headers;
+            headers.insert(HOST, HeaderValue::from_static(TUNNEL_HOST));
+        }
+        let http_request = builder
+            .body(Full::new(Bytes::new()))
+            .map_err(|_| Error::Local(LocalError::new("the request is not valid")))?;
+        let exchange = async {
+            let stream = self.open_stream().await?;
+            let io = hyper_util::rt::TokioIo::new(stream);
+            let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+                .await
+                .map_err(|e| NetworkError::new(NetworkKind::Other, format!("tunnel: {e}")))?;
+            // `with_upgrades` keeps the connection task alive until the upgrade has been handed over.
+            let driver = tokio::spawn(async move {
+                let _ = conn.with_upgrades().await;
+            });
+            let driver = AbortOnDrop(driver);
+            let response = sender
+                .send_request(http_request)
+                .await
+                .map_err(|e| NetworkError::new(NetworkKind::Other, format!("tunnel: {e}")))?;
+            Ok::<_, NetworkError>((response, driver))
+        };
+        let (response, driver) = match tokio::time::timeout_at(deadline, exchange).await {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(Error::Network(NetworkError::new(
+                    NetworkKind::Timeout,
+                    "the request through the tunnel timed out",
+                )));
+            }
+        };
+        if response.status() == hyper::StatusCode::SWITCHING_PROTOCOLS {
+            let upgraded = hyper::upgrade::on(response)
+                .await
+                .map_err(|e| Error::Network(NetworkError::new(NetworkKind::Other, format!("tunnel: {e}"))))?;
+            // The connection task ends by itself once the upgrade is handed over; it must not be aborted with it.
+            std::mem::forget(driver);
+            return Ok(Upgrade::Upgraded(hyper_util::rt::TokioIo::new(upgraded)));
+        }
+        let status = StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let content_length = response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        let body = TunnelBody {
+            body: response.into_body(),
+            deadline,
+            read_timeout: request.read_timeout,
+            _driver: driver,
+        };
+        Ok(Upgrade::Refused(Response::from_tunnel(status, content_length, body)))
+    }
+
     /// Closes the connection and the endpoint, telling the server at once instead of letting it time out.
     ///
     /// The tunnel stays closed: a request made after this, or a connection task still waiting for the lock, fails
@@ -582,10 +652,20 @@ pub(crate) struct TunnelRequest<'a> {
     pub(crate) path_and_query: &'a str,
     pub(crate) headers: HeaderMap,
     pub(crate) body: Option<Vec<u8>>,
+    /// A file streamed as the body instead of `body` (a blob upload).
+    pub(crate) upload: Option<crate::upload::FileBody>,
     /// The whole-request timeout.
     pub(crate) timeout: Duration,
     /// The longest wait for the next piece of the body.
     pub(crate) read_timeout: Duration,
+}
+
+/// What [`Tunnel::upgrade`] got.
+pub(crate) enum Upgrade {
+    /// `101`: the raw stream.
+    Upgraded(hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>),
+    /// Anything else, with its body unread.
+    Refused(Response),
 }
 
 /// Aborts a task when dropped: the HTTP connection task of a request does not outlive its response.

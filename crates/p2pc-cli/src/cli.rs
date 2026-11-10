@@ -56,7 +56,8 @@ pub enum Command {
     Status(JobIdArg),
     /// Cancel a job.
     Cancel(JobIdArg),
-    /// List machines, or show, drain, resume and remove one.
+    /// List machines, or show, approve, drain, resume and remove one. Also `p2pc nodes`.
+    #[command(visible_alias = "nodes")]
     Machines(MachinesArgs),
     /// Create, list and revoke join tokens for new machines.
     #[command(name = "join-token")]
@@ -65,6 +66,16 @@ pub enum Command {
     Keys(KeysArgs),
     /// Show the audit log.
     Audit(AuditArgs),
+    /// List the persistent volumes of the machines, or remove one.
+    Volumes(VolumesArgs),
+    /// Upload, list and remove blobs: big files that jobs read as inputs.
+    Blobs(BlobsArgs),
+    /// List the ready-made templates of the hub, and launch one.
+    Templates(TemplatesArgs),
+    /// List the paired devices (a phone, a laptop), revoke one, or pair a new one.
+    Devices(DevicesArgs),
+    /// Run a long-lived service on your machines, reach its ports from here, list and stop services.
+    Service(ServiceArgs),
     /// Print a shell completion script.
     Completion(CompletionArgs),
     /// Show a job's logs, or follow them live.
@@ -89,6 +100,263 @@ pub enum Command {
     /// For example `claude mcp add p2pc -- p2pc mcp --profile agent`. It refuses a key that has the `admin` scope or
     /// no daily cap, unless you say otherwise. Logs go to stderr; stdout carries only the protocol.
     Mcp(McpArgs),
+}
+
+/// `p2pc service`.
+#[derive(Debug, Args)]
+pub struct ServiceArgs {
+    /// What to do.
+    #[command(subcommand)]
+    pub command: ServiceCommand,
+}
+
+/// `p2pc service <subcommand>`.
+#[derive(Debug, Subcommand)]
+pub enum ServiceCommand {
+    /// Start a service and print its job ID.
+    ///
+    /// A service keeps running and exposes ports (reach them with `p2pc service connect`). The options of `p2pc run`
+    /// apply; --timeout defaults to 30 days, the longest a service may run. A service stops on `p2pc service stop`,
+    /// when it has been idle for --idle, or when its time is up.
+    Run(Box<ServiceRunArgs>),
+    /// Forward a local port to a port of a running service, until the service ends.
+    ///
+    /// Each local TCP connection opens one connection to the service through the hub. It exits when the service ends:
+    /// 0 if it was stopped or exited cleanly, otherwise the code of how it ended (75 lost, 124 timed out, the service's
+    /// own exit code, or 125). Ctrl-C exits 130 and SIGTERM 0. It listens on loopback unless --allow-non-loopback.
+    Connect(ServiceConnectArgs),
+    /// Stop a service (the same as `p2pc cancel`).
+    Stop(JobIdArg),
+    /// List the services.
+    #[command(visible_alias = "ls")]
+    List(ServiceListArgs),
+}
+
+/// How a service reacts to losing its machine (H2 §7.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RestartArg {
+    /// The first loss of the machine ends the service.
+    Never,
+    /// Start it again on another machine (up to the retry limits).
+    OnNodeLoss,
+}
+
+/// `p2pc service run`.
+#[derive(Debug, Args)]
+pub struct ServiceRunArgs {
+    /// What to run: the options of `p2pc run`.
+    #[command(flatten)]
+    pub job: JobArgs,
+    /// A port the service listens on: `PORT` or `PORT:NAME` (the name defaults to `port-PORT`). At least one; at most
+    /// 8. Repeatable.
+    #[arg(long = "port", required = true, value_name = "PORT[:NAME]")]
+    pub ports: Vec<String>,
+    /// Check the service's health with an HTTP GET of this path on the first port (only the status line is read).
+    #[arg(long, value_name = "PATH", conflicts_with = "health_tcp")]
+    pub health_http: Option<String>,
+    /// Check the service's health by connecting to its first port.
+    #[arg(long)]
+    pub health_tcp: bool,
+    /// Stop the service after this long without a connection or traffic (300s to 7d, default 1h).
+    #[arg(long, value_parser = parse::parse_duration_secs, value_name = "DURATION", conflicts_with = "no_idle")]
+    pub idle: Option<u32>,
+    /// Never stop the service for being idle (the time limit of --timeout still applies).
+    #[arg(long)]
+    pub no_idle: bool,
+    /// What to do when the machine is lost (default: on-node-loss).
+    #[arg(long, value_enum, value_name = "never|on-node-loss")]
+    pub restart: Option<RestartArg>,
+    /// A persistent volume: `NAME:MOUNT[:SIZE]`, for example `data:/volumes/data:4G` (SIZE as --mem; default 1G). The
+    /// mount is under /volumes. Repeatable, at most 4.
+    #[arg(long = "volume", value_name = "NAME:MOUNT[:SIZE]")]
+    pub volumes: Vec<String>,
+    /// Wait until the service is healthy before returning (exit 125 or its code if it ends first).
+    #[arg(long)]
+    pub wait_ready: bool,
+}
+
+/// `p2pc service connect`.
+#[derive(Debug, Args)]
+pub struct ServiceConnectArgs {
+    /// The service's job ID, `job_…`.
+    #[arg(value_name = "JOB_ID")]
+    pub id: JobId,
+    /// The port of the service to reach (one of the ports it exposes).
+    #[arg(long, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
+    pub port: u16,
+    /// Where to listen locally (default: 127.0.0.1 and a free port, which is printed).
+    #[arg(long, default_value = "127.0.0.1:0", value_name = "ADDR:PORT")]
+    pub listen: std::net::SocketAddr,
+    /// Allow a --listen address that is not loopback. This lets that network reach the service, which has no
+    /// authentication of its own here.
+    #[arg(long)]
+    pub allow_non_loopback: bool,
+}
+
+/// `p2pc service list`.
+#[derive(Debug, Args)]
+pub struct ServiceListArgs {
+    /// How many services to show, 1 to 100.
+    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=100), conflicts_with = "all")]
+    pub limit: u32,
+    /// Fetch every page.
+    #[arg(long)]
+    pub all: bool,
+}
+
+/// `p2pc devices`.
+#[derive(Debug, Args)]
+pub struct DevicesArgs {
+    /// What to do.
+    #[command(subcommand)]
+    pub command: DevicesCommand,
+}
+
+/// `p2pc devices <subcommand>`.
+#[derive(Debug, Subcommand)]
+pub enum DevicesCommand {
+    /// List the devices: label, platform, scopes, limits, last use and whether each is live.
+    #[command(visible_alias = "list")]
+    Ls,
+    /// Revoke a device: it is disconnected at once and can never connect again.
+    Revoke(DeviceRevoke),
+    /// Create a pairing ticket for a new device and print its URL, once.
+    ///
+    /// The URL is a secret: whoever opens it first pairs a device. It works once and expires after 10 minutes. On a
+    /// terminal a QR code of it is drawn too, for a phone's camera. Without --scopes the device gets the phone profile
+    /// (launch templates, upload blobs, ask to join PCs). The limits are checked by the hub against yours: a device
+    /// never gets more than the principal that creates it.
+    Pair(DevicePair),
+}
+
+/// `p2pc devices revoke`.
+#[derive(Debug, Args)]
+pub struct DeviceRevoke {
+    /// The device's ID, `dev_…`.
+    #[arg(value_name = "ID")]
+    pub id: p2pc_proto::ids::DeviceId,
+}
+
+/// `p2pc devices pair`.
+#[derive(Debug, Args)]
+pub struct DevicePair {
+    /// The device's scopes, comma separated or repeated: admin, jobs:write, jobs:read, nodes:read, nodes:write,
+    /// services:connect, templates:launch, blobs:write, nodes:invite or nodes:join. Default: the phone profile.
+    #[arg(long = "scopes", visible_alias = "scope", value_delimiter = ',', value_parser = parse_scope, value_name = "SCOPE")]
+    pub scopes: Vec<Scope>,
+    /// The device's daily cap in compute units (1 unit = 1 vCPU-hour reserved), for example `10` or `2.5`.
+    #[arg(long = "cap", value_parser = parse::parse_units, value_name = "UNITS")]
+    pub cap: Option<Units>,
+    /// An image the device may run, as a glob on the normalized reference. Repeatable. Without any, every image is
+    /// allowed.
+    #[arg(long = "image", value_name = "PATTERN")]
+    pub images: Vec<String>,
+}
+
+/// `p2pc templates`.
+#[derive(Debug, Args)]
+pub struct TemplatesArgs {
+    /// What to do.
+    #[command(subcommand)]
+    pub command: TemplatesCommand,
+}
+
+/// `p2pc templates <subcommand>`.
+#[derive(Debug, Subcommand)]
+pub enum TemplatesCommand {
+    /// List the templates the hub serves, with what each one needs.
+    #[command(visible_alias = "list")]
+    Ls,
+    /// Launch a template. Prints the job's ID.
+    ///
+    /// The parameters are the template's own (`p2pc templates ls --json` lists them); a parameter you leave out takes
+    /// the template's default. A template that is a singleton is not started twice: the running instance is returned.
+    Launch(TemplateLaunchArgs),
+}
+
+/// `p2pc templates launch`.
+#[derive(Debug, Args)]
+pub struct TemplateLaunchArgs {
+    /// The template's ID, for example `private-chat`.
+    #[arg(value_name = "ID")]
+    pub id: String,
+    /// A parameter: `name=value`. A blob parameter takes the digest `p2pc blobs put` printed. Repeatable.
+    #[arg(long = "param", value_name = "NAME=VALUE")]
+    pub params: Vec<String>,
+}
+
+/// `p2pc blobs`.
+#[derive(Debug, Args)]
+pub struct BlobsArgs {
+    /// What to do.
+    #[command(subcommand)]
+    pub command: BlobsCommand,
+}
+
+/// `p2pc blobs <subcommand>`.
+#[derive(Debug, Subcommand)]
+pub enum BlobsCommand {
+    /// Upload a file to the hub, unless the hub already has it, and print its digest.
+    ///
+    /// The digest (`sha256:<hex>`) goes to stdout and is what a job's `inputs` entry names. The file is read from the
+    /// path you give, as any command does. A blob expires 24 hours after it was uploaded or last used.
+    Put(BlobPut),
+    /// List the blobs of the account, with the space they use.
+    #[command(visible_alias = "list")]
+    Ls,
+    /// Remove your claim on a blob (it is deleted when nobody else holds one). Fails while a job uses it.
+    Rm(BlobRm),
+}
+
+/// `p2pc blobs put`.
+#[derive(Debug, Args)]
+pub struct BlobPut {
+    /// The file to upload.
+    #[arg(value_name = "FILE")]
+    pub file: PathBuf,
+}
+
+/// `p2pc blobs rm`.
+#[derive(Debug, Args)]
+pub struct BlobRm {
+    /// The blob's digest, `sha256:<hex>` (the `sha256:` prefix is optional).
+    #[arg(value_name = "DIGEST", value_parser = parse::parse_digest)]
+    pub digest: p2pc_proto::api::Sha256Digest,
+}
+
+/// `p2pc volumes`.
+#[derive(Debug, Args)]
+pub struct VolumesArgs {
+    /// What to do.
+    #[command(subcommand)]
+    pub command: VolumesCommand,
+}
+
+/// `p2pc volumes <subcommand>`.
+#[derive(Debug, Subcommand)]
+pub enum VolumesCommand {
+    /// List the volumes: name, machine, size, limit, last use and the job that holds each one now.
+    #[command(visible_alias = "list")]
+    Ls,
+    /// Remove a volume from a machine (admin only). Its data is deleted and cannot be recovered.
+    ///
+    /// The machine must be online and the volume must not be in use. A template's volume is named
+    /// `tpl:<template>/<name>`, for example `tpl:private-chat/models`.
+    Rm(VolumeRm),
+}
+
+/// `p2pc volumes rm`.
+#[derive(Debug, Args)]
+pub struct VolumeRm {
+    /// The machine that holds the volume: its name or ID.
+    #[arg(value_name = "NODE")]
+    pub node: String,
+    /// The volume's name, as `p2pc volumes ls` shows it.
+    #[arg(value_name = "NAME")]
+    pub name: String,
+    /// Do not ask for confirmation. Required when there is no terminal.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 }
 
 /// `p2pc logs`.
@@ -243,6 +511,10 @@ pub struct JobArgs {
     /// A local file to put in the job: `LOCAL` goes to `/inputs/<name>`, `LOCAL:/inputs/PATH` to PATH. Repeatable.
     #[arg(long = "file", value_name = "LOCAL[:/inputs/PATH]")]
     pub files: Vec<String>,
+    /// A big local file to give the job as a read-only input: it is uploaded to the hub as a blob (unless the hub has
+    /// it) and the job gets it at `/inputs/<name>`, or at PATH. Unlike --file, there is no 512 KiB limit. Repeatable.
+    #[arg(long = "input", value_name = "LOCAL[:/inputs/PATH]")]
+    pub inputs: Vec<String>,
     /// Domains the job may reach, comma separated. Without it the job has no network.
     #[arg(long, value_delimiter = ',', value_name = "DOMAIN,DOMAIN")]
     pub egress: Vec<String>,
@@ -293,8 +565,10 @@ fn parse_status(text: &str) -> Result<JobStatus, String> {
 }
 
 fn parse_scope(text: &str) -> Result<Scope, String> {
-    serde_json::from_value(serde_json::Value::String(text.to_string()))
-        .map_err(|_| format!("{text:?} is not a scope: use admin, jobs:write, jobs:read, nodes:read or nodes:write"))
+    serde_json::from_value(serde_json::Value::String(text.to_string())).map_err(|_| {
+        let names: Vec<&str> = Scope::ALL.iter().map(|s| s.as_str()).collect();
+        format!("{text:?} is not a scope: use {}", names.join(", "))
+    })
 }
 
 /// `p2pc machines`.
@@ -308,8 +582,17 @@ pub struct MachinesArgs {
 /// `p2pc machines <subcommand>`.
 #[derive(Debug, Subcommand)]
 pub enum MachinesCommand {
+    /// List the machines, with whether each one is approved (the same as giving no subcommand).
+    #[command(visible_alias = "list")]
+    Ls,
     /// Show one machine's inventory and state.
     Show(MachineArg),
+    /// Approve a machine that waits for approval (admin only): print its node phrase and ask for confirmation.
+    ///
+    /// A machine enrolled with a token that a phone or a developer device minted gets no job until an admin approves
+    /// it. Compare the phrase with the one the machine itself shows (`p2pc-agent status`, or the PC's app) before you
+    /// say yes: it proves that the machine you approve is the machine you are looking at.
+    Approve(MachineApprove),
     /// Stop sending new jobs to a machine. Running jobs finish.
     Drain(MachineArg),
     /// Send jobs to a drained machine again.
@@ -324,6 +607,17 @@ pub struct MachineArg {
     /// The machine's name or ID (`node_…`).
     #[arg(value_name = "ID_OR_NAME")]
     pub target: String,
+}
+
+/// `p2pc nodes approve`.
+#[derive(Debug, Args)]
+pub struct MachineApprove {
+    /// The machine's name or ID.
+    #[arg(value_name = "ID_OR_NAME")]
+    pub target: String,
+    /// Do not ask for confirmation (the phrase is still printed). Required when there is no terminal.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 }
 
 /// `p2pc machines rm`.
