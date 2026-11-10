@@ -68,6 +68,10 @@ pub enum Command {
     Audit(AuditArgs),
     /// List the persistent volumes of the machines, or remove one.
     Volumes(VolumesArgs),
+    /// Upload, list and remove blobs: big files that jobs read as inputs.
+    Blobs(BlobsArgs),
+    /// List the ready-made templates of the hub, and launch one.
+    Templates(TemplatesArgs),
     /// Print a shell completion script.
     Completion(CompletionArgs),
     /// Show a job's logs, or follow them live.
@@ -92,6 +96,77 @@ pub enum Command {
     /// For example `claude mcp add p2pc -- p2pc mcp --profile agent`. It refuses a key that has the `admin` scope or
     /// no daily cap, unless you say otherwise. Logs go to stderr; stdout carries only the protocol.
     Mcp(McpArgs),
+}
+
+/// `p2pc templates`.
+#[derive(Debug, Args)]
+pub struct TemplatesArgs {
+    /// What to do.
+    #[command(subcommand)]
+    pub command: TemplatesCommand,
+}
+
+/// `p2pc templates <subcommand>`.
+#[derive(Debug, Subcommand)]
+pub enum TemplatesCommand {
+    /// List the templates the hub serves, with what each one needs.
+    #[command(visible_alias = "list")]
+    Ls,
+    /// Launch a template. Prints the job's ID.
+    ///
+    /// The parameters are the template's own (`p2pc templates ls --json` lists them); a parameter you leave out takes
+    /// the template's default. A template that is a singleton is not started twice: the running instance is returned.
+    Launch(TemplateLaunchArgs),
+}
+
+/// `p2pc templates launch`.
+#[derive(Debug, Args)]
+pub struct TemplateLaunchArgs {
+    /// The template's ID, for example `private-chat`.
+    #[arg(value_name = "ID")]
+    pub id: String,
+    /// A parameter: `name=value`. A blob parameter takes the digest `p2pc blobs put` printed. Repeatable.
+    #[arg(long = "param", value_name = "NAME=VALUE")]
+    pub params: Vec<String>,
+}
+
+/// `p2pc blobs`.
+#[derive(Debug, Args)]
+pub struct BlobsArgs {
+    /// What to do.
+    #[command(subcommand)]
+    pub command: BlobsCommand,
+}
+
+/// `p2pc blobs <subcommand>`.
+#[derive(Debug, Subcommand)]
+pub enum BlobsCommand {
+    /// Upload a file to the hub, unless the hub already has it, and print its digest.
+    ///
+    /// The digest (`sha256:<hex>`) goes to stdout and is what a job's `inputs` entry names. The file is read from the
+    /// path you give, as any command does. A blob expires 24 hours after it was uploaded or last used.
+    Put(BlobPut),
+    /// List the blobs of the account, with the space they use.
+    #[command(visible_alias = "list")]
+    Ls,
+    /// Remove your claim on a blob (it is deleted when nobody else holds one). Fails while a job uses it.
+    Rm(BlobRm),
+}
+
+/// `p2pc blobs put`.
+#[derive(Debug, Args)]
+pub struct BlobPut {
+    /// The file to upload.
+    #[arg(value_name = "FILE")]
+    pub file: PathBuf,
+}
+
+/// `p2pc blobs rm`.
+#[derive(Debug, Args)]
+pub struct BlobRm {
+    /// The blob's digest, `sha256:<hex>` (the `sha256:` prefix is optional).
+    #[arg(value_name = "DIGEST", value_parser = parse::parse_digest)]
+    pub digest: p2pc_proto::api::Sha256Digest,
 }
 
 /// `p2pc volumes`.
@@ -281,6 +356,10 @@ pub struct JobArgs {
     /// A local file to put in the job: `LOCAL` goes to `/inputs/<name>`, `LOCAL:/inputs/PATH` to PATH. Repeatable.
     #[arg(long = "file", value_name = "LOCAL[:/inputs/PATH]")]
     pub files: Vec<String>,
+    /// A big local file to give the job as a read-only input: it is uploaded to the hub as a blob (unless the hub has
+    /// it) and the job gets it at `/inputs/<name>`, or at PATH. Unlike --file, there is no 512 KiB limit. Repeatable.
+    #[arg(long = "input", value_name = "LOCAL[:/inputs/PATH]")]
+    pub inputs: Vec<String>,
     /// Domains the job may reach, comma separated. Without it the job has no network.
     #[arg(long, value_delimiter = ',', value_name = "DOMAIN,DOMAIN")]
     pub egress: Vec<String>,

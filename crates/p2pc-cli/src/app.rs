@@ -280,6 +280,8 @@ async fn dispatch(ctx: &mut Ctx<'_, '_>, command: Command) -> Result<u8, CliErro
         Command::Keys(a) => commands::keys::run(ctx, a).await,
         Command::Audit(a) => commands::audit::run(ctx, a).await,
         Command::Volumes(a) => commands::volumes::run(ctx, a).await,
+        Command::Blobs(a) => commands::blobs::run(ctx, a).await,
+        Command::Templates(a) => commands::templates::run(ctx, a).await,
         Command::Completion(a) => commands::completion(ctx, a),
         Command::Logs(a) => commands::logs::run(ctx, a).await,
         Command::Results(a) => commands::results::run(ctx, a).await,

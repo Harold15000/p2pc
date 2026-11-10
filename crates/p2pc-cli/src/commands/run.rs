@@ -7,12 +7,13 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::time::Duration;
 
+use p2pc_client::Client;
 use p2pc_proto::api::{
-    DEFAULT_DISK_MB, DEFAULT_MAX_ATTEMPTS, DEFAULT_TIMEOUT_S, Egress, InputFile, JobSpec, Outputs, Placement,
-    Resources, Retry,
+    BlobInput, DEFAULT_DISK_MB, DEFAULT_MAX_ATTEMPTS, DEFAULT_TIMEOUT_S, Egress, InputFile, Job, JobSpec, Outputs,
+    Placement, Resources, Retry,
 };
 use p2pc_proto::ids::JobId;
-use p2pc_proto::validate::Limits;
+use p2pc_proto::validate::{H2Features, Limits};
 
 use crate::app::{CliError, Ctx};
 use crate::cli::{JobArgs, RunArgs};
@@ -21,15 +22,85 @@ use crate::config::Env;
 use crate::follow::{FollowError, Followed, PollSchedule, StreamFollower, TokioSleeper};
 use crate::outcome::{EXIT_INTERRUPTED, describe, exit_code};
 use crate::output::{fmt_cpu, render_kv};
-use crate::parse::{parse_env_arg, parse_env_file, parse_file_arg};
+use crate::parse::{parse_env_arg, parse_env_file, parse_file_arg, parse_input_arg};
 
 /// The limits applied before sending: the §7 table without the registry policy, which only the server knows (it may
 /// allow more registries than the default list). The server stays the authority on everything.
+///
+/// The H2 job features are on: the CLI only sends `service`, `volumes` or `inputs` when the user asked for them, and the
+/// hub decides whether it serves them.
 pub(crate) fn local_limits() -> Limits {
     Limits {
         allowed_registries: None,
+        h2: H2Features::ALL,
         ..Limits::default()
     }
+}
+
+/// What `--input` did for one file.
+#[derive(Debug, Clone)]
+pub(crate) struct InputReport {
+    /// Where the job sees it.
+    pub path: String,
+    /// Its size in bytes.
+    pub size: u64,
+    /// Whether it was uploaded now (`false`: the hub had it, or this is an estimate and nothing is uploaded).
+    pub uploaded: bool,
+}
+
+/// Turns every `--input` into a blob input of the spec: hashes the file, uploads it unless the hub has it (`upload`),
+/// adds the `inputs` entry and checks the result again, with the disk rule of §7.1 and the real size of the blobs.
+///
+/// `upload` is `false` for `p2pc estimate`, which must have no side effect: it hashes the file and names the blob, and
+/// the hub says whether it could run such a job.
+pub(crate) async fn attach_inputs(
+    client: &Client,
+    spec: &mut JobSpec,
+    args: &JobArgs,
+    upload: bool,
+) -> Result<Vec<InputReport>, CliError> {
+    let mut reports = Vec::new();
+    let mut total: u64 = 0;
+    for arg in &args.inputs {
+        let input = parse_input_arg(arg).map_err(CliError::Usage)?;
+        let remote = match input.remote {
+            Some(remote) => remote,
+            None => format!("/inputs/{}", file_name(&input.local)?),
+        };
+        let measured = crate::commands::blobs::measure(&input.local)
+            .await
+            .map_err(|e| CliError::usage(format!("--input {e}")))?;
+        let uploaded = if upload {
+            crate::commands::blobs::upload_if_missing(client, &input.local, measured).await?
+        } else {
+            false
+        };
+        total = total.saturating_add(measured.size);
+        // Built through serde: a `BlobInput` is a type of `p2pc-proto`, which may grow fields (CONTRIBUTING rule 7).
+        let entry: BlobInput = serde_json::from_value(serde_json::json!({
+            "path": remote,
+            "blob": crate::commands::blobs::blob_ref(&measured.digest),
+        }))
+        .map_err(|_| CliError::usage("--input: could not build the input"))?;
+        spec.inputs.push(entry);
+        reports.push(InputReport {
+            path: remote,
+            size: measured.size,
+            uploaded,
+        });
+    }
+    if !reports.is_empty() {
+        let limits = local_limits();
+        spec.validate(&limits)?;
+        spec.check_inputs_fit_disk(total)?;
+    }
+    Ok(reports)
+}
+
+/// Uploads the inputs and submits the job: the whole of what Ctrl-C interrupts in `p2pc run`.
+async fn submit(client: &Client, spec: &mut JobSpec, args: &JobArgs) -> Result<(Job, Vec<InputReport>), CliError> {
+    let reports = attach_inputs(client, spec, args, true).await?;
+    Ok((client.create_job(spec).await?, reports))
 }
 
 /// Builds and validates the job spec from the flags. `env` answers `--env KEY`; files are read from disk.
@@ -153,7 +224,7 @@ pub async fn run(ctx: &mut Ctx<'_, '_>, args: RunArgs) -> Result<u8, CliError> {
             None => std::future::pending().await,
         }
     });
-    let job = tokio::select! {
+    let (job, reports) = tokio::select! {
         biased;
         () = &mut interrupt => {
             // Best effort: the exit code says what happened even if stderr is gone.
@@ -168,8 +239,21 @@ pub async fn run(ctx: &mut Ctx<'_, '_>, args: RunArgs) -> Result<u8, CliError> {
             );
             return Ok(EXIT_INTERRUPTED);
         }
-        job = client.create_job(&spec) => job?,
+        submitted = submit(&client, &mut spec, &args.job) => submitted?,
     };
+    for report in &reports {
+        let _ = writeln!(
+            ctx.host.err,
+            "input {} ({}): {}",
+            crate::output::printable(&report.path),
+            crate::output::fmt_bytes(report.size),
+            if report.uploaded {
+                "uploaded"
+            } else {
+                "already on the hub"
+            }
+        );
+    }
 
     if args.detach {
         if ctx.json {
@@ -268,8 +352,11 @@ fn detach_hint(err: &mut dyn Write, id: &JobId) -> io::Result<()> {
 
 /// `p2pc estimate`.
 pub async fn estimate(ctx: &mut Ctx<'_, '_>, args: JobArgs) -> Result<u8, CliError> {
-    let spec = build_spec(&args, ctx.host.env)?;
-    let estimate = ctx.client()?.estimate(&spec).await?;
+    let mut spec = build_spec(&args, ctx.host.env)?;
+    let client = ctx.client()?;
+    // Nothing is uploaded for an estimate: the file is hashed and named, and the hub says whether it could run.
+    attach_inputs(&client, &mut spec, &args, false).await?;
+    let estimate = client.estimate(&spec).await?;
     if ctx.json {
         ctx.print_json(&estimate)?;
         return Ok(0);
