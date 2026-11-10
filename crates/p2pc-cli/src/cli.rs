@@ -72,6 +72,8 @@ pub enum Command {
     Blobs(BlobsArgs),
     /// List the ready-made templates of the hub, and launch one.
     Templates(TemplatesArgs),
+    /// List the paired devices (a phone, a laptop), revoke one, or pair a new one.
+    Devices(DevicesArgs),
     /// Print a shell completion script.
     Completion(CompletionArgs),
     /// Show a job's logs, or follow them live.
@@ -96,6 +98,55 @@ pub enum Command {
     /// For example `claude mcp add p2pc -- p2pc mcp --profile agent`. It refuses a key that has the `admin` scope or
     /// no daily cap, unless you say otherwise. Logs go to stderr; stdout carries only the protocol.
     Mcp(McpArgs),
+}
+
+/// `p2pc devices`.
+#[derive(Debug, Args)]
+pub struct DevicesArgs {
+    /// What to do.
+    #[command(subcommand)]
+    pub command: DevicesCommand,
+}
+
+/// `p2pc devices <subcommand>`.
+#[derive(Debug, Subcommand)]
+pub enum DevicesCommand {
+    /// List the devices: label, platform, scopes, limits, last use and whether each is live.
+    #[command(visible_alias = "list")]
+    Ls,
+    /// Revoke a device: it is disconnected at once and can never connect again.
+    Revoke(DeviceRevoke),
+    /// Create a pairing ticket for a new device and print its URL, once.
+    ///
+    /// The URL is a secret: whoever opens it first pairs a device. It works once and expires after 10 minutes. On a
+    /// terminal a QR code of it is drawn too, for a phone's camera. Without --scopes the device gets the phone profile
+    /// (launch templates, upload blobs, ask to join PCs). The limits are checked by the hub against yours: a device
+    /// never gets more than the principal that creates it.
+    Pair(DevicePair),
+}
+
+/// `p2pc devices revoke`.
+#[derive(Debug, Args)]
+pub struct DeviceRevoke {
+    /// The device's ID, `dev_…`.
+    #[arg(value_name = "ID")]
+    pub id: p2pc_proto::ids::DeviceId,
+}
+
+/// `p2pc devices pair`.
+#[derive(Debug, Args)]
+pub struct DevicePair {
+    /// The device's scopes, comma separated or repeated: admin, jobs:write, jobs:read, nodes:read, nodes:write,
+    /// services:connect, templates:launch, blobs:write, nodes:invite or nodes:join. Default: the phone profile.
+    #[arg(long = "scopes", visible_alias = "scope", value_delimiter = ',', value_parser = parse_scope, value_name = "SCOPE")]
+    pub scopes: Vec<Scope>,
+    /// The device's daily cap in compute units (1 unit = 1 vCPU-hour reserved), for example `10` or `2.5`.
+    #[arg(long = "cap", value_parser = parse::parse_units, value_name = "UNITS")]
+    pub cap: Option<Units>,
+    /// An image the device may run, as a glob on the normalized reference. Repeatable. Without any, every image is
+    /// allowed.
+    #[arg(long = "image", value_name = "PATTERN")]
+    pub images: Vec<String>,
 }
 
 /// `p2pc templates`.
@@ -410,8 +461,10 @@ fn parse_status(text: &str) -> Result<JobStatus, String> {
 }
 
 fn parse_scope(text: &str) -> Result<Scope, String> {
-    serde_json::from_value(serde_json::Value::String(text.to_string()))
-        .map_err(|_| format!("{text:?} is not a scope: use admin, jobs:write, jobs:read, nodes:read or nodes:write"))
+    serde_json::from_value(serde_json::Value::String(text.to_string())).map_err(|_| {
+        let names: Vec<&str> = Scope::ALL.iter().map(|s| s.as_str()).collect();
+        format!("{text:?} is not a scope: use {}", names.join(", "))
+    })
 }
 
 /// `p2pc machines`.

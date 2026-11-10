@@ -83,7 +83,11 @@ fn nodes_show_tells_the_approval_and_the_phrase() {
     let server = server(vec![pending(id, "new-pc")]);
     let out = Cli::new().with_server(&server).run(&["nodes", "show", "new-pc"]);
     assert_eq!(out.code, 0, "{out:?}");
-    assert!(out.stdout.contains("pending_approval") && out.stdout.contains(PHRASE), "{}", out.stdout);
+    assert!(
+        out.stdout.contains("pending_approval") && out.stdout.contains(PHRASE),
+        "{}",
+        out.stdout
+    );
 }
 
 #[test]
@@ -98,13 +102,18 @@ fn approve_prints_the_phrase_asks_and_approves_on_yes() {
     assert_eq!(out.code, 0, "{out:?}");
     // The phrase is what the owner compares with the joined PC's screen, so it is on the screen before the question.
     assert!(out.stderr.contains(PHRASE), "{}", out.stderr);
-    assert!(out.stderr.contains("new-pc") && out.stderr.contains("[y/N]"), "{}", out.stderr);
-    assert!(out.stdout.contains("approved") && out.stdout.contains(&id.to_string()), "{}", out.stdout);
-    assert_eq!(approvals(&server), 1);
-    assert_eq!(
-        server.requests_to(&format!("POST /v1/nodes/{id}/approve")).len(),
-        1
+    assert!(
+        out.stderr.contains("new-pc") && out.stderr.contains("[y/N]"),
+        "{}",
+        out.stderr
     );
+    assert!(
+        out.stdout.contains("approved") && out.stdout.contains(&id.to_string()),
+        "{}",
+        out.stdout
+    );
+    assert_eq!(approvals(&server), 1);
+    assert_eq!(server.requests_to(&format!("POST /v1/nodes/{id}/approve")).len(), 1);
 }
 
 #[test]
@@ -112,11 +121,12 @@ fn approve_does_nothing_on_no_or_on_an_empty_answer() {
     let id = NodeId::generate();
     for answer in ["n\n", "\n", "yes please\n", ""] {
         let server = server(vec![pending(id, "new-pc")]);
-        let out = Cli::new()
-            .with_server(&server)
-            .with_tty()
-            .with_stdin(answer)
-            .run(&["nodes", "approve", &id.to_string()]);
+        let out =
+            Cli::new()
+                .with_server(&server)
+                .with_tty()
+                .with_stdin(answer)
+                .run(&["nodes", "approve", &id.to_string()]);
         assert_eq!(out.code, 130, "{answer:?}: {out:?}");
         assert!(out.stderr.contains("Not approved"), "{}", out.stderr);
         assert_eq!(approvals(&server), 0, "{answer:?}");
@@ -131,7 +141,11 @@ fn approve_yes_skips_the_question_but_still_prints_the_phrase() {
         .with_server(&server)
         .run(&["nodes", "approve", "new-pc", "--yes"]);
     assert_eq!(out.code, 0, "{out:?}");
-    assert!(out.stderr.contains(PHRASE) && !out.stderr.contains("[y/N]"), "{}", out.stderr);
+    assert!(
+        out.stderr.contains(PHRASE) && !out.stderr.contains("[y/N]"),
+        "{}",
+        out.stderr
+    );
     assert_eq!(approvals(&server), 1);
 }
 
@@ -139,7 +153,9 @@ fn approve_yes_skips_the_question_but_still_prints_the_phrase() {
 fn approve_without_a_terminal_or_yes_refuses_before_any_request() {
     let id = NodeId::generate();
     let server = server(vec![pending(id, "new-pc")]);
-    let out = Cli::new().with_server(&server).run(&["nodes", "approve", &id.to_string()]);
+    let out = Cli::new()
+        .with_server(&server)
+        .run(&["nodes", "approve", &id.to_string()]);
     assert_eq!(out.code, 125, "{out:?}");
     assert!(out.stderr.contains("--yes"), "{}", out.stderr);
     assert!(server.requests().is_empty());
@@ -197,7 +213,10 @@ fn a_node_name_from_the_server_cannot_inject_escape_sequences() {
     let out = Cli::new()
         .with_server(&server)
         .run(&["nodes", "approve", &id.to_string(), "--yes"]);
-    assert!(!out.stderr.contains('\u{1b}') && !out.stdout.contains('\u{1b}'), "{out:?}");
+    assert!(
+        !out.stderr.contains('\u{1b}') && !out.stdout.contains('\u{1b}'),
+        "{out:?}"
+    );
 }
 
 #[test]

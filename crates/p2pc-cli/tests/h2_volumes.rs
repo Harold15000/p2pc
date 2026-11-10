@@ -75,7 +75,11 @@ fn volumes_ls_shows_name_node_size_and_holder() {
         "{}",
         lines[1]
     );
-    assert!(lines[2].contains("scratch") && lines[2].trim_end().ends_with('-'), "{}", lines[2]);
+    assert!(
+        lines[2].contains("scratch") && lines[2].trim_end().ends_with('-'),
+        "{}",
+        lines[2]
+    );
 }
 
 #[test]
@@ -87,16 +91,20 @@ fn volumes_ls_json_is_an_array_and_an_empty_list_says_so() {
     assert_eq!(serde_json::from_str::<Vec<Value>>(&out.stdout).unwrap().len(), 1);
     let empty = Cli::new().with_server(&server(node, vec![])).run(&["volumes", "ls"]);
     assert_eq!(empty.code, 0);
-    assert!(empty.stdout.is_empty() && empty.stderr.contains("No volumes"), "{empty:?}");
+    assert!(
+        empty.stdout.is_empty() && empty.stderr.contains("No volumes"),
+        "{empty:?}"
+    );
 }
 
 #[test]
 fn volumes_rm_sends_a_template_name_as_one_percent_encoded_segment() {
     let node = NodeId::generate();
     let server = server(node, vec![]);
-    let out = Cli::new()
-        .with_server(&server)
-        .run(&["volumes", "rm", &node.to_string(), "tpl:private-chat/models", "--yes"]);
+    let out =
+        Cli::new()
+            .with_server(&server)
+            .run(&["volumes", "rm", &node.to_string(), "tpl:private-chat/models", "--yes"]);
     assert_eq!(out.code, 0, "{out:?}");
     assert_eq!(
         deletes(&server),
@@ -121,12 +129,17 @@ fn volumes_rm_asks_first_and_does_nothing_on_no() {
     let node = NodeId::generate();
     for (stdin, deleted) in [("y\n", 1), ("n\n", 0), ("", 0)] {
         let server = server(node, vec![]);
-        let out = Cli::new()
-            .with_server(&server)
-            .with_tty()
-            .with_stdin(stdin)
-            .run(&["volumes", "rm", &node.to_string(), "scratch"]);
-        assert!(out.stderr.contains("scratch") && out.stderr.contains("[y/N]"), "{}", out.stderr);
+        let out = Cli::new().with_server(&server).with_tty().with_stdin(stdin).run(&[
+            "volumes",
+            "rm",
+            &node.to_string(),
+            "scratch",
+        ]);
+        assert!(
+            out.stderr.contains("scratch") && out.stderr.contains("[y/N]"),
+            "{}",
+            out.stderr
+        );
         assert_eq!(deletes(&server).len(), deleted, "{stdin:?}: {out:?}");
         assert_eq!(out.code, if deleted == 1 { 0 } else { 130 }, "{stdin:?}");
     }
@@ -179,9 +192,14 @@ fn volumes_rm_shows_the_hubs_reason_for_a_busy_volume_and_an_offline_node() {
 #[test]
 fn volumes_rm_json_names_what_was_removed() {
     let node = NodeId::generate();
-    let out = Cli::new()
-        .with_server(&server(node, vec![]))
-        .run(&["volumes", "rm", &node.to_string(), "tpl:private-chat/models", "--yes", "--json"]);
+    let out = Cli::new().with_server(&server(node, vec![])).run(&[
+        "volumes",
+        "rm",
+        &node.to_string(),
+        "tpl:private-chat/models",
+        "--yes",
+        "--json",
+    ]);
     let v: Value = serde_json::from_str(&out.stdout).unwrap();
     assert_eq!(v["removed"], "tpl:private-chat/models");
     assert_eq!(v["node_id"], node.to_string());
