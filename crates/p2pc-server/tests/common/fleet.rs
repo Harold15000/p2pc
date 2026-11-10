@@ -246,10 +246,7 @@ impl FakeAgent {
             load: serde_json::from_value(json!({"cpu_pct": 1, "mem_used_mb": 1})).unwrap(),
             running: running
                 .iter()
-                .map(|(lease_id, epoch)| RunningLease {
-                    lease_id: *lease_id,
-                    epoch: *epoch,
-                })
+                .map(|(lease_id, epoch)| RunningLease::new(*lease_id, *epoch))
                 .collect(),
         })
         .await;

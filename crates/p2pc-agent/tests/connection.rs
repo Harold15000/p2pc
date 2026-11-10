@@ -407,10 +407,7 @@ fn good_job() -> Value {
 #[tokio::test(start_paused = true)]
 async fn hello_carries_the_version_an_empty_feature_list_the_inventory_and_the_running_leases() {
     let mut w = start(Options::default());
-    let lease = RunningLease {
-        lease_id: LeaseId::generate(),
-        epoch: 3,
-    };
+    let lease = RunningLease::new(LeaseId::generate(), 3);
     w.supervisor.running.lock().unwrap().push(lease);
     let mut s = w.next_connection().await;
     let hello = s.handshake(w.owner).await;
@@ -562,10 +559,7 @@ async fn heartbeats_honour_the_interval_and_seq_increases_and_acks_keep_the_time
 #[tokio::test(start_paused = true)]
 async fn a_release_sends_a_heartbeat_at_once_listing_what_is_still_held() {
     let mut w = start(Options::default());
-    let lease = |epoch| RunningLease {
-        lease_id: LeaseId::generate(),
-        epoch,
-    };
+    let lease = |epoch| RunningLease::new(LeaseId::generate(), epoch);
     let (cleaning, running) = (lease(1), lease(2));
     // `Hello` lists the leases that run or whose report is unconfirmed; `Heartbeat` those that hold resources.
     *w.supervisor.running.lock().unwrap() = vec![running];
@@ -690,10 +684,11 @@ async fn the_timer_keeps_running_while_disconnected() {
 #[tokio::test(start_paused = true)]
 async fn backoff_is_capped_at_5_s_with_running_leases_and_reset_after_welcome() {
     let mut w = start(Options::default());
-    w.supervisor.running.lock().unwrap().push(RunningLease {
-        lease_id: LeaseId::generate(),
-        epoch: 1,
-    });
+    w.supervisor
+        .running
+        .lock()
+        .unwrap()
+        .push(RunningLease::new(LeaseId::generate(), 1));
     w.connector.refuse.store(true, Ordering::SeqCst);
     // Let it fail for a while.
     tokio::time::sleep(Duration::from_secs(120)).await;
@@ -878,6 +873,28 @@ async fn drain_and_resume_reach_the_supervisor_and_unknown_messages_are_ignored(
     w.shutdown().await;
 }
 
+/// H2 §6.1 before the agent uses them: `VolumeDelete` and `NodeApproved` are ignored, like an unknown type, and
+/// nothing closes.
+#[tokio::test(start_paused = true)]
+async fn h2_server_messages_are_ignored_for_now() {
+    let mut w = start(Options::default());
+    let mut s = w.next_connection().await;
+    let _ = s.handshake(w.owner).await;
+    s.send(json!({"type": "drain"})).await;
+    s.send(json!({"type": "volume_delete", "name": "cache"})).await;
+    s.send(json!({"type": "node_approved"})).await;
+    s.send(json!({"type": "resume"})).await;
+    assert_eq!(w.next_event().await.1, Event::Drain);
+    assert_eq!(w.next_event().await.1, Event::Resume);
+    assert_eq!(
+        w.connector.attempts.lock().unwrap().len(),
+        1,
+        "the H2 messages did not close anything"
+    );
+    let (_task, _rx) = s.serve(true);
+    w.shutdown().await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn not_enrolled_and_agent_too_old_stop_the_agent_with_their_exit_codes() {
     for (code, exit_code, state) in [
@@ -1057,10 +1074,11 @@ async fn errors_in_the_handshake_do_not_reset_the_lease_timer() {
 #[tokio::test(start_paused = true)]
 async fn a_slow_detection_is_not_repeated_before_every_dial_during_an_outage() {
     let mut w = start(Options::default());
-    w.supervisor.running.lock().unwrap().push(RunningLease {
-        lease_id: LeaseId::generate(),
-        epoch: 1,
-    });
+    w.supervisor
+        .running
+        .lock()
+        .unwrap()
+        .push(RunningLease::new(LeaseId::generate(), 1));
     let mut s = w.next_connection().await;
     let _ = s.handshake(w.owner).await;
     let _ = s.recv().await;

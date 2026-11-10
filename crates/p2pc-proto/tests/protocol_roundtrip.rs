@@ -13,8 +13,9 @@ use p2pc_proto::api::{
 use p2pc_proto::auth::JoinToken;
 use p2pc_proto::ids::{AccountId, LeaseId, NodeId};
 use p2pc_proto::protocol::{
-    AgentMsg, LeaseJob, LeaseRejectReason, Load, LogData, MAX_FRAME_LEN, Outcome, RunningLease, ServerMsg, UploadAck,
-    UploadHeader, Usage, read_frame, write_frame,
+    AgentMsg, HealthState, LeaseJob, LeaseRejectReason, Leave, Load, LogData, MAX_FRAME_LEN, NodeApproved, Outcome,
+    RunningLease, ServerMsg, ServiceHealth, UploadAck, UploadHeader, Usage, VolumeDelete, VolumeInfo, VolumeReport,
+    read_frame, write_frame,
 };
 use proptest::collection::{btree_map, vec};
 use proptest::option;
@@ -241,11 +242,35 @@ fn join_token() -> impl Strategy<Value = JoinToken> {
         })
 }
 
+fn health() -> impl Strategy<Value = HealthState> {
+    prop_oneof![
+        Just(HealthState::Starting),
+        Just(HealthState::Healthy),
+        Just(HealthState::Unhealthy)
+    ]
+}
+
 fn running() -> impl Strategy<Value = Vec<RunningLease>> {
     vec(
-        (lease_id(), any::<u64>()).prop_map(|(lease_id, epoch)| RunningLease { lease_id, epoch }),
+        (
+            lease_id(),
+            any::<u64>(),
+            option::of(health()),
+            option::of(any::<u64>()),
+            option::of(any::<u64>()),
+        )
+            .prop_map(|(lease_id, epoch, health, used_cpu_ms, max_rss_mb)| RunningLease {
+                health,
+                used_cpu_ms,
+                max_rss_mb,
+                ..RunningLease::new(lease_id, epoch)
+            }),
         0..4,
     )
+}
+
+fn volume_name() -> impl Strategy<Value = String> {
+    prop_oneof!["[a-z0-9][a-z0-9._-]{0,20}", "tpl:[a-z-]{1,12}/[a-z]{1,8}"]
 }
 
 fn stream() -> impl Strategy<Value = LogStream> {
@@ -349,6 +374,29 @@ fn agent_msg() -> impl Strategy<Value = AgentMsg> {
                     outputs
                 }
             ),
+        // H2 §6.1.
+        (lease_id(), any::<u64>(), health(), timestamp(), option::of(text())).prop_map(
+            |(lease_id, epoch, state, since, detail)| AgentMsg::ServiceHealth(ServiceHealth {
+                lease_id,
+                epoch,
+                state,
+                since,
+                detail
+            })
+        ),
+        vec(
+            (volume_name(), any::<u64>(), timestamp(), option::of(lease_id())).prop_map(
+                |(name, size_mb, last_used_at, in_use_by)| VolumeInfo {
+                    name,
+                    size_mb,
+                    last_used_at,
+                    in_use_by
+                }
+            ),
+            0..3
+        )
+        .prop_map(|volumes| AgentMsg::VolumeReport(VolumeReport { volumes })),
+        text().prop_map(|reason| AgentMsg::Leave(Leave { reason })),
     ]
 }
 
@@ -359,15 +407,19 @@ fn server_msg() -> impl Strategy<Value = ServerMsg> {
             ulid().prop_map(NodeId::from_ulid),
             ulid().prop_map(AccountId::from_ulid),
             any::<u32>(),
-            any::<u32>()
+            any::<u32>(),
+            any::<bool>()
         )
             .prop_map(
-                |(server_version, node_id, account_id, heartbeat_interval_s, lease_ttl_s)| ServerMsg::Welcome {
-                    server_version,
-                    node_id,
-                    account_id,
-                    heartbeat_interval_s,
-                    lease_ttl_s
+                |(server_version, node_id, account_id, heartbeat_interval_s, lease_ttl_s, pending_approval)| {
+                    ServerMsg::Welcome {
+                        server_version,
+                        node_id,
+                        account_id,
+                        heartbeat_interval_s,
+                        lease_ttl_s,
+                        pending_approval,
+                    }
                 }
             ),
         any::<u64>().prop_map(|seq| ServerMsg::HeartbeatAck { seq }),
@@ -394,6 +446,9 @@ fn server_msg() -> impl Strategy<Value = ServerMsg> {
         Just(ServerMsg::Resume {}),
         Just(ServerMsg::Unknown),
         (text(), text()).prop_map(|(code, message)| ServerMsg::Error { code, message }),
+        // H2 §6.1.
+        volume_name().prop_map(|name| ServerMsg::VolumeDelete(VolumeDelete { name })),
+        Just(ServerMsg::NodeApproved(NodeApproved {})),
     ]
 }
 

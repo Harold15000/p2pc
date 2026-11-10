@@ -313,10 +313,13 @@ async fn join_enrolls_a_node_in_the_tokens_account() {
         heartbeat_interval_s,
         lease_ttl_s,
         server_version,
+        pending_approval,
     }) = agent.recv().await
     else {
         panic!("no Welcome");
     };
+    // H1 behaviour until node approval lands (H2 §5.5).
+    assert!(!pending_approval);
     assert_eq!(account_id, h.app.account_id);
     assert_eq!((heartbeat_interval_s, lease_ttl_s), (5, 60));
     assert_eq!(server_version, env!("CARGO_PKG_VERSION"));
@@ -1130,15 +1133,7 @@ async fn hello_from_an_enrolled_node_gets_welcome_and_its_leases_are_cancelled()
     h.disconnected(node_id).await;
     let lease: LeaseId = "lse_01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap();
     let mut again = h.agent(&key).await;
-    again
-        .hello(
-            "0.1.0",
-            vec![RunningLease {
-                lease_id: lease,
-                epoch: 2,
-            }],
-        )
-        .await;
+    again.hello("0.1.0", vec![RunningLease::new(lease, 2)]).await;
     assert_eq!(again.welcome().await, node_id);
     // No lease exists before T06: the default reconciler cancels it.
     assert_eq!(
@@ -1174,6 +1169,31 @@ async fn an_agent_older_than_min_agent_version_is_refused() {
         a.hello(version, vec![]).await;
         a.expect_error("agent_too_old").await;
         a.expect_closed().await;
+    }
+}
+
+/// H2 §6.1 before the hub serves them: the new agent messages are answered as an unknown type (H1 §6), the connection
+/// stays, and a `Leave` removes nothing.
+#[tokio::test]
+async fn h2_agent_messages_are_answered_as_unknown_types_for_now() {
+    let mut h = start(test_limits()).await;
+    let key = SecretKey::generate();
+    let (mut agent, _node_id) = h.joined(&key, "n").await;
+    let lease = LeaseId::generate();
+    for (n, msg) in [
+        json!({"type": "service_health", "lease_id": lease, "epoch": 1, "state": "healthy",
+               "since": "2026-11-10T10:00:00Z"}),
+        json!({"type": "volume_report", "volumes": []}),
+        json!({"type": "leave", "reason": "uninstall"}),
+    ]
+    .iter()
+    .enumerate()
+    {
+        agent.send(msg).await;
+        agent.expect_error("unsupported_message").await;
+        let seq = n as u64 + 1;
+        agent.heartbeat(seq).await;
+        assert_eq!(agent.recv().await, Some(ServerMsg::HeartbeatAck { seq }));
     }
 }
 
@@ -2159,15 +2179,7 @@ async fn a_failed_reconciliation_closes_the_session_without_cancelling() {
     };
     let lease: LeaseId = "lse_01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap();
     let mut again = h.agent(&key).await;
-    again
-        .hello(
-            "0.1.0",
-            vec![RunningLease {
-                lease_id: lease,
-                epoch: 3,
-            }],
-        )
-        .await;
+    again.hello("0.1.0", vec![RunningLease::new(lease, 3)]).await;
     assert_eq!(again.welcome().await, node_id);
     again.expect_closed().await;
 }

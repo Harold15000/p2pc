@@ -436,6 +436,8 @@ async fn drive(
                     account_id,
                     heartbeat_interval_s,
                     lease_ttl_s,
+                    // `pending_approval` (H2 §5.5) is not used yet (T2-23).
+                    ..
                 } => {
                     if account_id != shared.owner {
                         tracing::error!(
@@ -659,6 +661,10 @@ async fn route(shared: &Shared, io: &Io, decisions: &mut JoinSet<()>, msg: Serve
         ServerMsg::Error { code, message } => tracing::warn!(%code, %message, "error from the server"),
         ServerMsg::Welcome { .. } => tracing::warn!("a second Welcome on one connection; ignored"),
         ServerMsg::Unknown => tracing::debug!("a message type this agent does not know; ignored"),
+        // H2 §6.1: sent only to agents that declared `volumes` or `approval`, which this one does not yet.
+        msg @ (ServerMsg::VolumeDelete(_) | ServerMsg::NodeApproved(_)) => {
+            tracing::debug!(kind = msg.kind(), "a message this agent does not use yet; ignored");
+        }
     }
     None
 }
