@@ -108,6 +108,22 @@ impl MockResponse {
         }
     }
 
+    /// The answer to a `HEAD`: no body, and a `Content-Length` of `length` (the size of the thing a `GET` would send).
+    #[must_use]
+    pub fn head(status: u16, length: u64) -> Self {
+        Self::empty(status).with_header(HEAD_LENGTH_HEADER, &length.to_string())
+    }
+
+    /// `101 Switching Protocols` to `p2pc-port/1` (H2 §7.4), after which the server echoes every byte it receives back
+    /// to the client until the client closes. A stand-in for a service behind the port bridge.
+    #[must_use]
+    pub fn upgrade_echo() -> Self {
+        Self::empty(101)
+            .with_header("Connection", "Upgrade")
+            .with_header("Upgrade", "p2pc-port/1")
+            .with_header(UPGRADE_ECHO_HEADER, "1")
+    }
+
     /// A plain-text body, for example a proxy's error page.
     #[must_use]
     pub fn text(status: u16, text: &str) -> Self {
@@ -136,6 +152,10 @@ impl MockResponse {
 
 /// The marker header of [`MockResponse::cut`]. It is not sent.
 const CUT_HEADER: &str = "x-mock-cut";
+/// The marker header of [`MockResponse::head`]: the `Content-Length` to announce. It is not sent.
+const HEAD_LENGTH_HEADER: &str = "x-mock-head-length";
+/// The marker header of [`MockResponse::upgrade_echo`]. It is not sent.
+const UPGRADE_ECHO_HEADER: &str = "x-mock-upgrade-echo";
 
 type Handler = dyn Fn(&RecordedRequest) -> MockResponse + Send + Sync + 'static;
 
@@ -208,14 +228,19 @@ fn serve(stream: TcpStream, handler: &Arc<Handler>, requests: &Arc<Mutex<Vec<Rec
     while let Some(request) = read_request(&mut reader) {
         // Refused before the handler, as the real server refuses it before anything else.
         if let Some(refusal) = refuse_fractional_timestamps(&request.body) {
-            if write_response(&mut writer, &refusal).is_err() {
+            if write_response(&mut writer, &refusal, false).is_err() {
                 return;
             }
             continue;
         }
         requests.lock().expect("lock").push(request.clone());
         let response = handler(&request);
-        if write_response(&mut writer, &response).is_err() {
+        if write_response(&mut writer, &response, request.method == "HEAD").is_err() {
+            return;
+        }
+        if response.headers.iter().any(|(k, _)| k == UPGRADE_ECHO_HEADER) {
+            // The connection is a raw byte pipe from here on: echo until the client is done.
+            echo(&mut reader, &mut writer);
             return;
         }
         if response.headers.iter().any(|(k, _)| k == CUT_HEADER) {
@@ -304,16 +329,36 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> Option<RecordedRequest> {
     })
 }
 
-fn write_response(writer: &mut TcpStream, r: &MockResponse) -> std::io::Result<()> {
+/// Echoes what the client sends, through the buffered reader (it may already hold the first bytes).
+fn echo(reader: &mut BufReader<TcpStream>, writer: &mut TcpStream) {
+    let mut buf = [0u8; 4096];
+    while let Ok(n) = reader.read(&mut buf) {
+        if n == 0 || writer.write_all(&buf[..n]).is_err() || writer.flush().is_err() {
+            return;
+        }
+    }
+}
+
+fn write_response(writer: &mut TcpStream, r: &MockResponse, head_request: bool) -> std::io::Result<()> {
     let cut = r.headers.iter().any(|(k, _)| k == CUT_HEADER);
-    let announced = r.body.len() + usize::from(cut);
-    let mut head = format!("HTTP/1.1 {} Mock\r\ncontent-length: {announced}\r\n", r.status);
-    for (k, v) in r.headers.iter().filter(|(k, _)| k != CUT_HEADER) {
+    let marker = |name: &str| r.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+    let mut head = format!("HTTP/1.1 {} Mock\r\n", r.status);
+    // A `101` has no body and no length; a `HEAD` answer announces the length of the body it does not send.
+    if r.status != 101 {
+        let announced = match marker(HEAD_LENGTH_HEADER) {
+            Some(length) => length,
+            None => (r.body.len() + usize::from(cut)).to_string(),
+        };
+        head.push_str(&format!("content-length: {announced}\r\n"));
+    }
+    for (k, v) in r.headers.iter().filter(|(k, _)| !k.starts_with("x-mock-")) {
         head.push_str(&format!("{k}: {v}\r\n"));
     }
     head.push_str("\r\n");
     writer.write_all(head.as_bytes())?;
-    writer.write_all(&r.body)?;
+    if !head_request {
+        writer.write_all(&r.body)?;
+    }
     writer.flush()
 }
 
@@ -506,6 +551,7 @@ mod tunnel_mock {
                                 });
                                 let _ = hyper::server::conn::http1::Builder::new()
                                     .serve_connection(io, service)
+                                    .with_upgrades()
                                     .await;
                             });
                         }
@@ -517,10 +563,11 @@ mod tunnel_mock {
     }
 
     async fn answer(
-        req: hyper::Request<hyper::body::Incoming>,
+        mut req: hyper::Request<hyper::body::Incoming>,
         handler: &Arc<Handler>,
         seen: &Arc<Mutex<SeenBox>>,
     ) -> hyper::Response<Full<Bytes>> {
+        let on_upgrade = hyper::upgrade::on(&mut req);
         let (parts, body) = req.into_parts();
         let body = Limited::new(body, 64 * 1024 * 1024)
             .collect()
@@ -551,8 +598,21 @@ mod tunnel_mock {
             }
         };
         let mut builder = hyper::Response::builder().status(r.status);
-        for (k, v) in &r.headers {
-            builder = builder.header(k, v);
+        for (k, v) in r.headers.iter().filter(|(k, _)| k != super::CUT_HEADER) {
+            if k == super::HEAD_LENGTH_HEADER {
+                builder = builder.header("content-length", v);
+            } else if k == super::UPGRADE_ECHO_HEADER {
+                // After the `101`, whatever the client sends comes back.
+                tokio::spawn(async move {
+                    let Ok(upgraded) = on_upgrade.await else { return };
+                    let (mut read, mut write) = tokio::io::split(hyper_util::rt::TokioIo::new(upgraded));
+                    let _ = tokio::io::copy(&mut read, &mut write).await;
+                });
+                // (the closure above moved `on_upgrade`: only one marker header can be present)
+                break;
+            } else {
+                builder = builder.header(k, v);
+            }
         }
         builder.body(Full::new(Bytes::from(r.body))).expect("a valid response")
     }

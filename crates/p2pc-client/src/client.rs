@@ -9,11 +9,13 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use p2pc_proto::api::{
-    ApiKeyInfo, AuditEvent, CreateApiKey, CreateJoinToken, Estimate, Job, JobSpec, JobStatus, JoinTokenInfo,
-    JoinTokenResponse, NewApiKey, Node, OutputFile, Page, ServerInfo, UsageGroupBy, UsageReport, WhoAmI,
+    ApiKeyInfo, AuditEvent, BlobList, BlobUploaded, CreateApiKey, CreateJoinToken, CreatePairingTicket, DeviceInfo,
+    Estimate, Job, JobKind, JobSpec, JobStatus, JoinTokenInfo, JoinTokenResponse, LaunchTemplate, NewApiKey, Node,
+    OutputFile, Page, PairingTicketCreated, PairingTicketInfo, ServerInfo, Sha256Digest, TemplateList, UsageGroupBy,
+    UsageReport, VolumeInfo, WhoAmI,
 };
 use p2pc_proto::auth::ApiKey;
-use p2pc_proto::ids::{JobId, JoinTokenId, KeyId, NodeId};
+use p2pc_proto::ids::{DeviceId, JobId, JoinTokenId, KeyId, NodeId, PairingTicketId};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Method, StatusCode};
 use serde::Serialize;
@@ -39,6 +41,14 @@ pub const IDEMPOTENCY_HEADER: &str = "Idempotency-Key";
 pub const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(3600);
 /// The whole-request timeout of a followed log: a day, because a job runs for at most 24 h (spec §7).
 pub const FOLLOW_TIMEOUT: Duration = Duration::from_secs(25 * 3600);
+/// The slowest upload the server tolerates (H2 §7.5: a floor of 16 KiB/s averaged over a minute). The whole-request
+/// timeout of a blob upload is its size at this rate, so a slow link is not cut off by the client before the server
+/// would cut it off.
+pub const UPLOAD_FLOOR_BYTES_PER_S: u64 = 16 * 1024;
+/// The shortest whole-request timeout of a blob upload.
+pub const UPLOAD_MIN_TIMEOUT: Duration = Duration::from_secs(600);
+/// The longest whole-request timeout of a blob upload: 2 GiB at the floor is 36 hours.
+pub const UPLOAD_MAX_TIMEOUT: Duration = Duration::from_secs(48 * 3600);
 
 /// Filters and paging of `GET /v1/jobs`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -47,6 +57,8 @@ pub struct JobListParams {
     pub status: Option<JobStatus>,
     /// Only jobs that ran on this node.
     pub node_id: Option<NodeId>,
+    /// Only `batch` or only `service` jobs (H2 §7.2).
+    pub kind: Option<JobKind>,
     /// Page size, at most 100.
     pub limit: Option<u32>,
     /// The `next_cursor` of the previous page.
@@ -140,20 +152,29 @@ impl ClientBuilder {
         let (transport, base) = match self.target {
             BuilderTarget::Url(text) => {
                 let base = parse_base_url(&text)?;
-                let http = reqwest::Client::builder()
-                    .tls_backend_preconfigured(tls_config()?)
-                    .user_agent(self.user_agent.clone())
-                    .connect_timeout(self.connect_timeout)
-                    .timeout(self.request_timeout)
-                    // A stalled body is noticed even for a download that overrides the total timeout.
-                    .read_timeout(self.request_timeout)
-                    // A redirect would re-send the request, and a downgrade from https to http would send the key
-                    // in clear text. The server never redirects, so a redirect means a wrong URL: say so instead of
-                    // following it.
-                    .redirect(reqwest::redirect::Policy::none())
-                    .build()
-                    .map_err(|e| BuildError::Tls(e.without_url().to_string()))?;
-                (Transport::Http(http), base)
+                let builder = |read_timeout: bool| -> Result<reqwest::Client, BuildError> {
+                    let mut builder = reqwest::Client::builder()
+                        .tls_backend_preconfigured(tls_config()?)
+                        .user_agent(self.user_agent.clone())
+                        .connect_timeout(self.connect_timeout)
+                        .timeout(self.request_timeout)
+                        // A redirect would re-send the request, and a downgrade from https to http would send the
+                        // key in clear text. The server never redirects, so a redirect means a wrong URL: say so
+                        // instead of following it.
+                        .redirect(reqwest::redirect::Policy::none());
+                    if read_timeout {
+                        // A stalled body is noticed even for a download that overrides the total timeout.
+                        builder = builder.read_timeout(self.request_timeout);
+                    }
+                    builder
+                        .build()
+                        .map_err(|e| BuildError::Tls(e.without_url().to_string()))
+                };
+                // A blob upload waits for the answer for as long as the upload takes; the read timeout of the other
+                // calls would cut it off after a minute. Its own whole-request timeout bounds it instead.
+                let http = builder(true)?;
+                let bulk = builder(false)?;
+                (Transport::Http { http, bulk }, base)
             }
             #[cfg(feature = "tunnel")]
             BuilderTarget::Tunnel(tunnel) => (Transport::Tunnel(tunnel), crate::tunnel::base_url()),
@@ -218,8 +239,11 @@ fn tls_config() -> Result<rustls::ClientConfig, BuildError> {
 /// How requests reach the server.
 #[derive(Clone)]
 enum Transport {
-    /// HTTP(S) over TCP, with reqwest.
-    Http(reqwest::Client),
+    /// HTTP(S) over TCP, with reqwest: `http` for the API, `bulk` for blob uploads.
+    Http {
+        http: reqwest::Client,
+        bulk: reqwest::Client,
+    },
     /// HTTP/1.1 over a QUIC stream of the `p2pc/http/1` tunnel.
     #[cfg(feature = "tunnel")]
     Tunnel(crate::tunnel::Tunnel),
@@ -248,7 +272,7 @@ impl fmt::Debug for Client {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut d = f.debug_struct("Client");
         match &self.transport {
-            Transport::Http(_) => d.field("base", &self.base.as_str()),
+            Transport::Http { .. } => d.field("base", &self.base.as_str()),
             #[cfg(feature = "tunnel")]
             Transport::Tunnel(t) => d.field("tunnel", t),
         };
@@ -262,6 +286,8 @@ impl fmt::Debug for Client {
 pub(crate) struct Response {
     status: StatusCode,
     content_length: Option<u64>,
+    /// The `Content-Length` header, whatever the body: the size a `HEAD` answer announces.
+    declared_length: Option<u64>,
     body: ResponseBody,
 }
 
@@ -273,9 +299,15 @@ enum ResponseBody {
 
 impl Response {
     fn from_reqwest(response: reqwest::Response) -> Self {
+        let declared_length = response
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
         Self {
             status: response.status(),
             content_length: response.content_length(),
+            declared_length,
             body: ResponseBody::Http(response),
         }
     }
@@ -289,6 +321,7 @@ impl Response {
         Self {
             status,
             content_length,
+            declared_length: content_length,
             body: ResponseBody::Tunnel(body),
         }
     }
@@ -299,6 +332,10 @@ impl Response {
 
     fn content_length(&self) -> Option<u64> {
         self.content_length
+    }
+
+    fn declared_length(&self) -> Option<u64> {
+        self.declared_length
     }
 
     /// The next piece of the body, `None` at its end.
@@ -327,6 +364,18 @@ struct Call<'a> {
     secret_response: bool,
     /// Replaces the client's whole-request timeout (a download streams for longer than a JSON request).
     timeout: Option<Duration>,
+    /// The segments are already percent-encoded, one each: they are appended as they are, not encoded again.
+    raw_segments: bool,
+    /// A file sent as the body, streamed.
+    upload: Option<Upload>,
+    /// Headers besides the usual ones.
+    extra_headers: Vec<(HeaderName, HeaderValue)>,
+}
+
+/// A file to stream as a request body.
+struct Upload {
+    path: PathBuf,
+    len: u64,
 }
 
 impl<'a> Call<'a> {
@@ -340,6 +389,16 @@ impl<'a> Call<'a> {
             repeatable: true,
             secret_response: false,
             timeout: None,
+            raw_segments: false,
+            upload: None,
+            extra_headers: Vec::new(),
+        }
+    }
+
+    fn head(segments: &'a [&'a str]) -> Self {
+        Self {
+            method: Method::HEAD,
+            ..Self::get(segments)
         }
     }
 
@@ -440,6 +499,9 @@ impl Client {
         }
         if let Some(node) = &params.node_id {
             call = call.query("node_id", node.to_string());
+        }
+        if let Some(kind) = params.kind {
+            call = call.query("kind", kind.as_str());
         }
         self.fetch(call.page(params.limit, params.cursor.as_deref())).await
     }
@@ -806,10 +868,233 @@ impl Client {
         self.fetch(call).await
     }
 
+    /// `POST /v1/nodes/{id}/approve` (H2 §5.5, `admin` only): lets a `pending_approval` node get work. Idempotent on
+    /// the server, but not retried by the client: an approval is a decision the user confirmed once. The answer's body,
+    /// if any, is not read.
+    pub async fn approve_node(&self, id: &NodeId) -> Result<(), Error> {
+        self.send_ignoring_body(Call::post(&["v1", "nodes", &id.to_string(), "approve"]))
+            .await
+    }
+
+    /// `HEAD /v1/blobs/{sha256}` (H2 §7.3): the size of the blob if the caller's account has it, `None` if not.
+    pub async fn head_blob(&self, digest: &Sha256Digest) -> Result<Option<u64>, Error> {
+        let text = digest.to_string();
+        let segments = ["v1", "blobs", text.as_str()];
+        match self.open(Call::head(&segments)).await {
+            // The answer to a `HEAD` has no body to read: only its headers matter.
+            Ok(response) => Ok(Some(response.declared_length().ok_or_else(|| {
+                Error::Unexpected(UnexpectedResponse::new(
+                    Some(response.status().as_u16()),
+                    "the answer has no Content-Length",
+                ))
+            })?)),
+            Err(Error::Api(e)) if e.status == 404 => Ok(None),
+            // A `HEAD` answer has no problem document: a bare 404 is "not there".
+            Err(Error::Unexpected(e)) if e.status == Some(404) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `POST /v1/blobs` (H2 §7.5): uploads the file at `path`, which has `size` bytes and the SHA-256 `digest`.
+    ///
+    /// The file is streamed, never held in memory. `Content-Length` and `X-P2PC-SHA256` are required by the server
+    /// before it reads the body, so the caller measures and hashes the file first; a file that is not `size` bytes
+    /// any more is refused here before anything is sent, and one that changes while it is sent is refused by the
+    /// server (`422 digest_mismatch`). Not retried.
+    pub async fn put_blob(&self, path: &Path, digest: &Sha256Digest, size: u64) -> Result<BlobUploaded, Error> {
+        let meta = tokio::fs::metadata(path)
+            .await
+            .map_err(|e| Error::Local(LocalError::new(format!("cannot read the file: {e}"))))?;
+        if !meta.is_file() || meta.len() != size {
+            return Err(Error::Local(LocalError::new(
+                "the file is not a regular file of the size that was measured; it changed while it was prepared",
+            )));
+        }
+        let mut call = Call::post(&["v1", "blobs"]);
+        call.upload = Some(Upload {
+            path: path.to_path_buf(),
+            len: size,
+        });
+        let hex = HeaderValue::from_str(&digest.to_string())
+            .map_err(|_| Error::Local(LocalError::new("the digest is not a valid header value")))?;
+        call.extra_headers
+            .push((HeaderName::from_static(p2pc_proto::api::BLOB_SHA256_HEADER), hex));
+        let floor = Duration::from_secs(size / UPLOAD_FLOOR_BYTES_PER_S);
+        call.timeout = Some(floor.clamp(UPLOAD_MIN_TIMEOUT, UPLOAD_MAX_TIMEOUT));
+        self.fetch(call).await
+    }
+
+    /// `GET /v1/blobs`: one page of the account's blobs, with its stored total and quota.
+    pub async fn list_blobs(&self, params: &ListParams) -> Result<BlobList, Error> {
+        self.fetch(Call::get(&["v1", "blobs"]).page(params.limit, params.cursor.as_deref()))
+            .await
+    }
+
+    /// `DELETE /v1/blobs/{sha256}`: removes the caller's claim on the blob. Not retried.
+    pub async fn delete_blob(&self, digest: &Sha256Digest) -> Result<(), Error> {
+        let text = digest.to_string();
+        self.send_ignoring_body(Call::delete(&["v1", "blobs", text.as_str()]))
+            .await
+    }
+
+    /// `GET /v1/volumes`: one page.
+    pub async fn list_volumes(&self, params: &ListParams) -> Result<Page<VolumeInfo>, Error> {
+        self.fetch(Call::get(&["v1", "volumes"]).page(params.limit, params.cursor.as_deref()))
+            .await
+    }
+
+    /// `DELETE /v1/volumes/{node_id}/{name}` (H2 §7.3). Not retried.
+    ///
+    /// `name` is sent as **one** percent-encoded path segment: a template volume `tpl:private-chat/models` goes out
+    /// as `tpl%3Aprivate-chat%2Fmodels`, and nothing in a name can add a segment or a query.
+    pub async fn delete_volume(&self, node: &NodeId, name: &str) -> Result<(), Error> {
+        let (node, name) = (node.to_string(), encode_segment(name));
+        let segments = ["v1", "volumes", node.as_str(), name.as_str()];
+        let mut call = Call::delete(&segments);
+        call.raw_segments = true;
+        self.send_ignoring_body(call).await
+    }
+
+    /// `GET /v1/templates` (H2 §7.6): the loaded bundle, or an empty list and `bundle_error`.
+    pub async fn list_templates(&self) -> Result<TemplateList, Error> {
+        self.fetch(Call::get(&["v1", "templates"])).await
+    }
+
+    /// `POST /v1/templates/{id}/launch` (H2 §7.6). Like a job submission, it always carries an idempotency key (the
+    /// caller's or a generated one), and a transient failure is retried with the same key, so a retry never starts a
+    /// second instance.
+    pub async fn launch_template(&self, id: &str, launch: &LaunchTemplate) -> Result<TemplateLaunch, Error> {
+        let mut launch = launch.clone();
+        launch.idempotency_key.get_or_insert_with(generate_idempotency_key);
+        let id = encode_segment(id);
+        let segments = ["v1", "templates", id.as_str(), "launch"];
+        let mut call = Call::post(&segments).json_body(&launch)?;
+        call.raw_segments = true;
+        call.repeatable = true;
+        let (status, job) = self.fetch_with_status(call).await?;
+        Ok(TemplateLaunch {
+            job,
+            existing: status == StatusCode::OK,
+        })
+    }
+
+    /// `POST /v1/devices/pairing-tickets` (H2 §5.2, `admin` only). The ticket and its URL are shown once. Not retried.
+    pub async fn create_pairing_ticket(&self, request: &CreatePairingTicket) -> Result<PairingTicketCreated, Error> {
+        let mut call = Call::post(&["v1", "devices", "pairing-tickets"]).json_body(request)?;
+        call.secret_response = true;
+        self.fetch(call).await
+    }
+
+    /// `GET /v1/devices/pairing-tickets`: one page.
+    pub async fn list_pairing_tickets(&self, params: &ListParams) -> Result<Page<PairingTicketInfo>, Error> {
+        self.fetch(Call::get(&["v1", "devices", "pairing-tickets"]).page(params.limit, params.cursor.as_deref()))
+            .await
+    }
+
+    /// `DELETE /v1/devices/pairing-tickets/{id}`: revokes an unused ticket. Not retried.
+    pub async fn revoke_pairing_ticket(&self, id: &PairingTicketId) -> Result<(), Error> {
+        self.send_ignoring_body(Call::delete(&["v1", "devices", "pairing-tickets", &id.to_string()]))
+            .await
+    }
+
+    /// `GET /v1/devices`: one page. For a device that is not `admin`, the page is that device alone.
+    pub async fn list_devices(&self, params: &ListParams) -> Result<Page<DeviceInfo>, Error> {
+        self.fetch(Call::get(&["v1", "devices"]).page(params.limit, params.cursor.as_deref()))
+            .await
+    }
+
+    /// `GET /v1/devices/{id}`.
+    pub async fn get_device(&self, id: &DeviceId) -> Result<DeviceInfo, Error> {
+        self.fetch(Call::get(&["v1", "devices", &id.to_string()])).await
+    }
+
+    /// `DELETE /v1/devices/{id}`: revokes the device. Not retried.
+    pub async fn revoke_device(&self, id: &DeviceId) -> Result<(), Error> {
+        self.send_ignoring_body(Call::delete(&["v1", "devices", &id.to_string()]))
+            .await
+    }
+
+    /// `POST /v1/jobs/{id}/ports/{port}/connect` (H2 §7.4): an HTTP/1.1 upgrade to `p2pc-port/1`, after which the
+    /// connection is a raw, bidirectional byte stream into the service's `port`.
+    ///
+    /// `wait_ready` adds `?wait_ready=true`: the hub waits up to 30 s for a `starting` service instead of answering
+    /// `409 service_not_ready`. A refusal before the upgrade is the hub's error (`404`, `409`, `422`, `429`, `502`); an
+    /// answer that is neither a refusal nor `101` is an [`UnexpectedResponse`], never a stream. Not retried: every
+    /// call is a connection the user asked for.
+    pub async fn open_port(&self, job: &JobId, port: u32, wait_ready: bool) -> Result<PortStream, Error> {
+        let (job, port) = (job.to_string(), port.to_string());
+        let segments = ["v1", "jobs", job.as_str(), "ports", port.as_str(), "connect"];
+        let mut call = Call::post(&segments);
+        if wait_ready {
+            call = call.query("wait_ready", "true");
+        }
+        call.extra_headers.push((
+            HeaderName::from_static("connection"),
+            HeaderValue::from_static("Upgrade"),
+        ));
+        call.extra_headers.push((
+            HeaderName::from_static("upgrade"),
+            HeaderValue::from_static(PORT_UPGRADE_PROTOCOL),
+        ));
+        let url = self.url(&call);
+        let headers = self.headers(&call)?;
+        let response = match &self.transport {
+            Transport::Http { http, .. } => {
+                let response = http
+                    .request(call.method.clone(), url)
+                    .headers(headers)
+                    .send()
+                    .await
+                    .map_err(|e| Error::Network(NetworkError::from_reqwest(e)))?;
+                if response.status() == StatusCode::SWITCHING_PROTOCOLS {
+                    let upgraded = response
+                        .upgrade()
+                        .await
+                        .map_err(|e| Error::Network(NetworkError::from_reqwest(e)))?;
+                    return Ok(PortStream::http(upgraded));
+                }
+                Response::from_reqwest(response)
+            }
+            #[cfg(feature = "tunnel")]
+            Transport::Tunnel(tunnel) => {
+                let mut headers = headers;
+                headers.insert(reqwest::header::USER_AGENT, self.user_agent.clone());
+                let request = crate::tunnel::TunnelRequest {
+                    method: call.method.clone(),
+                    path_and_query: &url[url::Position::BeforePath..],
+                    headers,
+                    body: None,
+                    upload: None,
+                    timeout: self.request_timeout,
+                    read_timeout: self.request_timeout,
+                };
+                match tunnel.upgrade(request).await? {
+                    crate::tunnel::Upgrade::Upgraded(stream) => return Ok(PortStream::tunnel(stream)),
+                    crate::tunnel::Upgrade::Refused(response) => response,
+                }
+            }
+        };
+        let status = response.status();
+        if status.is_success() {
+            // A proxy's page, or a hub that does not know the route: not a stream into a service.
+            return Err(Error::Unexpected(UnexpectedResponse::new(
+                Some(status.as_u16()),
+                "the server did not switch protocols; it is not a P2PC hub that serves service ports",
+            )));
+        }
+        let body = read_body(response).await?;
+        Err(error_from_response(status, &body))
+    }
+
     async fn fetch<T: DeserializeOwned>(&self, call: Call<'_>) -> Result<T, Error> {
+        self.fetch_with_status(call).await.map(|(_, value)| value)
+    }
+
+    /// Like [`Client::fetch`], and the status of the `2xx` too (a template launch answers `200` or `201`).
+    async fn fetch_with_status<T: DeserializeOwned>(&self, call: Call<'_>) -> Result<(StatusCode, T), Error> {
         let secret = call.secret_response;
         let (status, body) = self.send(call).await?;
-        serde_json::from_slice(&body).map_err(|e| {
+        let value = serde_json::from_slice(&body).map_err(|e| {
             let what = if secret {
                 // The body holds a secret: say where it went wrong, never what it said.
                 format!(
@@ -821,7 +1106,8 @@ impl Client {
                 format!("the response does not have the documented shape: {e}")
             };
             Error::Unexpected(UnexpectedResponse::new(Some(status.as_u16()), what))
-        })
+        })?;
+        Ok((status, value))
     }
 
     async fn send_ignoring_body(&self, call: Call<'_>) -> Result<(), Error> {
@@ -849,7 +1135,15 @@ impl Client {
 
     fn url(&self, call: &Call<'_>) -> Url {
         let mut url = self.base.clone();
-        if let Ok(mut path) = url.path_segments_mut() {
+        if call.raw_segments {
+            // Already encoded, one segment each: `set_path` keeps the `%XX` sequences as they are.
+            let mut path = url.path().trim_end_matches('/').to_string();
+            for segment in call.segments {
+                path.push('/');
+                path.push_str(segment);
+            }
+            url.set_path(&path);
+        } else if let Ok(mut path) = url.path_segments_mut() {
             path.pop_if_empty().extend(call.segments);
         }
         if !call.query.is_empty() {
@@ -883,6 +1177,13 @@ impl Client {
         if call.body.is_some() {
             headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         }
+        if let Some(upload) = &call.upload {
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+            headers.insert(reqwest::header::CONTENT_LENGTH, HeaderValue::from(upload.len));
+        }
+        for (name, value) in &call.extra_headers {
+            headers.insert(name.clone(), value.clone());
+        }
         Ok(headers)
     }
 
@@ -891,13 +1192,17 @@ impl Client {
     async fn start(&self, url: &Url, call: &Call<'_>) -> Result<Response, Error> {
         let headers = self.headers(call)?;
         let response = match &self.transport {
-            Transport::Http(http) => {
+            Transport::Http { http, bulk } => {
+                let http = if call.upload.is_some() { bulk } else { http };
                 let mut request = http.request(call.method.clone(), url.clone()).headers(headers);
                 if let Some(timeout) = call.timeout {
                     request = request.timeout(timeout);
                 }
                 if let Some(body) = &call.body {
                     request = request.body(body.clone());
+                }
+                if let Some(upload) = &call.upload {
+                    request = request.body(reqwest::Body::wrap(open_upload(upload).await?));
                 }
                 let response = request.send().await.map_err(|e| {
                     if e.is_builder() {
@@ -918,6 +1223,10 @@ impl Client {
                     path_and_query: &url[url::Position::BeforePath..],
                     headers,
                     body: call.body.clone(),
+                    upload: match &call.upload {
+                        Some(upload) => Some(open_upload(upload).await?),
+                        None => None,
+                    },
                     timeout: call.timeout.unwrap_or(self.request_timeout),
                     read_timeout: self.request_timeout,
                 };
@@ -1024,6 +1333,125 @@ pub fn whole_seconds(at: time::OffsetDateTime) -> time::OffsetDateTime {
 #[must_use]
 pub fn generate_idempotency_key() -> String {
     format!("p2pc-{}", ulid::Ulid::generate())
+}
+
+/// The `Upgrade` protocol of a service port connection (H2 §7.4).
+pub const PORT_UPGRADE_PROTOCOL: &str = "p2pc-port/1";
+
+/// The answer of [`Client::launch_template`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct TemplateLaunch {
+    /// The job: the instance that was started, or the one that was already running.
+    pub job: Job,
+    /// `true` when the hub answered `200` with the running instance of a `singleton` template instead of starting a
+    /// new one (H2 §7.6).
+    pub existing: bool,
+}
+
+/// An upgraded connection into a service port: raw bytes both ways (H2 §7.4). Dropping it closes the connection.
+pub struct PortStream {
+    inner: PortInner,
+}
+
+enum PortInner {
+    Http(reqwest::Upgraded),
+    #[cfg(feature = "tunnel")]
+    Tunnel(hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>),
+}
+
+impl fmt::Debug for PortStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PortStream").finish_non_exhaustive()
+    }
+}
+
+impl PortStream {
+    fn http(upgraded: reqwest::Upgraded) -> Self {
+        Self {
+            inner: PortInner::Http(upgraded),
+        }
+    }
+
+    #[cfg(feature = "tunnel")]
+    pub(crate) fn tunnel(upgraded: hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>) -> Self {
+        Self {
+            inner: PortInner::Tunnel(upgraded),
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for PortStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut self.inner {
+            PortInner::Http(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "tunnel")]
+            PortInner::Tunnel(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for PortStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match &mut self.inner {
+            PortInner::Http(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "tunnel")]
+            PortInner::Tunnel(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut self.inner {
+            PortInner::Http(s) => std::pin::Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "tunnel")]
+            PortInner::Tunnel(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut self.inner {
+            PortInner::Http(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "tunnel")]
+            PortInner::Tunnel(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Opens the file of an upload for streaming.
+async fn open_upload(upload: &Upload) -> Result<crate::upload::FileBody, Error> {
+    let file = tokio::fs::File::open(&upload.path)
+        .await
+        .map_err(|e| Error::Local(LocalError::new(format!("cannot read the file: {e}"))))?;
+    Ok(crate::upload::FileBody::new(file, upload.len))
+}
+
+/// Percent-encodes one path segment: everything except the unreserved characters (`A-Z a-z 0-9 - . _ ~`) is
+/// written as `%XX`, so a `/`, `?`, `#`, `:` or `%` in a name stays inside its segment. A segment of only dots is
+/// encoded too, because `.` and `..` would otherwise mean "this directory" and "the parent".
+fn encode_segment(segment: &str) -> String {
+    let only_dots = !segment.is_empty() && segment.bytes().all(|b| b == b'.');
+    let mut out = String::with_capacity(segment.len());
+    for byte in segment.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'~') || (byte == b'.' && !only_dots) {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 /// Walks a cursor-paginated list to the end.
