@@ -1,6 +1,6 @@
 # Milestone 2 · P2PC Desktop App and Phone Access (v0.2): specification
 
-- **Status:** draft for review (spec v6, 2026-11-10: v5 plus the fixes of its sixth review). Implementation starts
+- **Status:** draft for review (spec v7, 2026-11-10: v6 plus the fixes of its seventh review). Implementation starts
   when the architect marks it accepted. The two hard-rule exceptions it proposes (persistent volumes, ADR-015; inbound
   iroh connections on the hub PC, ADR-016; both in §4.3) take effect only through one separate change after that
   (O-16); until then the tasks that need them are blocked (§17).
@@ -153,8 +153,8 @@ the agent's ingress socket → the shim inside the container → `127.0.0.1:1143
     (§8.5). The hub's state lives in `/var/lib/p2pc-server` inside the distro. P2PC installs no Windows service and
     no firewall rule on the Windows host, and adds no listening TCP port reachable from the LAN: the hub's REST binds
     the distro's loopback, which WSL's `localhostForwarding` also exposes on the Windows host's own loopback (§8.5).
-    The app's iroh endpoints bind UDP sockets, as every iroh endpoint does (§10.4), and so does the hub's, which
-    accepts incoming connections as H1's server does (§10.5).
+    The app's device endpoint and the hub's endpoint bind UDP sockets (§10.4); the hub's accepts incoming connections
+    as H1's server does (§10.5), and the app's relay-only invite listener binds none (§5.4).
   - *Alternatives.* (a) `p2pc-server` as a native Windows service: needs administrator rights, a Windows build of the
     server and a second set of hardening; rejected for the "Windows host stays untouched" rule. (b) A second,
     hub-only distro: doubles the image and the upgrade path, and the WSL VM is shared anyway (H1 §9.0); rejected.
@@ -192,7 +192,7 @@ slice is defined in §12). The Linux installers are unchanged.
 | Node enrollment | **Changed.** A node enrolled with a join token minted by a non-`admin` principal starts `pending_approval` and gets no lease until an `admin` principal approves it. Tokens minted by `admin` API keys enroll as in H1. A token minted by an `admin` **device** (the hub PC's "Copy invite") also starts its node `pending_approval`, unless it was minted with the `pre_approved` option, which only the hub PC's app uses: for its own node at first run (§8.2 step 4) and as the explicit option of "Copy invite" (15 minutes, single use; `join_tokens.pre_approved`). A join token minted for an approved join request is bound to the joining agent's NodeId and enrolls no other (`join_tokens.bound_iroh_node_id`, §5.4). | §5.4, §5.5 |
 | Sandbox and hard rules | **Proposed change, not in force with this spec.** Hard rule 3 (CONTRIBUTING) and H1 §9 ("never … host paths beyond the three per-job directories") would gain exactly one exception, recorded in ADR-015 (**Proposed**): **persistent volumes**. A volume is a directory the agent creates itself, per account, named by a hash of the volume name (never a path taken from the JobSpec); it is mounted only into service jobs and template jobs of that account, is size-limited (`max_mb`, H1's fail-closed measurement), is checked without following links before every mount, and is deleted without following links. **The exception takes effect only when the architect accepts this spec after E11, through a separate change that amends CONTRIBUTING hard rule 3 and H1 §9's "Never" line together and marks ADR-015 Accepted** (the same change puts the listening exception below in force, O-16). Until then hard rule 3 and H1 §9 stand unchanged, no code may mount a volume, and T2-22 (agent volumes) is blocked (§17, O-16). Nothing else in hard rule 3 changes and services need no exception from it: every job, services included, has a finite wall-clock limit (`timeout_s`, at most 30 days). | §7.1, §11.1, §11.3 |
 | Phoning home (hard rule 6) | The app's daily update check and its web app verification fetch are **opt-in**: an explicit yes/no at first run with nothing preselected, and a Settings toggle. Without it the app checks for updates and verifies the web app only when the user clicks "Check for updates" or "Verify web app". | §3, §8.2, §9.6, §14.1 |
-| Listening (hard rule 4, H1 §10) | **Proposed change, not in force with this spec.** Hard rule 4 (CONTRIBUTING: "nodes never listen on the network") and H1 §10 ("nodes never listen on a TCP or UDP port that is reachable from outside, beyond what iroh needs for outbound QUIC") would gain exactly one bounded exception, recorded in ADR-016 (**Proposed**): **the hub PC accepts inbound iroh connections**. The hub PC is also a node, and H2 does not read the rules as covering agents only. On that PC, only while the hub is enabled, the hub's own iroh endpoint accepts incoming QUIC on the one UDP socket iroh binds, with every ALPN behind a ticket, a token, a key or a paired NodeId and under pre-auth limits; on a PC that is joining, the app's relay-only invite listener accepts the two `p2pc/invite/1` exchanges of one join (open, then hand-over, both from one phone) while the invite is valid. Nothing else listens beyond the loopback REST listener, and every agent still only dials out (§10.5). **The exception takes effect only through the same separate change as the volume exception (O-16), which amends CONTRIBUTING hard rules 3 and 4, H1 §9 and H1 §10 together and marks ADR-015 and ADR-016 Accepted.** Until then hard rule 4 and H1 §10 stand unchanged, no code may make a P2PC process on a node PC accept an inbound connection, and the tasks that do (T2-11, T2-41, T2-43, T2-44) are blocked (§17, O-16). | §5.4, §10.5, O-16 |
+| Listening (hard rule 4, H1 §10) | **Proposed change, not in force with this spec.** Hard rule 4 (CONTRIBUTING: "nodes never listen on the network") and H1 §10 ("nodes never listen on a TCP or UDP port that is reachable from outside, beyond what iroh needs for outbound QUIC") would gain exactly one bounded exception, recorded in ADR-016 (**Proposed**): **the hub PC accepts inbound iroh connections**. The hub PC is also a node, and H2 does not read the rules as covering agents only. On that PC, only while the hub is enabled, the hub's own iroh endpoint accepts incoming QUIC on the UDP sockets `p2pc-net` binds for that endpoint under H1's address hygiene, with every ALPN behind a ticket, a token, a key or a paired NodeId and under pre-auth limits; on a PC that is joining, the app's relay-only invite listener (no IP transport) accepts the two `p2pc/invite/1` exchanges of one join (open, then hand-over, both from one phone) while the invite is valid. Nothing else listens beyond the loopback REST listener, and every agent still only dials out (§10.5). **The exception takes effect only through the same separate change as the volume exception (O-16), which amends CONTRIBUTING hard rules 3 and 4, H1 §9 and H1 §10 together and marks ADR-015 and ADR-016 Accepted.** Until then hard rule 4 and H1 §10 stand unchanged, no code may make a P2PC process on a node PC accept an inbound connection, and the tasks that do (T2-11, T2-41, T2-43, T2-44) are blocked (§17, O-16). | §5.4, §10.5, O-16 |
 | `Join` failure limits (H1 §6 "Before `Join`") | **Changed: a fix of pre-existing H1 behaviour.** H1's 60 failed `Join`s a minute in total no longer refuses a `Join` without looking at its token: a `Join` with a valid token that gets a slot enrolls whatever the failure counters say, as for pairing and invites. The connection, pending and per-NodeId limits are unchanged. | §6.1, T2-17 |
 | Agent protocol | New messages and server-opened streams behind the agent capabilities `service_jobs`, `volumes`, `blob_inputs`, `leave`, `share_update`, `approval` in `Hello.features`. No new ALPN. | §6.1 |
 | New ALPNs | `p2pc/pair/1` and `p2pc/device/1` on the hub; `p2pc/invite/1` on a joining PC's app. | §6 |
@@ -226,7 +226,8 @@ A device key is never derived from, or sent to, anything else. Losing it means p
   and no-escalation rule as for API keys (H1 §5): if the creator has a cap, the ticket must carry one at or below it,
   and if the creator has an image list, the ticket's list must be made only of its patterns, else
   `403 escalation_denied`. The device row stores both, and they bind the device as its own principal (§5.5, §12). The
-  desktop app's pairing screen offers an optional daily limit.
+  desktop app's pairing screen offers an optional daily limit. A paired device takes its ticket creator's project:
+  `pairing_tickets` and `devices` store `(project_id, account_id)` with the same composite foreign key as `api_keys`.
 - **Format.** `p2pc_pair_<base32 payload>`, in the H1 join-token style. The payload holds the hub NodeId, the hub's
   relay URLs, a 16-byte random code and the expiry. The hub stores only SHA-256 of the code.
 - **The payload is not authenticated** (as H1 §5 join tokens). The hub uses the expiry, the scopes and the single-use
@@ -246,7 +247,7 @@ A device key is never derived from, or sent to, anything else. Losing it means p
 - **Listing and revoking.** `GET /v1/devices/pairing-tickets` and `DELETE /v1/devices/pairing-tickets/{id}` (`admin`),
   like join tokens. The desktop app revokes the ticket it showed when its QR screen closes.
 - **Audit.** `pairing_ticket_created`, `device_paired`, `pairing_ticket_revoked`, `device_revoked`, failed pairings
-  aggregated per minute (H1 §5 "Audit" rules).
+  aggregated per minute (H1 §5 "Audit" rules; `auth_failed`, §5.6).
 
 ### 5.3 Pairing exchange (ALPN `p2pc/pair/1`)
 
@@ -290,12 +291,13 @@ ticket because other requests failed:
 **Who creates the owner's first device.** `p2pc-server init --owner-device <NodeId> [--label <text>]` creates the
 account, the default project and an **owner device** with the `admin` scope, and prints no API key. The desktop app
 generates its own device key first and passes its public NodeId. `p2pc-server devices add --data-dir <dir> --node-id
-<NodeId> --scopes <list> --label <text>` does the same offline later (local data-dir access, audited as
-`device_added_offline`, the H1 `keys recover` pattern). Its twin `p2pc-server devices revoke --data-dir <dir> --id
-<device_id>` revokes a device offline, under the same last-admin rule as `DELETE /v1/devices/{id}` (§5.5), audited as
-`device_revoked_offline`. Like `keys recover`, both work while the hub runs. The hub PC's app uses `devices revoke`
-through `wsl.exe` when its own device connection cannot get a slot within 10 s, so the owner's revocation never
-depends on the pre-auth slots that unknown NodeIds share (§6.3). Plain `p2pc-server init` keeps its H1 behaviour.
+<NodeId> --scopes <list> --label <text> [--project <project_id>]` (default: the default project) does the same offline
+later (local data-dir access, audited as `device_added_offline`, the H1 `keys recover` pattern). Its twin `p2pc-server
+devices revoke --data-dir <dir> --id <device_id>` revokes a device offline, under the same last-admin rule as `DELETE
+/v1/devices/{id}` (§5.5), audited as `device_revoked_offline`. Like `keys recover`, both work while the hub runs. The
+hub PC's app uses `devices revoke` through `wsl.exe` when its own device connection cannot get a slot within 10 s, so
+the owner's revocation never depends on the pre-auth slots that unknown NodeIds share (§6.3). Plain `p2pc-server init`
+keeps its H1 behaviour.
 
 ### 5.4 Joining another PC (invites)
 
@@ -305,10 +307,10 @@ would need a rendezvous service to resolve it, which H2 does not have (D4). So:
 - **Primary path: phone-assisted invite, approved on the hub PC.**
   1. The new PC's app starts an **invite listener**: a temporary iroh endpoint in the app with a fresh key, serving
      only ALPN `p2pc/invite/1` (under the proposed listening exception of §4.3, ADR-016, so not before O-16). The
-     phone is relay-only, so this connection always goes through a relay; the listener is therefore configured
-     relay-only too (`direct_addresses = "none"`: it publishes and serves no direct address).
-     E10 confirms that iroh serves a relay-only endpoint this way; if it cannot, the listener keeps H1's address
-     hygiene (§10.4).
+     phone is relay-only, so this connection always goes through a relay; the listener is therefore relay-only too:
+     it MUST be built through `p2pc-net` with `direct_addresses = "none"`, so it has no IP transport, binds no UDP
+     socket and publishes and serves no direct address. E10 confirms that iroh serves a relay-only endpoint this way;
+     if E10 shows this is impossible, this spec and ADR-016 are amended before O-16.
   2. It reads the local agent's NodeId (`iroh_node_id` in `p2pc-agent status --json`; the agent creates its key at
      first start, H1 §5 "Node identity"), draws a 32-byte **listener nonce** from the platform CSPRNG, which it keeps
      in memory only, and shows a QR code: `https://<web app origin>/invite#p2pc_inv_<base32: listener NodeId, agent
@@ -419,7 +421,8 @@ would need a rendezvous service to resolve it, which H2 does not have (D4). So:
 ### 5.5 Principals and scopes
 
 - **Principal.** Every authenticated request carries a principal: `Key{key_id}` (H1) or `Device{device_id}`. Ownership
-  (`account_id`, `project_id`), scopes, caps and image allowlists come from the principal's row. Audit events, the usage
+  (`account_id`, `project_id`), scopes, caps and image allowlists come from the principal's row (a device's project
+  from its pairing ticket, §5.2). Audit events, the usage
   ledger and `GET /v1/whoami` name the principal (`whoami` gains `principal: {kind, id}`; `key_id` stays, `null` for
   a device). §5.6 says how the database stores it.
 - **A device principal exists only on `p2pc/device/1`.** Requests on the TCP REST listener and on `p2pc/http/1` are
@@ -522,6 +525,15 @@ stores a principal in two columns:
   with `CHECK (actor_key_id IS NULL OR actor_device_id IS NULL)` (aggregated failures have no actor), and its update
   trigger compares the new column too. `nodes` gains `approval` (`NOT NULL DEFAULT 'approved'`) and `enrolled_by`, the
   principal of the token that enrolled it (`NULL` for H1 nodes); both are plain added columns.
+- **Audit kinds.** The rebuilt `audit_events` keeps H1's closed `kind` list and adds every H2 kind:
+  `pairing_ticket_created`, `pairing_ticket_revoked`, `device_paired`, `device_revoked`, `device_added_offline`,
+  `device_revoked_offline`, `join_request_created`, `join_request_revealed`, `join_request_reveal_failed`,
+  `join_request_approved`, `join_request_rejected`, `join_request_delivered`, `node_approved`, `node_left` and
+  `template_bundle_loaded`. Aggregated failures add no kind: they reuse H1's `auth_failed` in the owner's account, as
+  H1 already does for failed `Join`s (`subject_id` `join`), with `subject_id` `pair` for failed pairings and `device`
+  for `not_paired` closes; failures beyond the aggregate failure cap of §5.3 are counted into the same row of their
+  ALPN. So the `auth_failed` bucket index and the update trigger's `WHEN`, which allow aggregation only for
+  `auth_failed`, stay as in H1.
 - **Idempotency per principal.** SQLite treats NULLs as distinct in a unique index, so H1's
   `jobs_idempotency ON jobs (key_id, idempotency_key)` would silently stop deduplicating every device submission once
   `key_id` may be NULL. It is replaced by two partial unique indexes, in which the principal column is never NULL:
@@ -544,12 +556,12 @@ stores a principal in two columns:
     temporary table, the table dropped and created again under its own name, rows copied back. The tables that
     reference `jobs` keep pointing at it, and foreign keys are checked at `COMMIT`. The migration runs in one
     transaction, so a failure leaves the H1 tables;
-  - every index and trigger of the old tables is created again, as `20261106130000_audit_node_reenrolled.sql` does
-    for `audit_events`: `jobs_terminal_is_final`, `usage_records_no_update`, `usage_records_no_delete`,
+  - every index and trigger of the old tables is created again, as `20261106130000_audit_node_reenrolled.sql` does for
+    `audit_events`: `jobs_terminal_is_final`, `usage_records_no_update`, `usage_records_no_delete`,
     `audit_events_no_delete`, `audit_events_no_update`, and every H1 index and constraint except those replaced here
-    (`jobs_idempotency` above; the ledger's `UNIQUE (job_id, attempt)` and `lease_id UNIQUE`, §12). Dropping a table
-    runs no row-level trigger, so the append-only triggers never fire during the rebuild, and they are in force again
-    before `COMMIT`;
+    (`jobs_idempotency` above; the `kind` list, which gains the H2 kinds above; the ledger's `UNIQUE (job_id, attempt)`
+    and `lease_id UNIQUE`, §12). Dropping a table runs no row-level trigger, so the append-only triggers never fire
+    during the rebuild, and they are in force again before `COMMIT`;
   - H1 rows are copied with `device_id` NULL and their key unchanged, and each ledger row becomes one slice (§12:
     `slice_start = started_at`, `slice_end = ended_at`, `last_slice = 1`, `kind = 'batch'`, `charge_day` = the UTC
     day of its job's `created_at`), so every H1 number (caps, `GET /v1/usage`) is the same after the migration;
@@ -651,8 +663,8 @@ connection.
   the control stream and uploads can always open (the port budget is below the connection's stream limit).
 - **Port stream end.** A clean end of either side is propagated as a QUIC stream finish; a reset as a reset. Idle port
   streams are **not** timed out on the agent connection (a chat may idle for minutes); the service's `idle_timeout_s`
-  (§7.1) ends the whole service instead. The client side of a port connection opened by a device has its own idle
-  limit (§6.3).
+  (§7.1) ends the whole service instead. The client side of every port connection has its own idle limit
+  (`port_idle_s`, §7.4).
 - **Blob integrity.** The agent hashes what it receives and refuses a mismatch (`error="input_integrity"`, a
   `start_failed`-class error, H1 §9 "Podman failures are not job exits").
 
@@ -703,20 +715,20 @@ first phone that opens it:
     scope, so paired phones, together, hold at most 64 and can never take the slots of the hub PC's app, which is how
     a device gets revoked. The reserve must be at least `device_streams_per_device`, and below the budget.
   - **Idle limits:** a streaming route keeps H1's 60 s idle limit; an upgraded port connection on `p2pc/device/1`
-    closes after `device_port_idle_s` (default 600 s) with no byte in either direction (the web app opens a new one
+    closes after `port_idle_s` (default 600 s, §7.4) with no byte in either direction (the web app opens a new one
     per chat request). A misbehaving phone that leaves streams open therefore gives them back within 10 minutes, and
     within 5 s of its revocation (§5.5).
 - **The hub checks the device at connection time and on every request.** A revocation is seen at the next request,
   and the hub also closes the connection actively (§5.5).
-- **Before the device check** (unauthenticated surface: any NodeId can complete the handshake). The hub looks the
-  NodeId up (one indexed lookup) right after the handshake, before it accepts any stream, and closes a NodeId that is
-  not a live device with `not_paired` (§5.5). Limits, counted separately from the other ALPNs: at most 32 connections
-  at once that have not passed the check, each checked within 5 s; beyond that a new connection closes with no detail.
-  `not_paired` closes are counted per NodeId, 10 a minute, and a NodeId over its limit is closed at connect without
-  the lookup; there is no global failure bucket, so a live device that gets a slot always passes. The closes are
-  aggregated into one audit event a minute (H1 §5 "Audit"), under the aggregate failure cap of §5.3. A connection that
-  passes counts against its device's 2 connections from then on. Unknown NodeIds share these 32 slots with every
-  device, the hub PC's app included, so a flood of fresh NodeIds can delay the app's connection; the owner's
+- **Before the device check** (unauthenticated surface: any NodeId can complete the handshake). The hub looks the NodeId
+  up (one indexed lookup) right after the handshake, before it accepts any stream, and closes a NodeId that is not a
+  live device with `not_paired` (§5.5). Limits, counted separately from the other ALPNs: at most 32 connections at once
+  that have not passed the check, each checked within 5 s; beyond that a new connection closes with no detail.
+  `not_paired` closes are counted per NodeId, 10 a minute, and a NodeId over its limit is closed at connect without the
+  lookup; there is no global failure bucket, so a live device that gets a slot always passes. The closes are aggregated
+  into one audit event a minute (H1 §5 "Audit"; `auth_failed`, §5.6), under the aggregate failure cap of §5.3. A
+  connection that passes counts against its device's 2 connections from then on. Unknown NodeIds share these 32 slots
+  with every device, the hub PC's app included, so a flood of fresh NodeIds can delay the app's connection; the owner's
   revocation then goes through the offline `p2pc-server devices revoke` (§5.3), which needs no slot.
 - **Why HTTP and not new messages:** one API for every client, one OpenAPI document, and the device gets every
   endpoint its scopes allow without protocol work. The cost is an HTTP/1.1 implementation in `p2pc-device` (hyper's
@@ -877,10 +889,12 @@ No endpoint returns blob contents: the hub is not a file store.
   (H1 tunnel) and behind a TLS reverse proxy that passes upgrades. One code path, one authorization check
   (SI-H2-5): `services:connect` for any service of the caller's project, or `templates:launch` for a template service
   of the caller's template view (§5.5); any other job answers `404`.
-- **Limits.** The upgraded connection leaves the H1 whole-request limit. On the TCP listener and `p2pc/http/1` it has
-  no idle limit of its own (§6.1); on `p2pc/device/1` it closes after `device_port_idle_s` without traffic (§6.3). At
-  most 64 open connections per service and 16 per principal per service. Bytes are counted per service per UTC day
-  (§12), never logged.
+- **Limits.** The upgraded connection leaves the H1 whole-request limit. On every transport it closes after
+  `port_idle_s` (default 600 s) with no byte in either direction. On the TCP listener and `p2pc/http/1`, upgraded port
+  connections together hold at most `port_conn_budget` (default 64, below H1's REST cap of 256) of that cap, so the rest
+  stays for other requests; beyond it, `429 too_many_connections`. On `p2pc/device/1` they count against the device
+  budget (§6.3). At most 64 open connections per service and 16 per principal per service. Bytes are counted per service
+  per UTC day (§12), never logged.
 - **Idle accounting.** The hub, which relays every byte, updates `last_activity_at` at most once every 10 s per
   service, and sends `Cancel{reason:"idle_timeout"}` when `idle_timeout_s` has passed with no open connection and no
   traffic. A clock-injected test covers it.
@@ -1277,8 +1291,9 @@ and the handling of a failed-upgrade backup.
   the app.
 - **The app's iroh endpoints.** The device endpoint only dials: it serves no ALPN, so it accepts no incoming
   connection. The invite listener (§5.4) exists only while a join is in progress, serves only `p2pc/invite/1` and is
-  relay-only; it rests on the proposed listening exception of §4.3 (ADR-016) and is not built before O-16. Both bind
-  UDP sockets (§10.4); the app opens no TCP listener.
+  relay-only; it rests on the proposed listening exception of §4.3 (ADR-016) and is not built before O-16. The device
+  endpoint binds UDP sockets (§10.4); the invite listener has no IP transport and binds none (§5.4); the app opens no
+  TCP listener.
 - Output from jobs and services shown in the app (logs, chat answers) is untrusted data and is rendered as text
   (§9.5).
 - Logs (`%LOCALAPPDATA%\P2PC\logs`, size-rotated) contain no secret, ticket, invite code or join token (SI-H2-1).
@@ -1514,9 +1529,9 @@ A chat needs well under 100 kbit/s; a blob upload is bounded by the relay (§7.5
   accepts.
 - **What listens.** No TCP port reachable from the LAN: the app opens no TCP listener, and the hub's REST binds the
   distro's loopback, which `localhostForwarding` also exposes on the Windows host's own loopback, never on its LAN
-  addresses (§8.5). The app's iroh endpoints bind UDP sockets, as the agent's endpoint already does in H1: the device
-  endpoint accepts no incoming connection, and the invite listener exists only during a join, serves only
-  `p2pc/invite/1` and is relay-only (`direct_addresses = "none"`, §5.4; E10 confirms it). Windows may show its
+  addresses (§8.5). The app's device endpoint binds UDP sockets, as the agent's endpoint already does in H1, and accepts
+  no incoming connection. The invite listener binds none: it exists only during a join, serves only `p2pc/invite/1` and
+  is relay-only, with no IP transport (`direct_addresses = "none"`, §5.4; E10 confirms it). Windows may show its
   firewall prompt on the app's first UDP bind; the app adds no firewall rule (§8.3), and it works whichever answer the
   user gives, because its connections are outbound or relayed (E10 records the prompt; the beta guide explains it).
   Service ports exist only on the container's loopback (§11.2). On the internet, the project's footprint is the static
@@ -1529,16 +1544,16 @@ PC's invite listener accepts the two relay-only exchanges of one join, §5.4, §
 does, but now by default on a home PC that is also a node, so its exposure is stated here, and so is the hard-rule
 exception it needs, proposed and not yet in force (below).
 
-- **Where it binds.** One UDP socket inside the distro, on the WSL side. With WSL's default NAT networking the WSL VM
-  sits behind the Windows host's NAT, so nothing on the LAN or the internet can send it an unsolicited packet: a peer
-  reaches it only through a relay, or directly once iroh's hole punching, coordinated through that relay, has opened
-  the path from inside. The hub keeps H1's address hygiene (no port mapping, default-route addresses only, §10.4) and
-  binds no TCP port beyond the loopback REST listener (§8.5).
+- **Where it binds.** The UDP sockets `p2pc-net` binds for it, inside the distro, on the WSL side. With WSL's default
+  NAT networking the WSL VM sits behind the Windows host's NAT, so nothing on the LAN or the internet can send it an
+  unsolicited packet: a peer reaches it only through a relay, or directly once iroh's hole punching, coordinated through
+  that relay, has opened the path from inside. The hub keeps H1's address hygiene (no port mapping, default-route
+  addresses only, §10.4) and binds no TCP port beyond the loopback REST listener (§8.5).
 - **Mirrored networking.** With `networkingMode=mirrored` (an opt-in in `.wslconfig`, which the app never edits) the
-  socket sits on the host's own addresses, so a LAN peer that knows the port can send to it directly; what it accepts is
-  the same set below. `p2pc-wsl` detects mirrored mode (for example with `wslinfo --networking-mode` run in the distro),
-  the app warns, and `p2pc-agent doctor` says so. E10 records whether the Hyper-V firewall drops unsolicited inbound UDP
-  in that mode.
+  sockets sit on the host's own addresses, so a LAN peer that knows the port can send to them directly; what it accepts
+  is the same set below. `p2pc-wsl` detects mirrored mode (for example with `wslinfo --networking-mode` run in the
+  distro), the app warns, and `p2pc-agent doctor` says so. E10 records whether the Hyper-V firewall drops unsolicited
+  inbound UDP in that mode.
 - **What it accepts from any NodeId** (unauthenticated surface), per ALPN:
   - `p2pc/agent/1`: only `Join` with a valid join token, under H1's "Before `Join`" limits (H1 §6: 64 connections,
     16 pending `Join`s, 10 s, 10 failures a minute per NodeId), with the fix of §6.1: no failure total refuses a
@@ -1562,14 +1577,14 @@ exception it needs, proposed and not yet in force (below).
   - **Where:** only on the hub PC, only while `hub.enabled` exists (§8.5), and only the hub's own iroh endpoint (plus
     a joining PC's invite listener, below). The agent on that PC and every other node keep the rules unchanged: they
     only dial out.
-  - **What:** the one UDP socket iroh binds for that endpoint, with H1's address hygiene; no TCP listener beyond the
+  - **What:** the UDP sockets `p2pc-net` binds for that endpoint under H1's address hygiene; no TCP listener beyond the
     loopback REST listener (§8.5); every ALPN behind a ticket, a token, a key or a paired NodeId, under the pre-auth
     limits above, and `p2pc/pair/1` only while a ticket is open.
   - **Reachability:** through a relay or hole punching under WSL's NAT networking; with mirrored networking, LAN peers
     reach the same surface directly, and the app warns (above).
   - **The joining PC's invite listener** (§5.4) falls under the same exception: an endpoint of the app on a PC whose
-    agent is installed, relay-only, accepting the two `p2pc/invite/1` exchanges of one join (`InviteOpen`, then
-    `Invite`, both from the one phone it binds to) under the §6.2 limits while the invite is valid.
+    agent is installed, relay-only with no IP transport (§5.4), accepting the two `p2pc/invite/1` exchanges of one join
+    (`InviteOpen`, then `Invite`, both from the one phone it binds to) under the §6.2 limits while the invite is valid.
   - **In force only through O-16.** Like the volume exception (§4.3, ADR-015), this one takes effect only through the
     separate O-16 change, which amends hard rule 4 and H1 §10 together with hard rule 3 and H1 §9 and marks ADR-015
     and ADR-016 Accepted. Until then no code makes the hub's endpoint on a node PC, or the invite listener, accept a
@@ -1648,8 +1663,9 @@ implemented before the separate change that puts it in force (O-16); T2-22 waits
     containers of leases it no longer runs (the `p2pc` labels, §11.1), confirms each one absent the same way, and only
     then clears their locks. No walk and no mount of a volume happens before the lock is free and the sweep has
     finished for it.
-- **Size.** Measured every 60 s with H1's fail-closed disk measurement (larger of apparent and allocated size, entry
-  budget, three failures count as over). Over `max_mb` → the lease stops with `error="volume_limit"`.
+- **Size.** Measured every 2 s, as H1 measures job disk (H1 §9 "Limits and status"), with H1's fail-closed disk
+  measurement (larger of apparent and allocated size, entry budget, three failures count as over). Over `max_mb` → the
+  lease stops with `error="volume_limit"`.
 - **Budget.** `volumes_mb` (the share of §8.2) covers every volume on the node. Placement of a lease needs
   `volumes_mb − Σ max_mb of volumes in use by other leases ≥ max_mb` for each of its volumes. Unused volumes do not
   count: when a new or growing volume needs room, the agent evicts unused volumes, least recently used first. A
@@ -1902,14 +1918,14 @@ H1's SI-1 to SI-13 stay in force and keep their tests.
 | SI-H2-1 | No secret appears in logs, `Debug` output, errors, audit events, the app's logs or the browser console: device keys, pairing tickets, invite codes, listener nonces before their reveal, join tokens, API keys. A test scans the outputs of every pairing, invite and join path. |
 | SI-H2-2 | Pairing tickets are single-use and expire, checked against the hub's row, never the payload. Two concurrent `Pair`s for one ticket create exactly one device; a retry from the same NodeId is idempotent while its device is live; a retry from the same NodeId after that device was revoked gets `invalid_ticket` and creates nothing; every failure is the same `invalid_ticket`. Tests: the concurrent pair, the retry, the retry after revocation (by an `admin` and by the device itself), a retry from another NodeId. |
 | SI-H2-3 | A device principal exists only on `p2pc/device/1`. No request on the TCP listener or `p2pc/http/1` can carry one (no header, no query parameter); a device stream with an `Authorization` header gets `400`. |
-| SI-H2-4 | Revoking a device closes its live connections and its open service streams within 5 s, and later connections get the same `not_paired` as a NodeId never paired. Paired non-`admin` devices cannot keep the owner from revoking: with every non-`admin` device at its per-device stream cap and the non-`admin` share of the device budget full (§6.3), an `admin` device still opens streams from its reserve and revokes; an idle device port connection closes after `device_port_idle_s`. With the 32 pre-check slots of `p2pc/device/1` held full by unknown NodeIds, the hub PC's app still revokes a phone through the offline `p2pc-server devices revoke` while the hub runs, and the hub closes that phone's connections and service streams within 5 s. Device streams and the TCP REST listener have separate budgets (§6.3): with the TCP listener's connection cap held full by unauthenticated loopback connections, an `admin` device still opens streams and revokes, and with the whole device budget in use, a TCP client with an API key still gets a connection. Tested with an injectable clock and a real in-process hub. |
+| SI-H2-4 | Revoking a device closes its live connections and its open service streams within 5 s, and later connections get the same `not_paired` as a NodeId never paired. Paired non-`admin` devices cannot keep the owner from revoking: with every non-`admin` device at its per-device stream cap and the non-`admin` share of the device budget full (§6.3), an `admin` device still opens streams from its reserve and revokes; an idle device port connection closes after `port_idle_s`. With the 32 pre-check slots of `p2pc/device/1` held full by unknown NodeIds, the hub PC's app still revokes a phone through the offline `p2pc-server devices revoke` while the hub runs, and the hub closes that phone's connections and service streams within 5 s. Device streams and the TCP REST listener have separate budgets (§6.3): with the TCP listener's connection cap held full by unauthenticated loopback connections, an `admin` device still opens streams and revokes, and with the whole device budget in use, a TCP client with an API key still gets a connection. Tested with an injectable clock and a real in-process hub. |
 | SI-H2-5 | Opening a service port requires `services:connect` (or `templates:launch` for a template service of the caller's template view, §5.5), the job's account and project, a `running` service and a listed port, through one code path for every transport. Cross-account, unlisted-port and template-view negative tests: a phone-profile device gets `404` on a `p2pc service run` service and on another device's non-singleton template service. |
 | SI-H2-6 | `PortOpen` and `BlobFetch` are fenced by `(lease_id, epoch)` on the hub and on the agent; a stale one is refused. |
 | SI-H2-7 | The agent never connects to a socket path inside a job's directories except its own `ingress.sock`, which it created in the read-only mount; the shim refuses unlisted ports. The agent reads only the status line of a health check response, at most 1 KiB (§11.2). Tests: a symlink planted where a socket could be, an unlisted port, a fake shim, a health check answered with an endless status line or an endless body (the check fails or passes on the status line alone, and the agent reads no more than 1 KiB). |
 | SI-H2-8 | Blobs are per account, in the database and on disk: `HEAD`, upload deduplication and `inputs` never see another account's blobs; the file lives under `<data>/blobs/<account_id>/`, and the lock is keyed by `(account_id, digest)`. The declared size is checked before the body is read, with `checked_add` against the quota; the hash is verified on upload and again on the node. Tests (with two accounts in the store, although H2 serves one): the same digest uploaded in both, then GC and `DELETE` in one, leave the other's file and row intact and readable by its job; concurrent upload in one account and GC in the other do not wait on each other's lock. |
 | SI-H2-9 | Volumes follow the one proposed exception to hard rule 3 of §4.3 and nothing more, and only once it is in force (O-16): a volume directory is created by the agent, per account and named by hash, never taken from the JobSpec; it is mounted only into a service or template job of its account; before every mount the agent recreates or verifies the directory chain and walks the tree without following links, refusing any symlink, any entry that is not a directory or a regular file, and any regular file with more than one link; `tpl:` volumes are created only by template launches; size limits hold; deletion never follows a link. Tests: a batch non-template job with `volumes` (`422` at the hub, `invalid_job` at the agent), a cross-account lease, names with `/`, `..` and NUL, a symlink planted inside a volume before deletion, **a symlink (to a file and to a directory outside the volume), a FIFO and a hard-linked file planted inside a volume before it is mounted again with `:U` or `:idmap`** (the mount is refused with `volume_unsafe`, and the link's target keeps its owner), a symlink replacing `data/` or `<hash>/` itself, a golden argv test of the `-v` arguments; **the one-holder lock**: a lease that ends while `podman rm` fails keeps the lock and a second lease is rejected; an agent restarted with an orphaned container still holding the volume walks and mounts nothing until its sweep has removed the container and Podman reports it absent. |
 | SI-H2-10 | A service container keeps `--network=none` (golden argv test) and its ports are reachable only through the bridge: a scan from the distro's network namespace, the Windows host and another LAN machine finds them closed. |
-| SI-H2-11 | P2PC adds no listener reachable from the LAN. TCP: the hub's REST is not reachable from another machine, and the desktop app opens no TCP listener. UDP: the app's only sockets are its iroh endpoints; the device endpoint accepts no incoming connection, and the invite listener exists only during a join and serves only `p2pc/invite/1`. The hub's endpoint accepts only what §10.5 lists, and serves `p2pc/pair/1` only while a pairing ticket is open. Tests: socket enumeration of the app process (no TCP listener; UDP sockets only from its iroh endpoints), a TCP scan and a UDP probe of the Windows host from the LAN machine (with NAT networking, no reply from the hub's socket), an incoming QUIC connection to the device endpoint that is refused, and probes of the hub's endpoint from an unknown NodeId through a relay: `p2pc/pair/1` with no ticket open fails at the handshake (or closes before a frame), `p2pc/device/1` gets `not_paired`, `p2pc/http/1` without a key gets `401`, and `p2pc/agent/1` without a valid `Join` is closed. |
+| SI-H2-11 | P2PC adds no listener reachable from the LAN. TCP: the hub's REST is not reachable from another machine, and the desktop app opens no TCP listener. UDP: the app's only sockets are its device endpoint's, which accepts no incoming connection; the invite listener exists only during a join, serves only `p2pc/invite/1` and has no IP transport (§5.4). The hub's endpoint accepts only what §10.5 lists, and serves `p2pc/pair/1` only while a pairing ticket is open. Tests: socket enumeration of the app process (no TCP listener; UDP sockets only from its device endpoint), the same enumeration during a join (the invite listener binds no LAN-reachable UDP socket) and a direct QUIC probe of the invite listener from the LAN machine that gets no answer, a TCP scan and a UDP probe of the Windows host from the LAN machine (with NAT networking, no reply from the hub's sockets), an incoming QUIC connection to the device endpoint that is refused, and probes of the hub's endpoint from an unknown NodeId through a relay: `p2pc/pair/1` with no ticket open fails at the handshake (or closes before a frame), `p2pc/device/1` gets `not_paired`, `p2pc/http/1` without a key gets `401`, and `p2pc/agent/1` without a valid `Join` is closed. |
 | SI-H2-12 | The web app and the desktop UI never turn untrusted text into HTML: a lint rule bans `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write`, `eval` and `new Function`; a DOM test feeds model output with `<script>`, `<img onerror>` and `javascript:` links and checks they render inert. The deployed header files contain the CSP of §9.5 (a test parses them). |
 | SI-H2-13 | Every template image is pinned by digest, and parameters reach the job only through the targets of §7.6: whole env values, whole argv elements, a field of the closed list (`service.idle_timeout_s`, `timeout_s`) within the template's bounds, which lie inside the JobSpec range, or an `inputs` entry at the template's fixed path. A test runs over the bundle (the shipped `private-chat` and `transcribe` pass it; a fixture with a `field:` target outside the list, or with bounds outside the JobSpec range, fails); a property test feeds shell metacharacters as parameter values and checks the resulting JobSpec; out-of-type and out-of-bounds values get `422 invalid_params`. |
 | SI-H2-14 | The hub loads a template bundle only with a valid release signature, a `bundle_version` above the embedded one and not below its persisted high-water mark (equal only with the recorded SHA-256), and a satisfied `min_hub_version`, and it never serves a bundle below the mark. Fixtures for each failure, plus: a validly signed bundle below the mark (the rollback case) is refused, also after a hub restart; a different bundle with the mark's version is refused; with the file at the mark deleted, the hub serves no template (`503 templates_unavailable`) rather than the older embedded bundle. |
@@ -2018,7 +2034,7 @@ start.
 | T2-41 | WSL image: hub in the distro | **O-16** | `deploy/wsl/` (`build-rootfs.sh`, `p2pc-run`, `test-distro.sh`, `install.ps1` upgrade list) | **Blocked** until O-16 puts the listening exception in force (§4.3, ADR-016): it makes the hub's endpoint accept connections on a node PC. §8.5: `p2pc-server` in the image, `p2pc-run`, `hub.enabled`, upgrade carries `/var/lib/p2pc-server`. |
 | T2-42 | Tauri app shell | T2-00 | `apps/desktop` (`src-tauri` core, tray, single instance, autostart, capabilities, DPAPI key) | §8.1, §8.4 states, §8.9. Embeds a placeholder UI until T2-31 lands. |
 | T2-43 | First run | T2-40, T2-41, T2-42, T2-10, **O-16** | `apps/desktop` `setup/` module and the setup pages in `apps/web/src/desktop/` | §8.2 steps 1-5 (including the opt-in choice of step 1, the disk arithmetic, the hub's blob quota and the `pre_approved` token of the hub PC's own node at "Create my cloud"), `setup.json` resume, §8.8 errors, the mirrored-networking warning (§10.5). |
-| T2-44 | Join flow | T2-43, T2-30, **O-16** | `apps/desktop` `invite/` module, `apps/web/src/desktop/join` | **Blocked** until O-16 (the invite listener rests on ADR-016). §5.4 PC side (relay-only invite listener with the §6.2 limits and its binding to one phone, QR with the agent NodeId and the listener commitment, the approval phrase shown after `InviteReveal`), invite text (pending by default, the explicit "Pre-approve" option on the hub PC only), hub phrase (SI-H2-16); on the hub PC, approving join requests and pending nodes with the approval and node phrases, the source device and the time; `join_pending` with the node phrase and `hub_gone` (§8.8). |
+| T2-44 | Join flow | T2-43, T2-30, **O-16** | `apps/desktop` `invite/` module, `apps/web/src/desktop/join` | **Blocked** until O-16 (the invite listener rests on ADR-016). §5.4 PC side (relay-only invite listener built through `p2pc-net` with `direct_addresses = "none"`, no IP transport, with the §6.2 limits and its binding to one phone, QR with the agent NodeId and the listener commitment, the approval phrase shown after `InviteReveal`), invite text (pending by default, the explicit "Pre-approve" option on the hub PC only), hub phrase (SI-H2-16); on the hub PC, approving join requests and pending nodes with the approval and node phrases, the source device and the time; `join_pending` with the node phrase and `hub_gone` (§8.8). |
 | T2-45 | `p2pc-wsl` upgrade and uninstall; app updater | T2-43 | `crates/p2pc-wsl` (`upgrade.rs`, `uninstall.rs`), `apps/desktop` `update/`, `uninstall/`, NSIS hooks | §8.3 second half, §8.7 (the hub deletes the other nodes first; failed-upgrade backups kept unless the box is ticked), §14.1-§14.2 (opt-in automatic checks, template bundle delivery), web app verification with the signed manifest and its high-water mark (§9.6, SI-H2-22), parity test with `install.ps1` (SI-H2-15). |
 | **Infrastructure and clients lane** | | | | |
 | T2-50 | Templates data and bundle | T2-01, E11 | `templates/`, `scripts/templates-bundle` | The two templates, bundle compiler and signer, bundle tests (SI-H2-13). |
@@ -2054,7 +2070,7 @@ wait for O-16, so this path holds only if E11 and the architect's acceptance clo
 | Experiment | What to measure | Pass | Fail means |
 |---|---|---|---|
 | **E9** · iroh WASM in mobile Safari and Chrome Android | WASM size (target ≤ 3 MB compressed **(H)**); pairing through the browser; relay-only connection through n0 and through a plain-HTTP `iroh-relay` behind a TLS PaaS; connect time (p50/p95); chat stream overhead per token; 50 MB upload time on 4G; what happens when the tab goes to the background (how long until the WebSocket drops, reconnect time on return); key persistence across browser restart; iOS Safari vs home-screen storage isolation and Android tab → installed app; hyper's HTTP/1.1 client over an iroh stream in WASM; whether iroh can use a non-extractable WebCrypto key. | Pairing and a streamed chat work on both phones; reconnect ≤ 5 s after returning; 50 MB upload ≤ 2 min on 4G through our relay **(H)**. | A native shell (for example Capacitor) around the same web app, or WebTransport; the spec changes §9 before T2-30. |
-| **E10** · Tauri 2 first run on a clean Windows 11 VM | Time to ready with and without WSL; reboots; UAC prompts; the `wsl --install --no-distribution` path (inbox, Store, already present, too old); SmartScreen and Defender behaviour on the unsigned installer; WebView2 presence; whether the hub's REST is reachable on Windows' loopback through `localhostForwarding`, and never from the LAN; the Windows firewall prompt on the app's first iroh (UDP) bind, for the device endpoint and the invite listener, and what each answer changes; whether the invite listener works relay-only with `direct_addresses = "none"` (§5.4); whether the hub's UDP socket gets any unsolicited packet from the LAN under NAT networking, and under mirrored networking whether the Hyper-V firewall drops it (§10.5); sleep and resume; the uninstall inventory. | AC-H2-1 targets met: ≤ 5 min (reboot excluded), ≤ 1 reboot, ≤ 1 UAC. | Revisit step order, bundling the image in the installer, or the WSL install path. |
+| **E10** · Tauri 2 first run on a clean Windows 11 VM | Time to ready with and without WSL; reboots; UAC prompts; the `wsl --install --no-distribution` path (inbox, Store, already present, too old); SmartScreen and Defender behaviour on the unsigned installer; WebView2 presence; whether the hub's REST is reachable on Windows' loopback through `localhostForwarding`, and never from the LAN; the Windows firewall prompt on the app's first iroh (UDP) bind, for the device endpoint, and what each answer changes; whether the invite listener works relay-only with `direct_addresses = "none"`, with no IP transport (§5.4; if not, this spec and ADR-016 are amended before O-16); whether the hub's UDP sockets get any unsolicited packet from the LAN under NAT networking, and under mirrored networking whether the Hyper-V firewall drops it (§10.5); sleep and resume; the uninstall inventory. | AC-H2-1 targets met: ≤ 5 min (reboot excluded), ≤ 1 reboot, ≤ 1 UAC. | Revisit step order, bundling the image in the installer, or the WSL install path. |
 | **E11** · GPU service in Podman inside the WSL2 distro | Ollama and whisper.cpp image sizes on disk (they fix the image allowance `I` of §8.2) and pull time; start to healthy with cached image and model; GPU visible (CUDA, not CPU fallback); the port reachable only through the ingress bridge; model download size, time and **the exact hosts** the egress allowlist needs (Ollama's registry and its CDN; Hugging Face for whisper models); Ollama through `HTTPS_PROXY`; `:U` vs `:idmap` on a model volume; **whether `:U` follows symbolic links** (a link planted in the volume to a file and to a directory outside it, then a remount: the targets' owners must not change), and that the template images write no symlinks, FIFOs or hard links into their volumes (§11.3); VRAM and tokens/s of candidate default models; whisper.cpp speed on a 30-minute file; that the images load only GGUF. Its volume measurements run in a throwaway `spikes/` directory, never in product code (§17), and feed the decision of O-16. | Healthy ≤ 60 s with cached model **(H)**; downloads work through the egress proxy; no port reachable except through the bridge. | Change the template's image, model or command; a pre-pull step by the agent. |
 | **E12** · relay map (proposed by this spec) | `iroh-relay` in plain-HTTP mode on Railway with native and browser clients; home-relay selection with a mixed map (our HTTP relay plus n0's relays); QUIC address discovery through n0 while relaying through ours; the egress gate opening on a WSL2 node with the production map; whether the hub's endpoint can drop and re-add `p2pc/pair/1` from its accepted ALPNs at run time (§10.5); relay throughput and cost per GB on the PaaS. | AC-H2-13 passes. | A relay on a host with UDP (and TLS) for production, or n0's paid relays. |
 
