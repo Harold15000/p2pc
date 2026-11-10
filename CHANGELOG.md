@@ -6,6 +6,10 @@ changes; they are listed under **Changed** or **Removed**.
 
 ## [Unreleased]
 
+### Security
+
+- RUSTSEC-2026-0462: upgraded `rmcp` to 3.9.0 (unbounded response buffering in its Streamable HTTP clients).
+
 ## [0.1.0] - preview
 
 First public release (milestone "Personal Cloud"): jobs run on machines you own. **Preview:** functional end to end,
