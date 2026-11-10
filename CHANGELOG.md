@@ -6,6 +6,13 @@ changes; they are listed under **Changed** or **Removed**.
 
 ## [Unreleased]
 
+### Security
+
+- RUSTSEC-2026-0462: upgraded `rmcp` to 3.9.0 (unbounded response buffering in its Streamable HTTP clients).
+- RUSTSEC-2026-0459 (bundled SQLite in `libsqlite3-sys` 0.37): not yet fixed upstream for `sqlx`. The server opens only
+  its own database, so the exposure is limited to restoring a database backup from an untrusted source: don't. The
+  advisory is ignored in `deny.toml` until a `sqlx` release allows `libsqlite3-sys` 0.39.
+
 ## [0.1.0] - preview
 
 First public release (milestone "Personal Cloud"): jobs run on machines you own. **Preview:** functional end to end,
