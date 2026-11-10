@@ -176,6 +176,7 @@ pub async fn list(
                     at: from_ts(at, "audit_events.at")?,
                     kind: parse_kind(&kind).ok_or(StoreError::Corrupt("audit_events.kind"))?,
                     actor_key_id: actor.map(|a| parse_col(&a, "audit_events.actor_key_id")).transpose()?,
+                    actor_device_id: None,
                     subject_id: subject,
                     detail,
                 },

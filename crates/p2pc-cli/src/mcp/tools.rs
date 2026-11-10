@@ -336,6 +336,11 @@ impl JobInput {
             placement: Placement::default(),
             retry: Retry::default(),
             idempotency_key,
+            kind: p2pc_proto::api::JobKind::Batch,
+            service: None,
+            volumes: Vec::new(),
+            inputs: Vec::new(),
+            template: None,
         };
         // The same checks as the server's, minus the registry policy that only the server knows.
         spec.validate(&local_limits())?;

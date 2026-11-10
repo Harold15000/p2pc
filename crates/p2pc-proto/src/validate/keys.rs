@@ -26,7 +26,7 @@ pub const MAX_IMAGE_PATTERN_LEN: usize = 256;
 pub const ESCALATION_DENIED: &str = "escalation_denied";
 
 /// `label`: 1-64 characters, no control characters.
-fn check_label(label: Option<&str>, c: &mut Collector) {
+pub(super) fn check_label(label: Option<&str>, c: &mut Collector) {
     let Some(label) = label else { return };
     if label.is_empty() || label.chars().any(char::is_control) {
         c.push(
@@ -43,6 +43,51 @@ fn check_label(label: Option<&str>, c: &mut Collector) {
     }
 }
 
+/// `scopes`: not empty, no duplicates (only known values deserialize at all).
+pub(super) fn check_scopes(scopes: &[Scope], c: &mut Collector) {
+    if scopes.is_empty() {
+        c.push("scopes", ErrorCode::OutOfRange, "must contain at least one scope");
+    }
+    let mut seen = BTreeSet::new();
+    for (i, scope) in scopes.iter().enumerate() {
+        if !seen.insert(*scope) {
+            c.push(
+                format!("scopes[{i}]"),
+                ErrorCode::Duplicate,
+                "the same scope appears twice",
+            );
+        }
+    }
+}
+
+/// `allowed_images`: at most 32 distinct patterns of 1-256 bytes with valid syntax. `None` allows every image.
+pub(super) fn check_allowed_images(patterns: Option<&[String]>, c: &mut Collector) {
+    let Some(patterns) = patterns else { return };
+    if patterns.len() > MAX_ALLOWED_IMAGES {
+        c.push(
+            "allowed_images",
+            ErrorCode::TooMany,
+            format!("at most {MAX_ALLOWED_IMAGES} patterns"),
+        );
+        return;
+    }
+    let mut seen = BTreeSet::new();
+    for (i, p) in patterns.iter().enumerate() {
+        let field = format!("allowed_images[{i}]");
+        if p.len() > MAX_IMAGE_PATTERN_LEN {
+            c.push(
+                field,
+                ErrorCode::TooLarge,
+                format!("at most {MAX_IMAGE_PATTERN_LEN} bytes"),
+            );
+        } else if let Err(e) = validate_pattern(p) {
+            c.push(field, ErrorCode::InvalidFormat, e.to_string());
+        } else if !seen.insert(p.as_str()) {
+            c.push(field, ErrorCode::Duplicate, "the same pattern appears twice");
+        }
+    }
+}
+
 impl CreateApiKey {
     /// Validates a key-creation request. `now` is injectable, for `expires_at`.
     ///
@@ -54,44 +99,8 @@ impl CreateApiKey {
     pub fn validate(&self, now: OffsetDateTime) -> Result<(), ValidationErrors> {
         let mut c = Collector(Vec::new());
         check_label(self.label.as_deref(), &mut c);
-        if self.scopes.is_empty() {
-            c.push("scopes", ErrorCode::OutOfRange, "must contain at least one scope");
-        }
-        let mut seen = BTreeSet::new();
-        for (i, scope) in self.scopes.iter().enumerate() {
-            if !seen.insert(*scope) {
-                c.push(
-                    format!("scopes[{i}]"),
-                    ErrorCode::Duplicate,
-                    "the same scope appears twice",
-                );
-            }
-        }
-        if let Some(patterns) = &self.allowed_images {
-            if patterns.len() > MAX_ALLOWED_IMAGES {
-                c.push(
-                    "allowed_images",
-                    ErrorCode::TooMany,
-                    format!("at most {MAX_ALLOWED_IMAGES} patterns"),
-                );
-            } else {
-                let mut seen = BTreeSet::new();
-                for (i, p) in patterns.iter().enumerate() {
-                    let field = format!("allowed_images[{i}]");
-                    if p.len() > MAX_IMAGE_PATTERN_LEN {
-                        c.push(
-                            field,
-                            ErrorCode::TooLarge,
-                            format!("at most {MAX_IMAGE_PATTERN_LEN} bytes"),
-                        );
-                    } else if let Err(e) = validate_pattern(p) {
-                        c.push(field, ErrorCode::InvalidFormat, e.to_string());
-                    } else if !seen.insert(p.as_str()) {
-                        c.push(field, ErrorCode::Duplicate, "the same pattern appears twice");
-                    }
-                }
-            }
-        }
+        check_scopes(&self.scopes, &mut c);
+        check_allowed_images(self.allowed_images.as_deref(), &mut c);
         if self.expires_at.is_some_and(|at| at <= now) {
             c.push("expires_at", ErrorCode::OutOfRange, "must be in the future");
         }
@@ -99,14 +108,27 @@ impl CreateApiKey {
     }
 }
 
+/// Longest `ttl_s` of a join token minted with `pre_approved`, or by a `nodes:join` principal (H2 §7.3): 15 minutes.
+pub const MAX_RESTRICTED_JOIN_TOKEN_TTL_S: u32 = 900;
+
 impl CreateJoinToken {
-    /// Validates a join-token request: `label` as for keys, and `ttl_s` from 1 to 86 400 (24 h) when given.
+    /// Validates a join-token request: `label` as for keys, and `ttl_s` from 1 to 86 400 (24 h) when given; at most
+    /// 900 with `pre_approved` (H2 §7.3, `422 out_of_range`).
+    ///
+    /// The server checks the rest, which depends on the caller: `pre_approved` only from `admin` (else `403`), and
+    /// `ttl_s <= 900` for a `nodes:join` principal ([`MAX_RESTRICTED_JOIN_TOKEN_TTL_S`]).
     pub fn validate(&self) -> Result<(), ValidationErrors> {
         let mut c = Collector(Vec::new());
         check_label(self.label.as_deref(), &mut c);
         let max = u32::try_from(MAX_JOIN_TOKEN_TTL.whole_seconds()).unwrap_or(u32::MAX);
         if self.ttl_s.is_some_and(|t| !(1..=max).contains(&t)) {
             c.push("ttl_s", ErrorCode::OutOfRange, format!("must be 1-{max} seconds"));
+        } else if self.pre_approved && self.ttl_s.is_some_and(|t| t > MAX_RESTRICTED_JOIN_TOKEN_TTL_S) {
+            c.push(
+                "ttl_s",
+                ErrorCode::OutOfRange,
+                format!("must be at most {MAX_RESTRICTED_JOIN_TOKEN_TTL_S} seconds with pre_approved"),
+            );
         }
         c.finish()
     }
@@ -135,37 +157,10 @@ impl fmt::Display for EscalationDenied {
 ///   power).
 ///
 /// Every violated rule is listed. The server still checks that the creator key is valid (not revoked or expired).
+/// It is [`check_limits_no_escalation`](super::check_limits_no_escalation) on the two keys' limits (keys have no blob
+/// quota).
 pub fn check_no_escalation(creator: &ApiKeyInfo, request: &CreateApiKey) -> Result<(), EscalationDenied> {
-    let mut fields = Vec::new();
-    let creator_is_admin = creator.scopes.contains(&Scope::Admin);
-    if !creator_is_admin && !request.scopes.iter().all(|s| creator.scopes.contains(s)) {
-        fields.push("scopes");
-    }
-    if let Some(cap) = creator.daily_unit_cap
-        && request.daily_unit_cap.is_none_or(|asked| asked > cap)
-    {
-        fields.push("daily_unit_cap");
-    }
-    if let Some(allowed) = &creator.allowed_images {
-        let within = request
-            .allowed_images
-            .as_ref()
-            .is_some_and(|asked| asked.iter().all(|p| allowed.contains(p)));
-        if !within {
-            fields.push("allowed_images");
-        }
-    }
-    // §5 (0658bbe): a longer life is more power.
-    if let Some(limit) = creator.expires_at
-        && request.expires_at.is_none_or(|asked| asked > limit)
-    {
-        fields.push("expires_at");
-    }
-    if fields.is_empty() {
-        Ok(())
-    } else {
-        Err(EscalationDenied { fields })
-    }
+    super::check_limits_no_escalation(&creator.into(), &request.into())
 }
 
 #[cfg(test)]
@@ -284,6 +279,7 @@ mod tests {
         let t = |label: Option<&str>, ttl_s: Option<u32>| CreateJoinToken {
             label: label.map(String::from),
             ttl_s,
+            pre_approved: false,
         };
         for ok in [
             t(None, None),
@@ -303,6 +299,46 @@ mod tests {
             let errs = r.validate().unwrap_err();
             assert!(errs.contains(field, code), "{field}: {errs}");
         }
+    }
+
+    /// H2 §7.3: a `pre_approved` token lives at most 15 minutes, and the flag is additive.
+    #[test]
+    fn pre_approved_join_tokens_are_short_lived() {
+        let t = |ttl_s: Option<u32>| CreateJoinToken {
+            ttl_s,
+            pre_approved: true,
+            ..CreateJoinToken::default()
+        };
+        for ok in [t(None), t(Some(1)), t(Some(900))] {
+            assert_eq!(ok.validate(), Ok(()), "{ok:?}");
+        }
+        let errs = t(Some(901)).validate().unwrap_err();
+        assert!(errs.contains("ttl_s", ErrorCode::OutOfRange), "{errs}");
+        assert_eq!(errs.len(), 1);
+        // Without the flag, H1's 24 h stay.
+        assert_eq!(
+            CreateJoinToken {
+                pre_approved: false,
+                ..t(Some(86_400))
+            }
+            .validate(),
+            Ok(())
+        );
+        assert!(!CreateJoinToken::default().pre_approved);
+    }
+
+    /// The key rule is the general principal rule; keys have no blob quota, so nothing changes for them.
+    #[test]
+    fn key_escalation_is_the_principal_rule() {
+        let c = creator(vec![Scope::JobsRead], Some(2), None);
+        let r = ask(vec![Scope::JobsRead], Some(3), None);
+        assert_eq!(
+            check_no_escalation(&c, &r),
+            super::super::check_limits_no_escalation(&(&c).into(), &(&r).into())
+        );
+        // A non-admin key cannot grant an H2 scope it lacks.
+        let denied = check_no_escalation(&c, &ask(vec![Scope::TemplatesLaunch], Some(1), None)).unwrap_err();
+        assert_eq!(denied.fields, ["scopes"]);
     }
 
     fn creator(scopes: Vec<Scope>, cap: Option<u64>, images: Option<Vec<&str>>) -> ApiKeyInfo {

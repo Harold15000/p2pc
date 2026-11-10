@@ -514,6 +514,11 @@ fn job() -> JobSpec {
         placement: Placement::default(),
         retry: Retry::default(),
         idempotency_key: None,
+        kind: p2pc_proto::api::JobKind::Batch,
+        service: None,
+        volumes: Vec::new(),
+        inputs: Vec::new(),
+        template: None,
     }
 }
 

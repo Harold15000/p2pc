@@ -108,6 +108,11 @@ pub fn build_spec(args: &JobArgs, env: Env) -> Result<JobSpec, CliError> {
             max_attempts: args.retries.map_or(DEFAULT_MAX_ATTEMPTS, |n| n.saturating_add(1)),
         },
         idempotency_key: args.idempotency_key.clone(),
+        kind: p2pc_proto::api::JobKind::Batch,
+        service: None,
+        volumes: Vec::new(),
+        inputs: Vec::new(),
+        template: None,
     };
     spec.validate(&limits)?;
     Ok(spec)

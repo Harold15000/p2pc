@@ -29,6 +29,12 @@ FIELD_ERROR_CODES = frozenset(
         "not_allowed",
         "duplicate",
         "path_conflict",
+        # H2 (spec §7.1, §7.7).
+        "required",
+        "read_only_field",
+        "volumes_not_allowed",
+        "inputs_exceed_disk",
+        "unknown_blob",
     }
 )
 

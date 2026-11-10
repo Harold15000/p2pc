@@ -51,7 +51,11 @@ async fn create(
             u32::try_from(d.as_secs()).map_err(|_| CliError::usage("--expires is too long: the maximum is 24h"))
         })
         .transpose()?;
-    let request = CreateJoinToken { label, ttl_s };
+    let request = CreateJoinToken {
+        label,
+        ttl_s,
+        pre_approved: false,
+    };
     request.validate()?;
     let response = ctx.client()?.create_join_token(&request).await?;
     if ctx.json {

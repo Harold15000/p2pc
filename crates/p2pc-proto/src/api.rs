@@ -11,24 +11,46 @@
 //!   an older CLI or server keeps working when a newer peer adds a field.
 //!
 //! Validation rules live in [`crate::validate`]; this module only describes shapes and defaults.
+//!
+//! **H2 additions** (H2 spec §5, §7, §12) are all additive: every new field of an H1 type is optional on input and
+//! is left out of the output while it has its H1 value, so an H1 peer reads and writes exactly the H1 bytes (pinned
+//! by the `h1_wire_fixtures_are_byte_identical` test). The H1 types keep their field types; the principal change of
+//! `UsageRecord.key_id`, `WhoAmI.key_id` and `JoinTokenInfo.created_by_key_id` belongs to the server task that
+//! stores principals (T2-10).
 
 use std::collections::BTreeMap;
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
 use crate::auth::{ApiKey, JoinToken};
-use crate::ids::{AccountId, AuditEventId, JobId, JoinTokenId, KeyId, NodeId, ProjectId};
+use crate::ids::{
+    AccountId, AuditEventId, DeviceId, JobId, JoinRequestId, JoinTokenId, KeyId, NodeId, PairingTicketId, ProjectId,
+};
 use crate::units::Units;
 
 /// Default `resources.disk_mb` (§7).
 pub const DEFAULT_DISK_MB: u64 = 2_048;
-/// Default `timeout_s` (§7).
+/// Default `timeout_s` of a batch job (§7).
 pub const DEFAULT_TIMEOUT_S: u32 = 3_600;
-/// Default `retry.max_attempts` (§7).
+/// Default `retry.max_attempts` of a batch job (§7).
 pub const DEFAULT_MAX_ATTEMPTS: u32 = 2;
+/// Default, and largest, `timeout_s` of a service: 30 days (H2 §7.1).
+pub const DEFAULT_SERVICE_TIMEOUT_S: u32 = 2_592_000;
+/// Default `retry.max_attempts` of a service (H2 §7.1): consecutive attempts that never became healthy.
+pub const DEFAULT_SERVICE_MAX_ATTEMPTS: u32 = 3;
+/// Default `service.idle_timeout_s` (H2 §7.1).
+pub const DEFAULT_IDLE_TIMEOUT_S: u32 = 3_600;
+/// Default `service.health.interval_s` (H2 §7.1).
+pub const DEFAULT_HEALTH_INTERVAL_S: u32 = 10;
+/// Default `service.health.timeout_s` (H2 §7.1).
+pub const DEFAULT_HEALTH_TIMEOUT_S: u32 = 3;
+/// Default `service.health.start_period_s` (H2 §7.1).
+pub const DEFAULT_HEALTH_START_PERIOD_S: u32 = 300;
+/// Default `service.health.failure_threshold` (H2 §7.1).
+pub const DEFAULT_HEALTH_FAILURE_THRESHOLD: u32 = 3;
 /// Default `outputs.max_mb` (the §7 example).
 pub const DEFAULT_OUTPUTS_MAX_MB: u64 = 1_024;
 /// The only placement pool in v0.1.
@@ -39,9 +61,6 @@ pub const MAX_PAGE_LIMIT: u32 = 100;
 fn default_disk_mb() -> u64 {
     DEFAULT_DISK_MB
 }
-fn default_timeout_s() -> u32 {
-    DEFAULT_TIMEOUT_S
-}
 fn default_max_attempts() -> u32 {
     DEFAULT_MAX_ATTEMPTS
 }
@@ -51,20 +70,167 @@ fn default_outputs_max_mb() -> u64 {
 fn default_pools() -> Vec<String> {
     vec![POOL_MINE.to_string()]
 }
+fn default_idle_timeout_s() -> Option<u32> {
+    Some(DEFAULT_IDLE_TIMEOUT_S)
+}
+fn default_health_interval_s() -> u32 {
+    DEFAULT_HEALTH_INTERVAL_S
+}
+fn default_health_timeout_s() -> u32 {
+    DEFAULT_HEALTH_TIMEOUT_S
+}
+fn default_health_start_period_s() -> u32 {
+    DEFAULT_HEALTH_START_PERIOD_S
+}
+fn default_health_failure_threshold() -> u32 {
+    DEFAULT_HEALTH_FAILURE_THRESHOLD
+}
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// Deserializes a field that is **present**: a JSON `null` is refused, as for a plain field, and the value is wrapped
+/// in `Some`. With `#[serde(default)]`, an absent field is `None`. The JobSpec wire types use it so that a field
+/// whose default depends on `kind` keeps H1's rule that `null` is not a value.
+fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<T>, D::Error> {
+    T::deserialize(d).map(Some)
+}
+
+/// What kind of job a spec describes (H2 §7.1): a batch job runs to completion (H1), a service keeps running and
+/// exposes ports. `batch` is the default, and is left out of serialized specs, so H1 peers see H1 bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum JobKind {
+    /// A job that runs to completion (H1).
+    #[default]
+    Batch,
+    /// A long-running job with ports (H2 §7.2).
+    Service,
+}
+
+impl JobKind {
+    /// Whether this is `batch` (used to leave the default out of serialized specs).
+    #[must_use]
+    pub const fn is_batch(&self) -> bool {
+        matches!(self, JobKind::Batch)
+    }
+
+    /// The snake_case name used on the wire.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            JobKind::Batch => "batch",
+            JobKind::Service => "service",
+        }
+    }
+
+    /// The default `timeout_s` of this kind: 3 600 for `batch` (H1), 2 592 000 (30 days) for `service` (H2 §7.1).
+    #[must_use]
+    pub const fn default_timeout_s(self) -> u32 {
+        match self {
+            JobKind::Batch => DEFAULT_TIMEOUT_S,
+            JobKind::Service => DEFAULT_SERVICE_TIMEOUT_S,
+        }
+    }
+
+    /// The default `retry.max_attempts` of this kind: 2 for `batch` (H1), 3 for `service` (H2 §7.1).
+    #[must_use]
+    pub const fn default_max_attempts(self) -> u32 {
+        match self {
+            JobKind::Batch => DEFAULT_MAX_ATTEMPTS,
+            JobKind::Service => DEFAULT_SERVICE_MAX_ATTEMPTS,
+        }
+    }
+}
+
+impl fmt::Display for JobKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What happens to a service when its node is lost (H2 §7.2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum RestartPolicy {
+    /// The first node loss ends the job `lost`.
+    Never,
+    /// Requeue it, under `retry.max_attempts` and at most 5 node-loss restarts in any 24 h.
+    #[default]
+    OnNodeLoss,
+}
+
+/// A blob input's content address (H2 §7.1, §7.5): `sha256:<64 lowercase hex>`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema), schema(value_type = String))]
+pub struct BlobRef(pub Sha256Digest);
+
+/// The prefix of a [`BlobRef`].
+pub const BLOB_REF_PREFIX: &str = "sha256:";
+
+impl fmt::Display for BlobRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{BLOB_REF_PREFIX}{}", self.0)
+    }
+}
+
+impl fmt::Debug for BlobRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "BlobRef({self})")
+    }
+}
+
+/// The string is not `sha256:<64 lowercase hex>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("expected a blob reference `sha256:<64 lowercase hex>`")]
+pub struct InvalidBlobRef;
+
+impl std::str::FromStr for BlobRef {
+    type Err = InvalidBlobRef;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let hex = s.strip_prefix(BLOB_REF_PREFIX).ok_or(InvalidBlobRef)?;
+        hex.parse().map(BlobRef).map_err(|_| InvalidBlobRef)
+    }
+}
+
+impl Serialize for BlobRef {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for BlobRef {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        crate::ids::deserialize_from_str(deserializer)
+    }
+}
 
 /// Defines the job spec types once, so the strict request types and the lenient response types cannot drift.
 ///
 /// `$strictness` is applied to every struct: `serde(deny_unknown_fields)` for the request types, nothing for the
 /// response types. `$note` is appended to every type's doc. `$File` is defined outside the macro, because the two
 /// families differ there: the request carries `content_b64`, the response only `{path, size, sha256}` (§7).
+///
+/// `$Spec` deserializes through `$Wire` (`wire:` gives the `serde(from)` attribute), a private twin whose
+/// `timeout_s` and `retry.max_attempts` are optional: an absent value takes the default of the spec's `kind`
+/// (H2 §7.1), which a field-level `serde(default)` cannot see. Serialization is the plain derive, unchanged for H1
+/// fields, and every H2 field is skipped while it has its default, so an H1 spec serializes to its H1 bytes.
 macro_rules! job_spec_types {
     (
         strictness: [$(#[$strictness:meta])*],
         note: $note:literal,
-        idempotency: [$($idempotency:tt)*],
-        $Spec:ident, $File:ident, $Res:ident, $Egress:ident, $Out:ident, $Place:ident, $Retry:ident $(,)?
+        wire: [$(#[$wire:meta])*],
+        idempotency: [$($idem:ident)?],
+        $Spec:ident, $Wire:ident, $File:ident, $Res:ident, $Egress:ident, $Out:ident, $Place:ident, $Retry:ident,
+        $RetryWire:ident, $Service:ident, $Port:ident, $Health:ident, $Volume:ident, $Input:ident, $Template:ident $(,)?
     ) => {
-        #[doc = "A job specification: what to run and with which limits (§7)."]
+        #[doc = "A job specification: what to run and with which limits (§7, H2 §7.1)."]
         #[doc = ""]
         #[doc = "`Debug` never prints environment values or input file contents (§7: env values are never logged)."]
         #[doc = ""]
@@ -72,7 +238,11 @@ macro_rules! job_spec_types {
         #[derive(Clone, PartialEq, Serialize, Deserialize)]
         #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
         $(#[$strictness])*
+        $(#[$wire])*
         pub struct $Spec {
+            /// `batch` (default) or `service` (H2 §7.1). Left out when `batch`.
+            #[serde(default, skip_serializing_if = "JobKind::is_batch")]
+            pub kind: JobKind,
             /// Optional human label.
             #[serde(default, skip_serializing_if = "Option::is_none")]
             pub name: Option<String>,
@@ -91,8 +261,10 @@ macro_rules! job_spec_types {
             pub files: Vec<$File>,
             /// Requested resources.
             pub resources: $Res,
-            /// Wall-clock limit in seconds. Default 3 600.
-            #[serde(default = "default_timeout_s")]
+            /// Wall-clock limit in seconds. Every job has one (hard rule 3). Default 3 600 for `batch` (1-86 400) and
+            /// 2 592 000, 30 days, for `service` (60-2 592 000). (`serde(default)` here only marks it optional in the
+            /// schema: deserialization goes through the wire type, which applies the default of the `kind`.)
+            #[serde(default)]
             pub timeout_s: u32,
             /// Network egress allowlist. Empty means no network at all.
             #[serde(default)]
@@ -103,10 +275,104 @@ macro_rules! job_spec_types {
             /// Where the job may run.
             #[serde(default)]
             pub placement: $Place,
-            /// Retry policy (only node loss consumes an attempt).
+            /// Retry policy. For `batch`, only node loss consumes an attempt (default 2); for `service`, it counts
+            /// consecutive attempts that never became healthy (default 3).
             #[serde(default)]
             pub retry: $Retry,
-            $($idempotency)*
+            /// The service block: required when `kind = "service"`, forbidden otherwise (H2 §7.1).
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub service: Option<$Service>,
+            /// Persistent volumes, 0-4 (H2 §7.1, §11.3): only for services and template launches.
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            pub volumes: Vec<$Volume>,
+            /// Blob inputs, 0-32, delivered read-only under `/inputs` (H2 §7.1, §7.5).
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            pub inputs: Vec<$Input>,
+            /// Read-only: set by a template launch (H2 §7.6). A `POST /v1/jobs` that sends it gets
+            /// `422 read_only_field`.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub template: Option<$Template>,
+            $(
+                /// Client-chosen key that makes the submission idempotent (§7). Scoped to the principal that submits
+                /// it, an API key or a device (H2 §5.6). It is **never returned**: no response type has it (see
+                /// [`JobSpecView`]).
+                #[serde(default, skip_serializing_if = "Option::is_none")]
+                pub $idem: Option<String>,
+            )?
+        }
+
+        /// The wire form of the spec: what is actually deserialized (see the macro's doc).
+        #[derive(Deserialize)]
+        $(#[$strictness])*
+        struct $Wire {
+            #[serde(default)]
+            kind: JobKind,
+            #[serde(default)]
+            name: Option<String>,
+            image: String,
+            command: Vec<String>,
+            #[serde(default)]
+            env: BTreeMap<String, String>,
+            #[serde(default)]
+            files: Vec<$File>,
+            resources: $Res,
+            #[serde(default, deserialize_with = "present")]
+            timeout_s: Option<u32>,
+            #[serde(default)]
+            egress: $Egress,
+            #[serde(default)]
+            outputs: $Out,
+            #[serde(default)]
+            placement: $Place,
+            #[serde(default)]
+            retry: $RetryWire,
+            #[serde(default)]
+            service: Option<$Service>,
+            #[serde(default)]
+            volumes: Vec<$Volume>,
+            #[serde(default)]
+            inputs: Vec<$Input>,
+            #[serde(default)]
+            template: Option<$Template>,
+            $(
+                #[serde(default)]
+                $idem: Option<String>,
+            )?
+        }
+
+        /// The wire form of `retry`: `max_attempts` is optional, and its default depends on the spec's `kind`.
+        #[derive(Default, Deserialize)]
+        $(#[$strictness])*
+        struct $RetryWire {
+            #[serde(default, deserialize_with = "present")]
+            max_attempts: Option<u32>,
+        }
+
+        impl From<$Wire> for $Spec {
+            fn from(w: $Wire) -> Self {
+                let kind = w.kind;
+                Self {
+                    kind,
+                    name: w.name,
+                    image: w.image,
+                    command: w.command,
+                    env: w.env,
+                    files: w.files,
+                    resources: w.resources,
+                    timeout_s: w.timeout_s.unwrap_or(kind.default_timeout_s()),
+                    egress: w.egress,
+                    outputs: w.outputs,
+                    placement: w.placement,
+                    retry: $Retry {
+                        max_attempts: w.retry.max_attempts.unwrap_or(kind.default_max_attempts()),
+                    },
+                    service: w.service,
+                    volumes: w.volumes,
+                    inputs: w.inputs,
+                    template: w.template,
+                    $($idem: w.$idem,)?
+                }
+            }
         }
 
         #[doc = "Requested resources."]
@@ -189,15 +455,126 @@ macro_rules! job_spec_types {
         #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
         $(#[$strictness])*
         pub struct $Retry {
-            /// Attempts in total, 1-5. Default 2. Only node loss consumes an attempt.
+            /// Attempts in total, 1-5. Default 2 for `batch` (only node loss consumes an attempt) and 3 for `service`
+            /// (consecutive attempts that never became healthy, H2 §7.2).
             #[serde(default = "default_max_attempts")]
             pub max_attempts: u32,
         }
 
+        /// The batch default (2 attempts). A spec read from JSON takes the default of its `kind` instead.
         impl Default for $Retry {
             fn default() -> Self {
                 Self { max_attempts: DEFAULT_MAX_ATTEMPTS }
             }
+        }
+
+        #[doc = "The service block of a `kind = \"service\"` job (H2 §7.1)."]
+        #[doc = ""]
+        #[doc = $note]
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+        #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+        $(#[$strictness])*
+        pub struct $Service {
+            /// The ports the service listens on inside its container, 1-8. The shim forwards no other port.
+            pub ports: Vec<$Port>,
+            /// The health check. Without it, the service is `healthy` as soon as a connection to its first port
+            /// succeeds through the bridge.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub health: Option<$Health>,
+            /// `null` (never) or 300-604 800 seconds without an open port connection and without traffic, measured
+            /// by the hub. Default 3 600 when absent.
+            #[serde(default = "default_idle_timeout_s", deserialize_with = "Option::deserialize")]
+            pub idle_timeout_s: Option<u32>,
+            /// What a node loss does (default `on_node_loss`).
+            #[serde(default)]
+            pub restart: RestartPolicy,
+        }
+
+        #[doc = "One exposed port of a service (H2 §7.1)."]
+        #[doc = ""]
+        #[doc = $note]
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+        #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+        $(#[$strictness])*
+        pub struct $Port {
+            /// The TCP port inside the container, 1-65 535, unique.
+            pub port: u32,
+            /// `[a-z][a-z0-9-]{0,31}`, unique.
+            pub name: String,
+        }
+
+        #[doc = "A service health check (H2 §7.1): exactly one of `http_get` or `tcp: true`."]
+        #[doc = ""]
+        #[doc = $note]
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+        #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+        $(#[$strictness])*
+        pub struct $Health {
+            /// An absolute path to `GET`, at most 256 bytes. Only the status line is read.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub http_get: Option<String>,
+            /// A TCP connect check.
+            #[serde(default, skip_serializing_if = "is_false")]
+            pub tcp: bool,
+            /// The port to check: one of `service.ports`.
+            pub port: u32,
+            /// Seconds between checks, 2-300. Default 10.
+            #[serde(default = "default_health_interval_s")]
+            pub interval_s: u32,
+            /// Seconds before one check fails, 1-60. Default 3.
+            #[serde(default = "default_health_timeout_s")]
+            pub timeout_s: u32,
+            /// Seconds the service may stay `starting`, 0-3 600. Default 300.
+            #[serde(default = "default_health_start_period_s")]
+            pub start_period_s: u32,
+            /// Consecutive failed checks that make it `unhealthy`, 1-20. Default 3.
+            #[serde(default = "default_health_failure_threshold")]
+            pub failure_threshold: u32,
+        }
+
+        #[doc = "A persistent volume of a job (H2 §7.1, §11.3)."]
+        #[doc = ""]
+        #[doc = $note]
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+        #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+        $(#[$strictness])*
+        pub struct $Volume {
+            /// `[a-z0-9][a-z0-9._-]{0,62}`, or `tpl:<template id>/<name>` (template launches only). A label, never
+            /// a path: the agent derives the directory from it.
+            pub name: String,
+            /// Where it is mounted: absolute, under `/volumes/`.
+            pub mount: String,
+            /// Size limit in MiB, 64-262 144.
+            pub max_mb: u64,
+        }
+
+        #[doc = "A blob input (H2 §7.1): the blob, delivered read-only at `path`."]
+        #[doc = ""]
+        #[doc = $note]
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+        #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+        $(#[$strictness])*
+        pub struct $Input {
+            /// Absolute path under `/inputs/`, with the `files` path rules.
+            pub path: String,
+            /// The blob, which must exist in the caller's account when the job is created.
+            pub blob: BlobRef,
+        }
+
+        #[doc = "The template a job was launched from (H2 §7.6). Read-only: only a template launch sets it."]
+        #[doc = ""]
+        #[doc = $note]
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+        #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+        $(#[$strictness])*
+        pub struct $Template {
+            /// The template's id.
+            pub id: String,
+            /// The template's version, from 1.
+            pub version: u32,
+            /// The model the hub pulls at launch (the template's `pull` parameter), `null` without one.
+            #[serde(default)]
+            pub pull: Option<String>,
         }
     };
 }
@@ -207,19 +584,23 @@ job_spec_types!(
     note: "**Strict** (request type): the `POST /v1/jobs` body, and what the agent parses a lease's job into \
            (`LeaseJob::parse_strict`). Unknown fields are rejected, which catches typos and refuses a lease the \
            agent would not fully understand (§6). Responses use the lenient twin, [`JobSpecView`].",
-    idempotency: [
-        /// Client-chosen key that makes the submission idempotent (§7). Scoped to the API key that submits it. It is
-        /// **never returned**: no response type has it (see [`JobSpecView`]).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub idempotency_key: Option<String>,
-    ],
+    wire: [#[serde(from = "JobSpecWire")]],
+    idempotency: [idempotency_key],
     JobSpec,
+    JobSpecWire,
     InputFile,
     Resources,
     Egress,
     Outputs,
     Placement,
     Retry,
+    RetryWire,
+    ServiceSpec,
+    ServicePort,
+    HealthCheck,
+    VolumeSpec,
+    BlobInput,
+    TemplateRef,
 );
 
 job_spec_types!(
@@ -229,16 +610,25 @@ job_spec_types!(
            after the server adds a field (§6). `env` values are always `\"<redacted>\"` and `files` carry \
            `{path, size, sha256}` with no content, and there is **no `idempotency_key`**: a response never carries it \
            (§7). Build it with [`JobSpecView::from_stored`].",
+    wire: [#[serde(from = "JobSpecViewWire")]],
     // No `idempotency_key`: responses never carry it (§7). The key only means something to the key that sent it, and
     // echoing it would let another key learn it.
     idempotency: [],
     JobSpecView,
+    JobSpecViewWire,
     InputFileView,
     ResourcesView,
     EgressView,
     OutputsView,
     PlacementView,
     RetryView,
+    RetryViewWire,
+    ServiceSpecView,
+    ServicePortView,
+    HealthCheckView,
+    VolumeSpecView,
+    BlobInputView,
+    TemplateRefView,
 );
 
 /// Writes the `Debug` of a spec type: env values and file contents are redacted, only names, paths and sizes show.
@@ -249,7 +639,8 @@ macro_rules! spec_debug {
                 // Env values and file contents are redacted: only names, paths and sizes are shown.
                 let env_names: Vec<&str> = self.env.keys().map(String::as_str).collect();
                 let mut d = f.debug_struct(stringify!($Spec));
-                d.field("name", &self.name)
+                d.field("kind", &self.kind)
+                    .field("name", &self.name)
                     .field("image", &self.image)
                     .field("command", &self.command)
                     .field("env_names", &env_names)
@@ -259,7 +650,11 @@ macro_rules! spec_debug {
                     .field("egress", &self.egress)
                     .field("outputs", &self.outputs)
                     .field("placement", &self.placement)
-                    .field("retry", &self.retry);
+                    .field("retry", &self.retry)
+                    .field("service", &self.service)
+                    .field("volumes", &self.volumes)
+                    .field("inputs", &self.inputs)
+                    .field("template", &self.template);
                 $(d.field(stringify!($extra), &self.$extra);)?
                 d.finish()
             }
@@ -326,6 +721,22 @@ convert_twins! {
     Outputs => OutputsView { max_mb }
     Placement => PlacementView { pools, node_id, labels }
     Retry => RetryView { max_attempts }
+    ServicePort => ServicePortView { port, name }
+    HealthCheck => HealthCheckView { http_get, tcp, port, interval_s, timeout_s, start_period_s, failure_threshold }
+    VolumeSpec => VolumeSpecView { name, mount, max_mb }
+    BlobInput => BlobInputView { path, blob }
+    TemplateRef => TemplateRefView { id, version, pull }
+}
+
+impl From<ServiceSpec> for ServiceSpecView {
+    fn from(v: ServiceSpec) -> Self {
+        Self {
+            ports: v.ports.into_iter().map(Into::into).collect(),
+            health: v.health.map(Into::into),
+            idle_timeout_s: v.idle_timeout_s,
+            restart: v.restart,
+        }
+    }
 }
 
 /// The metadata of one input file, `{path, size, sha256}`: what responses show instead of the content (§7).
@@ -383,6 +794,7 @@ impl JobSpecView {
 
     fn redacted(spec: &JobSpec, files: Vec<FileMeta>) -> Self {
         Self {
+            kind: spec.kind,
             name: spec.name.clone(),
             image: spec.image.clone(),
             command: spec.command.clone(),
@@ -394,6 +806,10 @@ impl JobSpecView {
             outputs: spec.outputs.clone().into(),
             placement: spec.placement.clone().into(),
             retry: spec.retry.clone().into(),
+            service: spec.service.clone().map(Into::into),
+            volumes: spec.volumes.iter().cloned().map(Into::into).collect(),
+            inputs: spec.inputs.iter().cloned().map(Into::into).collect(),
+            template: spec.template.clone().map(Into::into),
         }
     }
 }
@@ -544,6 +960,10 @@ pub struct Job {
     /// attempt is an accepted lease: refused or unanswered offers are not listed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempts: Option<Vec<JobAttempt>>,
+    /// The service view of a `kind = "service"` job (H2 §7.2): health, ports, idle and cap deadlines, the hub's model
+    /// pull and today's traffic. Left out for batch jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<ServiceView>,
 }
 
 impl Job {
@@ -577,8 +997,152 @@ impl Job {
             started_at: None,
             finished_at: None,
             attempts: None,
+            service: None,
         }
     }
+}
+
+/// `Job.reason` of a service stopped by a principal (H2 §7.2); the job ends `cancelled`.
+pub const REASON_STOPPED: &str = "stopped";
+/// `Job.reason` of a service stopped after `idle_timeout_s` without connections or traffic (H2 §7.2).
+pub const REASON_IDLE_TIMEOUT: &str = "idle_timeout";
+/// `Job.reason` of a service stopped because its principal's daily cap was reached (H2 §7.2, §12).
+pub const REASON_CAP_REACHED: &str = "cap_reached";
+/// `Job.error` of a service the agent stopped because it never became healthy, or stayed unhealthy (H2 §7.2).
+pub const ERROR_HEALTH_CHECK_FAILED: &str = "health_check_failed";
+/// `Job.error` of a service that lost its node a sixth time within 24 h (H2 §7.2); the job ends `lost`.
+pub const ERROR_RESTART_LIMIT: &str = "restart_limit";
+/// Most node-loss restarts of one service in any 24 h, whatever `retry.max_attempts` says (H2 §7.2).
+pub const MAX_NODE_LOSS_RESTARTS_PER_24H: u32 = 5;
+/// How long an attempt must stay `healthy` to reset the count of attempts that never became healthy (H2 §7.2).
+pub const HEALTHY_RESETS_ATTEMPTS_AFTER_S: u32 = 600;
+
+/// The health of a running service (H2 §7.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceHealth {
+    /// From `JobStarted` until the first passing check, at most `start_period_s`.
+    Starting,
+    /// The last check passed.
+    Healthy,
+    /// The last `failure_threshold` checks failed.
+    Unhealthy,
+}
+
+/// The state of the hub's model pull for a template service (H2 §7.2, §7.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SetupState {
+    /// The pull is running.
+    Pulling,
+    /// The pull ended with a final `status: "success"` line.
+    Done,
+    /// Both tries failed; the hub does not pull again in this attempt.
+    Failed,
+}
+
+/// Why a model pull failed (H2 §7.6 "Reading").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SetupFailure {
+    /// A line with `error`.
+    ErrorLine,
+    /// A line longer than 4 KiB, or malformed.
+    BadLine,
+    /// The stream ended without the final `success` line.
+    Eof,
+    /// The stream broke (`node_unreachable`, an agent reconnect or a hub restart).
+    StreamBroken,
+    /// 2 h after the try started.
+    Deadline,
+}
+
+/// The hub's model pull of a template service, `service.setup` (H2 §7.2, §7.6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ServiceSetup {
+    /// `pulling`, `done` or `failed`.
+    pub state: SetupState,
+    /// MiB downloaded so far.
+    #[serde(default)]
+    pub completed_mb: u64,
+    /// MiB to download, once the service reported it.
+    #[serde(default)]
+    pub total_mb: Option<u64>,
+    /// Tries so far (at most 2 per attempt).
+    #[serde(default)]
+    pub tries: u32,
+    /// Why it failed, when `state` is `failed`.
+    #[serde(default)]
+    pub reason: Option<SetupFailure>,
+}
+
+/// A service's traffic for one UTC day, recorded and not billed (H2 §12 `service_traffic`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ServiceTraffic {
+    /// 00:00 UTC of the day the totals are for.
+    #[serde(with = "crate::timestamp")]
+    #[cfg_attr(feature = "openapi", schema(value_type = String, format = DateTime))]
+    pub day: OffsetDateTime,
+    /// Bytes from clients to the service.
+    #[serde(default)]
+    pub bytes_in: u64,
+    /// Bytes from the service to clients.
+    #[serde(default)]
+    pub bytes_out: u64,
+    /// Port connections opened.
+    #[serde(default)]
+    pub connections: u64,
+}
+
+/// The `service` member of `GET /v1/jobs/{id}` for a service (H2 §7.2). Lenient, and every field defaults, so a
+/// newer server may add fields and an older one may leave some out.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ServiceView {
+    /// The health of the running attempt; `null` while the service is not running.
+    #[serde(default)]
+    pub health: Option<ServiceHealth>,
+    /// Since when `health` has had its value.
+    #[serde(default, with = "crate::timestamp::option")]
+    #[cfg_attr(feature = "openapi", schema(value_type = Option<String>, format = DateTime))]
+    pub health_since: Option<OffsetDateTime>,
+    /// The exposed ports, from the spec.
+    #[serde(default)]
+    pub ports: Vec<ServicePortView>,
+    /// Port connections open now.
+    #[serde(default)]
+    pub open_connections: u32,
+    /// Last byte forwarded in either direction (updated at most every 10 s).
+    #[serde(default, with = "crate::timestamp::option")]
+    #[cfg_attr(feature = "openapi", schema(value_type = Option<String>, format = DateTime))]
+    pub last_activity_at: Option<OffsetDateTime>,
+    /// When the idle timeout stops the service; `null` while a connection is open or when `idle_timeout_s` is
+    /// `null`.
+    #[serde(default, with = "crate::timestamp::option")]
+    #[cfg_attr(feature = "openapi", schema(value_type = Option<String>, format = DateTime))]
+    pub idle_deadline: Option<OffsetDateTime>,
+    /// When `timeout_s` ends the current attempt.
+    #[serde(default, with = "crate::timestamp::option")]
+    #[cfg_attr(feature = "openapi", schema(value_type = Option<String>, format = DateTime))]
+    pub deadline: Option<OffsetDateTime>,
+    /// When today's cap reservation runs out (H2 §12); `null` for an uncapped principal.
+    #[serde(default, with = "crate::timestamp::option")]
+    #[cfg_attr(feature = "openapi", schema(value_type = Option<String>, format = DateTime))]
+    pub cap_deadline: Option<OffsetDateTime>,
+    /// Node-loss restarts in the last 24 h (at most [`MAX_NODE_LOSS_RESTARTS_PER_24H`]).
+    #[serde(default)]
+    pub restarts_24h: u32,
+    /// The hub's model pull (H2 §7.6); `null` for a job without one.
+    #[serde(default)]
+    pub setup: Option<ServiceSetup>,
+    /// Today's traffic totals (H2 §12).
+    #[serde(default)]
+    pub traffic: Option<ServiceTraffic>,
 }
 
 /// One attempt of a job, in `GET /v1/jobs/{id}` (§7): an accepted lease, on one node.
@@ -1011,6 +1575,36 @@ pub struct Node {
     #[serde(with = "crate::timestamp")]
     #[cfg_attr(feature = "openapi", schema(value_type = String, format = DateTime))]
     pub created_at: OffsetDateTime,
+    /// `approved` (default, and every H1 node) or `pending_approval` (H2 §5.5): a pending node gets no lease until
+    /// an `admin` approves it. Left out when `approved`.
+    #[serde(default, skip_serializing_if = "NodeApproval::is_approved")]
+    pub approval: NodeApproval,
+    /// The principal that minted the node's join token, as the hub recorded it; `null` for H1 nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrolled_by: Option<Principal>,
+    /// The node phrase (H2 §5.5): 6 words derived from the node's iroh NodeId, shown before approving it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_phrase: Option<String>,
+}
+
+/// Whether a node may get work (H2 §5.5 "Node approval").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum NodeApproval {
+    /// The node is eligible for leases.
+    #[default]
+    Approved,
+    /// Enrolled by a non-`admin` principal's token: waiting for approval on the hub PC, never offered a lease.
+    PendingApproval,
+}
+
+impl NodeApproval {
+    /// Whether this is `approved` (used to leave the default out of serialized nodes).
+    #[must_use]
+    pub const fn is_approved(&self) -> bool {
+        matches!(self, NodeApproval::Approved)
+    }
 }
 
 impl Node {
@@ -1037,6 +1631,9 @@ impl Node {
             labels: BTreeMap::new(),
             last_seen: None,
             created_at,
+            approval: NodeApproval::Approved,
+            enrolled_by: None,
+            node_phrase: None,
         }
     }
 }
@@ -1077,6 +1674,142 @@ pub enum Scope {
     /// Drain, resume and delete nodes.
     #[serde(rename = "nodes:write")]
     NodesWrite,
+    /// Open a port connection to a service (H2 §7.4).
+    #[serde(rename = "services:connect")]
+    ServicesConnect,
+    /// Launch templates, and see the narrow template view of jobs (H2 §5.5, §7.6).
+    #[serde(rename = "templates:launch")]
+    TemplatesLaunch,
+    /// Upload blobs, and withdraw one's own claim on them (H2 §7.5).
+    #[serde(rename = "blobs:write")]
+    BlobsWrite,
+    /// Open a join request that an `admin` must approve (H2 §5.4).
+    #[serde(rename = "nodes:invite")]
+    NodesInvite,
+    /// Mint join tokens valid at most 15 minutes, whose nodes start `pending_approval` (H2 §5.4).
+    #[serde(rename = "nodes:join")]
+    NodesJoin,
+}
+
+impl Scope {
+    /// Every scope, in declaration order.
+    pub const ALL: [Scope; 10] = [
+        Scope::Admin,
+        Scope::JobsWrite,
+        Scope::JobsRead,
+        Scope::NodesRead,
+        Scope::NodesWrite,
+        Scope::ServicesConnect,
+        Scope::TemplatesLaunch,
+        Scope::BlobsWrite,
+        Scope::NodesInvite,
+        Scope::NodesJoin,
+    ];
+
+    /// The wire name, for example `jobs:read`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Scope::Admin => "admin",
+            Scope::JobsWrite => "jobs:write",
+            Scope::JobsRead => "jobs:read",
+            Scope::NodesRead => "nodes:read",
+            Scope::NodesWrite => "nodes:write",
+            Scope::ServicesConnect => "services:connect",
+            Scope::TemplatesLaunch => "templates:launch",
+            Scope::BlobsWrite => "blobs:write",
+            Scope::NodesInvite => "nodes:invite",
+            Scope::NodesJoin => "nodes:join",
+        }
+    }
+}
+
+/// The "Owner" profile (H2 §5.5): the desktop app on the hub PC.
+pub const OWNER_PROFILE: [Scope; 1] = [Scope::Admin];
+
+/// The default "Phone" profile (H2 §5.5): the default scopes of a pairing ticket. It cannot submit arbitrary
+/// JobSpecs, read other jobs, open a non-template service or mint join tokens.
+pub const PHONE_PROFILE: [Scope; 4] = [
+    Scope::NodesRead,
+    Scope::TemplatesLaunch,
+    Scope::BlobsWrite,
+    Scope::NodesInvite,
+];
+
+/// The opt-in "Developer device" profile (H2 §5.5): the phone profile plus `jobs:read`, `jobs:write`,
+/// `services:connect` and `nodes:join`.
+pub const DEVELOPER_DEVICE_PROFILE: [Scope; 8] = [
+    Scope::NodesRead,
+    Scope::TemplatesLaunch,
+    Scope::BlobsWrite,
+    Scope::NodesInvite,
+    Scope::JobsRead,
+    Scope::JobsWrite,
+    Scope::ServicesConnect,
+    Scope::NodesJoin,
+];
+
+/// Who authenticated a request (H2 §5.5): an API key (H1) or a paired device. JSON `{"kind": "key", "id": "…"}` or
+/// `{"kind": "device", "id": "dev_…"}`, as `GET /v1/whoami`'s `principal`.
+///
+/// [`Display`](fmt::Display) and [`FromStr`](std::str::FromStr) use the `key:<id>` and `device:<id>` labels of
+/// `GET /v1/usage?group_by=principal` (H2 §12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+pub enum Principal {
+    /// An API key.
+    Key(KeyId),
+    /// A paired device.
+    Device(DeviceId),
+}
+
+impl Principal {
+    /// The key, if the principal is one.
+    #[must_use]
+    pub const fn key_id(&self) -> Option<KeyId> {
+        match self {
+            Principal::Key(k) => Some(*k),
+            Principal::Device(_) => None,
+        }
+    }
+
+    /// The device, if the principal is one.
+    #[must_use]
+    pub const fn device_id(&self) -> Option<DeviceId> {
+        match self {
+            Principal::Key(_) => None,
+            Principal::Device(d) => Some(*d),
+        }
+    }
+}
+
+impl fmt::Display for Principal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Principal::Key(k) => write!(f, "key:{k}"),
+            Principal::Device(d) => write!(f, "device:{d}"),
+        }
+    }
+}
+
+/// The string is not `key:<key id>` or `device:<device id>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("expected `key:<key id>` or `device:<device id>`")]
+pub struct InvalidPrincipal;
+
+impl std::str::FromStr for Principal {
+    type Err = InvalidPrincipal;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some(k) = s.strip_prefix("key:") {
+            k.parse().map(Principal::Key).map_err(|_| InvalidPrincipal)
+        } else if let Some(d) = s.strip_prefix("device:") {
+            d.parse().map(Principal::Device).map_err(|_| InvalidPrincipal)
+        } else {
+            Err(InvalidPrincipal)
+        }
+    }
 }
 
 /// Body of `POST /v1/keys`.
@@ -1161,9 +1894,14 @@ pub struct CreateJoinToken {
     /// Optional human label, shown when tokens are listed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    /// Validity in seconds. Default 900 (15 minutes), maximum 86 400 (24 h).
+    /// Validity in seconds. Default 900 (15 minutes), maximum 86 400 (24 h); at most 900 with `pre_approved`, and
+    /// for a `nodes:join` principal (H2 §7.3, where the spec calls it `expires_in_s`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_s: Option<u32>,
+    /// The node it enrolls starts `approved` (H2 §5.4, §5.5). `admin` principals only (else `403`). Left out when
+    /// `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pre_approved: bool,
 }
 
 /// A join token as listed by `GET /v1/nodes/join-tokens` (§5 "Listing and revoking"). Never contains the token or
@@ -1251,6 +1989,10 @@ pub struct WhoAmI {
     #[serde(default, with = "crate::timestamp::option")]
     #[cfg_attr(feature = "openapi", schema(value_type = Option<String>, format = DateTime))]
     pub expires_at: Option<OffsetDateTime>,
+    /// Who the caller is, `{kind, id}` (H2 §5.5). `null` from an H1 server, whose callers are always the `key_id`
+    /// key. Left out when `null`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<Principal>,
 }
 
 /// Response of `GET /healthz` (§7): liveness only, with no data.
@@ -1295,6 +2037,67 @@ pub enum AuditKind {
     /// A live node joined again with a new token of its own account (§5 "Re-enrolling the same machine"): same
     /// node id, refreshed inventory, the token's project.
     NodeReenrolled,
+    /// A pairing ticket was created (H2 §5.2).
+    PairingTicketCreated,
+    /// An unused pairing ticket was revoked (H2 §5.2).
+    PairingTicketRevoked,
+    /// A device paired with a ticket (H2 §5.3).
+    DevicePaired,
+    /// A device was revoked (H2 §5.5).
+    DeviceRevoked,
+    /// A device was registered offline by `p2pc-server devices add` (H2 §5.3).
+    DeviceAddedOffline,
+    /// A device was revoked offline by `p2pc-server devices revoke` (H2 §5.3).
+    DeviceRevokedOffline,
+    /// A join request was opened (H2 §5.4).
+    JoinRequestCreated,
+    /// A join request's listener nonce matched its commitment (H2 §5.4).
+    JoinRequestRevealed,
+    /// A join request's listener nonce did not match its commitment (H2 §5.4).
+    JoinRequestRevealFailed,
+    /// An `admin` approved a join request (H2 §5.4).
+    JoinRequestApproved,
+    /// A join request was rejected or withdrawn (H2 §5.4).
+    JoinRequestRejected,
+    /// The join token of an approved request was handed to the requesting device (H2 §5.4).
+    JoinRequestDelivered,
+    /// An `admin` approved a `pending_approval` node (H2 §5.5).
+    NodeApproved,
+    /// A node left the cloud by itself (H2 §6.1 `leave`).
+    NodeLeft,
+    /// A template bundle became current (H2 §7.6).
+    TemplateBundleLoaded,
+}
+
+impl AuditKind {
+    /// Every kind, in declaration order (H1's, then H2's).
+    pub const ALL: [AuditKind; 25] = [
+        AuditKind::KeyCreated,
+        AuditKind::KeyRevoked,
+        AuditKind::JoinTokenCreated,
+        AuditKind::JoinTokenConsumed,
+        AuditKind::JoinTokenRevoked,
+        AuditKind::NodeEnrolled,
+        AuditKind::NodeDeleted,
+        AuditKind::AuthFailed,
+        AuditKind::KeyRecovered,
+        AuditKind::NodeReenrolled,
+        AuditKind::PairingTicketCreated,
+        AuditKind::PairingTicketRevoked,
+        AuditKind::DevicePaired,
+        AuditKind::DeviceRevoked,
+        AuditKind::DeviceAddedOffline,
+        AuditKind::DeviceRevokedOffline,
+        AuditKind::JoinRequestCreated,
+        AuditKind::JoinRequestRevealed,
+        AuditKind::JoinRequestRevealFailed,
+        AuditKind::JoinRequestApproved,
+        AuditKind::JoinRequestRejected,
+        AuditKind::JoinRequestDelivered,
+        AuditKind::NodeApproved,
+        AuditKind::NodeLeft,
+        AuditKind::TemplateBundleLoaded,
+    ];
 }
 
 /// One row of the append-only audit log, as returned by `GET /v1/audit` (§5 "Audit").
@@ -1315,6 +2118,10 @@ pub struct AuditEvent {
     /// The key that acted, if any.
     #[serde(default)]
     pub actor_key_id: Option<KeyId>,
+    /// The device that acted, if any (H2 §5.6). At most one of `actor_key_id` and `actor_device_id` is set. Left
+    /// out when `null`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_device_id: Option<DeviceId>,
     /// The object acted on (a key, join token or node ID), as an opaque string.
     #[serde(default)]
     pub subject_id: Option<String>,
@@ -1384,10 +2191,36 @@ pub struct ServerInfo {
     pub address: crate::auth::ServerAddress,
     /// The server version (semver).
     pub version: String,
+    /// The REST API generation (H2 §7.3): 1 for H1, [`API_VERSION_H2`] for H2. An absent value means 1, and 1 is
+    /// left out, so an H1 server's response is unchanged.
+    #[serde(default = "api_version_h1", skip_serializing_if = "is_api_version_h1")]
+    pub api_version: u32,
+    /// The oldest web app build this hub accepts (H2 §14.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_web_version: Option<String>,
+    /// The hub's display name (H2 §7.3, `PATCH /v1/server`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub_name: Option<String>,
+    /// The largest blob upload, in MiB (H2 §7.5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_blob_mb: Option<u64>,
+}
+
+/// `ServerInfo.api_version` of an H1 server, and its value when absent.
+pub const API_VERSION_H1: u32 = 1;
+/// `ServerInfo.api_version` of a server that serves the H2 API (H2 §7.3).
+pub const API_VERSION_H2: u32 = 2;
+
+fn api_version_h1() -> u32 {
+    API_VERSION_H1
+}
+fn is_api_version_h1(v: &u32) -> bool {
+    *v == API_VERSION_H1
 }
 
 impl ServerInfo {
-    /// The info for a server `address` (its NodeId and relays come from it) and `version`.
+    /// The info for a server `address` (its NodeId and relays come from it) and `version`, with the H1 API
+    /// generation and no H2 fields: the server sets `api_version` to [`API_VERSION_H2`] once it serves the H2 API.
     #[must_use]
     pub fn new(address: crate::auth::ServerAddress, version: impl Into<String>) -> Self {
         Self {
@@ -1395,8 +2228,21 @@ impl ServerInfo {
             relays: address.relays.iter().map(|u| u.as_str().to_string()).collect(),
             address,
             version: version.into(),
+            api_version: API_VERSION_H1,
+            min_web_version: None,
+            hub_name: None,
+            max_blob_mb: None,
         }
     }
+}
+
+/// Body of `PATCH /v1/server` (H2 §7.3), `admin` only. Validate with [`UpdateServer::validate`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct UpdateServer {
+    /// The hub's display name: 1-64 printable characters.
+    pub hub_name: String,
 }
 
 /// One row of the append-only usage ledger: one finished attempt (§11).
@@ -1509,6 +2355,10 @@ pub struct UsageTotals {
     /// How many of `attempts` are server estimates ([`UsageRecord::estimated`]).
     #[serde(default)]
     pub estimated_attempts: u64,
+    /// How many ledger rows (slices, H2 §12) are server estimates, midnight slices of running services included.
+    /// Left out when 0, and absent from H1 servers.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub estimated_slices: u64,
 }
 
 /// Response of `GET /v1/usage`: the usage ledger of the caller's project for attempts that ended in `[from, to)`,
@@ -1548,6 +2398,867 @@ impl UsageReport {
             next_cursor: None,
             total,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// H2 resources (H2 spec §5.2-§5.5, §7.3-§7.7): blobs, volumes, templates, devices, pairing tickets, join requests and
+// the error codes H2 adds. Request bodies reject unknown fields; responses ignore them.
+// ---------------------------------------------------------------------------------------------------------------
+
+/// The request header of `POST /v1/blobs` with the blob's SHA-256, 64 lowercase hex (H2 §7.5). The same header name
+/// as [`OUTPUT_SHA256_HEADER`].
+pub const BLOB_SHA256_HEADER: &str = "x-p2pc-sha256";
+/// Default largest blob upload, in MiB (H2 §7.5 `max_blob_mb`).
+pub const DEFAULT_MAX_BLOB_MB: u64 = 2_048;
+/// Default per-account blob quota, in MiB (H2 §7.5 `blobs_quota_mb`).
+pub const DEFAULT_BLOBS_QUOTA_MB: u64 = 20_480;
+
+/// Response of `POST /v1/blobs` (`201`, or `200` when the account already had it; H2 §7.5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct BlobUploaded {
+    /// The blob's digest.
+    pub sha256: Sha256Digest,
+    /// Size in bytes.
+    pub size: u64,
+    /// When the account first stored it.
+    #[serde(with = "crate::timestamp")]
+    #[cfg_attr(feature = "openapi", schema(value_type = String, format = DateTime))]
+    pub created_at: OffsetDateTime,
+    /// When it expires if nothing references it; `null` while a non-terminal job keeps it alive.
+    #[serde(default, with = "crate::timestamp::option")]
+    #[cfg_attr(feature = "openapi", schema(value_type = Option<String>, format = DateTime))]
+    pub expires_at: Option<OffsetDateTime>,
+}
+
+/// One blob of `GET /v1/blobs` (H2 §7.3). There is no endpoint that returns blob contents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct BlobInfo {
+    /// The blob's digest.
+    pub sha256: Sha256Digest,
+    /// Size in bytes.
+    pub size: u64,
+    /// When the account first stored it.
+    #[serde(with = "crate::timestamp")]
+    #[cfg_attr(feature = "openapi", schema(value_type = String, format = DateTime))]
+    pub created_at: OffsetDateTime,
+    /// How many jobs reference it (a count, so the response stays bounded).
+    #[serde(default)]
+    pub referenced_by: u64,
+    /// When it expires if nothing references it; `null` while a non-terminal job keeps it alive.
+    #[serde(default, with = "crate::timestamp::option")]
+    #[cfg_attr(feature = "openapi", schema(value_type = Option<String>, format = DateTime))]
+    pub expires_at: Option<OffsetDateTime>,
+}
+
+/// Response of `GET /v1/blobs` (H2 §7.3, §12): one page of the account's blobs, plus its stored total and quota.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct BlobList {
+    /// The blobs of this page.
+    pub items: Vec<BlobInfo>,
+    /// Pass as `cursor` to get the next page. `None` on the last page.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    /// Bytes the account stores in blobs (every page).
+    #[serde(default)]
+    pub total_bytes: u64,
+    /// The account's blob quota, in MiB.
+    #[serde(default)]
+    pub quota_mb: u64,
+}
+
+/// One volume of `GET /v1/volumes`, from the latest `VolumeReport`s (H2 §7.3, §11.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct VolumeInfo {
+    /// The volume's name, as in the JobSpec (`tpl:<id>/<name>` for template volumes).
+    pub name: String,
+    /// The node that holds it.
+    pub node_id: NodeId,
+    /// Its measured size, in MiB.
+    pub size_mb: u64,
+    /// Its limit, in MiB.
+    pub max_mb: u64,
+    /// When a job last used it.
+    #[serde(default, with = "crate::timestamp::option")]
+    #[cfg_attr(feature = "openapi", schema(value_type = Option<String>, format = DateTime))]
+    pub last_used_at: Option<OffsetDateTime>,
+    /// The job that holds it now, if any (a volume has at most one holder).
+    #[serde(default)]
+    pub in_use_by: Option<JobId>,
+}
+
+/// The UI a template gets in the web app (H2 §7.6, §9.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum TemplateUi {
+    /// The private chat UI.
+    Chat,
+    /// The transcription UI.
+    Transcribe,
+    /// No UI.
+    None,
+}
+
+/// What a template needs from a GPU (H2 §7.6 `requirements.gpu`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum GpuRequirement {
+    /// Launches with `resources.gpu = 1`.
+    Required,
+    /// `gpu: 1` when the account has an eligible GPU node, `gpu: 0` otherwise.
+    Preferred,
+    /// No GPU.
+    #[default]
+    None,
+}
+
+/// A template's hardware requirements (H2 §7.6).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct TemplateRequirements {
+    /// GPU need.
+    #[serde(default)]
+    pub gpu: GpuRequirement,
+    /// Smallest GPU memory, in MiB, if it matters.
+    #[serde(default)]
+    pub min_vram_mb: Option<u64>,
+}
+
+/// The JobSpec field an `int` template parameter may set (H2 §7.6 `field:` targets): a closed list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ParamField {
+    /// `timeout_s`.
+    TimeoutS,
+    /// `service.idle_timeout_s`.
+    ServiceIdleTimeoutS,
+}
+
+impl ParamField {
+    /// The field's path, as written after `field:`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ParamField::TimeoutS => "timeout_s",
+            ParamField::ServiceIdleTimeoutS => "service.idle_timeout_s",
+        }
+    }
+
+    /// The field's JobSpec range for a template of `kind` (H2 §7.1), inclusive. A template's bounds for the
+    /// parameter must lie inside it. `None` when the field does not exist for that kind (`service.*` of a batch).
+    #[must_use]
+    pub const fn range(self, kind: JobKind) -> Option<(u32, u32)> {
+        use crate::validate::{
+            MAX_IDLE_TIMEOUT_S, MAX_SERVICE_TIMEOUT_S, MAX_TIMEOUT_S, MIN_IDLE_TIMEOUT_S, MIN_SERVICE_TIMEOUT_S,
+        };
+        match (self, kind) {
+            (ParamField::TimeoutS, JobKind::Batch) => Some((1, MAX_TIMEOUT_S)),
+            (ParamField::TimeoutS, JobKind::Service) => Some((MIN_SERVICE_TIMEOUT_S, MAX_SERVICE_TIMEOUT_S)),
+            (ParamField::ServiceIdleTimeoutS, JobKind::Service) => Some((MIN_IDLE_TIMEOUT_S, MAX_IDLE_TIMEOUT_S)),
+            (ParamField::ServiceIdleTimeoutS, JobKind::Batch) => None,
+        }
+    }
+}
+
+/// Where a template parameter goes (H2 §7.6 "Parameter targets"). On the wire it is a string: `env:<NAME>`,
+/// `argv:<index>`, `field:timeout_s`, `field:service.idle_timeout_s`, `input:<path>` or `pull`. Parsing checks the
+/// env name, the canonical decimal index and the `/inputs` path rules, so a target can never name a reserved
+/// variable or a path outside `/inputs`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ParamTarget {
+    /// The whole value of an env variable of the template's spec.
+    Env(String),
+    /// One whole argv element of the template's spec.
+    Argv(u32),
+    /// A listed JobSpec field (`int` parameters only).
+    Field(ParamField),
+    /// One `inputs` entry at this fixed path (`blob` parameters only).
+    Input(String),
+    /// The model the hub pulls at launch (`enum` parameters of `ui = "chat"` templates only).
+    Pull,
+}
+
+impl fmt::Display for ParamTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ParamTarget::Env(name) => write!(f, "env:{name}"),
+            ParamTarget::Argv(i) => write!(f, "argv:{i}"),
+            ParamTarget::Field(field) => write!(f, "field:{}", field.as_str()),
+            ParamTarget::Input(path) => write!(f, "input:{path}"),
+            ParamTarget::Pull => f.write_str("pull"),
+        }
+    }
+}
+
+/// The string is not a valid [`ParamTarget`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "expected `env:<NAME>`, `argv:<index>`, `field:timeout_s`, `field:service.idle_timeout_s`, `input:<path under \
+     /inputs/>` or `pull`"
+)]
+pub struct InvalidParamTarget;
+
+impl std::str::FromStr for ParamTarget {
+    type Err = InvalidParamTarget;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "pull" {
+            return Ok(ParamTarget::Pull);
+        }
+        let (kind, rest) = s.split_once(':').ok_or(InvalidParamTarget)?;
+        match kind {
+            "env" if crate::validate::is_settable_env_name(rest) => Ok(ParamTarget::Env(rest.to_string())),
+            "argv" => {
+                // Canonical decimal only: no sign, no leading zero, no spaces.
+                let canonical = !rest.is_empty()
+                    && rest.bytes().all(|b| b.is_ascii_digit())
+                    && (rest == "0" || !rest.starts_with('0'));
+                if !canonical {
+                    return Err(InvalidParamTarget);
+                }
+                rest.parse().map(ParamTarget::Argv).map_err(|_| InvalidParamTarget)
+            }
+            "field" => match rest {
+                "timeout_s" => Ok(ParamTarget::Field(ParamField::TimeoutS)),
+                "service.idle_timeout_s" => Ok(ParamTarget::Field(ParamField::ServiceIdleTimeoutS)),
+                _ => Err(InvalidParamTarget),
+            },
+            "input" if crate::validate::validate_input_path(rest).is_ok() => Ok(ParamTarget::Input(rest.to_string())),
+            _ => Err(InvalidParamTarget),
+        }
+    }
+}
+
+impl Serialize for ParamTarget {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for ParamTarget {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        crate::ids::deserialize_from_str(deserializer)
+    }
+}
+
+/// The type of a template parameter (H2 §7.6): `{"type": "enum", "values": [...]}`, `{"type": "int", "min": …,
+/// "max": …}`, `{"type": "bool"}` or `{"type": "blob"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ParamType {
+    /// One of the template's values.
+    Enum {
+        /// The allowed values.
+        values: Vec<String>,
+    },
+    /// An integer within the template's bounds, inclusive.
+    Int {
+        /// Smallest value.
+        min: i64,
+        /// Largest value.
+        max: i64,
+    },
+    /// `true` or `false`.
+    Bool,
+    /// A blob digest, `sha256:<64 hex>`, of the caller's account.
+    Blob,
+}
+
+/// A parameter value in a launch request (H2 §7.6): a bool, an integer, or a string (enum values and blob
+/// digests).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(untagged)]
+pub enum ParamValue {
+    /// A `bool` parameter.
+    Bool(bool),
+    /// An `int` parameter.
+    Int(i64),
+    /// An `enum` value or a `blob` digest.
+    Text(String),
+}
+
+/// A template parameter (H2 §7.6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct TemplateParam {
+    /// The parameter's name, the key of `params` in a launch.
+    pub name: String,
+    /// A label for the UI.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// The type and its bounds or values.
+    #[serde(flatten)]
+    pub ty: ParamType,
+    /// The value used when a launch leaves it out; a parameter without one is required.
+    #[serde(default)]
+    pub default: Option<ParamValue>,
+    /// Where the value goes: `env:<NAME>`, `argv:<index>`, `field:<field>`, `input:<path>` or `pull`.
+    #[cfg_attr(feature = "openapi", schema(value_type = String))]
+    pub target: ParamTarget,
+}
+
+/// One HTTP request that non-`admin` principals may send to a template service (H2 §7.4, §7.6): exact method and
+/// exact absolute path (a final `*` segment only where the template needs it).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct AllowedRoute {
+    /// A port of the template's `service.ports`.
+    pub port: u32,
+    /// The method, for example `POST`.
+    pub method: String,
+    /// The exact path, for example `/api/chat`.
+    pub path: String,
+}
+
+/// A template as `GET /v1/templates` lists it (H2 §7.6): what the UI needs to offer and launch it. The JobSpec and
+/// the allowed routes stay on the hub ([`Template`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct TemplateInfo {
+    /// The template's id, `[a-z][a-z0-9-]{0,62}`.
+    pub id: String,
+    /// The template's version, from 1.
+    pub version: u32,
+    /// Title for the UI.
+    pub title: String,
+    /// Description for the UI.
+    #[serde(default)]
+    pub description: String,
+    /// `batch` or `service`.
+    pub kind: JobKind,
+    /// The web app UI it gets.
+    pub ui: TemplateUi,
+    /// One shared instance per account and project (H2 §7.6).
+    #[serde(default)]
+    pub singleton: bool,
+    /// Hardware requirements.
+    #[serde(default)]
+    pub requirements: TemplateRequirements,
+    /// Its parameters.
+    #[serde(default)]
+    pub params: Vec<TemplateParam>,
+    /// The image and model licenses, shown in the UI.
+    #[serde(default)]
+    pub licenses: Vec<String>,
+    /// Estimate of the first-run download, in MiB, shown before launch.
+    #[serde(default)]
+    pub download_mb: u64,
+}
+
+/// A template of the signed bundle (H2 §7.6): its listing fields, the vetted JobSpec and the routes non-`admin`
+/// principals may send to it. The bundle rules (pinned digest, targets, `tpl:` volumes, routes) are checked over the
+/// whole bundle by the bundle test (T2-50), not by this type.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct Template {
+    /// What `GET /v1/templates` shows.
+    #[serde(flatten)]
+    pub info: TemplateInfo,
+    /// The vetted JobSpec the launch starts from.
+    pub spec: JobSpec,
+    /// For a service: the requests non-`admin` principals may send. None means closed to them.
+    #[serde(default)]
+    pub allowed_routes: Vec<AllowedRoute>,
+}
+
+/// Response of `GET /v1/templates` (H2 §7.3, §7.6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct TemplateList {
+    /// The served bundle's version; `null` when none can be served.
+    #[serde(default)]
+    pub bundle_version: Option<u64>,
+    /// The templates (empty when no bundle can be served).
+    #[serde(default)]
+    pub templates: Vec<TemplateInfo>,
+    /// Why no bundle can be served, if so.
+    #[serde(default)]
+    pub bundle_error: Option<String>,
+}
+
+/// Body of `POST /v1/templates/{id}/launch` (H2 §7.3, §7.6). Validate with [`LaunchTemplate::validate`]; the
+/// parameters themselves are checked against the template (`422 invalid_params`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct LaunchTemplate {
+    /// Parameter values by name.
+    #[serde(default)]
+    pub params: BTreeMap<String, ParamValue>,
+    /// As for jobs: scoped to the principal, never returned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+}
+
+/// Body of `POST /v1/devices/pairing-tickets` (H2 §5.2), `admin` only. Validate with
+/// [`CreatePairingTicket::validate`] and check it against its creator with
+/// [`check_limits_no_escalation`](crate::validate::check_limits_no_escalation).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct CreatePairingTicket {
+    /// Label of the device it pairs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// The device's scopes. Default: the phone profile ([`PHONE_PROFILE`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<Vec<Scope>>,
+    /// The device's daily cap in milli-units.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_unit_cap: Option<Units>,
+    /// The device's image allowlist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_images: Option<Vec<String>>,
+    /// The ticket's validity in seconds, 1-3 600. Default 600.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_in_s: Option<u32>,
+    /// The device's life in seconds, counted from the ticket's creation; more than the ticket's validity. Absent:
+    /// the device never expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_expires_in_s: Option<u64>,
+    /// The most blob bytes, in MiB, the device may hold a claim on (H2 §7.5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blobs_quota_mb: Option<u64>,
+}
+
+/// Response of `POST /v1/devices/pairing-tickets` (H2 §5.2): returned once. `Debug` redacts `ticket` and `url`
+/// (the URL carries the ticket in its fragment).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct PairingTicketCreated {
+    /// The ticket's row ID, for listing and revoking.
+    pub id: PairingTicketId,
+    /// The ticket, `p2pc_pair_…`. Single-use. A secret: shown once.
+    pub ticket: String,
+    /// `https://<web app origin>/pair#<ticket>`, for the QR code.
+    pub url: String,
+    /// When the ticket expires.
+    #[serde(with = "crate::timestamp")]
+    #[cfg_attr(feature = "openapi", schema(value_type = String, format = DateTime))]
+    pub expires_at: OffsetDateTime,
+}
+
+impl fmt::Debug for PairingTicketCreated {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PairingTicketCreated")
+            .field("id", &self.id)
+            .field("ticket", &"<redacted>")
+            .field("url", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+/// A pairing ticket as `GET /v1/devices/pairing-tickets` lists it (H2 §5.2). Never contains the ticket or its code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct PairingTicketInfo {
+    /// Row ID.
+    pub id: PairingTicketId,
+    /// Label of the device it pairs.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// The device's scopes.
+    pub scopes: Vec<Scope>,
+    /// The device's daily cap.
+    #[serde(default)]
+    pub daily_unit_cap: Option<Units>,
+    /// The device's image allowlist.
+    #[serde(default)]
+    pub allowed_images: Option<Vec<String>>,
+    /// The device's blob quota, in MiB.
+    #[serde(default)]
+    pub blobs_quota_mb: Option<u64>,
+    /// When the device it pairs expires, if it does.
+    #[serde(default, with = "crate::timestamp::option")]
+    #[cfg_attr(feature = "openapi", schema(value_type = Option<String>, format = DateTime))]
+    pub device_expires_at: Option<OffsetDateTime>,
+    /// The principal that created it.
+    pub created_by: Principal,
+    /// Creation time.
+    #[serde(with = "crate::timestamp")]
+    #[cfg_attr(feature = "openapi", schema(value_type = String, format = DateTime))]
+    pub created_at: OffsetDateTime,
+    /// Expiry.
+    #[serde(with = "crate::timestamp")]
+    #[cfg_attr(feature = "openapi", schema(value_type = String, format = DateTime))]
+    pub expires_at: OffsetDateTime,
+    /// When a `Pair` consumed it.
+    #[serde(default, with = "crate::timestamp::option")]
+    #[cfg_attr(feature = "openapi", schema(value_type = Option<String>, format = DateTime))]
+    pub consumed_at: Option<OffsetDateTime>,
+    /// The device it created.
+    #[serde(default)]
+    pub device_id: Option<DeviceId>,
+    /// When it was revoked unused.
+    #[serde(default, with = "crate::timestamp::option")]
+    #[cfg_attr(feature = "openapi", schema(value_type = Option<String>, format = DateTime))]
+    pub revoked_at: Option<OffsetDateTime>,
+}
+
+/// A paired device, as `GET /v1/devices` lists it (H2 §7.3). Never contains key material: a device is
+/// authenticated by its iroh NodeId.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct DeviceInfo {
+    /// Device ID.
+    pub id: DeviceId,
+    /// Its label.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// The platform hint the device sent when it paired (at most 64 bytes, free text).
+    #[serde(default)]
+    pub platform: String,
+    /// Its scopes.
+    pub scopes: Vec<Scope>,
+    /// Its daily cap.
+    #[serde(default)]
+    pub daily_unit_cap: Option<Units>,
+    /// Its image allowlist.
+    #[serde(default)]
+    pub allowed_images: Option<Vec<String>>,
+    /// Its blob quota, in MiB.
+    #[serde(default)]
+    pub blobs_quota_mb: Option<u64>,
+    /// When it expires, if it does.
+    #[serde(default, with = "crate::timestamp::option")]
+    #[cfg_attr(feature = "openapi", schema(value_type = Option<String>, format = DateTime))]
+    pub expires_at: Option<OffsetDateTime>,
+    /// When it paired.
+    #[serde(with = "crate::timestamp")]
+    #[cfg_attr(feature = "openapi", schema(value_type = String, format = DateTime))]
+    pub created_at: OffsetDateTime,
+    /// Last request (written at most once a minute).
+    #[serde(default, with = "crate::timestamp::option")]
+    #[cfg_attr(feature = "openapi", schema(value_type = Option<String>, format = DateTime))]
+    pub last_seen_at: Option<OffsetDateTime>,
+    /// When it was revoked. Revoked rows are kept.
+    #[serde(default, with = "crate::timestamp::option")]
+    #[cfg_attr(feature = "openapi", schema(value_type = Option<String>, format = DateTime))]
+    pub revoked_at: Option<OffsetDateTime>,
+    /// The principal that created its pairing ticket.
+    pub paired_by: Principal,
+}
+
+impl DeviceInfo {
+    /// A live device with no label, limits or activity. Set the other public fields after (CONTRIBUTING rule 7).
+    #[must_use]
+    pub fn new(
+        id: DeviceId,
+        platform: impl Into<String>,
+        scopes: Vec<Scope>,
+        created_at: OffsetDateTime,
+        paired_by: Principal,
+    ) -> Self {
+        Self {
+            id,
+            label: None,
+            platform: platform.into(),
+            scopes,
+            daily_unit_cap: None,
+            allowed_images: None,
+            blobs_quota_mb: None,
+            expires_at: None,
+            created_at,
+            last_seen_at: None,
+            revoked_at: None,
+            paired_by,
+        }
+    }
+
+    /// Whether the device is live at `now`: not revoked and not past its `expires_at` (H2 §5.5).
+    #[must_use]
+    pub fn is_live(&self, now: OffsetDateTime) -> bool {
+        self.revoked_at.is_none() && self.expires_at.is_none_or(|at| at > now)
+    }
+
+    /// Whether it is an **unrestricted `admin`** device (H2 §5.5 "Last admin"): `admin`, no expiry, no cap, no
+    /// image list and no blob quota. The hub refuses to revoke the last live one (`409 last_admin_device`).
+    #[must_use]
+    pub fn is_unrestricted_admin(&self) -> bool {
+        self.scopes.contains(&Scope::Admin)
+            && self.expires_at.is_none()
+            && self.daily_unit_cap.is_none()
+            && self.allowed_images.is_none()
+            && self.blobs_quota_mb.is_none()
+    }
+}
+
+/// Body of `POST /v1/nodes/join-requests` (H2 §5.4, §7.3), copied from the invite QR. NodeIds, the commitment and
+/// the nonces are 32 bytes, written as 64 lowercase hex characters (as [`ServerInfo::node_id`]). Validate with
+/// [`CreateJoinRequest::validate`]; the hub also checks that both NodeIds are Ed25519 points.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct CreateJoinRequest {
+    /// The joining PC's invite listener NodeId.
+    pub listener_node_id: String,
+    /// The joining PC's agent NodeId: the join token will be bound to it.
+    pub iroh_node_id: String,
+    /// The invite's expiry, from the QR.
+    #[serde(with = "crate::timestamp")]
+    #[cfg_attr(feature = "openapi", schema(value_type = String, format = DateTime))]
+    pub invite_expires_at: OffsetDateTime,
+    /// `BLAKE3("p2pc-join-commit-v1" || listener nonce)`, from the QR.
+    pub listener_commitment: String,
+}
+
+/// Response of `POST /v1/nodes/join-requests` (`201`, H2 §5.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct JoinRequestCreated {
+    /// The request's ID.
+    pub id: JoinRequestId,
+    /// 15 minutes after its creation.
+    #[serde(with = "crate::timestamp")]
+    #[cfg_attr(feature = "openapi", schema(value_type = String, format = DateTime))]
+    pub expires_at: OffsetDateTime,
+    /// The hub's 32-byte nonce, 64 lowercase hex, which the phone sends in `InviteOpen`.
+    pub hub_nonce: String,
+}
+
+/// Body of `POST /v1/nodes/join-requests/{id}/reveal` (H2 §5.4 step 4). `Debug` redacts the nonce.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct RevealJoinRequest {
+    /// The listener's 32-byte nonce, 64 lowercase hex.
+    pub listener_nonce: String,
+}
+
+impl fmt::Debug for RevealJoinRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RevealJoinRequest")
+            .field("listener_nonce", &"<redacted>")
+            .finish()
+    }
+}
+
+/// The state of a join request (H2 §5.4, §7.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum JoinRequestState {
+    /// Created; waiting for the listener nonce.
+    AwaitingReveal,
+    /// Revealed; waiting for an `admin`'s approval.
+    Pending,
+    /// Approved; the requesting device may fetch the token.
+    Approved,
+    /// Rejected, withdrawn, or revealed with a wrong nonce.
+    Rejected,
+    /// Past its 15 minutes.
+    Expired,
+    /// Its token was handed to the requesting device.
+    Delivered,
+}
+
+/// A join request as `GET /v1/nodes/join-requests` lists it (H2 §7.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct JoinRequestInfo {
+    /// Request ID.
+    pub id: JoinRequestId,
+    /// The principal that opened it.
+    pub requested_by: Principal,
+    /// The joining PC's invite listener NodeId (64 lowercase hex).
+    pub listener_node_id: String,
+    /// The joining PC's agent NodeId (64 lowercase hex).
+    pub iroh_node_id: String,
+    /// The 6-word approval phrase; `null` while `awaiting_reveal`.
+    #[serde(default)]
+    pub approval_phrase: Option<String>,
+    /// Its state.
+    pub state: JoinRequestState,
+    /// Creation time.
+    #[serde(with = "crate::timestamp")]
+    #[cfg_attr(feature = "openapi", schema(value_type = String, format = DateTime))]
+    pub created_at: OffsetDateTime,
+    /// 15 minutes after creation.
+    #[serde(with = "crate::timestamp")]
+    #[cfg_attr(feature = "openapi", schema(value_type = String, format = DateTime))]
+    pub expires_at: OffsetDateTime,
+}
+
+/// Response of `POST /v1/nodes/join-requests/{id}/token` (H2 §7.3): returned once. `Debug` redacts the token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct JoinRequestToken {
+    /// The join token, bound to the request's agent NodeId. Single-use.
+    #[cfg_attr(feature = "openapi", schema(value_type = String))]
+    pub join_token: JoinToken,
+    /// When it expires.
+    #[serde(with = "crate::timestamp")]
+    #[cfg_attr(feature = "openapi", schema(value_type = String, format = DateTime))]
+    pub expires_at: OffsetDateTime,
+}
+
+/// The error codes H2 adds (H2 §7.7), with their HTTP status.
+///
+/// `invalid_ticket` and `not_paired` are answered on the pairing and device protocols, not by a REST route, so they
+/// have no HTTP status. H1's `last_admin_key` and `cap_exceeded` keep serving keys and template launches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum H2ErrorCode {
+    /// `PairError`: unknown, expired, revoked or used ticket (one code for all).
+    InvalidTicket,
+    /// Close code of a `p2pc/device/1` connection from a NodeId that is not a live device.
+    NotPaired,
+    /// `400`: a device request that carries an `Authorization` header.
+    UnexpectedAuthorization,
+    /// `409`: revoking the last live unrestricted `admin` device.
+    LastAdminDevice,
+    /// `403`: a request to a template service that matches none of its `allowed_routes`.
+    RouteNotAllowed,
+    /// `431`: request line and headers over 8 KiB or 64 headers.
+    HeadersTooLarge,
+    /// `409`: the service is not running.
+    ServiceNotRunning,
+    /// `409`: the service is still `starting`.
+    ServiceNotReady,
+    /// `422`: the port is not in `service.ports`.
+    PortNotExposed,
+    /// `429`: a port connection limit is reached.
+    TooManyConnections,
+    /// `502`: the hub could not open the stream to the node, or the agent refused it.
+    NodeUnreachable,
+    /// `422`: a blob input that the caller's account does not hold.
+    UnknownBlob,
+    /// `422`: blob inputs and inline files do not fit in `resources.disk_mb` minus 64 MiB.
+    InputsExceedDisk,
+    /// `422`: the uploaded body does not hash to `X-P2PC-SHA256`.
+    DigestMismatch,
+    /// `507`: the account's or the device's blob quota would be exceeded.
+    QuotaExceeded,
+    /// `409`: a non-terminal job references the blob.
+    BlobInUse,
+    /// `409`: a job holds the volume.
+    VolumeInUse,
+    /// `422`: volumes on a batch job that is not a template launch.
+    VolumesNotAllowed,
+    /// `503`: the node is offline (a volume deletion is not queued).
+    NodeOffline,
+    /// `422`: a client sent a read-only field (`template`).
+    ReadOnlyField,
+    /// `404`: no template with that id.
+    UnknownTemplate,
+    /// `422`: an unknown parameter, a wrong type or a value out of the template's bounds.
+    InvalidParams,
+    /// `503`: no template bundle can be served.
+    TemplatesUnavailable,
+    /// `409`: a singleton is running with another model.
+    SingletonRunning,
+    /// `409`: the join request is not in a state, or not within the time, that allows the call.
+    JoinRequestClosed,
+    /// `422`: a join request with a bad expiry, NodeId or commitment.
+    InvalidJoinRequest,
+}
+
+impl H2ErrorCode {
+    /// Every code, in the order of H2 §7.7.
+    pub const ALL: [H2ErrorCode; 26] = [
+        H2ErrorCode::InvalidTicket,
+        H2ErrorCode::NotPaired,
+        H2ErrorCode::UnexpectedAuthorization,
+        H2ErrorCode::LastAdminDevice,
+        H2ErrorCode::RouteNotAllowed,
+        H2ErrorCode::HeadersTooLarge,
+        H2ErrorCode::ServiceNotRunning,
+        H2ErrorCode::ServiceNotReady,
+        H2ErrorCode::PortNotExposed,
+        H2ErrorCode::TooManyConnections,
+        H2ErrorCode::NodeUnreachable,
+        H2ErrorCode::UnknownBlob,
+        H2ErrorCode::InputsExceedDisk,
+        H2ErrorCode::DigestMismatch,
+        H2ErrorCode::QuotaExceeded,
+        H2ErrorCode::BlobInUse,
+        H2ErrorCode::VolumeInUse,
+        H2ErrorCode::VolumesNotAllowed,
+        H2ErrorCode::NodeOffline,
+        H2ErrorCode::ReadOnlyField,
+        H2ErrorCode::UnknownTemplate,
+        H2ErrorCode::InvalidParams,
+        H2ErrorCode::TemplatesUnavailable,
+        H2ErrorCode::SingletonRunning,
+        H2ErrorCode::JoinRequestClosed,
+        H2ErrorCode::InvalidJoinRequest,
+    ];
+
+    /// The snake_case `code` of the problem.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        use H2ErrorCode::*;
+        match self {
+            InvalidTicket => "invalid_ticket",
+            NotPaired => "not_paired",
+            UnexpectedAuthorization => "unexpected_authorization",
+            LastAdminDevice => "last_admin_device",
+            RouteNotAllowed => "route_not_allowed",
+            HeadersTooLarge => "headers_too_large",
+            ServiceNotRunning => "service_not_running",
+            ServiceNotReady => "service_not_ready",
+            PortNotExposed => "port_not_exposed",
+            TooManyConnections => "too_many_connections",
+            NodeUnreachable => "node_unreachable",
+            UnknownBlob => "unknown_blob",
+            InputsExceedDisk => "inputs_exceed_disk",
+            DigestMismatch => "digest_mismatch",
+            QuotaExceeded => "quota_exceeded",
+            BlobInUse => "blob_in_use",
+            VolumeInUse => "volume_in_use",
+            VolumesNotAllowed => "volumes_not_allowed",
+            NodeOffline => "node_offline",
+            ReadOnlyField => "read_only_field",
+            UnknownTemplate => "unknown_template",
+            InvalidParams => "invalid_params",
+            TemplatesUnavailable => "templates_unavailable",
+            SingletonRunning => "singleton_running",
+            JoinRequestClosed => "join_request_closed",
+            InvalidJoinRequest => "invalid_join_request",
+        }
+    }
+
+    /// The HTTP status of the problem, or `None` for the two protocol-only codes.
+    #[must_use]
+    pub const fn http_status(self) -> Option<u16> {
+        use H2ErrorCode::*;
+        Some(match self {
+            InvalidTicket | NotPaired => return None,
+            UnexpectedAuthorization => 400,
+            RouteNotAllowed => 403,
+            UnknownTemplate => 404,
+            LastAdminDevice | ServiceNotRunning | ServiceNotReady | BlobInUse | VolumeInUse | SingletonRunning
+            | JoinRequestClosed => 409,
+            PortNotExposed | UnknownBlob | InputsExceedDisk | DigestMismatch | VolumesNotAllowed | ReadOnlyField
+            | InvalidParams | InvalidJoinRequest => 422,
+            TooManyConnections => 429,
+            HeadersTooLarge => 431,
+            NodeUnreachable => 502,
+            NodeOffline | TemplatesUnavailable => 503,
+            QuotaExceeded => 507,
+        })
+    }
+
+    /// The problem for this code, with `title`; `None` for the protocol-only codes.
+    #[must_use]
+    pub fn problem(self, title: impl Into<String>) -> Option<Problem> {
+        self.http_status()
+            .map(|status| Problem::new(status, self.as_str(), title))
+    }
+}
+
+impl fmt::Display for H2ErrorCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -1609,17 +3320,31 @@ impl Problem {
 
     /// The `422` for a rejected [`JobSpec`].
     ///
-    /// The code is `too_large` when the job does not fit its `Lease` frame (field `job`), `unsupported_pool` when the
-    /// pool is the problem (§7 names both codes), and `validation_failed` otherwise. Every field error is listed in
-    /// `errors`.
+    /// The code is, in this order of precedence:
+    /// - `too_large` when the job does not fit its `Lease` frame (field `job`);
+    /// - the H2 §7.1 codes `read_only_field`, `volumes_not_allowed`, `inputs_exceed_disk` and `unknown_blob`, when a
+    ///   field error has that code (an H1 request never produces them);
+    /// - `unsupported_pool` when the pool is the problem (§7 names it and `too_large`);
+    /// - `validation_failed` otherwise.
+    ///
+    /// Every field error is listed in `errors`.
     #[must_use]
     pub fn from_validation(errors: &crate::validate::ValidationErrors) -> Self {
         use crate::validate::ErrorCode;
-        // §7 names two codes: `too_large` when the job does not fit its Lease frame (that check only runs when
-        // every other rule passed, so it never coexists with another error), and `unsupported_pool`.
+        let has = |code: ErrorCode| errors.iter().any(|e| e.code == code);
+        // `too_large` on `job` comes from the Lease frame check, which only runs when every other rule passed, so it
+        // never coexists with another error.
+        let h2 = [
+            ErrorCode::ReadOnlyField,
+            ErrorCode::VolumesNotAllowed,
+            ErrorCode::InputsExceedDisk,
+            ErrorCode::UnknownBlob,
+        ];
         let code = if errors.iter().any(|e| e.field == "job" && e.code == ErrorCode::TooLarge) {
             "too_large"
-        } else if errors.iter().any(|e| e.code == ErrorCode::UnsupportedPool) {
+        } else if let Some(code) = h2.into_iter().find(|c| has(*c)) {
+            code.as_str()
+        } else if has(ErrorCode::UnsupportedPool) {
             "unsupported_pool"
         } else {
             "validation_failed"
@@ -1883,6 +3608,7 @@ mod tests {
             started_at: None,
             finished_at: None,
             attempts: None,
+            service: None,
         };
         let out = format!("{} {:?}", serde_json::to_string(&job).unwrap(), job);
         for s in secrets.iter().copied().chain(["value"]) {
@@ -1978,6 +3704,7 @@ mod tests {
             daily_unit_cap: Some(Units::from_units(5)),
             allowed_images: Some(vec!["docker.io/library/*".to_string()]),
             expires_at: Some(time::macros::datetime!(2027-01-01 00:00:00 UTC)),
+            principal: None,
         };
         let v = serde_json::to_value(&w).unwrap();
         assert_eq!(
@@ -2053,6 +3780,7 @@ mod tests {
             started_at: None,
             finished_at: None,
             attempts: None,
+            service: None,
         };
         let text = serde_json::to_string(&job).unwrap();
         assert!(!text.contains("idempotency"), "{text}");
@@ -2089,6 +3817,7 @@ mod tests {
             started_at: None,
             finished_at: None,
             attempts: None,
+            service: None,
         };
         let mut v = serde_json::to_value(&job).unwrap();
         assert_eq!(v["reason"], "no node has a free GPU");
@@ -2134,6 +3863,7 @@ mod tests {
             at: time::macros::datetime!(2026-11-05 10:00:00 UTC),
             kind: AuditKind::AuthFailed,
             actor_key_id: None,
+            actor_device_id: None,
             subject_id: None,
             detail: json!({"count": 12, "minute": "2026-11-05T10:00:00Z"})
                 .as_object()
@@ -2483,6 +4213,807 @@ mod tests {
         assert!(!LOG_TRUNCATED_MESSAGE.chars().any(char::is_control));
     }
 
+    // ---------------------------------------------------------------------------------------------------------------
+    // H2 (T2-01): JobSpec extension, service view, principals, devices, blobs, templates and errors.
+    // ---------------------------------------------------------------------------------------------------------------
+
+    /// H1 wire fixtures, captured by serializing with the H1 types before the H2 fields existed. Each one must
+    /// deserialize and serialize again to exactly these bytes: an H1 peer sees no change (architect's ruling 4).
+    const H1_FIXTURES: [(&str, &str); 10] = [
+        (
+            "spec_full",
+            r#"{"name":"optional label","image":"docker.io/library/python:3.12-slim","command":["python","-c","print(6*7)"],"env":{"KEY":"value"},"files":[{"path":"/inputs/data.csv","content_b64":"aGk="}],"resources":{"cpu":2.0,"memory_mb":4096,"gpu":0,"disk_mb":10240},"timeout_s":3600,"egress":{"allow":["pypi.org","files.pythonhosted.org"]},"outputs":{"max_mb":1024},"placement":{"pools":["mine"],"node_id":null,"labels":{}},"retry":{"max_attempts":2},"idempotency_key":"optional"}"#,
+        ),
+        (
+            "spec_minimal",
+            r#"{"image":"python:3.12","command":["true"],"env":{},"files":[],"resources":{"cpu":0.5,"memory_mb":256,"gpu":0,"disk_mb":2048},"timeout_s":3600,"egress":{"allow":[]},"outputs":{"max_mb":1024},"placement":{"pools":["mine"],"node_id":null,"labels":{}},"retry":{"max_attempts":2}}"#,
+        ),
+        (
+            "spec_pinned",
+            r#"{"image":"ghcr.io/org/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","command":["/bin/app","--x"],"env":{"A":"1","B_2":""},"files":[],"resources":{"cpu":1.25,"memory_mb":128,"gpu":1,"disk_mb":1},"timeout_s":86400,"egress":{"allow":[]},"outputs":{"max_mb":1024},"placement":{"pools":["mine"],"node_id":"node_01ARZ3NDEKTSV4RRFFQ69G5FAV","labels":{"gpu.vendor/model":"x"}},"retry":{"max_attempts":5}}"#,
+        ),
+        (
+            "view",
+            r#"{"name":"optional label","image":"docker.io/library/python:3.12-slim","command":["python"],"env":{"KEY":"<redacted>"},"files":[{"path":"/inputs/data.csv","size":2,"sha256":"8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4"}],"resources":{"cpu":2.0,"memory_mb":4096,"gpu":0,"disk_mb":2048},"timeout_s":3600,"egress":{"allow":[]},"outputs":{"max_mb":1024},"placement":{"pools":["mine"],"node_id":null,"labels":{}},"retry":{"max_attempts":2}}"#,
+        ),
+        (
+            "job",
+            r#"{"id":"job_01ARZ3NDEKTSV4RRFFQ69G5FAV","project_id":"prj_01ARZ3NDEKTSV4RRFFQ69G5FAV","name":"optional label","status":"running","attempt":1,"spec":{"name":"optional label","image":"docker.io/library/python:3.12-slim","command":["python"],"env":{"KEY":"<redacted>"},"files":[{"path":"/inputs/data.csv","size":2,"sha256":"8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4"}],"resources":{"cpu":2.0,"memory_mb":4096,"gpu":0,"disk_mb":2048},"timeout_s":3600,"egress":{"allow":[]},"outputs":{"max_mb":1024},"placement":{"pools":["mine"],"node_id":null,"labels":{}},"retry":{"max_attempts":2}},"node_id":"node_01ARZ3NDEKTSV4RRFFQ69G5FAV","reason":null,"cancel_requested_at":null,"exit_code":null,"error":null,"estimated_units":2000,"created_at":"2026-11-05T10:00:00Z","started_at":"2026-11-05T10:01:00Z","finished_at":null,"attempts":[{"attempt":1,"node_id":"node_01ARZ3NDEKTSV4RRFFQ69G5FAV","outcome":"running","reason":null,"started_at":null,"ended_at":null}]}"#,
+        ),
+        (
+            "whoami",
+            r#"{"account_id":"acc_01ARZ3NDEKTSV4RRFFQ69G5FAV","project_id":"prj_01ARZ3NDEKTSV4RRFFQ69G5FAV","key_id":"abcdefgh2345","scopes":["jobs:read","jobs:write"],"label":"ci","daily_unit_cap":5000,"allowed_images":null,"expires_at":null}"#,
+        ),
+        ("join_token_req", r#"{"label":"laptop","ttl_s":900}"#),
+        (
+            "audit",
+            r#"{"id":"aud_01ARZ3NDEKTSV4RRFFQ69G5FAV","at":"2026-11-05T10:00:00Z","kind":"key_created","actor_key_id":"abcdefgh2345","subject_id":"x","detail":{"n":1}}"#,
+        ),
+        (
+            "usage_totals",
+            r#"{"key":"job_01ARZ3NDEKTSV4RRFFQ69G5FAV","attempts":2,"reserved_cpu_ms":1,"reserved_gpu_ms":0,"used_cpu_ms":1,"max_rss_mb":3,"units":7,"estimated_attempts":1}"#,
+        ),
+        (
+            "node",
+            r#"{"id":"node_01ARZ3NDEKTSV4RRFFQ69G5FAV","name":"node-1","hostname":"node-1","state":"online","draining":false,"inventory":{"hostname":"node-1","platform":"linux","cpu":{"model":"Example CPU","cores":8},"memory_mb":1024,"os":"linux","arch":"x86_64","gpus":[],"gpu_status":{"status":"ok"},"dxg":false,"sandbox":[],"offered":{"cpu":4.0,"memory_mb":512,"gpu":0},"agent_version":"0.1.0"},"free":{"cpu":1.0,"memory_mb":1,"gpu":0},"labels":{},"last_seen":null,"created_at":"2026-11-05T10:00:00Z"}"#,
+        ),
+    ];
+
+    fn reserialize<T: Serialize + serde::de::DeserializeOwned>(json: &str) -> String {
+        serde_json::to_string(&serde_json::from_str::<T>(json).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn h1_wire_fixtures_are_byte_identical() {
+        for (name, json) in H1_FIXTURES {
+            let again = match name {
+                n if n.starts_with("spec_") => reserialize::<JobSpec>(json),
+                "view" => reserialize::<JobSpecView>(json),
+                "job" => reserialize::<Job>(json),
+                "whoami" => reserialize::<WhoAmI>(json),
+                "join_token_req" => reserialize::<CreateJoinToken>(json),
+                "audit" => reserialize::<AuditEvent>(json),
+                "usage_totals" => reserialize::<UsageTotals>(json),
+                "node" => reserialize::<Node>(json),
+                other => panic!("unknown fixture {other}"),
+            };
+            assert_eq!(again, json, "{name}");
+        }
+        // The Lease an H1 agent receives for an H1 job is unchanged too: the same object (a `LeaseJob` is a JSON map,
+        // whose keys were already sorted in H1, so compare values, not bytes).
+        let spec: JobSpec = serde_json::from_str(H1_FIXTURES[0].1).unwrap();
+        let lease_job = crate::protocol::LeaseJob::from_spec(&spec);
+        assert_eq!(
+            serde_json::to_value(&lease_job).unwrap(),
+            serde_json::from_str::<serde_json::Value>(H1_FIXTURES[0].1).unwrap()
+        );
+        // And an H1 job still parses through the agent's strict check.
+        assert_eq!(lease_job.parse_strict().unwrap(), spec);
+    }
+
+    /// The H2 §7.1 "Private AI chat" example, with placeholders filled in.
+    fn service_json() -> serde_json::Value {
+        json!({
+            "kind": "service",
+            "name": "Private AI chat",
+            "image": format!("docker.io/ollama/ollama@sha256:{}", "a".repeat(64)),
+            "command": ["/bin/ollama", "serve"],
+            "env": {"OLLAMA_HOST": "127.0.0.1:11434", "OLLAMA_MODELS": "/volumes/models"},
+            "resources": {"cpu": 4, "memory_mb": 8192, "gpu": 1, "disk_mb": 2048},
+            "timeout_s": 2_592_000,
+            "egress": {"allow": ["registry.ollama.example", "models.example.com"]},
+            "service": {
+                "ports": [{"port": 11434, "name": "api"}],
+                "health": {"http_get": "/api/version", "port": 11434, "interval_s": 10, "timeout_s": 3,
+                           "start_period_s": 600, "failure_threshold": 3},
+                "idle_timeout_s": 3600,
+                "restart": "on_node_loss"
+            },
+            "volumes": [{"name": "tpl:private-chat/models", "mount": "/volumes/models", "max_mb": 20480}],
+            "placement": {"pools": ["mine"], "node_id": null, "labels": {}},
+            "retry": {"max_attempts": 3},
+            "idempotency_key": "optional"
+        })
+    }
+
+    #[test]
+    fn the_h2_service_example_parses_and_round_trips() {
+        let spec: JobSpec = serde_json::from_value(service_json()).unwrap();
+        assert_eq!(spec.kind, JobKind::Service);
+        let service = spec.service.as_ref().unwrap();
+        assert_eq!(
+            service.ports,
+            [ServicePort {
+                port: 11434,
+                name: "api".into()
+            }]
+        );
+        let health = service.health.as_ref().unwrap();
+        assert_eq!(health.http_get.as_deref(), Some("/api/version"));
+        assert!(!health.tcp);
+        assert_eq!(health.start_period_s, 600);
+        assert_eq!(service.idle_timeout_s, Some(3600));
+        assert_eq!(service.restart, RestartPolicy::OnNodeLoss);
+        assert_eq!(spec.volumes[0].name, "tpl:private-chat/models");
+        let back = serde_json::to_value(&spec).unwrap();
+        assert_eq!(serde_json::from_value::<JobSpec>(back.clone()).unwrap(), spec);
+        assert_eq!(back["kind"], "service");
+    }
+
+    /// The H2 §7.1 "Transcribe audio" example: a batch job with a blob input.
+    #[test]
+    fn the_h2_batch_example_with_a_blob_input_parses() {
+        let digest = "b".repeat(64);
+        let spec: JobSpec = serde_json::from_value(json!({
+            "kind": "batch",
+            "image": format!("ghcr.io/ggml-org/whisper.cpp@sha256:{}", "c".repeat(64)),
+            "command": ["/bin/sh", "/inputs/.template/transcribe.sh"],
+            "env": {"LANGUAGE": "auto", "MODEL": "small"},
+            "inputs": [{"path": "/inputs/audio", "blob": format!("sha256:{digest}")}],
+            "volumes": [{"name": "tpl:transcribe/models", "mount": "/volumes/models", "max_mb": 5120}],
+            "resources": {"cpu": 4, "memory_mb": 4096, "gpu": 1, "disk_mb": 4096},
+            "timeout_s": 3600
+        }))
+        .unwrap();
+        assert_eq!(spec.kind, JobKind::Batch);
+        assert_eq!(spec.inputs[0].blob.to_string(), format!("sha256:{digest}"));
+        assert_eq!(spec.retry.max_attempts, DEFAULT_MAX_ATTEMPTS);
+        // `kind: batch` is the default, so it is left out again.
+        assert!(serde_json::to_value(&spec).unwrap().get("kind").is_none());
+    }
+
+    #[test]
+    fn absent_timeout_and_attempts_take_the_default_of_the_kind() {
+        let minimal = |kind: Option<&str>| {
+            let mut v = json!({"image": "python:3.12", "command": ["true"], "resources": {"cpu": 1, "memory_mb": 256}});
+            if let Some(kind) = kind {
+                v["kind"] = json!(kind);
+            }
+            serde_json::from_value::<JobSpec>(v).unwrap()
+        };
+        for spec in [minimal(None), minimal(Some("batch"))] {
+            assert_eq!((spec.timeout_s, spec.retry.max_attempts), (3_600, 2));
+        }
+        let service = minimal(Some("service"));
+        assert_eq!((service.timeout_s, service.retry.max_attempts), (2_592_000, 3));
+        // An empty `retry` takes the default too; explicit values are kept for both kinds.
+        let mut v = serde_json::to_value(&service).unwrap();
+        v["retry"] = json!({});
+        v.as_object_mut().unwrap().remove("timeout_s");
+        let again: JobSpec = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!((again.timeout_s, again.retry.max_attempts), (2_592_000, 3));
+        v["timeout_s"] = json!(60);
+        v["retry"] = json!({"max_attempts": 1});
+        let explicit: JobSpec = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!((explicit.timeout_s, explicit.retry.max_attempts), (60, 1));
+        // As in H1, `null` is not a value for these fields.
+        for (field, null) in [("timeout_s", json!(null)), ("retry", json!({"max_attempts": null}))] {
+            let mut bad = v.clone();
+            bad[field] = null;
+            assert!(serde_json::from_value::<JobSpec>(bad).is_err(), "{field}");
+        }
+        // The view applies the same defaults (an older server could omit them).
+        let mut view = serde_json::to_value(JobSpecView::from_stored(&service).unwrap()).unwrap();
+        view.as_object_mut().unwrap().remove("timeout_s");
+        view.as_object_mut().unwrap().remove("retry");
+        let view: JobSpecView = serde_json::from_value(view).unwrap();
+        assert_eq!((view.timeout_s, view.retry.max_attempts), (2_592_000, 3));
+    }
+
+    #[test]
+    fn service_block_defaults_and_null_idle_timeout() {
+        let parse = |service: serde_json::Value| {
+            let mut v = service_json();
+            v["service"] = service;
+            serde_json::from_value::<JobSpec>(v).map(|s| s.service.unwrap())
+        };
+        let s = parse(json!({"ports": [{"port": 80, "name": "http"}]})).unwrap();
+        assert_eq!(s.idle_timeout_s, Some(DEFAULT_IDLE_TIMEOUT_S));
+        assert_eq!(s.restart, RestartPolicy::OnNodeLoss);
+        assert!(s.health.is_none());
+        // `null` means never; absent means the default.
+        let never = parse(json!({"ports": [{"port": 80, "name": "http"}], "idle_timeout_s": null})).unwrap();
+        assert_eq!(never.idle_timeout_s, None);
+        let tcp = parse(json!({"ports": [{"port": 80, "name": "http"}], "restart": "never",
+            "health": {"tcp": true, "port": 80}}))
+        .unwrap();
+        let h = tcp.health.unwrap();
+        assert_eq!(
+            (h.tcp, h.interval_s, h.timeout_s, h.start_period_s, h.failure_threshold),
+            (true, 10, 3, 300, 3)
+        );
+        assert_eq!(tcp.restart, RestartPolicy::Never);
+        // Strict: unknown fields in the new request types are refused.
+        assert!(parse(json!({"ports": [{"port": 80, "name": "http", "proto": "udp"}]})).is_err());
+        assert!(parse(json!({"ports": [], "replicas": 2})).is_err());
+        assert!(parse(json!({"ports": [], "restart": "always"})).is_err());
+        let mut v = service_json();
+        v["volumes"][0]["path"] = json!("/x");
+        assert!(serde_json::from_value::<JobSpec>(v).is_err());
+        let mut v = service_json();
+        v["template"] = json!({"id": "private-chat", "version": 1, "pull": null, "extra": 1});
+        assert!(serde_json::from_value::<JobSpec>(v).is_err());
+        let mut v = service_json();
+        v["kind"] = json!("daemon");
+        assert!(serde_json::from_value::<JobSpec>(v).is_err());
+    }
+
+    #[test]
+    fn the_view_of_a_service_keeps_its_h2_fields_and_tolerates_new_ones() {
+        let mut spec: JobSpec = serde_json::from_value(service_json()).unwrap();
+        spec.inputs.push(BlobInput {
+            path: "/inputs/a".into(),
+            blob: BlobRef(Sha256Digest([1; 32])),
+        });
+        spec.template = Some(TemplateRef {
+            id: "private-chat".into(),
+            version: 2,
+            pull: Some("model:4b".into()),
+        });
+        let view = JobSpecView::from_stored(&spec).unwrap();
+        assert_eq!(view.kind, JobKind::Service);
+        assert_eq!(view.service.as_ref().unwrap().ports[0].port, 11434);
+        assert_eq!(view.volumes[0].max_mb, 20480);
+        assert_eq!(view.inputs[0].path, "/inputs/a");
+        assert_eq!(view.template.as_ref().unwrap().pull.as_deref(), Some("model:4b"));
+        assert!(view.env.values().all(|v| v == REDACTED));
+        let mut v = serde_json::to_value(&view).unwrap();
+        assert!(v.get("idempotency_key").is_none());
+        for path in ["service", "volumes/0", "inputs/0", "template"] {
+            let pointer = format!("/{path}");
+            v.pointer_mut(&pointer).unwrap()["future_field"] = json!(1);
+        }
+        v["service"]["ports"][0]["future_field"] = json!(1);
+        v["service"]["health"]["future_field"] = json!(1);
+        assert_eq!(serde_json::from_value::<JobSpecView>(v).unwrap(), view);
+    }
+
+    #[test]
+    fn a_service_job_carries_the_service_view() {
+        let spec: JobSpec = serde_json::from_value(service_json()).unwrap();
+        let mut job = Job::new(
+            JobId::generate(),
+            ProjectId::generate(),
+            JobStatus::Running,
+            1,
+            JobSpecView::from_stored(&spec).unwrap(),
+            Units::ZERO,
+            time::macros::datetime!(2026-11-05 10:00:00 UTC),
+        );
+        assert!(serde_json::to_value(&job).unwrap().get("service").is_none());
+        job.service = Some(ServiceView {
+            health: Some(ServiceHealth::Healthy),
+            ports: job.spec.service.as_ref().unwrap().ports.clone(),
+            open_connections: 2,
+            restarts_24h: 1,
+            setup: Some(ServiceSetup {
+                state: SetupState::Failed,
+                completed_mb: 10,
+                total_mb: Some(2_500),
+                tries: 2,
+                reason: Some(SetupFailure::StreamBroken),
+            }),
+            traffic: Some(ServiceTraffic {
+                day: time::macros::datetime!(2026-11-05 00:00:00 UTC),
+                bytes_in: 1,
+                bytes_out: 2,
+                connections: 3,
+            }),
+            ..ServiceView::default()
+        });
+        let v = serde_json::to_value(&job).unwrap();
+        assert_eq!(v["service"]["health"], "healthy");
+        assert_eq!(v["service"]["setup"]["reason"], "stream_broken");
+        assert_eq!(v["service"]["traffic"]["day"], "2026-11-05T00:00:00Z");
+        assert!(v["service"]["idle_deadline"].is_null());
+        assert_eq!(serde_json::from_value::<Job>(v).unwrap(), job);
+        // Every field of the view defaults: an older or newer server's view parses.
+        assert_eq!(
+            serde_json::from_value::<ServiceView>(json!({"later": true})).unwrap(),
+            ServiceView::default()
+        );
+        for (health, name) in [
+            (ServiceHealth::Starting, "starting"),
+            (ServiceHealth::Unhealthy, "unhealthy"),
+        ] {
+            assert_eq!(serde_json::to_value(health).unwrap(), json!(name));
+        }
+        for (reason, name) in [
+            (SetupFailure::ErrorLine, "error_line"),
+            (SetupFailure::BadLine, "bad_line"),
+            (SetupFailure::Eof, "eof"),
+            (SetupFailure::Deadline, "deadline"),
+        ] {
+            assert_eq!(serde_json::to_value(reason).unwrap(), json!(name));
+        }
+    }
+
+    #[test]
+    fn blob_refs_are_sha256_prefixed_lowercase_hex() {
+        let hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let r: BlobRef = format!("sha256:{hex}").parse().unwrap();
+        assert_eq!(r.0.to_string(), hex);
+        assert_eq!(serde_json::to_value(r).unwrap(), json!(format!("sha256:{hex}")));
+        for bad in [
+            hex.to_string(),
+            format!("SHA256:{hex}"),
+            format!("sha256:{}", hex.to_uppercase()),
+            format!("sha256:{}", &hex[..63]),
+            format!("sha512:{hex}"),
+            format!("sha256: {hex}"),
+        ] {
+            assert_eq!(bad.parse::<BlobRef>(), Err(InvalidBlobRef), "{bad}");
+        }
+    }
+
+    #[test]
+    fn principals_serialize_as_kind_and_id_and_label_for_usage() {
+        let key: KeyId = "abcdefgh2345".parse().unwrap();
+        let dev: DeviceId = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap();
+        assert_eq!(
+            serde_json::to_value(Principal::Key(key)).unwrap(),
+            json!({"kind": "key", "id": "abcdefgh2345"})
+        );
+        assert_eq!(
+            serde_json::to_value(Principal::Device(dev)).unwrap(),
+            json!({"kind": "device", "id": "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"})
+        );
+        assert!(serde_json::from_value::<Principal>(json!({"kind": "device", "id": "abcdefgh2345"})).is_err());
+        assert!(serde_json::from_value::<Principal>(json!({"kind": "node", "id": "x"})).is_err());
+        for p in [Principal::Key(key), Principal::Device(dev)] {
+            assert_eq!(p.to_string().parse::<Principal>(), Ok(p));
+        }
+        // Built from the key ID rather than spelled out, so no literal looks like a credential.
+        assert_eq!(Principal::Key(key).to_string(), format!("key:{key}"));
+        assert_eq!(
+            (Principal::Key(key).key_id(), Principal::Key(key).device_id()),
+            (Some(key), None)
+        );
+        assert_eq!(Principal::Device(dev).device_id(), Some(dev));
+        let bad = [
+            key.to_string(),
+            "key:".into(),
+            format!("device:{key}"),
+            format!("Key:{key}"),
+        ];
+        for bad in &bad {
+            assert_eq!(bad.parse::<Principal>(), Err(InvalidPrincipal), "{bad}");
+        }
+    }
+
+    #[test]
+    fn whoami_principal_is_additive() {
+        let mut w: WhoAmI = serde_json::from_str(H1_FIXTURES[5].1).unwrap();
+        assert_eq!(w.principal, None);
+        w.principal = Some(Principal::Key(w.key_id));
+        let v = serde_json::to_value(&w).unwrap();
+        assert_eq!(v["principal"], json!({"kind": "key", "id": "abcdefgh2345"}));
+        assert_eq!(serde_json::from_value::<WhoAmI>(v).unwrap(), w);
+    }
+
+    #[test]
+    fn h2_scopes_audit_kinds_and_profiles_use_the_spec_names() {
+        let names: Vec<&str> = Scope::ALL.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "admin",
+                "jobs:write",
+                "jobs:read",
+                "nodes:read",
+                "nodes:write",
+                "services:connect",
+                "templates:launch",
+                "blobs:write",
+                "nodes:invite",
+                "nodes:join"
+            ]
+        );
+        for s in Scope::ALL {
+            assert_eq!(serde_json::to_value(s).unwrap(), json!(s.as_str()));
+        }
+        use Scope::*;
+        assert_eq!(PHONE_PROFILE, [NodesRead, TemplatesLaunch, BlobsWrite, NodesInvite]);
+        // The developer profile is the phone profile plus exactly four scopes.
+        assert_eq!(&DEVELOPER_DEVICE_PROFILE[..4], &PHONE_PROFILE);
+        assert_eq!(
+            &DEVELOPER_DEVICE_PROFILE[4..],
+            &[JobsRead, JobsWrite, ServicesConnect, NodesJoin]
+        );
+        assert!(!PHONE_PROFILE.contains(&JobsWrite) && !PHONE_PROFILE.contains(&NodesJoin));
+        assert_eq!(OWNER_PROFILE, [Admin]);
+
+        let h2_kinds = [
+            "pairing_ticket_created",
+            "pairing_ticket_revoked",
+            "device_paired",
+            "device_revoked",
+            "device_added_offline",
+            "device_revoked_offline",
+            "join_request_created",
+            "join_request_revealed",
+            "join_request_reveal_failed",
+            "join_request_approved",
+            "join_request_rejected",
+            "join_request_delivered",
+            "node_approved",
+            "node_left",
+            "template_bundle_loaded",
+        ];
+        let wire: Vec<serde_json::Value> = AuditKind::ALL
+            .iter()
+            .map(|k| serde_json::to_value(k).unwrap())
+            .collect();
+        assert_eq!(&wire[10..], h2_kinds.map(|k| json!(k)).as_slice());
+        let unique: std::collections::BTreeSet<String> = wire.iter().map(ToString::to_string).collect();
+        assert_eq!(unique.len(), AuditKind::ALL.len());
+    }
+
+    #[test]
+    fn audit_actor_device_is_additive() {
+        let mut e: AuditEvent = serde_json::from_str(H1_FIXTURES[7].1).unwrap();
+        assert_eq!(e.actor_device_id, None);
+        e.actor_key_id = None;
+        e.actor_device_id = Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap());
+        e.kind = AuditKind::DevicePaired;
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["actor_device_id"], "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert_eq!(serde_json::from_value::<AuditEvent>(v).unwrap(), e);
+    }
+
+    #[test]
+    fn node_approval_fields_are_additive() {
+        let mut node: Node = serde_json::from_str(H1_FIXTURES[9].1).unwrap();
+        assert_eq!(
+            (node.approval, node.enrolled_by, node.node_phrase.clone()),
+            (NodeApproval::Approved, None, None)
+        );
+        node.approval = NodeApproval::PendingApproval;
+        node.enrolled_by = Some(Principal::Device("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap()));
+        node.node_phrase = Some("one two three four five six".into());
+        let v = serde_json::to_value(&node).unwrap();
+        assert_eq!(v["approval"], "pending_approval");
+        assert_eq!(v["enrolled_by"]["kind"], "device");
+        assert_eq!(serde_json::from_value::<Node>(v).unwrap(), node);
+    }
+
+    #[test]
+    fn server_info_api_version_is_one_when_absent_and_two_for_h2() {
+        let address = crate::auth::ServerAddress::new(
+            "b".repeat(64),
+            vec![url::Url::parse("https://relay.example.invalid/").unwrap()],
+        );
+        let h1 = ServerInfo::new(address, "0.1.0");
+        assert_eq!(h1.api_version, API_VERSION_H1);
+        let v = serde_json::to_value(&h1).unwrap();
+        assert_eq!(keys_of(&v), ["address", "node_id", "relays", "version"]);
+        assert_eq!(serde_json::from_value::<ServerInfo>(v).unwrap().api_version, 1);
+        let h2 = ServerInfo {
+            api_version: API_VERSION_H2,
+            hub_name: Some("Home".into()),
+            max_blob_mb: Some(DEFAULT_MAX_BLOB_MB),
+            min_web_version: Some("0.2.0".into()),
+            ..h1
+        };
+        let v = serde_json::to_value(&h2).unwrap();
+        assert_eq!(
+            (v["api_version"].clone(), v["max_blob_mb"].clone()),
+            (json!(2), json!(2048))
+        );
+        assert_eq!(serde_json::from_value::<ServerInfo>(v).unwrap(), h2);
+        let patch: UpdateServer = serde_json::from_value(json!({"hub_name": "Home"})).unwrap();
+        assert_eq!(patch.hub_name, "Home");
+        assert!(serde_json::from_value::<UpdateServer>(json!({"hub_name": "x", "api_version": 3})).is_err());
+    }
+
+    #[test]
+    fn join_token_pre_approved_and_usage_estimated_slices_are_additive() {
+        let req: CreateJoinToken = serde_json::from_value(json!({"pre_approved": true, "ttl_s": 900})).unwrap();
+        assert!(req.pre_approved);
+        assert_eq!(serde_json::to_value(&req).unwrap()["pre_approved"], true);
+        let mut t: UsageTotals = serde_json::from_str(H1_FIXTURES[8].1).unwrap();
+        assert_eq!(t.estimated_slices, 0);
+        t.estimated_slices = 4;
+        assert_eq!(serde_json::to_value(&t).unwrap()["estimated_slices"], 4);
+    }
+
+    #[test]
+    fn h2_error_codes_are_unique_snake_case_with_the_spec_statuses() {
+        let mut seen = std::collections::BTreeSet::new();
+        for code in H2ErrorCode::ALL {
+            let s = code.as_str();
+            assert!(seen.insert(s), "{s}");
+            assert_eq!(serde_json::to_value(code).unwrap(), json!(s));
+            assert!(s.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'), "{s}");
+            if let Some(p) = code.problem("t") {
+                assert_eq!((p.code.as_str(), Some(p.status)), (s, code.http_status()));
+            }
+        }
+        use H2ErrorCode::*;
+        for (code, status) in [
+            (InvalidTicket, None),
+            (NotPaired, None),
+            (UnexpectedAuthorization, Some(400)),
+            (RouteNotAllowed, Some(403)),
+            (HeadersTooLarge, Some(431)),
+            (ServiceNotReady, Some(409)),
+            (PortNotExposed, Some(422)),
+            (TooManyConnections, Some(429)),
+            (NodeUnreachable, Some(502)),
+            (QuotaExceeded, Some(507)),
+            (NodeOffline, Some(503)),
+            (TemplatesUnavailable, Some(503)),
+            (UnknownTemplate, Some(404)),
+            (VolumesNotAllowed, Some(422)),
+            (ReadOnlyField, Some(422)),
+            (JoinRequestClosed, Some(409)),
+        ] {
+            assert_eq!(code.http_status(), status, "{code}");
+        }
+        // The validation codes with an H2 problem code use the same names.
+        use crate::validate::ErrorCode as E;
+        for (field_code, problem) in [
+            (E::ReadOnlyField, ReadOnlyField),
+            (E::VolumesNotAllowed, VolumesNotAllowed),
+            (E::InputsExceedDisk, InputsExceedDisk),
+            (E::UnknownBlob, UnknownBlob),
+        ] {
+            assert_eq!(field_code.as_str(), problem.as_str());
+        }
+    }
+
+    #[test]
+    fn problem_codes_for_the_h2_validation_errors() {
+        use crate::validate::{ErrorCode, H2Features, Limits, SpecContext};
+        let limits = Limits {
+            h2: H2Features::ALL,
+            ..Limits::default()
+        };
+        let mut spec: JobSpec = serde_json::from_value(service_json()).unwrap();
+        spec.volumes.clear();
+        assert_eq!(spec.validate(&limits), Ok(()));
+        let code = |s: &JobSpec, ctx| Problem::from_validation(&s.validate_in(&limits, ctx).unwrap_err()).code;
+        let mut with_template = spec.clone();
+        with_template.template = Some(TemplateRef {
+            id: "private-chat".into(),
+            version: 1,
+            pull: None,
+        });
+        assert_eq!(code(&with_template, SpecContext::Create), "read_only_field");
+        let mut batch = spec.clone();
+        batch.kind = JobKind::Batch;
+        batch.service = None;
+        batch.timeout_s = 3_600;
+        batch.volumes =
+            serde_json::from_value(json!([{"name": "data", "mount": "/volumes/data", "max_mb": 64}])).unwrap();
+        assert_eq!(code(&batch, SpecContext::Create), "volumes_not_allowed");
+        let errs = batch.check_inputs_fit_disk(0);
+        assert_eq!(errs, Ok(()), "no inputs: the disk rule does not apply");
+        batch.inputs.push(BlobInput {
+            path: "/inputs/a".into(),
+            blob: BlobRef(Sha256Digest([0; 32])),
+        });
+        let disk = batch.check_inputs_fit_disk(u64::MAX).unwrap_err();
+        assert!(disk.contains("inputs", ErrorCode::InputsExceedDisk));
+        assert_eq!(Problem::from_validation(&disk).code, "inputs_exceed_disk");
+        // Out of range stays H1's `validation_failed`, with the field code `out_of_range`.
+        let mut long = spec.clone();
+        long.timeout_s = 2_592_001;
+        assert_eq!(code(&long, SpecContext::Create), "validation_failed");
+    }
+
+    #[test]
+    fn secrets_in_h2_responses_are_redacted_in_debug() {
+        let created = PairingTicketCreated {
+            id: "ptk_01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap(),
+            ticket: "p2pc_pair_SECRETPAYLOAD".into(), // gitleaks:allow
+            url: "https://app.example.invalid/pair#p2pc_pair_SECRETPAYLOAD".into(), // gitleaks:allow
+            expires_at: time::macros::datetime!(2026-11-05 10:10:00 UTC),
+        };
+        let dbg = format!("{created:?}");
+        assert!(!dbg.contains("SECRETPAYLOAD"), "{dbg}");
+        // Serialization shows them: this response is the one time the ticket is shown.
+        assert!(serde_json::to_string(&created).unwrap().contains("SECRETPAYLOAD"));
+        let reveal = RevealJoinRequest {
+            listener_nonce: "7".repeat(64),
+        };
+        assert!(!format!("{reveal:?}").contains("7777"));
+    }
+
+    #[test]
+    fn device_info_liveness_and_unrestricted_admin() {
+        let now = time::macros::datetime!(2026-11-05 10:00:00 UTC);
+        let by = Principal::Key("abcdefgh2345".parse().unwrap());
+        let mut d = DeviceInfo::new(DeviceId::generate(), "iOS Safari", vec![Scope::Admin], now, by);
+        assert!(d.is_live(now) && d.is_unrestricted_admin());
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(v["paired_by"], json!({"kind": "key", "id": "abcdefgh2345"}));
+        assert_eq!(serde_json::from_value::<DeviceInfo>(v).unwrap(), d);
+        d.expires_at = Some(now);
+        assert!(!d.is_live(now) && !d.is_unrestricted_admin());
+        d.expires_at = Some(now + time::Duration::seconds(1));
+        assert!(d.is_live(now));
+        d.expires_at = None;
+        d.blobs_quota_mb = Some(1);
+        assert!(!d.is_unrestricted_admin());
+        d.blobs_quota_mb = None;
+        d.revoked_at = Some(now);
+        assert!(!d.is_live(now));
+        d.scopes = PHONE_PROFILE.to_vec();
+        assert!(!d.is_unrestricted_admin());
+    }
+
+    #[test]
+    fn param_targets_parse_only_the_spec_forms() {
+        use std::str::FromStr;
+        for (text, target) in [
+            ("env:LANGUAGE", ParamTarget::Env("LANGUAGE".into())),
+            ("argv:0", ParamTarget::Argv(0)),
+            ("argv:12", ParamTarget::Argv(12)),
+            ("field:timeout_s", ParamTarget::Field(ParamField::TimeoutS)),
+            (
+                "field:service.idle_timeout_s",
+                ParamTarget::Field(ParamField::ServiceIdleTimeoutS),
+            ),
+            ("input:/inputs/audio", ParamTarget::Input("/inputs/audio".into())),
+            ("pull", ParamTarget::Pull),
+        ] {
+            assert_eq!(ParamTarget::from_str(text), Ok(target.clone()), "{text}");
+            assert_eq!(target.to_string(), text);
+            assert_eq!(serde_json::to_value(&target).unwrap(), json!(text));
+        }
+        for bad in [
+            "env:P2PC_TOKEN",
+            "env:lower",
+            "env:",
+            "argv:-1",
+            "argv:01",
+            "argv: 1",
+            "argv:99999999999",
+            "field:resources.gpu",
+            "field:image",
+            "input:/etc/passwd",
+            "input:/inputs/../x",
+            "input:/inputs",
+            "pull:x",
+            "shell:echo",
+            "",
+        ] {
+            assert_eq!(ParamTarget::from_str(bad), Err(InvalidParamTarget), "{bad}");
+        }
+        assert_eq!(ParamField::TimeoutS.range(JobKind::Batch), Some((1, 86_400)));
+        assert_eq!(ParamField::TimeoutS.range(JobKind::Service), Some((60, 2_592_000)));
+        assert_eq!(
+            ParamField::ServiceIdleTimeoutS.range(JobKind::Service),
+            Some((300, 604_800))
+        );
+        assert_eq!(ParamField::ServiceIdleTimeoutS.range(JobKind::Batch), None);
+    }
+
+    #[test]
+    fn template_shapes() {
+        let entry = json!({
+            "id": "private-chat", "version": 1, "title": "Private AI chat", "description": "Chat with a model",
+            "kind": "service", "ui": "chat", "singleton": true,
+            "requirements": {"gpu": "preferred", "min_vram_mb": 6144},
+            "params": [
+                {"name": "model", "type": "enum", "values": ["m-small", "m-large"], "default": "m-small",
+                 "target": "pull"},
+                {"name": "idle", "type": "int", "min": 900, "max": 86400, "default": 3600,
+                 "target": "field:service.idle_timeout_s"},
+                {"name": "audio", "type": "blob", "target": "input:/inputs/audio"}
+            ],
+            "licenses": ["Ollama: MIT"], "download_mb": 2600,
+            "spec": service_json(),
+            "allowed_routes": [{"port": 11434, "method": "POST", "path": "/api/chat"}]
+        });
+        let t: Template = serde_json::from_value(entry).unwrap();
+        assert_eq!(
+            t.info.params[0].ty,
+            ParamType::Enum {
+                values: vec!["m-small".into(), "m-large".into()]
+            }
+        );
+        assert_eq!(t.info.params[1].default, Some(ParamValue::Int(3600)));
+        assert_eq!(t.info.params[2].target, ParamTarget::Input("/inputs/audio".into()));
+        assert_eq!(t.info.requirements.gpu, GpuRequirement::Preferred);
+        assert_eq!(t.allowed_routes[0].path, "/api/chat");
+        let v = serde_json::to_value(&t).unwrap();
+        assert_eq!(v["params"][1]["type"], "int");
+        assert_eq!(serde_json::from_value::<Template>(v).unwrap(), t);
+        // The listing never carries the spec or the routes.
+        let list = TemplateList {
+            bundle_version: Some(7),
+            templates: vec![t.info.clone()],
+            bundle_error: None,
+        };
+        let text = serde_json::to_string(&list).unwrap();
+        assert!(
+            !text.contains("allowed_routes") && !text.contains("OLLAMA_HOST"),
+            "{text}"
+        );
+        let launch: LaunchTemplate =
+            serde_json::from_value(json!({"params": {"model": "m-small", "idle": 900, "gpu": false}})).unwrap();
+        assert_eq!(launch.params["idle"], ParamValue::Int(900));
+        assert_eq!(launch.params["gpu"], ParamValue::Bool(false));
+        assert!(serde_json::from_value::<LaunchTemplate>(json!({"params": {}, "template": "x"})).is_err());
+    }
+
+    #[test]
+    fn h2_request_bodies_reject_unknown_fields() {
+        assert!(serde_json::from_value::<CreatePairingTicket>(json!({})).is_ok());
+        assert!(serde_json::from_value::<CreatePairingTicket>(json!({"scope": ["admin"]})).is_err());
+        let req = json!({"listener_node_id": "a".repeat(64), "iroh_node_id": "b".repeat(64),
+            "invite_expires_at": "2026-11-05T10:15:00Z", "listener_commitment": "c".repeat(64)});
+        assert!(serde_json::from_value::<CreateJoinRequest>(req.clone()).is_ok());
+        let mut extra = req;
+        extra["code"] = json!("x");
+        assert!(serde_json::from_value::<CreateJoinRequest>(extra).is_err());
+        assert!(serde_json::from_value::<RevealJoinRequest>(json!({"listener_nonce": "a", "x": 1})).is_err());
+    }
+
+    proptest::proptest! {
+        /// Ruling 4: an absent `timeout_s` or `retry.max_attempts` takes the default of the kind; a present one is
+        /// kept; and the spec round-trips through its own serialization.
+        #[test]
+        fn wire_defaults_follow_the_kind(
+            service in proptest::bool::ANY,
+            timeout in proptest::option::of(1u32..3_000_000),
+            attempts in proptest::option::of(1u32..6),
+            retry_object in proptest::bool::ANY,
+        ) {
+            let kind = if service { JobKind::Service } else { JobKind::Batch };
+            let mut v = json!({"image": "python:3.12", "command": ["true"], "resources": {"cpu": 1, "memory_mb": 256}});
+            if service {
+                v["kind"] = json!("service");
+                v["service"] = json!({"ports": [{"port": 80, "name": "http"}]});
+            }
+            if let Some(t) = timeout {
+                v["timeout_s"] = json!(t);
+            }
+            match (attempts, retry_object) {
+                (Some(a), _) => v["retry"] = json!({"max_attempts": a}),
+                (None, true) => v["retry"] = json!({}),
+                (None, false) => {}
+            }
+            let spec: JobSpec = serde_json::from_value(v).unwrap();
+            proptest::prop_assert_eq!(spec.kind, kind);
+            proptest::prop_assert_eq!(spec.timeout_s, timeout.unwrap_or(kind.default_timeout_s()));
+            proptest::prop_assert_eq!(spec.retry.max_attempts, attempts.unwrap_or(kind.default_max_attempts()));
+            let text = serde_json::to_string(&spec).unwrap();
+            let back: JobSpec = serde_json::from_str(&text).unwrap();
+            proptest::prop_assert_eq!(&back, &spec);
+            proptest::prop_assert_eq!(serde_json::to_string(&back).unwrap(), text);
+        }
+
+        /// An H1-shaped spec (no H2 field) serializes with no H2 key, so H1 peers read it, and re-serializes to the
+        /// same bytes.
+        #[test]
+        fn h1_shaped_specs_have_no_h2_keys_and_stable_bytes(
+            name in proptest::option::of("[a-z ]{0,8}"),
+            env in proptest::collection::btree_map("[A-Z]{1,4}", "[a-z0-9]{0,4}", 0..4),
+            timeout in 1u32..86_401,
+            attempts in 1u32..6,
+            node in proptest::bool::ANY,
+            idem in proptest::option::of("[a-z0-9]{1,8}"),
+        ) {
+            let mut spec: JobSpec = serde_json::from_value(spec_json()).unwrap();
+            spec.name = name;
+            spec.env = env;
+            spec.timeout_s = timeout;
+            spec.retry.max_attempts = attempts;
+            spec.placement.node_id = node.then(|| "node_01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap());
+            spec.idempotency_key = idem;
+            let text = serde_json::to_string(&spec).unwrap();
+            for key in ["\"kind\"", "\"service\"", "\"volumes\"", "\"inputs\"", "\"template\""] {
+                proptest::prop_assert!(!text.contains(key), "{} in {}", key, text);
+            }
+            proptest::prop_assert_eq!(reserialize::<JobSpec>(&text), text.clone());
+            let view = serde_json::to_string(&JobSpecView::from_stored(&spec).unwrap()).unwrap();
+            proptest::prop_assert_eq!(reserialize::<JobSpecView>(&view), view);
+        }
+    }
+
     /// Runs with `--features openapi` (CI's clippy builds it with `--all-features`).
     #[cfg(feature = "openapi")]
     #[test]
@@ -2517,6 +5048,25 @@ mod tests {
             AuditKind,
             JoinTokenInfo,
             ServerInfo,
+            UpdateServer,
+            Principal,
+            ServiceView,
+            BlobUploaded,
+            BlobList,
+            VolumeInfo,
+            TemplateList,
+            LaunchTemplate,
+            Template,
+            CreatePairingTicket,
+            PairingTicketCreated,
+            PairingTicketInfo,
+            DeviceInfo,
+            CreateJoinRequest,
+            JoinRequestCreated,
+            RevealJoinRequest,
+            JoinRequestInfo,
+            JoinRequestToken,
+            H2ErrorCode,
         )))]
         struct Doc;
 
@@ -2586,5 +5136,43 @@ mod tests {
                 .contains("\"key\"")
         );
         assert!(schemas["Problem"]["properties"].get("type").is_some());
+        // H2: the new JobSpec fields are optional, in both families, and the new request types are closed.
+        for schema in ["JobSpec", "JobSpecView"] {
+            for field in ["kind", "service", "volumes", "inputs", "template"] {
+                assert!(schemas[schema]["properties"].get(field).is_some(), "{schema}.{field}");
+            }
+            let required = schemas[schema]["required"].as_array().unwrap();
+            assert_eq!(
+                required,
+                &[json!("image"), json!("command"), json!("resources")],
+                "{schema}"
+            );
+        }
+        for closed in [
+            "ServiceSpec",
+            "ServicePort",
+            "HealthCheck",
+            "VolumeSpec",
+            "BlobInput",
+            "TemplateRef",
+        ] {
+            assert_eq!(schemas[closed]["additionalProperties"], json!(false), "{closed}");
+            assert_ne!(
+                schemas[format!("{closed}View").as_str()]["additionalProperties"],
+                json!(false),
+                "{closed}View"
+            );
+        }
+        assert!(schemas["Job"]["properties"].get("service").is_some());
+        for name in [
+            "Principal",
+            "DeviceInfo",
+            "TemplateList",
+            "BlobList",
+            "H2ErrorCode",
+            "JoinRequestInfo",
+        ] {
+            assert!(schemas.get(name).is_some(), "missing schema {name}");
+        }
     }
 }

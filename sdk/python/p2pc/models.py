@@ -29,7 +29,7 @@ from collections.abc import AsyncGenerator, Awaitable, Callable, Iterator
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Generic, Literal, Self, TypeVar
+from typing import TYPE_CHECKING, Annotated, Any, Generic, Literal, Self, TypeVar
 
 from pydantic import (
     BaseModel,
@@ -50,23 +50,32 @@ if TYPE_CHECKING:
 __all__ = [
     "AUDIT_KINDS",
     "GPU_STATUS_KINDS",
+    "JOB_KINDS",
     "LOG_STREAMS",
+    "NODE_APPROVALS",
     "NODE_STATES",
     "PLATFORMS",
+    "RESTART_POLICIES",
     "SANDBOX_CLASSES",
+    "SERVICE_HEALTHS",
+    "SETUP_FAILURES",
+    "SETUP_STATES",
     "ApiKey",
     "AsyncJob",
     "AuditEvent",
+    "BlobInputView",
     "Capacity",
     "CpuInfo",
     "CreateApiKey",
     "CreateJoinToken",
+    "DevicePrincipal",
     "Egress",
     "EgressView",
     "Estimate",
     "FieldError",
     "GpuInfo",
     "GpuStatus",
+    "HealthCheckView",
     "InputFile",
     "InputFileView",
     "Inventory",
@@ -78,6 +87,7 @@ __all__ = [
     "JobStatus",
     "JoinToken",
     "JoinTokenInfo",
+    "KeyPrincipal",
     "LogLine",
     "NewApiKey",
     "Node",
@@ -87,15 +97,23 @@ __all__ = [
     "Page",
     "Placement",
     "PlacementView",
+    "Principal",
     "Resources",
     "ResourcesView",
     "Retry",
     "RetryView",
     "SandboxCapability",
     "ServerInfo",
+    "ServicePortView",
+    "ServiceSetup",
+    "ServiceSpecView",
+    "ServiceTraffic",
+    "ServiceView",
     "SmokeResult",
+    "TemplateRefView",
     "UsageReport",
     "UsageTotals",
+    "VolumeSpecView",
     "WhoAmI",
     "Wsl2Health",
 ]
@@ -105,7 +123,21 @@ __all__ = [
 MAX_FILES_BYTES = 512 * 1024
 MAX_COMMAND_BYTES = 64 * 1024
 MAX_ENV_BYTES = 32 * 1024
-KEY_SCOPES = frozenset({"admin", "jobs:write", "jobs:read", "nodes:read", "nodes:write"})
+KEY_SCOPES = frozenset(
+    {
+        "admin",
+        "jobs:write",
+        "jobs:read",
+        "nodes:read",
+        "nodes:write",
+        # H2 (spec §5.5).
+        "services:connect",
+        "templates:launch",
+        "blobs:write",
+        "nodes:invite",
+        "nodes:join",
+    }
+)
 NODE_STATES = frozenset({"online", "offline"})
 LOG_STREAMS = frozenset({"stdout", "stderr"})
 GPU_STATUS_KINDS = frozenset(
@@ -125,8 +157,32 @@ AUDIT_KINDS = frozenset(
         "node_deleted",
         "auth_failed",
         "key_recovered",
+        # H2 (spec §5.6).
+        "pairing_ticket_created",
+        "pairing_ticket_revoked",
+        "device_paired",
+        "device_revoked",
+        "device_added_offline",
+        "device_revoked_offline",
+        "join_request_created",
+        "join_request_revealed",
+        "join_request_reveal_failed",
+        "join_request_approved",
+        "join_request_rejected",
+        "join_request_delivered",
+        "node_approved",
+        "node_left",
+        "template_bundle_loaded",
     }
 )
+# H2 enums (spec §5.5, §7.1, §7.2). Response fields that carry them are plain strings, so a value a
+# newer server adds still parses, as for the H1 enums above.
+JOB_KINDS = frozenset({"batch", "service"})
+RESTART_POLICIES = frozenset({"never", "on_node_loss"})
+SERVICE_HEALTHS = frozenset({"starting", "healthy", "unhealthy"})
+SETUP_STATES = frozenset({"pulling", "done", "failed"})
+SETUP_FAILURES = frozenset({"error_line", "bad_line", "eof", "stream_broken", "deadline"})
+NODE_APPROVALS = frozenset({"approved", "pending_approval"})
 MILLI = 1000  # milli-units per unit, and milli-vCPUs per vCPU (spec §11)
 MIB = 1024 * 1024
 MAX_OUTPUTS_MB = 10_240  # the server's largest outputs.max_mb
@@ -463,11 +519,68 @@ class InputFileView(_Response):
     sha256: str
 
 
+class ServicePortView(_Response):
+    """One exposed port of a service (H2 spec §7.1)."""
+
+    port: int
+    name: str
+
+
+class HealthCheckView(_Response):
+    """A service health check: ``http_get`` (a path) or ``tcp``, on one of the service's ports."""
+
+    port: int
+    http_get: str | None = None
+    tcp: bool = False
+    interval_s: int = 10
+    timeout_s: int = 3
+    start_period_s: int = 300
+    failure_threshold: int = 3
+
+
+class ServiceSpecView(_Response):
+    """The ``service`` block of a service job (H2 spec §7.1). ``idle_timeout_s=None`` is never.
+
+    ``restart`` is one of :data:`RESTART_POLICIES`, kept as a string.
+    """
+
+    ports: list[ServicePortView]
+    health: HealthCheckView | None = None
+    idle_timeout_s: int | None = 3600
+    restart: str = "on_node_loss"
+
+
+class VolumeSpecView(_Response):
+    """A persistent volume of a job (H2 spec §7.1): a name, never a host path."""
+
+    name: str
+    mount: str
+    max_mb: int
+
+
+class BlobInputView(_Response):
+    """A blob input (H2 spec §7.1): the blob ``sha256:<hex>``, delivered read-only at ``path``."""
+
+    path: str
+    blob: str
+
+
+class TemplateRefView(_Response):
+    """The template a job was launched from (H2 spec §7.6)."""
+
+    id: str
+    version: int
+    pull: str | None = None
+
+
 class JobSpecView(_Response):
     """The spec of a job as returned by the API (spec §7, "Job representation in responses").
 
     The image is normalized, every ``env`` value is the string ``"<redacted>"`` and files carry
     no content. Idempotency keys are never returned.
+
+    The H2 members (``kind``, ``service``, ``volumes``, ``inputs``, ``template``) default to an H1
+    batch job, which is what an H1 server's jobs are. ``kind`` is one of :data:`JOB_KINDS`.
     """
 
     name: str | None = None
@@ -481,6 +594,52 @@ class JobSpecView(_Response):
     outputs: OutputsView | None = None
     placement: PlacementView = Field(default_factory=PlacementView)
     retry: RetryView | None = None
+    kind: str = "batch"
+    service: ServiceSpecView | None = None
+    volumes: list[VolumeSpecView] = Field(default_factory=list)
+    inputs: list[BlobInputView] = Field(default_factory=list)
+    template: TemplateRefView | None = None
+
+
+class ServiceSetup(_Response):
+    """The hub's model pull of a template service (H2 spec §7.2, §7.6).
+
+    ``state`` is one of :data:`SETUP_STATES`, ``reason`` one of :data:`SETUP_FAILURES`.
+    """
+
+    state: str
+    completed_mb: int = 0
+    total_mb: int | None = None
+    tries: int = 0
+    reason: str | None = None
+
+
+class ServiceTraffic(_Response):
+    """A service's traffic for one UTC day, recorded and not billed (H2 spec §12)."""
+
+    day: datetime
+    bytes_in: int = 0
+    bytes_out: int = 0
+    connections: int = 0
+
+
+class ServiceView(_Response):
+    """The ``service`` member of a service job (H2 spec §7.2). Every member is optional.
+
+    ``health`` is one of :data:`SERVICE_HEALTHS`, or ``None`` while the service is not running.
+    """
+
+    health: str | None = None
+    health_since: datetime | None = None
+    ports: list[ServicePortView] = Field(default_factory=list)
+    open_connections: int = 0
+    last_activity_at: datetime | None = None
+    idle_deadline: datetime | None = None
+    deadline: datetime | None = None
+    cap_deadline: datetime | None = None
+    restarts_24h: int = 0
+    setup: ServiceSetup | None = None
+    traffic: ServiceTraffic | None = None
 
 
 class JobAttempt(_Response):
@@ -522,6 +681,9 @@ class _JobFields(_Response):
     attempts: list[JobAttempt] | None = Field(
         default=None,
         description="oldest first; only in jobs.get (a list of jobs leaves the field out)",
+    )
+    service: ServiceView | None = Field(
+        default=None, description="only for service jobs (H2 spec §7.2)"
     )
 
     # --- equality and copies --------------------------------------------------------------
@@ -747,8 +909,29 @@ class NewApiKey(ApiKey):
     key: SecretStr
 
 
+class KeyPrincipal(_Response):
+    """A principal that is an API key (H2 spec §5.5): ``{"kind": "key", "id": <key id>}``."""
+
+    kind: Literal["key"]
+    id: str
+
+
+class DevicePrincipal(_Response):
+    """A principal that is a paired device (H2 spec §5.5): ``{"kind": "device", "id": "dev_…"}``."""
+
+    kind: Literal["device"]
+    id: str
+
+
+Principal = Annotated[KeyPrincipal | DevicePrincipal, Field(discriminator="kind")]
+"""Who authenticated a request (H2 spec §5.5): an API key or a paired device."""
+
+
 class WhoAmI(_Response):
-    """``GET /v1/whoami``: the presented key and its limits. Never its secret."""
+    """``GET /v1/whoami``: the presented key and its limits. Never its secret.
+
+    ``principal`` is ``None`` from an H1 server, whose callers are always the ``key_id`` key.
+    """
 
     account_id: str
     project_id: str
@@ -758,16 +941,21 @@ class WhoAmI(_Response):
     daily_unit_cap: int | None = None
     allowed_images: list[str] | None = None
     expires_at: datetime | None = None
+    principal: Principal | None = None
 
 
 class AuditEvent(_Response):
-    """One row of the append-only audit log (``detail`` never holds a secret)."""
+    """One row of the append-only audit log (``detail`` never holds a secret).
+
+    At most one of ``actor_key_id`` and ``actor_device_id`` is set.
+    """
 
     id: str
     at: datetime
     kind: str
     detail: dict[str, Any]
     actor_key_id: str | None = None
+    actor_device_id: str | None = None
     subject_id: str | None = None
 
 
@@ -916,7 +1104,11 @@ class Inventory(_Response):
 
 
 class Node(_Response):
-    """An enrolled node (spec §7). ``name`` is derived by the server and unique per account."""
+    """An enrolled node (spec §7). ``name`` is derived by the server and unique per account.
+
+    ``approval`` is one of :data:`NODE_APPROVALS`: a ``pending_approval`` node gets no work until
+    an admin approves it (H2 spec §5.5). An H1 server's nodes are ``approved``.
+    """
 
     id: str
     name: str
@@ -928,15 +1120,25 @@ class Node(_Response):
     inventory: Inventory
     labels: dict[str, str] = Field(default_factory=dict)
     last_seen: datetime | None = None
+    approval: str = "approved"
+    enrolled_by: Principal | None = None
+    node_phrase: str | None = None
 
 
 class ServerInfo(_Response):
-    """``GET /v1/server``: how to reach the server's iroh endpoint. Nothing in it is secret."""
+    """``GET /v1/server``: how to reach the server's iroh endpoint. Nothing in it is secret.
+
+    ``api_version`` is 1 for an H1 server (which leaves it out) and 2 for H2 (H2 spec §7.3).
+    """
 
     node_id: str
     relays: list[str]
     address: str
     version: str
+    api_version: int = 1
+    min_web_version: str | None = None
+    hub_name: str | None = None
+    max_blob_mb: int | None = None
 
 
 class UsageTotals(_Response):
@@ -946,6 +1148,8 @@ class UsageTotals(_Response):
     ``key`` is the job, node or key ID of the group, and ``None`` in :attr:`UsageReport.total`.
     ``estimated_attempts`` counts how many of ``attempts`` are server estimates (a node that
     never reported its usage); the server leaves it out when there are none.
+    ``estimated_slices`` counts every estimated ledger row, midnight slices of running services
+    included (H2 spec §12); also left out when 0.
     """
 
     attempts: int
@@ -956,6 +1160,7 @@ class UsageTotals(_Response):
     units: int = Field(description="milli-units")
     key: str | None = None
     estimated_attempts: int = 0
+    estimated_slices: int = 0
 
 
 class UsageReport(_Response):
