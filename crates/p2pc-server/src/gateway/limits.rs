@@ -21,7 +21,8 @@ pub struct GatewayLimits {
     pub max_connections_per_node: usize,
     /// Failed `Join`s per NodeId per minute (§6: 10).
     pub join_failures_per_node_per_minute: u32,
-    /// Failed `Join`s per minute in total (§6: 60).
+    /// Failed `Join`s per minute in total (§6: 60). Beyond it failures get no detailed answer, but the token is still
+    /// looked up, so a valid one enrolls (H2 §6.1, T2-17).
     pub join_failures_per_minute: u32,
     /// Frames decoded at once, across all connections: bounds serde's decode amplification (T02 review).
     pub max_concurrent_decodes: usize,
@@ -156,14 +157,26 @@ impl MinuteLimiter {
 
     /// Whether another event for `key` would still be within both caps at `now`.
     pub fn allows(&mut self, key: &str, now: OffsetDateTime) -> bool {
-        self.roll(now);
-        let used = self.counts.get(key).copied().unwrap_or(0);
-        used < self.per_key && self.sum < self.total
+        self.key_allows(key, now) && self.total_allows(now)
     }
 
-    /// Counts an event for `key` at `now`. A new key in a full table evicts the oldest key.
-    pub fn record(&mut self, key: &str, now: OffsetDateTime) {
+    /// Whether another event for `key` would still be within the per-key cap at `now`, whatever the total.
+    pub fn key_allows(&mut self, key: &str, now: OffsetDateTime) -> bool {
         self.roll(now);
+        self.counts.get(key).copied().unwrap_or(0) < self.per_key
+    }
+
+    /// Whether another event would still be within the total cap at `now`, whatever its key.
+    pub fn total_allows(&mut self, now: OffsetDateTime) -> bool {
+        self.roll(now);
+        self.sum < self.total
+    }
+
+    /// Counts an event for `key` at `now`, and returns whether it was within the total cap (before it was counted).
+    /// A new key in a full table evicts the oldest key.
+    pub fn record(&mut self, key: &str, now: OffsetDateTime) -> bool {
+        self.roll(now);
+        let within_total = self.sum < self.total;
         if let Some(count) = self.counts.get_mut(key) {
             *count = count.saturating_add(1);
         } else {
@@ -175,6 +188,7 @@ impl MinuteLimiter {
             self.order.push_back(key.to_string());
         }
         self.sum = self.sum.saturating_add(1);
+        within_total
     }
 
     /// How many keys the table holds now.
@@ -243,6 +257,27 @@ mod tests {
         // The next minute starts empty.
         assert!(l.allows("a", T + Duration::seconds(60)));
         assert!(l.allows("fresh", T + Duration::seconds(60)));
+    }
+
+    /// H2 §6.1 (T2-17): the per-key and the total caps are told apart, so a caller can refuse a key over its own cap
+    /// and still serve a fresh key once only the total is reached. `record` says whether the event fit in the total,
+    /// and keeps counting per key beyond it.
+    #[test]
+    fn the_per_key_and_total_caps_are_reported_apart() {
+        let mut l = MinuteLimiter::new(2, 3);
+        assert!(l.record("a", T), "1 of 3");
+        assert!(l.record("b", T), "2 of 3");
+        assert!(l.record("c", T), "3 of 3");
+        assert!(!l.total_allows(T));
+        assert!(!l.allows("fresh", T), "the combined check still refuses");
+        assert!(l.key_allows("fresh", T), "a fresh key is within its own cap");
+        assert!(l.key_allows("a", T));
+        assert!(!l.record("a", T), "beyond the total");
+        assert!(!l.key_allows("a", T), "counted per key beyond the total too");
+        assert!(l.key_allows("b", T));
+        // The next minute starts empty.
+        assert!(l.total_allows(T + Duration::seconds(60)));
+        assert!(l.key_allows("a", T + Duration::seconds(60)));
     }
 
     /// T05 review: NodeIds cost nothing, so a full table must not lock out new keys. The oldest key is evicted

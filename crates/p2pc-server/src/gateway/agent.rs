@@ -8,8 +8,10 @@
 //!
 //! - **Unknown NodeIds** (not enrolled, or deleted) may send exactly one `Join`, within the first-message timeout,
 //!   in a frame of at most 64 KiB. They are capped at 64 connections and 16 pending `Join`s, and failed `Join`s are
-//!   rate-limited per NodeId and in total. Beyond any limit the connection is closed with no detail. A `Hello` gets
-//!   `Error{not_enrolled}`, the same bytes whether or not the NodeId was ever enrolled.
+//!   rate-limited per NodeId. Beyond any of these limits the connection is closed with no detail. The total of failed
+//!   `Join`s a minute only caps failure answers: beyond it a failed `Join` is closed with no detail, but a valid token
+//!   still enrolls (H2 §6.1). A `Hello` gets `Error{not_enrolled}`, the same bytes whether or not the NodeId was ever
+//!   enrolled.
 //! - **Enrolled NodeIds** start with `Hello` (or retry their `Join`, which is idempotent), then heartbeat.
 //!
 //! [`NodeHub::send`]: super::NodeHub::send
@@ -289,16 +291,30 @@ enum Joined {
     Node(Box<NodeRow>, bool),
     /// The token does not enroll this NodeId: `Error{invalid_token}`.
     InvalidToken,
-    /// Over a limit (failure rate, pending `Join`s) or a storage error: close with no detail.
+    /// Over a limit (this NodeId's failure rate, pending `Join`s), an invalid token beyond the failure total, or a
+    /// storage error: close with no detail.
     Refused,
 }
 
-/// Runs a `Join` (§5, SI-11). A NodeId over its failure budget, or a `Join` beyond the pending cap, is refused
+/// Runs a `Join` (§5, SI-11). A NodeId over its own failure budget, or a `Join` beyond the pending cap, is refused
 /// without the token being looked at.
+///
+/// The total of failed `Join`s a minute never refuses a `Join` by itself (H2 §6.1, T2-17): otherwise anyone could
+/// lock out every real enrollment by sending bad `Join`s from throwaway NodeIds. Once it is reached the token is
+/// still looked up, so a valid one enrolls; the total only caps the failure answers and logging (the aggregate
+/// failure cap of H2 §5.3): a failure beyond it is closed with no detail and only counted into the aggregated
+/// `auth_failed` row. What bounds the lookups is the connection and pending caps.
 async fn join(inner: &Inner, iroh_id: &str, token: &JoinToken, inventory: &Inventory, unknown: bool) -> Joined {
     let now = inner.state.clock.now();
-    if !inner.join_failures().allows(iroh_id, now) {
-        tracing::debug!("join refused: failure rate limit");
+    let (key_ok, total_ok) = {
+        let mut failures = inner.join_failures();
+        (failures.key_allows(iroh_id, now), failures.total_allows(now))
+    };
+    if !key_ok {
+        // Beyond the aggregate cap, refusals are not logged one by one.
+        if total_ok {
+            tracing::debug!("join refused: failure rate limit of this NodeId");
+        }
         return Joined::Refused;
     }
     // §6: at most this many `Join`s in progress from unknown NodeIds.
@@ -315,14 +331,20 @@ async fn join(inner: &Inner, iroh_id: &str, token: &JoinToken, inventory: &Inven
     match result {
         Ok(Some((node, reenrolled))) => Joined::Node(Box::new(node), reenrolled),
         Ok(None) => {
-            inner.join_failures().record(iroh_id, now);
+            // Counted against this NodeId even beyond the total, so its own limit keeps applying.
+            let within_total = inner.join_failures().record(iroh_id, now);
+            // The aggregated row (one a minute) counts every failure, beyond the total too.
             if let Some(owner) = inner.state.owner_account {
                 inner
                     .state
                     .auth_failures
                     .record(owner, JOIN_FAILURE_SUBJECT.to_string(), now);
             }
-            Joined::InvalidToken
+            if within_total {
+                Joined::InvalidToken
+            } else {
+                Joined::Refused
+            }
         }
         Err(e) => {
             tracing::warn!(error = %e, "join failed on a storage error");
