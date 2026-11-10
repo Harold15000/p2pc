@@ -1,6 +1,6 @@
 # Milestone 2 · P2PC Desktop App and Phone Access (v0.2): specification
 
-- **Status:** draft for review (spec v8, 2026-11-10: v7 plus the fixes of its eighth review). Implementation starts
+- **Status:** draft for review (spec v9, 2026-11-10: v8 plus the fixes of its ninth review). Implementation starts
   when the architect marks it accepted. The two hard-rule exceptions it proposes (persistent volumes, ADR-015; inbound
   iroh connections on the hub PC, ADR-016; both in §4.3) take effect only through one separate change after that
   (O-16); until then the tasks that need them are blocked (§17).
@@ -227,9 +227,11 @@ A device key is never derived from, or sent to, anything else. Losing it means p
   and no-escalation rule as for API keys (H1 §5): if the creator has a cap, the ticket must carry one at or below it,
   and if the creator has an image list, the ticket's list must be made only of its patterns, else
   `403 escalation_denied`. `device_expires_in_s` (optional; absent: the device never expires) sets the device's
-  `expires_at`, counted from the ticket's creation; if the creator has an `expires_at`, the ticket must set one at or
-  before it (H1 §5: a longer life is more power), else `403 escalation_denied`. `blobs_quota_mb` (optional) caps the
-  bytes of the device's own blobs (§7.5); a creator that has one may set only one at or below it. The device row
+  `expires_at`, counted from the ticket's creation with `checked_add`; it must be a positive integer greater than
+  `expires_in_s`, so a device is never born expired (else, or on overflow, `422 out_of_range`); if the creator has an
+  `expires_at`, the ticket must set one at or before it (H1 §5: a longer life is more power), else
+  `403 escalation_denied`. `blobs_quota_mb` (optional) caps the bytes of the blobs the device holds a claim on (§7.5);
+  if the creator has one, the ticket must carry one at or below it, else `403 escalation_denied`. The device row
   stores all of these, and they bind the device as its own principal (§5.5, §12). The desktop app's pairing screen
   offers an optional daily limit. A paired device takes its ticket creator's project:
   `pairing_tickets` and `devices` store `(project_id, account_id)` with the same composite foreign key as `api_keys`.
@@ -449,7 +451,8 @@ would need a rendezvous service to resolve it, which H2 does not have (D4). So:
   - **State:** `GET /v1/jobs` and `GET /v1/jobs/{id}` on visible jobs (H1 redaction of `env` and `files` applies).
   - **Logs and outputs:** `GET /v1/jobs/{id}/logs` and `GET /v1/jobs/{id}/outputs[/{path}]` only on the template jobs
     this principal launched; on a singleton instance launched by someone else, `404`.
-  - **Ports:** `POST /v1/jobs/{id}/ports/{port}/connect` on a visible template service (§7.4).
+  - **Ports:** `POST /v1/jobs/{id}/ports/{port}/connect` on a visible template service, filtered by the template's
+    `allowed_routes` (§7.4).
   - **Cancel:** `POST /v1/jobs/{id}/cancel` on a visible job (§7.2).
 
   A principal that also holds `jobs:read`, `jobs:write` or `services:connect` keeps H1's project-wide rule for that
@@ -467,18 +470,15 @@ would need a rendezvous service to resolve it, which H2 does not have (D4). So:
   other devices' template jobs, open a non-template service, or mint join tokens. A stolen, unlocked phone or an XSS
   in the web app can, until the device is revoked:
   - launch vetted templates (§7.6) and read the state, logs and outputs of the template jobs it launched;
-  - see the state of the shared `singleton` instances, open their ports and stop them. For the beta that is the
-    private chat: the attacker can chat with the owner's model and use Ollama's whole API, which the bridge does not
-    filter (the UI needs `/api/pull`): pull any model published on the template's registry (`/api/pull`), write
-    arbitrary model files into the volume with no egress (`POST /api/blobs/:digest`, `POST /api/create`), and
-    overwrite or delete models, the default one included (`/api/copy`, `/api/create` under an existing name,
-    `DELETE /api/delete`). This is an **accepted residual risk** of the beta: attacker-chosen GGUF files reach the
-    model parser inside the GPU container (§11.5), and a poisoned model stays in the volume **after the device is
-    revoked**, until the model reset offered on revocation (below). Chat history is not on the hub (§9.4), so other
-    devices' conversations are not exposed;
+  - see the state of the shared `singleton` instances, send them the HTTP requests their template allows, and stop
+    them. A template-view principal never gets a raw port connection: the hub forwards only the template's
+    `allowed_routes` (§7.4, §7.6). For the beta that is the private chat: the attacker can chat with the owner's models
+    and list them (`POST /api/chat`, `GET /api/tags`), and cannot pull, create, copy, push or delete a model; the only
+    model downloads are the hub's own, of the template's declared model at launch (§7.6). Chat history is not on the
+    hub (§9.4), so other devices' conversations are not exposed;
   - see the PCs and volumes (`nodes:read`);
-  - upload blobs, check whether the account holds a blob of a given digest (`HEAD`), and delete unreferenced blobs
-    that it uploaded (`blobs:write`, §7.5);
+  - upload blobs, check whether the account holds a blob of a given digest (`HEAD`), and withdraw its own claim on a
+    blob it uploaded, which deletes the blob only when no other principal has a claim on it (`blobs:write`, §7.5);
   - ask for a PC to join, which the hub PC must approve (§5.4).
 
   That is everything it can reach; SI-H2-18 pins it with a negative test per route. It bounds what an attacker with a
@@ -487,18 +487,18 @@ would need a rendezvous service to resolve it, which H2 does not have (D4). So:
   device expiry and blob quota are within its creator's (§5.2). Only `admin` principals create pairing tickets in H2.
 - **Revocation.** `DELETE /v1/devices/{id}` (`admin`) sets `revoked_at`, closes every live `p2pc/device/1` connection of
   that NodeId and every service stream it opened, within 5 s (SI-H2-4). As for keys (H1 §5), an `admin` principal may
-  revoke only a device it could have created (`check_no_escalation` applied to the device's scopes, cap, image list and
-  expiry), else `403 escalation_denied`. A device can revoke itself ("Forget this cloud" in the web app). The hub
-  refuses to revoke the last live unrestricted `admin` principal, device or key (H1 "Last admin key", extended to
-  devices; an unrestricted device, like a key, has no `expires_at`, no `daily_unit_cap` and no `allowed_images`):
+  revoke only a device it could have created (`check_no_escalation` applied to the device's scopes, cap, image list,
+  expiry and blob quota), else `403 escalation_denied`. A device can revoke itself ("Forget this cloud" in the web
+  app). The hub refuses to revoke the last live unrestricted `admin` principal, device or key (H1 "Last admin key",
+  extended to devices; an unrestricted device has no `expires_at`, no `daily_unit_cap`, no `allowed_images` and no
+  `blobs_quota_mb`, and a key keeps H1's definition, since keys have no blob quota):
   revoking such a key keeps H1's `409 last_admin_key`, unchanged, and revoking such a device gets the new `409
   last_admin_device`. The offline `devices add` and `keys recover` remain the way back. The offline `p2pc-server devices
   revoke` (§5.3) revokes the same way when the app cannot get a device connection; a running hub notices a revocation
-  written by another process because it re-reads, every 2 s, the `revoked_at` of the devices that hold live connections,
-  and then closes them as for `DELETE`, so the 5 s of SI-H2-4 hold for it too.
-- **Model reset.** Revoking a device with `templates:launch` also offers "Reset the private chat's models": the app
-  stops the `private-chat` instance and deletes its `tpl:private-chat/models` volume on every node that reports it
-  (`DELETE /v1/volumes/{node_id}/{name}`, §7.3), so the next launch downloads the default model again.
+  written by another process because of its **liveness sweep**: every 2 s it re-reads the `revoked_at` and
+  `expires_at` of the devices that hold live connections, and closes every connection and service stream of a device
+  that is revoked or has `expires_at <= now`, by the same path as `DELETE`. So the 5 s of SI-H2-4 hold for an offline
+  revocation and for an expiry too, including upgraded port connections and log follows that carry traffic.
 - **Unknown or revoked device.** A device is live while it is neither revoked nor past its `expires_at`. A
   `p2pc/device/1` connection from a NodeId that is not a live device gets the same close code (`not_paired`) whether
   it was never paired, revoked, expired or belongs to nothing. Revoked and expired rows are kept.
@@ -543,7 +543,10 @@ stores a principal in two columns:
   set only by an `admin` principal's explicit option, §5.4). `audit_events` gains `actor_device_id`
   with `CHECK (actor_key_id IS NULL OR actor_device_id IS NULL)` (aggregated failures have no actor), and its update
   trigger compares the new column too. `nodes` gains `approval` (`NOT NULL DEFAULT 'approved'`) and `enrolled_by`, the
-  principal of the token that enrolled it (`NULL` for H1 nodes); both are plain added columns.
+  principal of the token that enrolled it (`NULL` for H1 nodes); both are plain added columns. The new `blobs` table
+  (§7.5) has no principal column: its uploaders are rows of the new `blob_uploaders (account_id, sha256,
+  uploaded_by_key_id, uploaded_by_device_id)`, with the same exactly-one `CHECK` and two partial unique indexes, one
+  per principal column, as for idempotency below. Each row is one principal's **claim** on the blob.
 - **Audit kinds.** The rebuilt `audit_events` keeps H1's closed `kind` list and adds every H2 kind:
   `pairing_ticket_created`, `pairing_ticket_revoked`, `device_paired`, `device_revoked`, `device_added_offline`,
   `device_revoked_offline`, `join_request_created`, `join_request_revealed`, `join_request_reveal_failed`,
@@ -735,9 +738,10 @@ first phone that opens it:
   - **Idle limits:** a streaming route keeps H1's 60 s idle limit; an upgraded port connection on `p2pc/device/1`
     closes after `port_idle_s` (default 600 s, §7.4) with no byte in either direction (the web app opens a new one
     per chat request). A misbehaving phone that leaves streams open therefore gives them back within 10 minutes, and
-    within 5 s of its revocation (§5.5).
-- **The hub checks the device at connection time and on every request.** A revocation is seen at the next request,
-  and the hub also closes the connection actively (§5.5).
+    within 5 s of its revocation or of its `expires_at` (§5.5).
+- **The hub checks the device at connection time and on every request.** A revocation or an expiry is seen at the next
+  request, and the hub also closes the device's connections and service streams actively: its 2 s liveness sweep
+  closes those of every device that is revoked or has `expires_at <= now` (§5.5).
 - **Before the device check** (unauthenticated surface: any NodeId can complete the handshake). The hub looks the NodeId
   up (one indexed lookup) right after the handshake, before it accepts any stream, and closes a NodeId that is not a
   live device with `not_paired` (§5.5). Limits, counted separately from the other ALPNs: at most 32 connections at once
@@ -860,7 +864,9 @@ The Lease frame limit (1 MiB, H1 §6) still applies to the whole job; blob input
   `templates:launch` path, never to `jobs:write`. A singleton instance is shared by every launcher (a launch returns
   the running instance, §7.6), so any principal that may launch it may also stop it.
 - **`GET /v1/jobs/{id}`** adds, for services, `service: {health, health_since, ports:[{port, name}], open_connections,
-  last_activity_at, idle_deadline, deadline, cap_deadline, restarts_24h}`; `idle_deadline` is `null` while a
+  last_activity_at, idle_deadline, deadline, cap_deadline, restarts_24h, setup}`; `setup` is the hub's model pull of
+  §7.6 (`{state: "pulling"|"done"|"failed", completed_mb, total_mb}`, `null` for a job without one); `idle_deadline` is
+  `null` while a
   connection is open or when `idle_timeout_s` is `null`; `deadline` is when `timeout_s` ends the current attempt;
   `cap_deadline` is when today's cap reservation runs out (§12), `null` for an uncapped principal. `GET /v1/jobs` gains
   the filter `kind`.
@@ -869,11 +875,11 @@ The Lease frame limit (1 MiB, H1 §6) still applies to the whole job; blob input
 
 | Method and path | Scope | Notes |
 |---|---|---|
-| `POST /v1/jobs/{id}/ports/{port}/connect` | services:connect, or templates:launch for a template service of its template view (§5.5) | HTTP/1.1 upgrade to a raw byte stream into the service (§7.4). |
+| `POST /v1/jobs/{id}/ports/{port}/connect` | services:connect, or templates:launch for a template service of its template view (§5.5) | HTTP/1.1 upgrade to a raw byte stream into the service; on the template-view path, one request filtered by the template's `allowed_routes` (§7.4). |
 | `POST /v1/blobs` | blobs:write | Upload one blob (§7.5). |
 | `HEAD /v1/blobs/{sha256}` | blobs:write or jobs:read | `200` with `Content-Length` if the caller's account has it, else `404`. |
 | `GET /v1/blobs` | jobs:read | `{sha256, size, created_at, referenced_by, expires_at}`, cursor pagination. |
-| `DELETE /v1/blobs/{sha256}` | blobs:write | Only a blob the caller uploaded, unless the caller is `admin` (else `403`, §7.5). `409 blob_in_use` while a non-terminal job references it. |
+| `DELETE /v1/blobs/{sha256}` | blobs:write | Removes the caller's claim (an `admin`: every claim); a caller without a claim gets `403`, unless it is `admin` (§7.5). `409 blob_in_use` while a non-terminal job references it. |
 | `GET /v1/volumes` | nodes:read | `{name, node_id, size_mb, max_mb, last_used_at, in_use_by}` from the latest `VolumeReport`s. |
 | `DELETE /v1/volumes/{node_id}/{name}` | admin | Sends `VolumeDelete`. `{name}` is one percent-encoded path segment: a `tpl:` name is sent as `tpl%3Aprivate-chat%2Fmodels`, and the hub decodes the segment once and validates the result with §7.1's name rule (`404` for an unknown volume). `409 volume_in_use`; `503 node_offline` (the deletion is not queued). A route test and a CLI test (`p2pc volumes rm`) cover a `tpl:` name. |
 | `GET /v1/templates` | jobs:read or templates:launch | The loaded template bundle (§7.6), with `bundle_version`; an empty list and `bundle_error` when no bundle can be loaded. |
@@ -898,7 +904,8 @@ No endpoint returns blob contents: the hub is not a file store.
 
 - **Request.** `POST /v1/jobs/{id}/ports/{port}/connect` with `Connection: Upgrade` and `Upgrade: p2pc-port/1`, no body.
   On success the hub answers `101 Switching Protocols` and the connection becomes a raw, bidirectional byte stream to
-  `127.0.0.1:<port>` inside the service's container.
+  `127.0.0.1:<port>` inside the service's container; on the template-view path, a filtered HTTP request instead
+  (below).
 - **Errors before the upgrade:** `404` (unknown job, or not visible to the principal), `409 service_not_running`,
   `409 service_not_ready` (health is `starting`; `?wait_ready=true` waits up to 30 s instead),
   `422 port_not_exposed`, `429 too_many_connections`, `502 node_unreachable` (the hub could not open the stream or the
@@ -907,6 +914,24 @@ No endpoint returns blob contents: the hub is not a file store.
   (H1 tunnel) and behind a TLS reverse proxy that passes upgrades. One code path, one authorization check
   (SI-H2-5): `services:connect` for any service of the caller's project, or `templates:launch` for a template service
   of the caller's template view (§5.5); any other job answers `404`.
+- **Template-view connections carry filtered HTTP, never raw bytes.** When the connect is authorized through the
+  template view (the principal has `templates:launch` but not `services:connect`), the hub does not splice the
+  upgraded connection into the port. It reads **one** HTTP/1.1 request from it and forwards that request only if its
+  method and path match an entry `{port, method, path}` of the template's `allowed_routes` (§7.6), taken from the
+  bundle the hub serves by the job's `template.id` (no bundle served: nothing matches):
+  - the request target is origin-form and equals the entry's path byte for byte, with no query, no fragment and no
+    decoding or normalization; the only wildcard is a final path segment `*` (one non-empty segment of
+    `[A-Za-z0-9._-]`), and the bundle test allows it only where a template needs it (the beta templates do not);
+  - request line and headers at most 8 KiB and 64 headers (`431 headers_too_large`), within H1's 10 s; a body only
+    with `Content-Length`, at most 1 MiB (`413 too_large`), within 30 s; `Transfer-Encoding`, `Upgrade`, `Expect` and
+    the `CONNECT` method get `400`;
+  - anything else gets `403 route_not_allowed` from the hub itself, and nothing reaches the service;
+  - an allowed request is forwarded with `Connection: close` set, no byte after its body is forwarded, and the
+    response is relayed as it comes (a streamed chat answer included) until the service closes; then the hub closes
+    the connection. The next request needs a new connection, as the web app already opens one per chat request.
+
+  Raw port connections stay available to principals with `services:connect` (developer devices, `admin` keys and
+  devices). SI-H2-18 tests the filter.
 - **Limits.** The upgraded connection leaves the H1 whole-request limit. On every transport it closes after
   `port_idle_s` (default 600 s) with no byte in either direction. On the TCP listener and `p2pc/http/1`, upgraded port
   connections together hold at most `port_conn_budget` (default 64, below H1's REST cap of 256) of that cap, so the rest
@@ -931,10 +956,11 @@ No endpoint returns blob contents: the hub is not a file store.
 - **Checks before reading the body:** `Content-Length <= max_blob_mb` (default 2,048 MiB, `413 too_large`); then, with
   `checked_add`, the account's stored bytes plus in-flight reservations plus this size `<= blobs_quota_mb` (default
   20,480 MiB; on the hub PC the app sets it at "Create my cloud" from the disk arithmetic of §8.2;
-  `507 quota_exceeded`); for a device with `blobs_quota_mb` (§5.2), the same sum over the blobs it uploaded and its
-  own reservations must also fit that quota (`507 quota_exceeded`); and at most 2 uploads per principal are in
+  `507 quota_exceeded`); for a device with `blobs_quota_mb` (§5.2), the same sum over the blobs it holds a claim on
+  and its own reservations must also fit that quota (`507 quota_exceeded`); and at most 2 uploads per principal are in
   progress at once (`429 too_many_uploads`). The reservation is taken in the same short transaction and released on
-  every exit path. The blob row records the principal of the upload that created it (the two columns of §5.6).
+  every exit path. Every principal whose upload creates the blob or is deduplicated against it gets its own claim, a
+  `blob_uploaders` row (§5.6), so a later uploader is recorded as well as the first.
 - **Writing.** The body streams to `<data>/blobs/staging/<random>` while hashing. A short body, a hash mismatch
   (`422 digest_mismatch`) or a broken connection deletes the staging file. On success: `fsync`, rename to
   `<data>/blobs/<account_id>/sha256/<aa>/<bb>/<hex>`, then insert the row (two short transactions with no I/O under
@@ -958,8 +984,9 @@ No endpoint returns blob contents: the hub is not a file store.
   2. **File**: delete it, outside any database transaction.
   3. **Row**: delete it.
 
-  `DELETE /v1/blobs/{sha256}` runs the same three steps at once for an unreferenced blob of the caller's account
-  that the caller uploaded; an `admin` may delete any, and any other caller gets `403`.
+  `DELETE /v1/blobs/{sha256}` on a blob of the caller's account that no non-terminal job references removes only the
+  caller's claim (an `admin` removes every claim; a caller without a claim gets `403`), and runs the same three steps
+  at once when no claim remains.
   An upload of a digest with a tombstone waits until step 3 has run for it, then stores the blob as new. A lock in the
   hub keyed by **`(account_id, digest)`** makes this safe: the GC (or the `DELETE`) holds it from before step 1 until
   step 3, and an upload holds it from its check of the row (deduplication or tombstone) until its rename and row
@@ -974,8 +1001,9 @@ No endpoint returns blob contents: the hub is not a file store.
   code. Fields: `id`, `version`, `title`, `description`, `kind`, `ui` (`chat`, `transcribe` or `none`), `singleton`
   (bool), `requirements` (`gpu = "required" | "preferred" | "none"`, `min_vram_mb`), `params` (typed: `enum` with
   values, `int` with bounds, `bool`, `blob`; each with one `target`, below), the `spec` (a JobSpec), `licenses` (the
-  image and model licenses, shown in the UI), and `download_mb` (an estimate of the first-run download, shown before
-  launch).
+  image and model licenses, shown in the UI), `download_mb` (an estimate of the first-run download, shown before
+  launch) and, for a service, `allowed_routes`: the `{port, method, path}` entries that template-view principals may
+  send to it (§7.4; exact method and path). A service template without them is closed to template-view principals.
 - **Resources are fixed by the template.** The `spec` sets the job's `resources`; a template has no separate
   `resources` field and no minimum or maximum, because no parameter target reaches them. The only resource the hub
   changes at launch is `resources.gpu` (below).
@@ -986,7 +1014,8 @@ No endpoint returns blob contents: the hub is not a file store.
     JobSpec range (§7.1) for the template's `kind`, and the launch checks the value's type and the template's bounds
     (`422 invalid_params` outside them) before the normal JobSpec validation runs on the result;
   - `input:<path>`, only for a `blob` parameter: one `inputs` entry `{path, blob}` at the path fixed by the template;
-    the digest must exist in the caller's account (`422 unknown_blob`, §7.1).
+    the digest must exist in the caller's account (`422 unknown_blob`, §7.1);
+  - `pull`, only for an `enum` parameter of a `ui = "chat"` template: the model the hub downloads at launch (below).
 
   The only other field the hub sets at launch is `resources.gpu`, from `requirements.gpu` (placement hints, below).
 - **Rules every template MUST meet** (checked by a test over the whole bundle):
@@ -995,6 +1024,8 @@ No endpoint returns blob contents: the hub is not a file store.
     field within the template's bounds, or an `inputs` entry at a fixed path; never interpolated into a shell string
     or a path; enum values come from the template;
   - egress is a fixed list in the template; volumes use the `tpl:<id>/` namespace;
+  - `allowed_routes` name ports in `service.ports`, one method and an exact absolute path each (a final `*` segment
+    only where the template needs it), and never a route that pulls, creates, copies, pushes or deletes models;
   - the spec sets a finite `timeout_s` (for a batch template, one that fits the daily caps the template is meant for);
   - every field passes the normal JobSpec validation.
 - **Bundle.** CI compiles `templates/*.toml` into `templates.json` and signs it with the release key (minisign,
@@ -1020,6 +1051,11 @@ No endpoint returns blob contents: the hub is not a file store.
   apply as for any job. For a `singleton` template, a launch while an instance is `queued`, `assigned` or `running`
   returns that instance (`200`); any principal with `templates:launch` in that account and project may also stop it
   (§7.2).
+- **Model download.** Models reach a template's volume only from the hub, never from a principal: when an attempt of a
+  job whose template has a `pull` parameter first becomes healthy, the hub itself sends one
+  `POST /api/pull {"model": <the parameter's value>, "stream": true}` to the service through the bridge and reports
+  its progress as `service.setup` (§7.2). It reads the answer as untrusted: lines of at most 4 KiB, only `status`,
+  `completed` and `total`; a longer or malformed line ends the pull with `setup.state = "failed"`.
 - **Launch by a capped principal** (one with a `daily_unit_cap`). The launch is checked against the cap before the job
   exists, and refused with H1's `402 cap_exceeded` and a `detail` that names the template, the units it needs and
   the units left today, so the UI can say "Your daily limit does not allow <template>". A batch template passes when
@@ -1033,15 +1069,17 @@ No endpoint returns blob contents: the hub is not a file store.
 
 | Template | Kind | What | Status |
 |---|---|---|---|
-| `private-chat` | service, singleton, `ui = "chat"` | Ollama (MIT [S12]) with its API on port 11434, models in `tpl:private-chat/models` (20 GiB cap), `idle_timeout_s` an `int` parameter with target `field:service.idle_timeout_s` (900-86,400 s, default 3,600, inside the field's 300-604,800 range), `timeout_s` 30 days (the maximum; after it the chat UI offers "Restart"). Parameter `model`: an enum of small models whose licenses allow this use; default **a model of at most ~4 B parameters with an Apache-2.0 or MIT license (H)**, chosen in E11 by quality, size (about 2.5 GiB **(H)**) and VRAM (fits 6 GiB **(H)**). Ollama follows `HTTPS_PROXY` for downloads [S12], which the shim sets (H1 §9). | E11 pins the image digest, the model list and the egress hosts. |
+| `private-chat` | service, singleton, `ui = "chat"` | Ollama (MIT [S12]) with its API on port 11434, models in `tpl:private-chat/models` (20 GiB cap), `idle_timeout_s` an `int` parameter with target `field:service.idle_timeout_s` (900-86,400 s, default 3,600, inside the field's 300-604,800 range), `timeout_s` 30 days (the maximum; after it the chat UI offers "Restart"). `allowed_routes`: `POST /api/chat` and `GET /api/tags` on port 11434, nothing else. Parameter `model` (target `pull`): an enum of small models whose licenses allow this use; default **a model of at most ~4 B parameters with an Apache-2.0 or MIT license (H)**, chosen in E11 by quality, size (about 2.5 GiB **(H)**) and VRAM (fits 6 GiB **(H)**). Ollama follows `HTTPS_PROXY` for downloads [S12], which the shim sets (H1 §9). | E11 pins the image digest, the model list and the egress hosts. |
 | `transcribe` | batch, `ui = "transcribe"` | whisper.cpp (MIT; upstream publishes `ghcr.io/ggml-org/whisper.cpp:main-cuda` with ffmpeg included [S13]) with a fixed script (`/inputs/.template/transcribe.sh`, shipped as an inline `files` entry of the template, so it is read-only in the container): convert the input with ffmpeg, run the model, write `transcript.txt`, `.srt` and `.vtt` to `/outputs`. Parameters: `audio` (`blob`, target `input:/inputs/audio`), `language` (enum, default `auto`, target `env:LANGUAGE`), `model` (`base`, `small` default, `medium`; target `env:MODEL`). Models in `tpl:transcribe/models` (5 GiB cap). | E11 chooses the image (an upstream image with ffmpeg and CUDA, or our own build published by digest) and the model download hosts. |
 
-The chat UI is part of the web app (§9.4): it talks to Ollama's HTTP API (`/api/tags`, `/api/pull` with streamed
-progress, `/api/chat` with `stream: true`) through §7.4. Nothing of a third-party web UI is loaded into the phone.
+The chat UI is part of the web app (§9.4): it uses exactly the template's `allowed_routes` of Ollama's HTTP API
+(`GET /api/tags`, `POST /api/chat` with `stream: true`) through §7.4, and shows the hub's model download from
+`service.setup`. Nothing of a third-party web UI is loaded into the phone.
 
 ### 7.7 Errors added
 
-`invalid_ticket`, `not_paired`, `unexpected_authorization`, `last_admin_device`, `service_not_running`,
+`invalid_ticket`, `not_paired`, `unexpected_authorization`, `last_admin_device`, `route_not_allowed`,
+`headers_too_large`, `service_not_running`,
 `service_not_ready`, `port_not_exposed`, `too_many_connections`, `node_unreachable`, `unknown_blob`,
 `inputs_exceed_disk`, `digest_mismatch`, `quota_exceeded`, `blob_in_use`, `volume_in_use`, `volumes_not_allowed`,
 `node_offline`, `read_only_field`, `unknown_template`, `invalid_params`, `templates_unavailable`, `join_request_closed`,
@@ -1382,7 +1420,7 @@ and the handling of a failed-upgrade backup.
 - **Losing the key** (storage cleared, phone reset) means pairing again; the old device stays listed until revoked, and
   the desktop app shows its `last_seen_at`.
 - **A stolen phone** is handled by revocation from the desktop app (U8, SI-H2-4). The device scopes (§5.5) bound what
-  the thief can do until then, except a poisoned chat model, which outlives revocation until the model reset (§5.5). A
+  the thief can do until then. A
   screen lock is the user's first defence; an app-level PIN or passkey unlock is H3 (O-9).
 
 ### 9.4 Template UIs
@@ -1390,8 +1428,8 @@ and the handling of a failed-upgrade backup.
 - **Private chat** (`ui = "chat"`).
   - Start: launches `private-chat` (singleton; launching again returns the running instance), shows `queued` reasons in
     words ("Your GPU PC is off", "The GPU is busy"), then the health state.
-  - First run: lists models with `/api/tags`; if the default is missing, calls `/api/pull` and shows its streamed
-    progress, with the size from the template (`download_mb`).
+  - First run: while the hub downloads the launch's model (§7.6), shows `service.setup`'s progress, with the size
+    from the template (`download_mb`); then lists models with `/api/tags`.
   - Chat: `/api/chat` with `stream: true`; tokens appear as they arrive.
   - **History stays on the device** (IndexedDB, encrypted with the same `CryptoKey`), with "Clear history". Nothing of
     the conversation is stored on the hub; the service's own volume holds only model files.
@@ -1482,8 +1520,8 @@ that load it. Mitigations, none of them complete:
 3. **A self-hosted copy.** The desktop app's `web_app_origin` setting changes the origin that pairing QR codes point
    to. Keys are bound to the origin (browser storage is per origin), so moving means pairing again.
 4. **Bounded device power** (§5.5): a stolen device key with the default phone profile can launch vetted templates,
-   read the state, logs and outputs of the template jobs it launched, use and stop the shared chat service (including
-   its model pulls and deletions through Ollama's API), upload, check and delete unreferenced blobs, and open join
+   read the state, logs and outputs of the template jobs it launched, use and stop the shared chat service (only its
+   `allowed_routes`: chat and the model list, §7.4), upload and check blobs and withdraw its own claims, and open join
    requests, which do nothing until an `admin` approves them on the hub PC. It cannot run arbitrary containers, read
    developer jobs or other devices' template jobs, open a non-template service, mint join tokens or create pairing
    tickets, and no PC it helps enroll gets work without that approval (SI-H2-18, SI-H2-19).
@@ -1732,12 +1770,11 @@ implemented before the separate change that puts it in force (O-16); T2-22 waits
 - The hub shares the distro with the jobs (D1). A container escape reaches the hub's database, blobs and identity, on
   top of the node identity it already reached in H1.
 - Volumes outlive jobs (§11.3). A compromised service can leave files in its volume that a later job of the same
-  account and volume name reads; for templates those are model files, read as data (below). A template-view
-  principal can also write arbitrary model files into the private chat's volume through Ollama's API (§5.5).
+  account and volume name reads; for templates those are model files, read as data (below).
 - Templates run third-party images (Ollama, whisper.cpp) with egress to model hosts. They are pinned by digest and
   reviewed, but they are not our code.
-- Model files come from the internet, or from any template-view principal (§5.5), so the parser also sees
-  attacker-chosen files. The default models are GGUF files read as data **(H: E11 confirms that the
+- Model files come from the internet: the template's declared models, which only the hub pulls (§7.6). The default
+  models are GGUF files read as data **(H: E11 confirms that the
   chosen images load only GGUF and do not execute code from model files)**.
 - These go into `docs/security/residual-risks.md` (task T2-61).
 
@@ -1841,9 +1878,10 @@ implemented before the separate change that puts it in force (O-16); T2-22 waits
 - **Hub data dir.** In app mode `/var/lib/p2pc-server` inside the hub PC's distro (0700, root); otherwise H1 §12.
   - New tables (additive migrations): `devices` and `pairing_tickets` (both with `daily_unit_cap`, `allowed_images`, the
     device expiry and `blobs_quota_mb`, §5.2), `join_requests` (with the listener commitment, the hub nonce and the
-    revealed listener nonce, §5.4), `blobs` (with the GC tombstone `deleting_at` and the uploader's principal, §7.5),
-    `blob_refs`, `volume_reports`, `service_state` (health, last activity, consecutive unhealthy attempts, node-loss
-    restart times of the last 24 h, and the day's cap reservation as `cap_day` and `cap_reserved_units`, §12),
+    revealed listener nonce, §5.4), `blobs` (with the GC tombstone `deleting_at`, §7.5), `blob_uploaders` (one claim
+    per uploading principal, §5.6), `blob_refs`, `volume_reports`, `service_state` (health, last activity, consecutive
+    unhealthy attempts, node-loss restart times of the last 24 h, the model download's `setup` state, and the day's cap
+    reservation as `cap_day` and `cap_reserved_units`, §12),
     `service_traffic`, `template_bundle_state` (one row: the high-water `bundle_version` and its SHA-256, §7.6), and the
     node columns `approval` and `enrolled_by`.
   - Rebuilt tables (one forward-only migration that keeps every append-only trigger, §5.6): `jobs`, `usage_records`
@@ -1946,7 +1984,7 @@ H1's SI-1 to SI-13 stay in force and keep their tests.
 | SI-H2-1 | No secret appears in logs, `Debug` output, errors, audit events, the app's logs or the browser console: device keys, pairing tickets, invite codes, listener nonces before their reveal, join tokens, API keys. A test scans the outputs of every pairing, invite and join path. |
 | SI-H2-2 | Pairing tickets are single-use and expire, checked against the hub's row, never the payload. Two concurrent `Pair`s for one ticket create exactly one device; a retry from the same NodeId is idempotent while its device is live; a retry from the same NodeId after that device was revoked gets `invalid_ticket` and creates nothing; every failure is the same `invalid_ticket`. Tests: the concurrent pair, the retry, the retry after revocation (by an `admin` and by the device itself), a retry from another NodeId. |
 | SI-H2-3 | A device principal exists only on `p2pc/device/1`. No request on the TCP listener or `p2pc/http/1` can carry one (no header, no query parameter); a device stream with an `Authorization` header gets `400`. |
-| SI-H2-4 | Revoking a device closes its live connections and its open service streams within 5 s, and later connections get the same `not_paired` as a NodeId never paired. Paired non-`admin` devices cannot keep the owner from revoking: with every non-`admin` device at its per-device stream cap and the non-`admin` share of the device budget full (§6.3), an `admin` device still opens streams from its reserve and revokes; an idle device port connection closes after `port_idle_s`. With the 32 pre-check slots of `p2pc/device/1` held full by unknown NodeIds, the hub PC's app still revokes a phone through the offline `p2pc-server devices revoke` while the hub runs, and the hub closes that phone's connections and service streams within 5 s. Device streams and the TCP REST listener have separate budgets (§6.3): with the TCP listener's connection cap held full by unauthenticated loopback connections (from the Windows host or another WSL2 distro), an `admin` device still opens streams and revokes, and with the whole device budget in use, a TCP client with an API key still gets a connection. Tested with an injectable clock and a real in-process hub. |
+| SI-H2-4 | Revoking a device closes its live connections and its open service streams within 5 s, and later connections get the same `not_paired` as a NodeId never paired. A device reaching its `expires_at` gets the same, through the 2 s liveness sweep (§5.5): with an injected clock, an open device port connection with traffic flowing is closed within 5 s of `expires_at`. Paired non-`admin` devices cannot keep the owner from revoking: with every non-`admin` device at its per-device stream cap and the non-`admin` share of the device budget full (§6.3), an `admin` device still opens streams from its reserve and revokes; an idle device port connection closes after `port_idle_s`. With the 32 pre-check slots of `p2pc/device/1` held full by unknown NodeIds, the hub PC's app still revokes a phone through the offline `p2pc-server devices revoke` while the hub runs, and the hub closes that phone's connections and service streams within 5 s. Device streams and the TCP REST listener have separate budgets (§6.3): with the TCP listener's connection cap held full by unauthenticated loopback connections (from the Windows host or another WSL2 distro), an `admin` device still opens streams and revokes, and with the whole device budget in use, a TCP client with an API key still gets a connection. Tested with an injectable clock and a real in-process hub. |
 | SI-H2-5 | Opening a service port requires `services:connect` (or `templates:launch` for a template service of the caller's template view, §5.5), the job's account and project, a `running` service and a listed port, through one code path for every transport. Cross-account, unlisted-port and template-view negative tests: a phone-profile device gets `404` on a `p2pc service run` service and on another device's non-singleton template service. |
 | SI-H2-6 | `PortOpen` and `BlobFetch` are fenced by `(lease_id, epoch)` on the hub and on the agent; a stale one is refused. |
 | SI-H2-7 | The agent never connects to a socket path inside a job's directories except its own `ingress.sock`, which it created in the read-only mount; the shim refuses unlisted ports. The agent reads only the status line of a health check response, at most 1 KiB (§11.2). Tests: a symlink planted where a socket could be, an unlisted port, a fake shim, a health check answered with an endless status line or an endless body (the check fails or passes on the status line alone, and the agent reads no more than 1 KiB). |
@@ -1955,12 +1993,12 @@ H1's SI-1 to SI-13 stay in force and keep their tests.
 | SI-H2-10 | A service container keeps `--network=none` (golden argv test) and its ports are reachable only through the bridge: a scan from the distro's network namespace, the Windows host and another LAN machine finds them closed. |
 | SI-H2-11 | P2PC adds no listener reachable from the LAN. TCP: the hub's REST is not reachable from another machine, and the desktop app opens no TCP listener. UDP: the app's only sockets are its device endpoint's, which accepts no incoming connection; the invite listener exists only during a join, serves only `p2pc/invite/1` and has no IP transport (§5.4). The hub's endpoint accepts only what §10.5 lists, and serves `p2pc/pair/1` only while a pairing ticket is open. Tests: socket enumeration of the app process (no TCP listener; UDP sockets only from its device endpoint), the same enumeration during a join (the invite listener binds no LAN-reachable UDP socket) and a direct QUIC probe of the invite listener from the LAN machine that gets no answer, a TCP scan and a UDP probe of the Windows host from the LAN machine (with NAT networking, no reply from the hub's sockets), an incoming QUIC connection to the device endpoint that is refused, and probes of the hub's endpoint from an unknown NodeId through a relay: `p2pc/pair/1` with no ticket open fails at the handshake (or closes before a frame), `p2pc/device/1` gets `not_paired`, `p2pc/http/1` without a key gets `401`, and `p2pc/agent/1` without a valid `Join` is closed. |
 | SI-H2-12 | The web app and the desktop UI never turn untrusted text into HTML: a lint rule bans `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write`, `eval` and `new Function`; a DOM test feeds model output with `<script>`, `<img onerror>` and `javascript:` links and checks they render inert. The deployed header files contain the CSP of §9.5 (a test parses them). |
-| SI-H2-13 | Every template image is pinned by digest, and parameters reach the job only through the targets of §7.6: whole env values, whole argv elements, a field of the closed list (`service.idle_timeout_s`, `timeout_s`) within the template's bounds, which lie inside the JobSpec range, or an `inputs` entry at the template's fixed path. A test runs over the bundle (the shipped `private-chat` and `transcribe` pass it; a fixture with a `field:` target outside the list, or with bounds outside the JobSpec range, fails); a property test feeds shell metacharacters as parameter values and checks the resulting JobSpec; out-of-type and out-of-bounds values get `422 invalid_params`. |
+| SI-H2-13 | Every template image is pinned by digest, and parameters reach the job only through the targets of §7.6: whole env values, whole argv elements, a field of the closed list (`service.idle_timeout_s`, `timeout_s`) within the template's bounds, which lie inside the JobSpec range, an `inputs` entry at the template's fixed path, or the `pull` model of a chat template (an enum value). A test runs over the bundle (the shipped `private-chat` and `transcribe` pass it; a fixture with a `field:` target outside the list, or with bounds outside the JobSpec range, fails); a property test feeds shell metacharacters as parameter values and checks the resulting JobSpec; out-of-type and out-of-bounds values get `422 invalid_params`. |
 | SI-H2-14 | The hub loads a template bundle only with a valid release signature, a `bundle_version` above the embedded one and not below its persisted high-water mark (equal only with the recorded SHA-256), and a satisfied `min_hub_version`, and it never serves a bundle below the mark. Fixtures for each failure, plus: a validly signed bundle below the mark (the rollback case) is refused, also after a hub restart; a different bundle with the mark's version is refused; with the file at the mark deleted, the hub serves no template (`503 templates_unavailable`) rather than the older embedded bundle. |
 | SI-H2-15 | The app's updater refuses an artifact with a bad signature, without a signed version, or with a signed version not greater than its own. |
 | SI-H2-16 | An invite code is single-use; the hub phrase is a pure function of (hub NodeId, listener NodeId, code), the approval phrase of (hub NodeId, agent NodeId, listener nonce, hub nonce) and the node phrase of (node NodeId), each 6 words (66 bits) with test vectors; the app joins only after the explicit confirmation. **Join requests resist an offline search** (§5.4 steps 3-5): the hub draws the hub nonce only after the request, with its agent NodeId and listener commitment, is stored; it computes and shows the approval phrase only after a reveal that matches the commitment; the listener reveals its nonce once, to the first phone with the valid code, and accepts `Invite` only from that phone. Tests: vectors for each rejected input of `POST /v1/nodes/join-requests` (`invite_expires_at` equal to now, in the past, and 1 s beyond now + 15 min + 120 s; a `listener_node_id` and an `iroh_node_id` of 32 bytes that do not decode to a curve point, and of the wrong length; a commitment of the wrong length), each `422 invalid_join_request` with no row created; two requests with identical inputs get different hub nonces and different phrases; `approve` of an `awaiting_reveal` request gets `409` and the hub PC shows no phrase for it; a reveal that does not match the commitment gets `409`, sets `rejected` and allows no second reveal; on the listener, a second phone's `InviteOpen` or `Invite` gets `already_open`, a repeated `InviteOpen` with another hub nonce gets `already_open`, an `Invite` before any `InviteOpen` gets `invalid_code`, and an `Invite` whose join token names another hub than the `InviteOpen` gets `hub_mismatch` and is not joined. The hub PC's approval screens show the phrase, the source device as recorded at pairing and the request or enrollment time; `approve` and `token` of a join request created more than 15 minutes ago get `409 join_request_closed`, also while the expiry sweep has not run (an injected clock with the sweep stopped, for a `pending` and for an `approved` request); a join token of a join request enrolls only its bound agent NodeId (another NodeId gets H1's invalid-token answer and the token stays unused); one device cannot hold more than 2 open join requests or create more than 6 an hour (`429`). |
 | SI-H2-17 | `p2pc/pair/1` and `p2pc/invite/1` enforce their pre-auth limits (connections, pending exchanges, deadline, 4 KiB frames, failure rates: §5.3 and §6.2), and `p2pc/device/1` its limits before the device check (§6.3: 32 unchecked connections, 5 s, 10 `not_paired` a minute per NodeId); their decoders are fuzzed or property-tested. The limits never lock the owner out: with failure counters over their limits from other NodeIds and other ticket-hash prefixes, a `Pair` with a valid ticket that gets a connection slot still pairs (§5.3), an `Invite` with the valid code still gets `InviteAck` (§6.2), and a live device still connects (§6.3). The same holds for `p2pc/agent/1` (§6.1, T2-17): with H1's 60-a-minute total of failed `Join`s reached by other NodeIds, a `Join` with a valid token from a fresh NodeId that gets a slot still enrolls, and a NodeId over its own 10 a minute is still refused without the token lookup. **The aggregate failure cap** (§5.3) holds on every one of these ALPNs: with failures spread over fresh NodeIds and every ticket-hash or token-hash prefix, beyond 60 a minute no failure gets a detailed answer or is logged or audited one by one (one aggregated audit event a minute counts them), while a valid credential that gets a slot still succeeds. |
-| SI-H2-18 | No escalation for devices: pairing tickets carry a subset of the creator's power (scopes, `daily_unit_cap`, image allowlist, expiry, device expiry, `blobs_quota_mb`), set through the ticket's body (§5.2; tests: a ticket from a capped creator without a cap, with a higher cap, or with an image pattern not in the creator's list gets `403 escalation_denied`, and a device paired with a cap and a list is refused a job beyond them; a ticket from an expiring key with no `device_expires_in_s`, or with one beyond the key's `expires_at`, gets `403 escalation_denied`; a device past its `expires_at` gets `not_paired`); a device's cap is enforced against its own principal (§12), never against the key or device that paired it; `nodes:join` creates tokens of at most 900 s and nothing else; `nodes:invite` creates only join requests; only `admin` creates pairing tickets; the last unrestricted `admin` principal cannot be revoked (`409 last_admin_key` for a key, `409 last_admin_device` for a device); a restricted `admin` principal revoking an unrestricted device gets `403 escalation_denied`; a non-`admin` device sees only itself: `GET /v1/devices` returns a one-item list and `GET /v1/devices/{id}` of another device gets `404`. **The default phone profile reaches only what §5.5 lists**, pinned by a negative test per route with a phone-profile device in a project that also holds a developer batch job, a `p2pc service run` service, another device's `transcribe` job and a `private-chat` instance launched by the owner: `POST /v1/jobs` gets `403`; `GET /v1/jobs` lists only its own template jobs and the singleton instance; `GET /v1/jobs/{id}`, `…/logs`, `…/outputs` and `…/outputs/{path}` of the developer jobs and of the other device's job get `404`; logs and outputs of the owner's singleton instance get `404`; `…/ports/{port}/connect` on the developer service gets `404`; `…/cancel` of the developer jobs and the other device's job gets `404` (and with `jobs:write`, H1's project-wide cancel still works); `GET /v1/usage`, `POST /v1/estimate`, `GET /v1/blobs`, `POST /v1/nodes/join-tokens`, `POST /v1/devices/pairing-tickets`, node drain, resume and delete, key and audit routes get `403`; `DELETE /v1/blobs/{sha256}` of a blob the owner uploaded gets `403`, a third concurrent upload gets `429 too_many_uploads`, and an upload beyond the device's `blobs_quota_mb` gets `507`. The private chat's port forwards Ollama's whole API, as §5.5 accepts. |
+| SI-H2-18 | No escalation for devices: pairing tickets carry a subset of the creator's power (scopes, `daily_unit_cap`, image allowlist, expiry, device expiry, `blobs_quota_mb`), set through the ticket's body (§5.2; tests: a ticket from a capped creator without a cap, with a higher cap, or with an image pattern not in the creator's list gets `403 escalation_denied`, and a device paired with a cap and a list is refused a job beyond them; a ticket from an expiring key with no `device_expires_in_s`, or with one beyond the key's `expires_at`, gets `403 escalation_denied`; a device past its `expires_at` gets `not_paired`); a device's cap is enforced against its own principal (§12), never against the key or device that paired it; `nodes:join` creates tokens of at most 900 s and nothing else; `nodes:invite` creates only join requests; only `admin` creates pairing tickets; the last unrestricted `admin` principal cannot be revoked (`409 last_admin_key` for a key, `409 last_admin_device` for a device); a restricted `admin` principal revoking an unrestricted device gets `403 escalation_denied`; a non-`admin` device sees only itself: `GET /v1/devices` returns a one-item list and `GET /v1/devices/{id}` of another device gets `404`. **The default phone profile reaches only what §5.5 lists**, pinned by a negative test per route with a phone-profile device in a project that also holds a developer batch job, a `p2pc service run` service, another device's `transcribe` job and a `private-chat` instance launched by the owner: `POST /v1/jobs` gets `403`; `GET /v1/jobs` lists only its own template jobs and the singleton instance; `GET /v1/jobs/{id}`, `…/logs`, `…/outputs` and `…/outputs/{path}` of the developer jobs and of the other device's job get `404`; logs and outputs of the owner's singleton instance get `404`; `…/ports/{port}/connect` on the developer service gets `404`; `…/cancel` of the developer jobs and the other device's job gets `404` (and with `jobs:write`, H1's project-wide cancel still works); `GET /v1/usage`, `POST /v1/estimate`, `GET /v1/blobs`, `POST /v1/nodes/join-tokens`, `POST /v1/devices/pairing-tickets`, node drain, resume and delete, key and audit routes get `403`; `DELETE /v1/blobs/{sha256}` of a blob the owner uploaded gets `403`, a third concurrent upload gets `429 too_many_uploads`, and an upload beyond the device's `blobs_quota_mb` gets `507`; after the owner uploads a digest the phone uploaded first, the phone's `DELETE` removes only its own claim and the owner's job still finds the blob. Blob quota and device expiry: a ticket from a creator with `blobs_quota_mb` without one or with a higher one gets `403 escalation_denied`, as does a revocation by such a creator of a device without one; `device_expires_in_s` of 0, not above `expires_in_s`, or overflowing gets `422 out_of_range`. **The private chat's port is filtered by its `allowed_routes`** (§7.4): through the phone-profile device, `POST /api/chat` (streamed) and `GET /api/tags` work; `POST /api/pull`, `POST /api/create`, `POST /api/blobs/<digest>` and `HEAD` of it, `POST /api/copy`, `DELETE /api/delete`, `POST /api/push`, an unknown path, an allowed path with a query string and an allowed path with the wrong method get `403 route_not_allowed` and reach nothing in the container (a fake service records every byte); headers over 8 KiB get `431`, a body over 1 MiB gets `413`, `Transfer-Encoding` gets `400`, and bytes after an allowed request's body are not forwarded; a developer device on the same port still gets a raw connection; the hub's own model pull at launch fills `service.setup`. |
 | SI-H2-19 | No PC gets work without an `admin`'s approval. The default phone profile has no `nodes:join`. A node enrolled with a token minted by a non-`admin` principal is `pending_approval`, and the scheduler never offers it a lease until an `admin` principal approves it; a join request yields a token only after an `admin` approval, only to the requesting device and only once. An invite text minted by an `admin` device gives a pending node unless it was minted with `pre_approved`, which only an `admin` principal may set, for at most 900 s. Tests: a property test over the scheduler with pending and approved nodes (no lease ever reaches a pending one); approval by a non-`admin` principal gets `403`; a `nodes:join` device's token gives a pending node; an `admin` device's token gives a pending node without `pre_approved` and an approved one with it; `pre_approved` from a non-`admin` principal gets `403` and with `expires_in_s` over 900 gets `422`; an `admin` API key's token gives an approved node (H1); first-run step 4 run against a real hub enrolls the hub PC's own node `approved`, and that node gets a lease; a join request's token call before approval, after delivery, after the approving principal was revoked, and from another device gets `409` or `404`; the phone profile's scope list is pinned by a test. |
 | SI-H2-20 | Ledger and caps stay exact with two kinds of principal and daily slices (§5.6, §12). Every row of `jobs`, `usage_records` and `join_tokens` names exactly one principal (`CHECK`); idempotency deduplicates per principal for keys and for devices alike; the ledger stays append-only after the rebuild; `spent(P, D)` never counts a service's reservation and the slices written against it twice, and gives H1's numbers for batch jobs. Tests: inserts with both or neither principal column set fail; two submissions with one idempotency key from one device give one job, and from two devices or from a device and a key give two; `UPDATE` and `DELETE` on `usage_records` fail after the migration; the migration test of §5.6; a property test with an injectable clock over batch and service jobs of key and device principals crossing midnights (reservations, slices, requeues, cancels), checking after every step that `spent(P, D)` equals the reference sum of §12, that a service's rows for a day exceed that day's `cap_reserved_units` only by an estimated slice of an attempt the hub could not reach at `cap_deadline` (up to the end it observed), and that ledger invariant 6 (one row per finished slice) holds; H1's cap tests pass unchanged. `GET /v1/usage` over the same histories: `attempts` counts last slices only (a service that crossed three midnights is one attempt), `estimated_attempts` and `estimated_slices` match the reference, `group_by=key` with device rows present returns key groups only and never fails to decode, `group_by=principal` covers every row, and a midnight slice's `max_rss_mb` is the attempt's peak so far. |
 | SI-H2-21 | The MCP tool `p2pc_blob_put` reads only regular, non-hidden files inside the configured upload directory, of at most `max_blob_mb`, through no symbolic link in any component, from one descriptor (§7.8). `p2pc mcp` creates the directory 0700 and refuses an unsafe one. Tests (each refused with `path_not_allowed` and nothing uploaded): `../` traversal and a `..` component in the middle; an absolute path outside the directory (`/etc/passwd`, the CLI's credentials file); a symbolic link inside the directory to a file outside it, one to a directory outside it used as a middle component, and the upload directory itself replaced by a link; a hidden file and a file under a hidden directory; a FIFO (the call does not block), a socket and a device node; a sparse file over `max_blob_mb`; a file that grows during the upload. Start-up tests: an upload directory with group or other access, one that is the home directory, and one that contains the credentials directory are refused. |
@@ -1970,7 +2008,7 @@ H1's SI-1 to SI-13 stay in force and keep their tests.
 
 | Threat | Mitigation | Residual |
 |---|---|---|
-| Stolen, unlocked phone | Bounded scopes and the template view (§5.5, SI-H2-18); revocation in ≤ 5 s; devices listed with `last_seen_at`; no `nodes:join` in the default profile, and every PC approved on the hub PC against a check phrase (SI-H2-16, SI-H2-19); at most 2 open join requests per device | Until revoked: use the shared chat service (chat with the owner's model, use Ollama's whole API: pull any registry model, write arbitrary model files, overwrite or delete models; stop it), launch templates and read the state, logs and outputs of the template jobs it launched, see the PCs, upload blobs, test whether a blob of a known digest exists and delete unreferenced ones it uploaded, and open join requests that the owner must approve on the hub PC. **After** revocation: a model it wrote or replaced stays in the chat's volume until the model reset (§5.5), and attacker-chosen GGUF files reach the model parser (§11.5). Not: developer jobs, other devices' template jobs, non-template services, chat history of other devices. |
+| Stolen, unlocked phone | Bounded scopes and the template view (§5.5, SI-H2-18); revocation in ≤ 5 s; devices listed with `last_seen_at`; no `nodes:join` in the default profile, and every PC approved on the hub PC against a check phrase (SI-H2-16, SI-H2-19); at most 2 open join requests per device | Until revoked or expired: use the shared chat service through its `allowed_routes` only (chat with the owner's models, list them; stop it), launch templates and read the state, logs and outputs of the template jobs it launched, see the PCs, upload blobs, test whether a blob of a known digest exists and withdraw its own claims, and open join requests that the owner must approve on the hub PC. Not: pulling, writing, replacing or deleting models; developer jobs, other devices' template jobs, non-template services, chat history of other devices. |
 | Misbehaving or many paired phones | Per-device stream cap, a share of the device budget reserved for `admin` devices, idle limits on device port connections (§6.3, SI-H2-4) | They can slow each other down; not the hub PC's app. |
 | Local processes on the hub PC (other Windows sessions too) and the user's other WSL2 distros (Docker Desktop's too) at the loopback REST listener | API key on every request (H1 §10); device streams have their own budget, outside the TCP connection cap (§6.3, SI-H2-4) | They can fill the TCP cap and delay API-key clients on that PC; never the devices, nor the owner's revocation. |
 | Prompt-injected agent behind MCP | `p2pc_blob_put` reads only regular, non-hidden files inside one upload directory, through no symbolic link (§7.8, SI-H2-21); H1's capped key and image allowlist | Files the user put in the upload directory can be uploaded and used as job inputs. |
@@ -2041,7 +2079,7 @@ start.
 | T2-10 | Server: devices and principals | T2-01, T2-02 | `p2pc-server` `auth.rs`, `store/devices.rs`, `store/jobs.rs` (principal columns and idempotency), `store/join_tokens.rs`, `store/audit.rs`, new `devices_api.rs`, migrations (every H2 table of §13), `config.rs` (every new key), `app.rs`, `init.rs`, `recover.rs` | §5.2, §5.5, §5.6: principals, scopes, pairing tickets REST (retry after revocation), revocation (`last_admin_device`), `GET /v1/devices` filtered for non-`admin` devices, `init --owner-device`, `devices add`, `whoami`, audit; **the §5.6 rebuild migration** of `jobs`, `usage_records` (the slice columns and key of §12 too, so the ledger is rebuilt once), `join_tokens` and `audit_events`, with its migration test; join requests (input checks, hub nonce, the reveal against the listener commitment, limits, the 15-minute rule for approval and token minting, approval phrase, tokens bound to the agent NodeId), pairing tickets with `daily_unit_cap` and `allowed_images`, the offline `devices revoke` and the 2 s re-check of live devices' revocation, `pre_approved` join tokens and node approval with the node phrase (§5.4, §5.5, SI-H2-2, SI-H2-16, SI-H2-18, SI-H2-19, SI-H2-20). |
 | T2-11 | Server: `p2pc/pair/1` and `p2pc/device/1` | T2-10, T2-17, **O-16** | `gateway/pair.rs`, `gateway/device.rs`, `gateway/limits.rs`, `gateway/mod.rs`, `gateway/endpoint.rs` | **Blocked** until the separate change of §4.3 puts the listening exception in force (O-16, ADR-016). In-process HTTP serving with the device principal, limits that never lock out a valid ticket, the device stream budget (per-device cap, `admin` reserve, idle limit of device port connections, outside the TCP REST cap, §6.3), the limits before the device check (§6.3), `p2pc/pair/1` served only while a ticket is open (§10.5), the aggregate failure cap (§5.3), active close on revocation (SI-H2-3/4/11/17). |
 | T2-12 | Server: service jobs | T2-10 | `scheduler/`, `jobs_api.rs`, `store/leases.rs`, `store/jobs.rs` | §7.2: restart policy and its 5-per-24-h cap, affinity wait, health from agents, idle cancel, the template view of the job routes (§5.5) and the cancel rule (H1's for `jobs:write`; the template view for `templates:launch`), `kind` filter, capabilities in placement, no lease to `pending_approval` nodes (SI-H2-18, SI-H2-19). |
-| T2-13 | Server: service ports | T2-11, T2-12 | new `ports_api.rs`, `gateway/ports.rs`, `conn.rs`, `app.rs` | §7.4 upgrade endpoint (with the template-view check) and hub-opened `PortOpen` streams, idle accounting, traffic counters (SI-H2-5/6). |
+| T2-13 | Server: service ports | T2-11, T2-12 | new `ports_api.rs`, `gateway/ports.rs`, `conn.rs`, `app.rs` | §7.4 upgrade endpoint (with the template-view check and its `allowed_routes` filter) and hub-opened `PortOpen` streams, idle accounting, traffic counters (SI-H2-5/6). |
 | T2-14 | Server: blobs | T2-12, T2-13 | new `blobs_api.rs`, `store/blobs.rs`, `gateway/blob_fetch.rs`; `gc.rs`, `jobs_api.rs` and `store/jobs.rs` (the blob check and reference insert in the job-creation transaction), `conn.rs` (the dispatcher for agent-opened streams), `app.rs` | §7.5 (with the tombstone GC), the staging sweep by last write that skips uploads in progress (§13), blob `inputs` at job creation, `BlobFetch` (SI-H2-8). |
 | T2-15 | Server: templates and volumes API | T2-14, T2-16, T2-50 | new `templates.rs`, `templates_api.rs`, `volumes_api.rs`, `app.rs` | §7.6 bundle loading with the anti-rollback high-water mark, parameter targets, launch (cap check for capped principals, through T2-16's `spent(P, D)` and daily service reservation: no cap logic of its own and no edit of `store/leases.rs`), §7.3 volumes, with the percent-encoded `{name}` segment and a route test for a `tpl:` name (SI-H2-13/14). |
 | T2-16 | Server: metering additions | T2-10, T2-12 | `units.rs`, `usage_api.rs`, `store/leases.rs` (`insert_usage`, `usage_report`, `spent_between` replaced by `spent(P, D)`), `store/usage.rs`, `scheduler/tests/props.rs` | §12: service slices at 00:00 UTC (and the catch-up at start) with their `max_rss_mb`, `charge_day`, new groups, `GET /v1/usage` over slices and principals (`attempts` from last slices, `estimated_slices`, no null group), the cap query `spent(P, D)` per principal and per slice day, the daily reservation of services and `cap_reached`; invariant 6 of the scheduler property test becomes "exactly one row per finished slice"; the cap property test of SI-H2-20. |
@@ -2065,7 +2103,7 @@ start.
 | T2-44 | Join flow | T2-43, T2-30, **O-16** | `apps/desktop` `invite/` module, `apps/web/src/desktop/join` | **Blocked** until O-16 (the invite listener rests on ADR-016). §5.4 PC side (relay-only invite listener built through `p2pc-net` with `direct_addresses = "none"`, no IP transport, with the §6.2 limits and its binding to one phone, QR with the agent NodeId and the listener commitment, the approval phrase shown after `InviteReveal`), invite text (pending by default, the explicit "Pre-approve" option on the hub PC only), hub phrase (SI-H2-16); on the hub PC, approving join requests and pending nodes with the approval and node phrases, the source device and the time; `join_pending` with the node phrase and `hub_gone` (§8.8). |
 | T2-45 | `p2pc-wsl` upgrade and uninstall; app updater | T2-43 | `crates/p2pc-wsl` (`upgrade.rs`, `uninstall.rs`), `apps/desktop` `update/`, `uninstall/`, NSIS hooks | §8.3 second half, §8.7 (the hub deletes the other nodes first; failed-upgrade backups kept unless the box is ticked), §14.1-§14.2 (opt-in automatic checks, template bundle delivery), web app verification with the signed manifest and its high-water mark (§9.6, SI-H2-22), parity test with `install.ps1` (SI-H2-15). |
 | **Infrastructure and clients lane** | | | | |
-| T2-50 | Templates data and bundle | T2-01, E11 | `templates/`, `scripts/templates-bundle` | The two templates, bundle compiler and signer, bundle tests (SI-H2-13). |
+| T2-50 | Templates data and bundle | T2-01, E11 | `templates/`, `scripts/templates-bundle` | The two templates (with `allowed_routes` and the `pull` parameter), bundle compiler and signer, bundle tests (SI-H2-13). |
 | T2-51 | Relay deployment and relay-map rules | E12 | `deploy/relay/`, `p2pc-net` (relay-map validation), `p2pc-agent` `doctor.rs` | §10.2-§10.3. |
 | T2-52 | Release pipeline | T2-45, T2-34, T2-50 | `.github/workflows/`, `scripts/release/` | Tauri artifacts and `latest.json` per channel, signed versions, image hash pinning, signed web manifest and template bundle. |
 | T2-53 | CLI and client additions | T2-01 | `p2pc-cli` commands, `p2pc-client` | §7.8 CLI (including `nodes approve`, `devices pair --cap/--image` and the percent-encoded name of `volumes rm`); tested against the mock server, which learns the new endpoints. |
