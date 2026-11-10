@@ -447,12 +447,30 @@ fn violation(field: &'static str, reason: &'static str) -> ProtocolViolation {
     ProtocolViolation { field, reason }
 }
 
-fn check_text(field: &'static str, s: &str) -> Result<(), ProtocolViolation> {
+pub(crate) fn check_text(field: &'static str, s: &str) -> Result<(), ProtocolViolation> {
     if s.len() > MAX_TEXT_LEN {
         return Err(violation(field, "too long"));
     }
     if s.chars().any(char::is_control) {
         return Err(violation(field, "control characters"));
+    }
+    Ok(())
+}
+
+/// Text that a screen shows to the owner as a fact they check (a device label, a platform, a hub name): at most
+/// `max` bytes, with no control characters and no invisible or direction-changing characters, so that one name
+/// cannot be made to look like another (H2 §5.3 "Paired: iPhone (Safari) — not you? Revoke").
+pub(crate) fn check_display_text(field: &'static str, s: &str, max: usize) -> Result<(), ProtocolViolation> {
+    if s.len() > max {
+        return Err(violation(field, "too long"));
+    }
+    let invisible = |c: char| {
+        matches!(c,
+            '\u{00ad}' | '\u{061c}' | '\u{180e}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}' | '\u{feff}' | '\u{fff9}'..='\u{fffb}')
+    };
+    if s.chars().any(|c| c.is_control() || invisible(c)) {
+        return Err(violation(field, "control, invisible or bidirectional characters"));
     }
     Ok(())
 }
