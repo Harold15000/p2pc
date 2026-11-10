@@ -703,6 +703,8 @@ async fn failed_joins_are_rate_limited_per_node_id() {
     a.welcome().await;
 }
 
+/// Beyond the total of failed `Join`s, a bad `Join` gets no detailed answer (a valid one still enrolls: H2 §6.1, see
+/// the next test).
 #[tokio::test]
 async fn failed_joins_are_rate_limited_in_total() {
     let h = start(GatewayLimits {
@@ -720,6 +722,115 @@ async fn failed_joins_are_rate_limited_in_total() {
     let mut a = h.agent(&SecretKey::generate()).await;
     a.join(&bad, "x").await;
     a.expect_closed().await;
+}
+
+/// H2 §6.1, SI-H2-17 (T2-17): with the total of failed `Join`s reached by other NodeIds, a `Join` with a valid token
+/// from a fresh NodeId that gets a slot still enrolls. The total limits failure answers only, never the lookup.
+#[tokio::test]
+async fn a_valid_join_enrolls_after_other_node_ids_exhaust_the_failure_total() {
+    let mut h = start(GatewayLimits {
+        join_failures_per_minute: 3,
+        ..test_limits()
+    })
+    .await;
+    let valid = h.token(json!({})).await;
+    let mut bad = valid.clone();
+    bad.code[0] ^= 1;
+    for _ in 0..3 {
+        let mut a = h.agent(&SecretKey::generate()).await;
+        a.join(&bad, "x").await;
+        a.expect_error("invalid_token").await;
+    }
+    // The total is reached: a further bad `Join` gets no detail.
+    let mut over = h.agent(&SecretKey::generate()).await;
+    over.join(&bad, "x").await;
+    over.expect_closed().await;
+    // A valid token still enrolls, in the same minute.
+    let mut good = h.agent(&SecretKey::generate()).await;
+    good.join(&valid, "good").await;
+    let node_id = good.welcome().await;
+    h.connected(node_id).await;
+    assert_eq!(h.node_count().await, 1);
+    assert_eq!(audit_count(&h, "node_enrolled").await, 1);
+}
+
+/// H2 §6.1, §5.3 (T2-17): bad `Join`s beyond the total are still refused, with no detail, and counted into the one
+/// aggregated `auth_failed` row; they still count against their own NodeId, whose limit refuses it without the
+/// lookup, even with a valid token.
+#[tokio::test]
+async fn bad_joins_beyond_the_total_are_refused_audited_and_count_per_node_id() {
+    let h = start(GatewayLimits {
+        join_failures_per_node_per_minute: 2,
+        join_failures_per_minute: 1,
+        ..test_limits()
+    })
+    .await;
+    let valid = h.token(json!({})).await;
+    let mut bad = valid.clone();
+    bad.code[5] ^= 0x10;
+    let key = SecretKey::generate();
+    // The first failure gets its detailed answer; it reaches the total.
+    let mut a = h.agent(&key).await;
+    a.join(&bad, "x").await;
+    a.expect_error("invalid_token").await;
+    // Beyond the total, the token is looked up, found invalid, and refused with no detail.
+    let mut a = h.agent(&key).await;
+    a.join(&bad, "x").await;
+    a.expect_closed().await;
+    let mut other = h.agent(&SecretKey::generate()).await;
+    other.join(&bad, "y").await;
+    other.expect_closed().await;
+    // `key` is now over its own limit (2): refused without the lookup, even with the valid token.
+    let mut a = h.agent(&key).await;
+    a.join(&valid, "x").await;
+    a.expect_closed().await;
+    assert_eq!(h.node_count().await, 0);
+    // The three failures are audited in the one aggregated row; the refusal without lookup is not a failure.
+    h.app.flush_audit().await;
+    let audit = h.app.get("/v1/audit?kind=auth_failed", &h.app.admin).await.json();
+    let items = audit["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{audit}");
+    assert_eq!(items[0]["subject_id"], "join");
+    assert_eq!(items[0]["detail"]["count"], 3);
+    // The valid token was never consumed: a fresh NodeId still enrolls with it.
+    let mut b = h.agent(&SecretKey::generate()).await;
+    b.join(&valid, "b").await;
+    b.welcome().await;
+}
+
+/// H2 §6.1 (T2-17): a `Join` with a valid token never consumes the failure budget, per NodeId or in total, and
+/// neither does the idempotent retry of an enrolled NodeId.
+#[tokio::test]
+async fn valid_joins_never_consume_the_failure_budget() {
+    let h = start(GatewayLimits {
+        join_failures_per_node_per_minute: 1,
+        join_failures_per_minute: 1,
+        ..test_limits()
+    })
+    .await;
+    for i in 0..3 {
+        let token = h.token(json!({})).await;
+        let key = SecretKey::generate();
+        let mut a = h.agent(&key).await;
+        a.join(&token, &format!("n{i}")).await;
+        let node_id = a.welcome().await;
+        // The same NodeId retries with the same token, more often than its failure limit.
+        for _ in 0..2 {
+            let mut retry = h.agent(&key).await;
+            retry.join(&token, &format!("n{i}")).await;
+            assert_eq!(retry.welcome().await, node_id);
+        }
+    }
+    assert_eq!(h.node_count().await, 3);
+    // The budget is untouched: the first failure of the minute still gets its detailed answer.
+    let mut bad = h.token(json!({})).await;
+    bad.code[1] ^= 1;
+    let mut a = h.agent(&SecretKey::generate()).await;
+    a.join(&bad, "x").await;
+    a.expect_error("invalid_token").await;
+    h.app.flush_audit().await;
+    let audit = h.app.get("/v1/audit?kind=auth_failed", &h.app.admin).await.json();
+    assert_eq!(audit["items"][0]["detail"]["count"], 1, "{audit}");
 }
 
 /// T05 review, carry-over 6: when the network changes, the gateway binds a new endpoint on the newly selected
