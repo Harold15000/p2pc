@@ -1,7 +1,8 @@
 # Milestone 2 · P2PC Desktop App and Phone Access (v0.2): specification
 
-- **Status:** draft for review (spec v1, 2026-11-10: v0 plus the fixes of its first review). Implementation starts
-  when the architect marks it accepted.
+- **Status:** draft for review (spec v2, 2026-11-10: v1 plus the fixes of its second review). Implementation starts
+  when the architect marks it accepted. The one hard-rule exception it proposes (persistent volumes, §4.3) takes
+  effect only through a separate change after that (§4.3, O-16).
 - **Owner:** the P2PC architect. Only the architect changes this file. Implementers who find a problem report it in
   their PR instead of editing the spec.
 - **Normative words:** MUST, SHOULD and MAY are used as in RFC 2119.
@@ -44,9 +45,9 @@ user.
 - **U3 · Create my cloud.** On the first PC Ana chooses "Create my cloud". The app starts the hub on that PC, enrolls
   the PC as the first node and makes the app itself the owner's first device. She never sees an API key.
 - **U4 · Join my cloud.** On the laptop Ana installs the app and chooses "Join my cloud". The laptop shows a QR code;
-  she scans it with her already-paired phone, approves the new PC in the app on her hub PC, checks that the phone and
-  the laptop show the same 4-word check phrase, and taps "Join" on the laptop. No token is typed. (Without a phone,
-  she can paste an invite text instead, §5.4.)
+  she scans it with her already-paired phone, approves the new PC in the app on her hub PC after checking that the hub
+  PC and the laptop show the same 4 words, checks that the phone and the laptop then show the same 4 other words, and
+  taps "Join" on the laptop. No token is typed. (Without a phone, she can paste an invite text instead, §5.4.)
 - **U5 · Add my phone.** The app shows a QR code. Ana scans it with the phone camera; the web app opens, pairs, and
   offers "Add to Home Screen". From then on the phone works on Wi-Fi and on 4G/5G.
 - **U6 · Private AI chat.** In the phone web app Ana taps "Private AI chat". The service starts on the PC with the GPU,
@@ -168,26 +169,28 @@ the agent's ingress socket → the shim inside the container → `127.0.0.1:1143
 
 **Stays exactly as in H1:** the agent control-stream framing and limits, leases, epochs and fencing, the two-sided
 liveness rule (SI-13), the scheduler's fit and offer-cap rules, the sandbox's fixed arguments (extended only; the one
-change to its mount rule is the "Sandbox and hard rules" row below), the egress proxy and its deny ranges, API keys,
-join tokens, the audit table, the REST error format, the CLI exit codes, the MCP server, and every existing endpoint's
-request and response shape. The Linux installers are unchanged.
+proposed change to its mount rule is the "Sandbox and hard rules" row below), the egress proxy and its deny ranges,
+API keys, join token semantics (their table changes only in who may create a token, below), the audit table's
+append-only rules, the REST error format, the CLI exit codes, the MCP server, and every existing endpoint's request
+and response shape. The Linux installers are unchanged.
 
 **Changes (all additive unless marked):**
 
 | Area | Change | Section |
 |---|---|---|
 | JobSpec | `kind` (`batch` default, `service`), `service` block, `volumes`, blob `inputs`, `template` (read-only). Old clients send none of them and get H1 behaviour. | §7.1 |
+| JobSpec rules for services | **Changed, for `kind = "service"` only** (batch jobs keep H1's rules exactly): `timeout_s` has the range 60-2,592,000 and defaults to the maximum (H1: 1-86,400, default 3,600); out of range is `422 out_of_range`, as in H1, never clamped. `retry.max_attempts` defaults to 3 (H1: 2) and counts consecutive attempts that never became healthy, under a cap of 5 node-loss restarts in 24 h (H1: every attempt consumed by node loss). | §7.1, §7.2 |
 | Job states | Unchanged words. A service's `running` adds `health` (`starting`, `healthy`, `unhealthy`). Stopping a service ends it `cancelled` with a `reason`. | §7.2 |
-| Principals | A request is authenticated by an API key **or** by a paired device. Every place that reads `key_id` reads a `principal` that is one of the two. | §5.5 |
+| Principals | **Changed.** A request is authenticated by an API key **or** by a paired device. Every place that reads `key_id` reads a `principal` that is one of the two. Storage: `jobs`, `usage_records` and `join_tokens` get a nullable `key_id` (H1: `NOT NULL`) plus a nullable `device_id`, with a `CHECK` that exactly one is set; job idempotency becomes unique per principal through two partial unique indexes; `audit_events` gains `actor_device_id`. SQLite cannot relax `NOT NULL` or add a `CHECK` in place, so this is a forward-only table rebuild (§5.6), not an additive column. | §5.5, §5.6 |
 | Scopes | New: `services:connect`, `templates:launch`, `blobs:write`, `nodes:join`, `nodes:invite`. `admin` covers them. | §5.5 |
-| Node enrollment | **Changed.** A node enrolled with a join token minted by a non-`admin` principal starts `pending_approval` and gets no lease until an `admin` principal approves it. Tokens minted by `admin` principals enroll as in H1. | §5.4, §5.5 |
-| Sandbox and hard rules | **Changed.** Hard rule 3 (CONTRIBUTING) and H1 §9 ("never … host paths beyond the three per-job directories") gain exactly one exception, recorded in ADR-015: **persistent volumes**. A volume is a directory the agent creates itself, per account, named by a hash of the volume name (never a path taken from the JobSpec); it is mounted only into service jobs and template jobs of that account, is size-limited (`max_mb`, H1's fail-closed measurement) and is deleted without following links. Nothing else in hard rule 3 changes and services need no exception from it: every job, services included, has a finite wall-clock limit (`timeout_s`, at most 30 days). | §7.1, §11.1, §11.3 |
+| Node enrollment | **Changed.** A node enrolled with a join token minted by a non-`admin` principal starts `pending_approval` and gets no lease until an `admin` principal approves it. Tokens minted by `admin` principals enroll as in H1. A join token minted for an approved join request is bound to the joining agent's NodeId and enrolls no other (`join_tokens.bound_iroh_node_id`, §5.4). | §5.4, §5.5 |
+| Sandbox and hard rules | **Proposed change, not in force with this spec.** Hard rule 3 (CONTRIBUTING) and H1 §9 ("never … host paths beyond the three per-job directories") would gain exactly one exception, recorded in ADR-015 (**Proposed**): **persistent volumes**. A volume is a directory the agent creates itself, per account, named by a hash of the volume name (never a path taken from the JobSpec); it is mounted only into service jobs and template jobs of that account, is size-limited (`max_mb`, H1's fail-closed measurement), is checked without following links before every mount, and is deleted without following links. **The exception takes effect only when the architect accepts this spec after E11, through a separate change that amends CONTRIBUTING hard rule 3 and H1 §9's "Never" line together and marks ADR-015 Accepted.** Until then hard rule 3 and H1 §9 stand unchanged, no code may mount a volume, and T2-22 (agent volumes) is blocked (§17, O-16). Nothing else in hard rule 3 changes and services need no exception from it: every job, services included, has a finite wall-clock limit (`timeout_s`, at most 30 days). | §7.1, §11.1, §11.3 |
 | Phoning home (hard rule 6) | The app's daily update check and its web app verification fetch are **opt-in**: an explicit yes/no at first run with nothing preselected, and a Settings toggle. Without it the app checks for updates and verifies the web app only when the user clicks "Check for updates" or "Verify web app". | §3, §8.2, §9.6, §14.1 |
 | Agent protocol | New messages and server-opened streams behind the agent capabilities `service_jobs`, `volumes`, `blob_inputs`, `leave`, `approval` in `Hello.features`. No new ALPN. | §6.1 |
 | New ALPNs | `p2pc/pair/1` and `p2pc/device/1` on the hub; `p2pc/invite/1` on a joining PC's app. | §6 |
 | `init` | `p2pc-server init --owner-device <NodeId>` registers a device instead of printing an API key (the H1 form still works). New offline command `p2pc-server devices add`. | §5.3 |
-| Usage ledger | Rows gain `device_id` (nullable), `kind`, `template_id` and the slice bounds; long attempts are split at UTC midnight. | §12 |
-| Daily caps | **Changed for services only:** a capped principal's service is charged against the cap one UTC day at a time (a daily reservation) instead of by its whole `timeout_s` at creation, and is stopped when the day's cap is reached. Batch jobs keep H1's estimate. | §12 |
+| Usage ledger | **Changed.** H1 keeps one row per finished attempt, keyed `UNIQUE (job_id, attempt)` and `lease_id UNIQUE`. H2 keeps one row per finished **slice**, keyed `UNIQUE (job_id, attempt, slice_start)`: a service attempt is split at every 00:00 UTC, and a batch attempt stays one slice. Rows gain the principal columns (§5.6), `kind`, `template_id`, `slice_start`, `slice_end`, `last_slice` and `charge_day`. The table is rebuilt (forward-only) with its append-only triggers. H1 property test 6 ("exactly one row per finished attempt") becomes "exactly one row per finished slice". | §5.6, §12 |
+| Daily caps | **Changed.** The cap query counts ledger rows by their `charge_day` (the UTC day each slice is charged to) instead of by `jobs.created_at`, plus open reservations, never counting a reservation and the rows written against it twice. A batch slice is charged to its job's creation day, so batch jobs keep H1's numbers exactly. A capped principal's service is charged one UTC day at a time (a daily reservation) instead of by its whole `timeout_s` at creation, and is stopped when the day's cap is reached. | §12 |
 | WSL image | Ships `p2pc-server`; `p2pc-node-run` becomes `p2pc-run` (agent, and hub when enabled); the upgrade carries `/var/lib/p2pc-server` too. | §8.5 |
 | Agent config | Share limits can change at run time (`p2pc-agent share set`), sent as `InventoryUpdate`. | §8.2 |
 | `install.ps1` | Kept for developers. The app does not call it; `p2pc-wsl` reimplements its install, upgrade and uninstall rules with the same checks and the same state layout, and a parity test pins them (§8.3). | §8.3 |
@@ -222,7 +225,10 @@ A device key is never derived from, or sent to, anything else. Losing it means p
   runs in the transaction that inserts the device. With two concurrent `Pair`s for one ticket, exactly one device is
   created (SI-H2-2).
 - **Retry is idempotent.** If the phone lost the `Paired` answer, the same ticket from the **same** device NodeId gets
-  the same answer again. Any other NodeId gets `invalid_ticket`.
+  the same answer again, as long as that device is still live. Any other NodeId gets `invalid_ticket`, and so does a
+  retry from the same NodeId once the device it created has been revoked (by an `admin` or by itself): a consumed
+  ticket never revives a revoked device, and the answer is the same `invalid_ticket` as for an unknown ticket
+  (SI-H2-2).
 - **Listing and revoking.** `GET /v1/devices/pairing-tickets` and `DELETE /v1/devices/pairing-tickets/{id}` (`admin`),
   like join tokens. The desktop app revokes the ticket it showed when its QR screen closes.
 - **Audit.** `pairing_ticket_created`, `device_paired`, `pairing_ticket_revoked`, `device_revoked`, failed pairings
@@ -274,28 +280,44 @@ would need a rendezvous service to resolve it, which H2 does not have (D4). So:
      is therefore configured relay-only too (`direct_addresses = "none"`: it publishes and serves no direct address).
      E10 confirms that iroh serves a relay-only endpoint this way; if it cannot, the listener keeps H1's address
      hygiene (§10.4).
-  2. It shows a QR code: `https://<web app origin>/invite#p2pc_inv_<base32: listener NodeId, relays, 16-byte code,
-     expiry (10 min)>`.
+  2. It reads the local agent's NodeId (`iroh_node_id` in `p2pc-agent status --json`; the agent creates its key at
+     first start, H1 §5 "Node identity") and shows a QR code: `https://<web app origin>/invite#p2pc_inv_<base32:
+     listener NodeId, agent NodeId, relays, 16-byte code, expiry (15 min)>`. Next to it the app shows the
+     **approval phrase** of step 4, computed from its own values, with "Your hub PC will show these words".
   3. The owner scans it with the paired phone. The phone relays the invite to the hub as a **join request**:
-     `POST /v1/nodes/join-requests {listener_node_id}` with the narrow scope **`nodes:invite`**, which the default phone
-     profile has (§5.5). The request carries no secret, expires after 10 minutes, and gives the phone nothing yet; at
-     most 4 are open per account (`429` beyond). The phone shows "Approve the new PC in the P2PC app on your hub PC".
+     `POST /v1/nodes/join-requests {listener_node_id, iroh_node_id, invite_expires_at}` (all three copied from the QR)
+     with the narrow scope **`nodes:invite`**, which the default phone profile has (§5.5). The request carries no
+     secret, expires 15 minutes after it was created, and gives the phone nothing yet. Limits (`429` beyond): at most 4
+     open per account, at most 2 open per requesting device, and at most 6 created per device per hour, so one stolen
+     phone cannot keep every slot filled. The phone shows "Approve the new PC in the P2PC app on your hub PC".
   4. **Approval on the hub PC.** The desktop app on the hub PC (an `admin` principal) shows "A new PC wants to join
-     your cloud, sent from <device label>: Approve / Reject". "Approve" calls
+     your cloud" with what the owner can check: the request's source device (its label and platform as recorded at
+     pairing, not as the request claims), the time the request was created ("3 minutes ago"), and the **approval
+     phrase**: 4 words from the fixed 2,048-word list of step 6, derived from
+     `BLAKE3("p2pc-join-request-v1" || agent NodeId || listener NodeId || invite expiry as u64 big-endian)`. The screen
+     says "Approve only if your new PC shows the same words". "Approve" calls
      `POST /v1/nodes/join-requests/{id}/approve` (`admin`), which records the approving principal and mints nothing yet.
-     "Reject" (`DELETE /v1/nodes/join-requests/{id}`) or the expiry ends the request with nothing minted. Every step is
-     audited (`join_request_created`, `join_request_approved`, `join_request_rejected`, `join_request_delivered`).
+     The hub refuses to approve a request created more than 15 minutes ago (`409 join_request_closed`), checked against
+     the row's `created_at` on the hub's clock, whatever state the expiry sweep has left it in. "Reject"
+     (`DELETE /v1/nodes/join-requests/{id}`) or the expiry ends the request with nothing minted. Every step is audited
+     (`join_request_created`, `join_request_approved`, `join_request_rejected`, `join_request_delivered`).
+     - *What the phrase defeats.* A thief with the owner's phone who opens a request for their own machine sends that
+       machine's NodeIds, so the hub PC shows other words than the owner's new PC. Copying the NodeIds of the owner's
+       QR instead gains nothing: the token is bound to the owner's agent NodeId (step 5) and enrolls only the owner's
+       PC.
   5. The phone polls `GET /v1/nodes/join-requests/{id}` until the request is `approved`, then calls
      `POST /v1/nodes/join-requests/{id}/token` (the requesting device only). That call mints the join token (15
-     minutes, single use, on behalf of the approving principal), stores only its hash (hard rule 5) and returns it
-     **once**; the request becomes `delivered`. A phone that loses that answer opens a new request. The phone dials
-     the listener on `p2pc/invite/1` and sends `Invite{code, join_token, hub_name}`. The app checks the code (constant
-     time, single use) and answers `InviteAck{}`.
-  6. Both screens show a **check phrase**: 4 words from a fixed 2,048-word list, derived from
-     `BLAKE3("p2pc-invite-v1" || hub NodeId || listener NodeId || code)`. The owner taps "Join" on the PC only if they
-     match. This defeats someone who photographed the QR and pushes their own hub's token: the PC would otherwise join
-     a stranger's cloud and run the stranger's jobs (H1 SI-1 protects the owner of the cloud, not a node joined to the
-     wrong cloud).
+     minutes, single use, on behalf of the approving principal, **bound to the request's agent NodeId**), stores only
+     its hash (hard rule 5) and returns it **once**; the request becomes `delivered`. The hub refuses a `Join` with a
+     bound token from any other NodeId with H1's invalid-token answer, and does not consume the token. A phone that
+     loses that answer opens a new request. The phone dials the listener on `p2pc/invite/1` and sends
+     `Invite{code, join_token, hub_name}`. The app checks the code (constant time, single use) and answers
+     `InviteAck{}`.
+  6. The phone and the new PC then show a second check phrase, the **hub phrase**: 4 words from a fixed 2,048-word
+     list, derived from `BLAKE3("p2pc-invite-v1" || hub NodeId || listener NodeId || code)`. The owner taps "Join" on
+     the PC only if they match. This defeats someone who photographed the QR and pushes their own hub's token: the PC
+     would otherwise join a stranger's cloud and run the stranger's jobs (H1 SI-1 protects the owner of the cloud, not
+     a node joined to the wrong cloud).
   7. The app feeds the join token to `p2pc-agent join -` through stdin (H1 §7 CLI conventions) and closes the
      listener. The token was minted by an `admin` principal, so the node is approved when it enrolls.
 - **Direct tokens from `nodes:join`.** A principal with `nodes:join` (the opt-in developer device profile, or an API
@@ -314,7 +336,7 @@ would need a rendezvous service to resolve it, which H2 does not have (D4). So:
 - **Principal.** Every authenticated request carries a principal: `Key{key_id}` (H1) or `Device{device_id}`. Ownership
   (`account_id`, `project_id`), scopes, caps and image allowlists come from the principal's row. Audit events, the usage
   ledger and `GET /v1/whoami` name the principal (`whoami` gains `principal: {kind, id}`; `key_id` stays, `null` for
-  a device).
+  a device). §5.6 says how the database stores it.
 - **A device principal exists only on `p2pc/device/1`.** Requests on the TCP REST listener and on `p2pc/http/1` are
   authenticated by API key only. No header can turn a request into a device request (SI-H2-3): device requests are
   served in-process with the principal attached as a request extension, never relayed to the TCP listener.
@@ -352,13 +374,66 @@ would need a rendezvous service to resolve it, which H2 does not have (D4). So:
     Nodes from tokens minted by `admin` principals, including those of approved join requests (§5.4), are created
     `approved`, as in H1.
   - Only an `admin` principal approves: `POST /v1/nodes/{id}/approve` (idempotent), audited as `node_approved`. The
-    desktop app on the hub PC shows "New PC waiting: <name>, added from <principal>: Approve / Remove"; "Remove" is
-    H1's `DELETE /v1/nodes/{id}`. The joined PC's app shows "Waiting for approval on your hub PC" (§8.8).
+    desktop app on the hub PC shows "New PC waiting: Approve / Remove" with what the owner can check, since the name
+    is whatever the node reported: the principal that minted its token (as recorded by the hub), the enrollment time,
+    and the **node phrase**, 4 words from the same list derived from `BLAKE3("p2pc-node-v1" || node NodeId)`.
+    "Remove" is H1's `DELETE /v1/nodes/{id}`. The joined PC's app shows "Waiting for approval on your hub PC" with the
+    same node phrase (§8.8), and `p2pc-agent status` prints it on a Linux node, so the owner approves only the
+    machine whose screen shows the same words.
   - Revoking a device offers "also remove the PCs this device added".
   - A stolen phone with the default profile can therefore only open join requests, and a stolen developer device only
     enroll pending nodes: in neither case does a machine the thief controls get any work without the owner's approval
     on the hub PC (SI-H2-19). This closes O-4.
-  - `GET /v1/nodes` and `GET /v1/nodes/{id}` gain `approval` and `enrolled_by` (additive).
+  - `GET /v1/nodes` and `GET /v1/nodes/{id}` gain `approval`, `enrolled_by` and `node_phrase` (additive).
+
+### 5.6 How principals are stored
+
+H1 stores the principal of jobs, ledger rows and join tokens as a `NOT NULL` API key: `jobs.key_id`
+(`crates/p2pc-server/migrations/20261105130000_jobs.sql`), `usage_records.key_id` (`20261105150000_scheduler.sql`) and
+`join_tokens.created_by_key_id` (`20261105140000_join_tokens_nodes.sql`). A device principal has no API key, so H2
+stores a principal in two columns:
+
+- **Columns.** `key_id TEXT REFERENCES api_keys (key_id)` and `device_id TEXT REFERENCES devices (device_id)`, both
+  nullable, with `CHECK ((key_id IS NULL) <> (device_id IS NULL))`: exactly one is set, in `jobs` and in
+  `usage_records`. `join_tokens` has `created_by_key_id` and `created_by_device_id` under the same `CHECK`, plus
+  `bound_iroh_node_id` (nullable; set only for tokens of join requests, §5.4). `audit_events` gains `actor_device_id`
+  with `CHECK (actor_key_id IS NULL OR actor_device_id IS NULL)` (aggregated failures have no actor), and its update
+  trigger compares the new column too. `nodes` gains `approval` (`NOT NULL DEFAULT 'approved'`) and `enrolled_by`, the
+  principal of the token that enrolled it (`NULL` for H1 nodes); both are plain added columns.
+- **Idempotency per principal.** SQLite treats NULLs as distinct in a unique index, so H1's
+  `jobs_idempotency ON jobs (key_id, idempotency_key)` would silently stop deduplicating every device submission once
+  `key_id` may be NULL. It is replaced by two partial unique indexes, in which the principal column is never NULL:
+
+  ```sql
+  CREATE UNIQUE INDEX jobs_idempotency_key ON jobs (key_id, idempotency_key)
+      WHERE idempotency_key IS NOT NULL AND key_id IS NOT NULL;
+  CREATE UNIQUE INDEX jobs_idempotency_device ON jobs (device_id, idempotency_key)
+      WHERE idempotency_key IS NOT NULL AND device_id IS NOT NULL;
+  ```
+
+  The scope stays H1's: one principal. Another principal reusing the same idempotency key gets its own job and learns
+  nothing about the first. Template launches (§7.6) use the same indexes.
+- **Cap lookups.** H1's `jobs_key_created` stays and gains `jobs_device_created ON jobs (device_id, created_at)`; the
+  ledger is indexed by principal and `charge_day` (§12).
+- **Migration.** One forward-only migration (T2-10), after the one that creates `devices`, rebuilds `jobs`,
+  `usage_records`, `join_tokens` and `audit_events`:
+  - SQLite cannot relax `NOT NULL`, add a `CHECK` or change a `UNIQUE` constraint in place, so each table is rebuilt
+    with the procedure of `20261108120000_finished_lease_holds.sql`: `PRAGMA defer_foreign_keys = ON`, rows saved in a
+    temporary table, the table dropped and created again under its own name, rows copied back. The tables that
+    reference `jobs` keep pointing at it, and foreign keys are checked at `COMMIT`. The migration runs in one
+    transaction, so a failure leaves the H1 tables;
+  - every index and trigger of the old tables is created again, as `20261106130000_audit_node_reenrolled.sql` does
+    for `audit_events`: `jobs_terminal_is_final`, `usage_records_no_update`, `usage_records_no_delete`,
+    `audit_events_no_delete`, `audit_events_no_update`, and every H1 index and constraint except those replaced here
+    (`jobs_idempotency` above; the ledger's `UNIQUE (job_id, attempt)` and `lease_id UNIQUE`, §12). Dropping a table
+    runs no row-level trigger, so the append-only triggers never fire during the rebuild, and they are in force again
+    before `COMMIT`;
+  - H1 rows are copied with `device_id` NULL and their key unchanged, and each ledger row becomes one slice (§12:
+    `slice_start = started_at`, `slice_end = ended_at`, `last_slice = 1`, `kind = 'batch'`, `charge_day` = the UTC
+    day of its job's `created_at`), so every H1 number (caps, `GET /v1/usage`) is the same after the migration;
+  - a migration test runs it on a database filled through the H1 migrations and checks: every row and value copied;
+    `PRAGMA foreign_key_check` empty; the append-only triggers still refuse `UPDATE` and `DELETE`; H1's cap and usage
+    values unchanged (SI-H2-20).
 
 ## 6. Protocol additions
 
@@ -509,12 +584,14 @@ A batch job with a blob input (the "Transcribe audio" template, abridged):
 }
 ```
 
-**Validation** (in `p2pc-proto`, unit-tested; H1 rules unchanged for every existing field):
+**Validation** (in `p2pc-proto`, unit-tested). Every existing field keeps its H1 rule, with two exceptions, both for
+`kind = "service"` only and both listed in §4.3: `timeout_s` (range and default) and `retry.max_attempts` (default and
+meaning). For batch jobs every H1 rule holds exactly.
 
 | Field | Rule |
 |---|---|
 | `kind` | `"batch"` (default) or `"service"`. |
-| `timeout_s` | Every job has a finite wall-clock limit (hard rule 3): no kind has a "no limit" value, and an absent `timeout_s` takes the default below. `batch`: H1 (1-86,400, default 3,600). `service`: 60-2,592,000 (30 days, the maximum); the default is the maximum, and a larger value is clamped to it (the response shows the effective value). When a service reaches it, it ends `timed_out` and the user restarts it (§7.2). Daily caps charge services per day (§12). |
+| `timeout_s` | Every job has a finite wall-clock limit (hard rule 3): no kind has a "no limit" value, and an absent `timeout_s` takes the default below. `batch`: H1, unchanged (1-86,400, default 3,600). **Changed for `service`:** 60-2,592,000 (30 days, the maximum), default the maximum. A value out of range gets `422 out_of_range` as in H1, never clamped. When a service reaches it, it ends `timed_out` and the user restarts it (§7.2). Daily caps charge services per day (§12). |
 | `service` | Required when `kind = "service"`, forbidden otherwise. |
 | `service.ports` | 1-8 entries. `port` 1-65,535, unique; `name` `[a-z][a-z0-9-]{0,31}`, unique. The shim refuses to forward any port not listed (§11.2). |
 | `service.health` | Optional. Exactly one of `http_get` (an absolute path, at most 256 bytes, no `..`, no CR/LF/NUL) or `tcp: true`; `port` must be in `ports`. `interval_s` 2-300 (default 10), `timeout_s` 1-60 (default 3), `start_period_s` 0-3,600 (default 300), `failure_threshold` 1-20 (default 3). Without `health`, the service is `healthy` as soon as a connection to its first port succeeds through the bridge. |
@@ -524,7 +601,8 @@ A batch job with a blob input (the "Transcribe audio" template, abridged):
 | `inputs` | 0-32 entries `{path, blob}`. `path` follows the `files` path rules (under `/inputs`, no `..`, no path a directory of another, no clash with `files`). `blob` is `sha256:<64 lowercase hex>` and must exist in the caller's account when the job is created (`422 unknown_blob`). The sum of blob sizes and inline `files` must fit in `resources.disk_mb` minus 64 MiB (`422 inputs_exceed_disk`). |
 | `template` | Read-only. Set by `POST /v1/templates/{id}/launch` (`{id, version}`); a client that sends it gets `422 read_only_field`. |
 | `resources.gpu` | 0 or 1, as H1. |
-| `idempotency_key` | H1 rules. |
+| `retry.max_attempts` | 1-5, as H1. `batch`: H1, unchanged (default 2; attempts are consumed only by node loss). **Changed for `service`:** default 3, and it counts **consecutive attempts that never became healthy**, with at most 5 node-loss restarts in any 24 h whatever the count (§7.2). `jobs.max_attempts` stores the value for both kinds. |
+| `idempotency_key` | H1 rules, scoped to the principal (an API key or a device, §5.6). |
 
 The Lease frame limit (1 MiB, H1 §6) still applies to the whole job; blob inputs do not count, inline `files` do.
 
@@ -547,9 +625,10 @@ The Lease frame limit (1 MiB, H1 §6) still applies to the whole job; blob input
   - node loss → see restart.
 - **Restart on node loss.** With `restart: "on_node_loss"`, a service whose node is lost is requeued like an H1 batch
   job, with two differences:
-  - `retry.max_attempts` (1-5, default 3 for services) counts **consecutive attempts that never became healthy**. An
-    attempt that was `healthy` for at least 10 minutes resets the count. A gaming PC that sleeps every night therefore
-    brings its chat back every morning, while a service that crashes the node at start stops after 3 tries;
+  - `retry.max_attempts` (1-5, default 3 for services; both changed from H1, §4.3 and §7.1) counts **consecutive
+    attempts that never became healthy**. An attempt that was `healthy` for at least 10 minutes resets the count. A
+    gaming PC that sleeps every night therefore brings its chat back every morning, while a service that crashes the
+    node at start stops after 3 tries;
   - whatever the count, node-loss restarts are capped at **5 in any 24 hours** per service. The node loss that would be
     the sixth within 24 hours ends the job `lost` with `error: "restart_limit"`, and the UI says the service kept
     losing its node. A nightly sleep stays well under the cap; a node that flaps cannot restart a service forever.
@@ -582,13 +661,13 @@ The Lease frame limit (1 MiB, H1 §6) still applies to the whole job; blob input
 | `GET /v1/templates` | jobs:read or templates:launch | The loaded template bundle (§7.6), with `bundle_version`. |
 | `POST /v1/templates/{id}/launch` | templates:launch | `{params, idempotency_key?}` → `201` with `Job`, or `200` with the running instance of a `singleton` template. |
 | `POST /v1/devices/pairing-tickets`, `GET …`, `DELETE …/{id}` | admin | §5.2. `POST` returns `{ticket, url, expires_at}` once. |
-| `GET /v1/devices`, `GET /v1/devices/{id}` | admin, or the device itself | `{id, label, platform, scopes, created_at, last_seen_at, revoked_at, paired_by}`. |
+| `GET /v1/devices`, `GET /v1/devices/{id}` | admin, or the device itself | `{id, label, platform, scopes, created_at, last_seen_at, revoked_at, paired_by}`. For a non-`admin` device, `GET /v1/devices` is filtered to that device alone (a one-item list), and `GET /v1/devices/{id}` of any other device gets `404`, as an unknown id. |
 | `DELETE /v1/devices/{id}` | admin, or the device itself | Revoke (§5.5). |
 | `POST /v1/nodes/join-tokens` | admin, or nodes:join | H1, plus `nodes:join` with `expires_in_s <= 900`; a node enrolled with a token minted by a non-`admin` principal starts `pending_approval` (§5.5). |
-| `POST /v1/nodes/join-requests` | nodes:invite | `{listener_node_id}` → `201 {id, expires_at}`; at most 4 open per account (`429`). §5.4. |
-| `GET /v1/nodes/join-requests`, `GET /v1/nodes/join-requests/{id}` | admin, or the requesting device (its own request) | `{id, requested_by, listener_node_id, state, created_at, expires_at}`, `state` one of `pending`, `approved`, `rejected`, `expired`, `delivered`. |
-| `POST /v1/nodes/join-requests/{id}/approve` | admin | Records the approval; mints nothing. `409 join_request_closed` unless `pending`. |
-| `POST /v1/nodes/join-requests/{id}/token` | the requesting device | Only when `approved`: mints the join token (15 min, single use) on behalf of the approving principal, stores only its hash, returns `{join_token, expires_at}` once and sets `delivered`. Otherwise `409 join_request_closed`. |
+| `POST /v1/nodes/join-requests` | nodes:invite | `{listener_node_id, iroh_node_id, invite_expires_at}` → `201 {id, expires_at}` (15 min). `429` beyond 4 open per account, 2 open per device or 6 created per device per hour. §5.4. |
+| `GET /v1/nodes/join-requests`, `GET /v1/nodes/join-requests/{id}` | admin, or the requesting device (its own requests only; the list is filtered to them) | `{id, requested_by, listener_node_id, iroh_node_id, approval_phrase, state, created_at, expires_at}`, `state` one of `pending`, `approved`, `rejected`, `expired`, `delivered`. |
+| `POST /v1/nodes/join-requests/{id}/approve` | admin | Records the approval; mints nothing. `409 join_request_closed` unless `pending` and created at most 15 minutes ago. |
+| `POST /v1/nodes/join-requests/{id}/token` | the requesting device | Only when `approved`: mints the join token (15 min, single use, bound to the request's `iroh_node_id`) on behalf of the approving principal, stores only its hash, returns `{join_token, expires_at}` once and sets `delivered`. Otherwise `409 join_request_closed`. |
 | `DELETE /v1/nodes/join-requests/{id}` | admin, or the requesting device | Reject or withdraw a `pending` request. |
 | `POST /v1/nodes/{id}/approve` | admin | Approves a `pending_approval` node (idempotent); audited `node_approved` (§5.5). |
 | `GET /v1/server` | any principal | H1 fields plus `api_version` (integer, 2 for H2), `min_web_version`, `hub_name`. |
@@ -632,13 +711,16 @@ No endpoint returns blob contents: the hub is not a file store.
   every exit path.
 - **Writing.** The body streams to `<data>/blobs/staging/<random>` while hashing. A short body, a hash mismatch
   (`422 digest_mismatch`) or a broken connection deletes the staging file. On success: `fsync`, rename to
-  `<data>/blobs/sha256/<aa>/<bb>/<hex>`, then insert the row (two short transactions with no I/O under the write
-  lock; the H1 rule).
+  `<data>/blobs/<account_id>/sha256/<aa>/<bb>/<hex>`, then insert the row (two short transactions with no I/O under
+  the write lock; the H1 rule). `<account_id>` is the hub's own account ID (a fixed ID format, never a string from the
+  request), so the file of a digest exists once per account and only rows of that account refer to it.
 - **Timeouts.** The upload route leaves the 30 s body limit; it has a 60 s idle limit instead, and a floor of 16 KiB/s
   averaged over any 60 s window. An upload of 2 GiB at 9 Mbit/s (E4's relay figure) takes about 30 minutes **(H)**:
   allowed, but the web app warns above 200 MiB.
-- **Namespacing.** Blobs are content-addressed **per account**: deduplication never crosses accounts, and `HEAD` in one
-  account says nothing about another (SI-H2-8).
+- **Namespacing.** Blobs are content-addressed **per account**, in the database and on disk: deduplication never
+  crosses accounts, `HEAD` in one account says nothing about another, and GC or `DELETE /v1/blobs/{sha256}` in one
+  account never removes a file that another account's row refers to (SI-H2-8). H2 has one account per hub (H1 §5);
+  the per-account path keeps this true when Milestone 3 adds more.
 - **Lifetime.** A blob expires 24 h after it was uploaded or after the last job that references it became terminal,
   whichever is later, plus the artifact retention when a job references it (H1 §12, 7 days). A non-terminal job keeps
   it alive. GC follows H1's retry-queue rule (`ORDER BY last_attempt_at`) and deletes in three steps, never the file
@@ -650,10 +732,12 @@ No endpoint returns blob contents: the hub is not a file store.
   2. **File**: delete it, outside any database transaction.
   3. **Row**: delete it.
 
-  An upload of a digest with a tombstone waits until step 3 has run for it, then stores the blob as new. A per-digest
-  lock in the hub makes this safe: the GC holds it from before step 1 until step 3, and an upload holds it from its
-  check of the row (deduplication or tombstone) until its rename and row insert. A GC that stops between steps resumes
-  from the tombstone.
+  `DELETE /v1/blobs/{sha256}` runs the same three steps at once for an unreferenced blob of the caller's account.
+  An upload of a digest with a tombstone waits until step 3 has run for it, then stores the blob as new. A lock in the
+  hub keyed by **`(account_id, digest)`** makes this safe: the GC (or the `DELETE`) holds it from before step 1 until
+  step 3, and an upload holds it from its check of the row (deduplication or tombstone) until its rename and row
+  insert. The same digest in two accounts takes two different locks and two different files. A GC that stops between
+  steps resumes from the tombstone.
 - **Delivery to a node** is the `BlobFetch` stream (§6.1), into the job's `inputs/` directory, read-only in the
   container like inline files.
 
@@ -729,7 +813,8 @@ output) apply to every new command.
   - `p2pc devices ls`, `p2pc devices revoke <id>`, `p2pc devices pair [--scopes …]`: prints the pairing URL once, as a
     secret, and a QR code in the terminal when stdout is a TTY.
   - `p2pc volumes ls`, `p2pc volumes rm <node> <name>`.
-  - `p2pc nodes approve <node>` (§5.5); `p2pc nodes ls` shows `approval`.
+  - `p2pc nodes approve <node>` (§5.5) prints the node phrase and asks for confirmation (`--yes` skips it);
+    `p2pc nodes ls` shows `approval`.
 - **Python SDK.** `client.blobs.put(path)`, `client.jobs.run(..., inputs={"/inputs/x": blob})`,
   `client.services.run(...)`, `client.services.connect(job, port)`, `client.templates.list()/launch(...)`.
 - **MCP.** `p2pc_run` accepts `inputs` with blob digests; a new tool `p2pc_blob_put` uploads a local file. No service
@@ -902,7 +987,7 @@ AC-H2-9 checks the result with a before/after inventory of the user profile, `HK
 | `distro_unhealthy` | Boot status or isolation checks fail (H1 `p2pc-test-distro` subset) | Which check | `attention` |
 | `hub_unreachable` | Joined PC cannot reach the hub | "Your hub PC is off or offline" | `attention`, retries |
 | `hub_gone` | `hub_unreachable` without a break for 14 days | "Your cloud is gone: remove P2PC from this PC, or join another cloud" | The app stops the watchdog (H1 `-Stop`: task disabled, distro terminated) and offers "Remove" (the uninstaller) or "Join another cloud" (§5.4). It never retries on its own again. |
-| `join_pending` | The node enrolled but is `pending_approval` (§5.5) | "Approve this PC in the P2PC app on your hub PC" | Waits; leaves the state on `NodeApproved` or the next `Welcome` |
+| `join_pending` | The node enrolled but is `pending_approval` (§5.5) | "Approve this PC in the P2PC app on your hub PC", with the node phrase the hub PC shows | Waits; leaves the state on `NodeApproved` or the next `Welcome` |
 | `join_rejected` | Invite expired, used, revoked | "Ask for a new invite" | Stays at 4 |
 | `node_removed` | Agent exit 7 | "This PC was removed from your cloud" with "Join again" | `attention` |
 | `agent_too_old` | Agent exit 6 | "Update needed" | runs the updater |
@@ -951,7 +1036,7 @@ AC-H2-9 checks the result with a before/after inventory of the user profile, `HK
 | Page | What |
 |---|---|
 | `/pair` | Reads the ticket from the fragment, clears it, pairs (§5.3), or explains the iOS steps (§9.3). Also "Scan pairing code" (camera, bundled QR decoder). |
-| `/invite` | Phone-assisted join of a PC (§5.4): sends the join request, waits for the approval on the hub PC, shows the check phrase, then hands over the join token. |
+| `/invite` | Phone-assisted join of a PC (§5.4): sends the join request, waits for the approval on the hub PC, shows the hub phrase, then hands over the join token. |
 | `/` (home) | Hub name and online state; PCs (name, online, sharing or paused, GPU); running services; shortcuts to the templates. |
 | `/chat` | The private chat (§9.4). |
 | `/transcribe` | Upload, launch, follow, read the transcript (§9.4). |
@@ -1148,11 +1233,13 @@ unprivileged.
 
 **Added arguments:**
 - `-v <volume dir>:<mount>:rw,U` per volume (§11.3): the one host path beyond the three per-job directories, allowed
-  by the hard-rule change of §4.3 ("Sandbox and hard rules", ADR-015) and nothing more. `<volume dir>` is always the
-  agent's own `/var/lib/p2pc/volumes/<account_id>/<hash>/data`, never a string from the JobSpec, and only for a
-  service or template job of that account. E11 measures whether `:U` (a recursive chown on each mount,
-  because `--userns=auto` may pick another range each time) is cheap enough for a model directory, or whether `:idmap`
-  replaces it.
+  only once the proposed hard-rule change of §4.3 ("Sandbox and hard rules", ADR-015, O-16) is in force, and nothing
+  more. Until then no code passes this argument. `<volume dir>` is always the agent's own
+  `/var/lib/p2pc/volumes/<account_id>/<hash>/data`, never a string from the JobSpec, only for a service or template job
+  of that account, and only after the check of §11.3 "Check before every mount" passed. E11 measures whether `:U` (a
+  recursive chown on each mount, because `--userns=auto` may pick another range each time) is cheap enough for a model
+  directory, or whether `:idmap` replaces it, and **whether `:U` follows symbolic links** (Podman is believed to use
+  `lchown`; E11 confirms it with a planted link to a file outside the volume).
 - `--label p2pc.kind=service` for services (orphan sweeps and `doctor`).
 - `/.p2pc/ports.json` (in the existing read-only `/.p2pc` mount): the ports the shim may forward.
 - With `ports.json`, the agent's `ingress.sock` in the same directory (§11.2).
@@ -1181,6 +1268,9 @@ unprivileged.
 
 ### 11.3 Volumes on the node
 
+Volumes rest on the proposed exception to hard rule 3 (§4.3, ADR-015 **Proposed**). Nothing in this section is
+implemented before the separate change that puts it in force (O-16); T2-22 waits for it.
+
 - **Layout.** `/var/lib/p2pc/volumes/<account_id>/<hex(sha256(name))[..32]>/` with `data/` (mounted) and `meta.json`
   (name, created, last used). The agent creates these directories itself (0700, created with `mkdirat` under
   directory descriptors, never following a link). Names never become paths directly, and no path from the JobSpec
@@ -1199,6 +1289,18 @@ unprivileged.
   volume whose `max_mb` exceeds `volumes_mb` makes the node ineligible, with a `reason`.
 - **Retention.** An unused volume is deleted after `volume_retention_days` (default 30), on `VolumeDelete`, and with
   the distro on uninstall. Under the H1 disk floor the agent evicts unused volumes before it kills jobs.
+- **Check before every mount.** A service that held the volume before may have left links in it, and `:U` changes the
+  owner of everything it reaches. So before every mount the agent recreates the volume's directory chain
+  (`volumes/<account_id>/<hash>/data`) with `mkdirat` under directory descriptors if it is missing, and otherwise
+  verifies it and walks the whole tree without following links: `openat(O_NOFOLLOW | O_DIRECTORY)` for directories
+  and `fstatat(AT_SYMLINK_NOFOLLOW)` (an lstat) for every entry. Any symbolic link, any entry that is neither a
+  directory nor a regular file (FIFO, socket, device), and any regular file with more than one hard link (a chown
+  through it would reach its other name) refuses the mount: the lease fails before start with
+  `error="volume_unsafe"` (a `start_failed`-class error, H1 §9 "Podman failures are not job exits") and the volume is
+  kept for the owner to delete (`VolumeDelete`), never repaired in place. The walk uses H1's entry budget of the disk
+  measurement; over it the mount is refused the same way. The walk runs while no container holds the volume (one
+  holder at a time, above), so nothing can change the tree between the walk and the mount. E11 confirms that the
+  template images write no links into their volumes.
 - **Deletion** walks the tree with `openat(O_NOFOLLOW)` and `unlinkat`, never following a link (SI-H2-9).
 - **Namespace.** `tpl:` volumes are created only by template launches (§7.1), so an arbitrary image cannot read or
   plant files in a template's model cache.
@@ -1232,27 +1334,75 @@ unprivileged.
 
 - **Units are unchanged** (H1 §11): 1 unit = 1 vCPU-hour reserved, a GPU-hour = 10 units, milli-units, no money.
 - **Services** are metered like batch attempts: reserved resources × the time the attempt held them.
-- **Daily split.** For every attempt that is still running at 00:00 UTC, the hub writes a ledger row for the part of
-  the attempt in the day that just ended (`slice_start`, `slice_end`), with reserved time exact and `used_cpu_ms` from
-  the latest cumulative `Heartbeat` value (§11.4) minus what earlier slices recorded. The final row covers the rest.
-  Daily caps and `GET /v1/usage` keep counting the same rows (H1 rule), so a week-long chat service shows up day by
-  day. A slice whose used CPU comes from no report is `estimated = 1`.
-- **New columns:** `device_id` (nullable, the principal when it is a device), `kind`, `template_id` (nullable),
-  `slice_start`, `slice_end`. `GET /v1/usage?group_by=` gains `device`, `kind` and `template`, and each group keeps
+- **Slices.** The ledger keeps one row per finished **slice** of an attempt (H1: one row per finished attempt, H1 §11):
+  - a **batch** attempt is one slice, from its start to its end, written when it ends, exactly as in H1 (a batch
+    attempt lasts at most 24 h, §7.1);
+  - a **service** attempt is cut at every 00:00 UTC it runs through. At 00:00 the hub writes the row of the slice that
+    just ended (from the attempt's start or the previous midnight, to this midnight), with reserved time exact and
+    `used_cpu_ms` from the latest cumulative `Heartbeat` value (§11.4) minus what earlier slices of the attempt
+    recorded. The attempt's end writes its last slice. A hub that was down at midnight writes the missed slices at
+    start, one per UTC day, before it serves requests;
+  - a slice whose used CPU comes from no report is `estimated = 1`. A service attempt that ends with no report (lost,
+    watchdog, cancel on an unreachable node) gets H1's estimate, cut into slices the same way.
+
+  `GET /v1/usage` and the caps count the same rows (H1 rule), so a week-long chat service shows up day by day.
+- **Ledger columns and key.** `usage_records` is rebuilt (§5.6) with:
+  - the principal: `key_id` or `device_id`, exactly one (§5.6);
+  - `kind` (`batch` or `service`) and `template_id` (nullable);
+  - `slice_start` and `slice_end` (`slice_start <= slice_end`), and `last_slice` (0 or 1; 1 on the attempt's last
+    row);
+  - `charge_day`: 00:00 UTC of the day the row is charged to (Unix seconds, `CHECK (charge_day % 86400 = 0)`). For a
+    service slice it is the day the slice lies in; for a batch slice it is the UTC day of its job's creation, the day
+    whose cap admitted the job, as H1 charges it;
+  - `started_at` keeps the attempt's start, and `ended_at` is the slice's end (`= slice_end`), so H1's
+    `CHECK (ended_at >= started_at)` holds and `GET /v1/usage` keeps H1's selection (rows that ended in `[from, to)`);
+    `estimated_attempts` keeps its name and counts estimated rows, as in H1.
+
+  The key `UNIQUE (job_id, attempt, slice_start)` replaces H1's `UNIQUE (job_id, attempt)`. `lease_id` stays
+  `NOT NULL REFERENCES leases (id)` but is no longer `UNIQUE`, since every slice of an attempt names its lease. A
+  partial unique index on `(job_id, attempt) WHERE last_slice = 1` keeps one last slice per attempt, and the cap reads
+  the indexes `(key_id, charge_day) WHERE key_id IS NOT NULL` and `(device_id, charge_day) WHERE device_id IS NOT NULL`.
+  The append-only triggers are created again unchanged: a slice is written once and never updated.
+- **Property test.** Invariant 6 of H1's scheduler property test (`crates/p2pc-server/src/scheduler/tests/props.rs`),
+  "`usage_records` has exactly one row per finished attempt", becomes **"exactly one row per finished slice"**: the rows
+  of each attempt tile `[started_at, ended_at]` with no gap and no overlap, cut only at 00:00 UTC and only for
+  services; a finished attempt has exactly one `last_slice = 1` row and a running one has none; a running service
+  attempt has one row for each midnight it crossed and none for its current slice. The property test drives the clock
+  across midnights. T2-16 changes the test together with the code.
+- **Grouping.** `GET /v1/usage?group_by=` gains `device`, `kind` and `template`, and each group keeps
   `estimated_attempts`.
-- **Caps.** For batch jobs nothing changes: at creation the estimate is resources × `timeout_s` (H1,
+- **The cap query.** A principal P's cap for the UTC day D is checked against `spent(P, D)`, which replaces H1's
+  `spent_between` (`crates/p2pc-server/src/store/leases.rs`, which counts jobs by `created_at`). In milli-units, it is
+  the sum of:
+  1. the `units` of P's ledger rows with `charge_day = D`;
+  2. for each **batch** job of P created on D: its `units_reserved` while it is not terminal (its current or next
+     attempt may still use it), and, once it is terminal with no ledger row, H1's rule (nothing if it was cancelled
+     before it ever ran, its reservation otherwise);
+  3. for each **service** of P that is not terminal and holds a reservation for D (`service_state.cap_day = D`):
+     `max(0, cap_reserved_units − the units of that job's rows with charge_day = D)`.
+
+  Term 3 is what stops double counting: a slice written against a day's reservation uses it up instead of adding to
+  it, so no unit is counted both as reserved and as recorded. A service's `jobs.units_reserved` is 0; its reservation
+  lives only in `service_state`. For batch jobs terms 1 and 2 give exactly H1's numbers, because every batch row is
+  charged to its job's creation day; H1's cap tests keep passing unchanged (AC-H2-12).
+- **Caps for services.** For batch jobs nothing changes: at creation the estimate is resources × `timeout_s` (H1,
   `402 cap_exceeded`). A service would reserve up to 30 days that way, more than any daily cap, so for a service whose
   principal has a `daily_unit_cap` the cap **charges per day of runtime, reserved daily**:
-  - at creation, and again at each 00:00 UTC while the service runs, the hub reserves against that UTC day's cap the
-    service's reserved rate (units per second, from its resources) × the runtime left in the day, bounded by what is
-    left of `timeout_s` and by what the day's cap still allows after the day's ledger rows and other reservations;
+  - at creation, and again at each 00:00 UTC while the service is not terminal, the hub sets the service's
+    reservation for that UTC day (`cap_day`, `cap_reserved_units`): its reserved rate (units per second, from its
+    resources) × the runtime left in the day, bounded by what is left of `timeout_s` and by the day's cap minus
+    `spent(P, D)` without this reservation;
   - creation (and template launch, §7.6) is refused with `402 cap_exceeded` when that gives under 15 minutes of
     runtime. At a day boundary, a reservation under 15 minutes stops the service at once;
-  - when the service reaches the end of its reserved runtime (`cap_deadline`, §7.2) before the day ends, the hub stops
-    it: `cancelled`, `reason: "cap_reached"`. The app and the web app show a notice: "Stopped: the daily limit of
+  - the midnight step is one `BEGIN IMMEDIATE` transaction per service: write the slice of the day that ended
+    (`charge_day` = that day), then replace the reservation with the new day's. The day that ended then counts rows
+    only, and no instant counts the slice and its reservation both, or neither;
+  - while the service runs, `cap_deadline` (§7.2) is the instant at which its rows for the day plus its current slice
+    at the reserved rate reach `cap_reserved_units`. If the service reaches it before the day ends, the hub stops it:
+    `cancelled`, `reason: "cap_reached"`. The app and the web app show a notice: "Stopped: the daily limit of
     <principal> was reached. You can start it again tomorrow, or raise the limit";
-  - the ledger keeps recording what the service actually held (the daily split above); the unused part of a day's
-    reservation is released when the service ends or the day closes.
+  - the ledger keeps recording what the service actually held (the slices above); the unused part of a day's
+    reservation is released when the service ends (term 3 no longer counts it) or the day closes.
 - **Service traffic** is recorded, not billed: `service_traffic(job_id, day, bytes_in, bytes_out, connections)`,
   returned in `GET /v1/jobs/{id}` as today's totals.
 - **Blob storage** is recorded, not billed: `GET /v1/blobs` returns the account's total and quota.
@@ -1262,9 +1412,12 @@ unprivileged.
 - **Hub data dir.** In app mode `/var/lib/p2pc-server` inside the hub PC's distro (0700, root); otherwise H1 §12.
   - New tables (additive migrations): `devices`, `pairing_tickets`, `join_requests`, `blobs` (with the GC tombstone
     `deleting_at`), `blob_refs`, `volume_reports`, `service_state` (health, last activity, consecutive unhealthy
-    attempts, node-loss restart times of the last 24 h, the day's cap reservation), `service_traffic`, the new ledger
-    columns, and the node columns `approval` and `enrolled_by`.
-  - Blobs: `<data>/blobs/sha256/<aa>/<bb>/<hex>`, staging in `<data>/blobs/staging/`, swept after 1 h.
+    attempts, node-loss restart times of the last 24 h, and the day's cap reservation as `cap_day` and
+    `cap_reserved_units`, §12), `service_traffic`, and the node columns `approval` and `enrolled_by`.
+  - Rebuilt tables (one forward-only migration that keeps every append-only trigger, §5.6): `jobs`, `usage_records`
+    (principal and slice columns, the new key, §12), `join_tokens` and `audit_events`.
+  - Blobs: `<data>/blobs/<account_id>/sha256/<aa>/<bb>/<hex>` (per account, §7.5), staging in
+    `<data>/blobs/staging/`, swept after 1 h.
   - Template bundles: `<data>/templates/`.
   - **Backup.** The hub's state lives in the distro's virtual disk. The app's upgrade archives it (§8.3); nothing else
     backs it up in H2. Losing the hub PC's disk loses the cloud: devices pair again with a new hub, PCs join again
@@ -1344,35 +1497,36 @@ H1's SI-1 to SI-13 stay in force and keep their tests.
 | ID | Invariant |
 |---|---|
 | SI-H2-1 | No secret appears in logs, `Debug` output, errors, audit events, the app's logs or the browser console: device keys, pairing tickets, invite codes, join tokens, API keys. A test scans the outputs of every pairing, invite and join path. |
-| SI-H2-2 | Pairing tickets are single-use and expire, checked against the hub's row, never the payload. Two concurrent `Pair`s for one ticket create exactly one device; a retry from the same NodeId is idempotent; every failure is the same `invalid_ticket`. |
+| SI-H2-2 | Pairing tickets are single-use and expire, checked against the hub's row, never the payload. Two concurrent `Pair`s for one ticket create exactly one device; a retry from the same NodeId is idempotent while its device is live; a retry from the same NodeId after that device was revoked gets `invalid_ticket` and creates nothing; every failure is the same `invalid_ticket`. Tests: the concurrent pair, the retry, the retry after revocation (by an `admin` and by the device itself), a retry from another NodeId. |
 | SI-H2-3 | A device principal exists only on `p2pc/device/1`. No request on the TCP listener or `p2pc/http/1` can carry one (no header, no query parameter); a device stream with an `Authorization` header gets `400`. |
 | SI-H2-4 | Revoking a device closes its live connections and its open service streams within 5 s, and later connections get the same `not_paired` as a NodeId never paired. Tested with an injectable clock and a real in-process hub. |
 | SI-H2-5 | Opening a service port requires `services:connect`, the job's account and project, a `running` service and a listed port, through one code path for every transport. Cross-account and unlisted-port negative tests. |
 | SI-H2-6 | `PortOpen` and `BlobFetch` are fenced by `(lease_id, epoch)` on the hub and on the agent; a stale one is refused. |
 | SI-H2-7 | The agent never connects to a socket path inside a job's directories except its own `ingress.sock`, which it created in the read-only mount; the shim refuses unlisted ports. Tests: a symlink planted where a socket could be, an unlisted port, a fake shim. |
-| SI-H2-8 | Blobs are per account: `HEAD`, upload deduplication and `inputs` never see another account's blobs. The declared size is checked before the body is read, with `checked_add` against the quota; the hash is verified on upload and again on the node. |
-| SI-H2-9 | Volumes follow the one hard-rule exception of §4.3 and nothing more: a volume directory is created by the agent, per account and named by hash, never taken from the JobSpec; it is mounted only into a service or template job of its account; `tpl:` volumes are created only by template launches; size limits hold; deletion never follows a link. Tests: a batch non-template job with `volumes` (`422` at the hub, `invalid_job` at the agent), a cross-account lease, names with `/`, `..` and NUL, a symlink planted inside a volume before deletion, a golden argv test of the `-v` arguments. |
+| SI-H2-8 | Blobs are per account, in the database and on disk: `HEAD`, upload deduplication and `inputs` never see another account's blobs; the file lives under `<data>/blobs/<account_id>/`, and the lock is keyed by `(account_id, digest)`. The declared size is checked before the body is read, with `checked_add` against the quota; the hash is verified on upload and again on the node. Tests (with two accounts in the store, although H2 serves one): the same digest uploaded in both, then GC and `DELETE` in one, leave the other's file and row intact and readable by its job; concurrent upload in one account and GC in the other do not wait on each other's lock. |
+| SI-H2-9 | Volumes follow the one proposed hard-rule exception of §4.3 and nothing more, and only once it is in force (O-16): a volume directory is created by the agent, per account and named by hash, never taken from the JobSpec; it is mounted only into a service or template job of its account; before every mount the agent recreates or verifies the directory chain and walks the tree without following links, refusing any symlink, any entry that is not a directory or a regular file, and any regular file with more than one link; `tpl:` volumes are created only by template launches; size limits hold; deletion never follows a link. Tests: a batch non-template job with `volumes` (`422` at the hub, `invalid_job` at the agent), a cross-account lease, names with `/`, `..` and NUL, a symlink planted inside a volume before deletion, **a symlink (to a file and to a directory outside the volume), a FIFO and a hard-linked file planted inside a volume before it is mounted again with `:U` or `:idmap`** (the mount is refused with `volume_unsafe`, and the link's target keeps its owner), a symlink replacing `data/` or `<hash>/` itself, a golden argv test of the `-v` arguments. |
 | SI-H2-10 | A service container keeps `--network=none` (golden argv test) and its ports are reachable only through the bridge: a scan from the distro's network namespace, the Windows host and another LAN machine finds them closed. |
 | SI-H2-11 | P2PC adds no listener reachable from the LAN. TCP: the hub's REST is not reachable from another machine, and the desktop app opens no TCP listener. UDP: the app's only sockets are its iroh endpoints; the device endpoint accepts no incoming connection, and the invite listener exists only during a join and serves only `p2pc/invite/1`. Tests: socket enumeration of the app process (no TCP listener; UDP sockets only from its iroh endpoints), a TCP scan and a UDP probe of the Windows host from the LAN machine, and an incoming QUIC connection to the device endpoint that is refused. |
 | SI-H2-12 | The web app and the desktop UI never turn untrusted text into HTML: a lint rule bans `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write`, `eval` and `new Function`; a DOM test feeds model output with `<script>`, `<img onerror>` and `javascript:` links and checks they render inert. The deployed header files contain the CSP of §9.5 (a test parses them). |
 | SI-H2-13 | Every template image is pinned by digest, and parameters reach the job only as whole env values or argv elements. A test runs over the bundle; a property test feeds shell metacharacters as parameter values and checks the resulting JobSpec. |
 | SI-H2-14 | The hub loads a template bundle only with a valid release signature, a higher `bundle_version` and a satisfied `min_hub_version`; fixtures for each failure. |
 | SI-H2-15 | The app's updater refuses an artifact with a bad signature, without a signed version, or with a signed version not greater than its own. |
-| SI-H2-16 | An invite code is single-use; the check phrase is a pure function of (hub NodeId, listener NodeId, code) with test vectors; the app joins only after the explicit confirmation. |
+| SI-H2-16 | An invite code is single-use; the hub phrase is a pure function of (hub NodeId, listener NodeId, code), the approval phrase of (agent NodeId, listener NodeId, invite expiry) and the node phrase of (node NodeId), each with test vectors; the app joins only after the explicit confirmation. The hub PC's approval screens show the phrase, the source device as recorded at pairing and the request or enrollment time; `approve` of a join request created more than 15 minutes ago gets `409 join_request_closed`; a join token of a join request enrolls only its bound agent NodeId (another NodeId gets H1's invalid-token answer and the token stays unused); one device cannot hold more than 2 open join requests or create more than 6 an hour (`429`). |
 | SI-H2-17 | `p2pc/pair/1` and `p2pc/invite/1` enforce their pre-auth limits (connections, pending exchanges, deadline, 4 KiB frames, failure rates); their decoders are fuzzed or property-tested. The limits never lock the owner out: with failure counters over their limits from other NodeIds and other ticket-hash prefixes, a `Pair` with a valid ticket that gets a connection slot still pairs (§5.3). |
-| SI-H2-18 | No escalation for devices: pairing tickets carry a subset of the creator's power; `nodes:join` creates tokens of at most 900 s and nothing else; `nodes:invite` creates only join requests; only `admin` creates pairing tickets; the last unrestricted `admin` principal cannot be revoked (`409 last_admin_key` for a key, `409 last_admin_device` for a device). |
+| SI-H2-18 | No escalation for devices: pairing tickets carry a subset of the creator's power (scopes, `daily_unit_cap`, image allowlist, expiry); a device's cap is enforced against its own principal (§12), never against the key or device that paired it; `nodes:join` creates tokens of at most 900 s and nothing else; `nodes:invite` creates only join requests; only `admin` creates pairing tickets; the last unrestricted `admin` principal cannot be revoked (`409 last_admin_key` for a key, `409 last_admin_device` for a device); a non-`admin` device sees only itself: `GET /v1/devices` returns a one-item list and `GET /v1/devices/{id}` of another device gets `404`. |
 | SI-H2-19 | No PC gets work without an `admin`'s approval. The default phone profile has no `nodes:join`. A node enrolled with a token minted by a non-`admin` principal is `pending_approval`, and the scheduler never offers it a lease until an `admin` principal approves it; a join request yields a token only after an `admin` approval, only to the requesting device and only once. Tests: a property test over the scheduler with pending and approved nodes (no lease ever reaches a pending one); approval by a non-`admin` principal gets `403`; a `nodes:join` device's token gives a pending node; a join request's token call before approval, after delivery and from another device gets `409` or `404`; the phone profile's scope list is pinned by a test. |
+| SI-H2-20 | Ledger and caps stay exact with two kinds of principal and daily slices (§5.6, §12). Every row of `jobs`, `usage_records` and `join_tokens` names exactly one principal (`CHECK`); idempotency deduplicates per principal for keys and for devices alike; the ledger stays append-only after the rebuild; `spent(P, D)` never counts a service's reservation and the slices written against it twice, and gives H1's numbers for batch jobs. Tests: inserts with both or neither principal column set fail; two submissions with one idempotency key from one device give one job, and from two devices or from a device and a key give two; `UPDATE` and `DELETE` on `usage_records` fail after the migration; the migration test of §5.6; a property test with an injectable clock over batch and service jobs of key and device principals crossing midnights (reservations, slices, requeues, cancels), checking after every step that `spent(P, D)` equals the reference sum of §12, that a service's rows for a day exceed that day's `cap_reserved_units` only by an estimated slice of an attempt the hub could not reach at `cap_deadline` (up to the end it observed), and that ledger invariant 6 (one row per finished slice) holds; H1's cap tests pass unchanged. |
 
 ### 15.2 Threat model additions
 
 | Threat | Mitigation | Residual |
 |---|---|---|
-| Stolen, unlocked phone | Bounded scopes (§5.5); revocation in ≤ 5 s; devices listed with `last_seen_at`; no `nodes:join` in the default profile, and every PC approved on the hub PC (SI-H2-19) | Until revoked: open the chat (read and write), launch templates, read job state, upload blobs, and open join requests that the owner must approve on the hub PC. |
+| Stolen, unlocked phone | Bounded scopes (§5.5); revocation in ≤ 5 s; devices listed with `last_seen_at`; no `nodes:join` in the default profile, and every PC approved on the hub PC against a check phrase (SI-H2-16, SI-H2-19); at most 2 open join requests per device | Until revoked: open the chat (read and write), launch templates, read job state, upload blobs, and open join requests that the owner must approve on the hub PC. |
 | XSS in the web app | CSP, Trusted Types, no HTML sinks, no third-party code, SRI | A bug in our own code can still leak the device key. |
 | Malicious or compromised static host | Reproducible build, signed manifest, the desktop app's verification, self-hosted copy (§9.6) | Targeted tampering of one client is not detected. |
 | Malicious or compromised relay | End-to-end encryption [S1] | Sees NodeIds, timing and volume; can drop traffic. |
 | Photographed pairing QR | 10-minute, single-use ticket; the app shows each new device | A race inside the window. |
-| Photographed invite QR | Check phrase (§5.4) | A user who confirms without comparing. |
+| Photographed invite QR | Hub phrase and approval phrase (§5.4); the join request's token is bound to the agent NodeId of the QR | A user who confirms without comparing. |
 | Container escape | H1 sandbox; owner's jobs only (SI-1); digest-pinned templates | Now also reaches the hub (D1, §11.5). |
 | Compromised upstream template image | Digest pinning, reviewed bumps, signed bundle | Trust in upstream at pin time. |
 | The hub relays service bytes in clear | It is the owner's own machine | A compromised hub sees chats. |
@@ -1392,7 +1546,7 @@ the release PR.
 | ID | Criterion | How |
 |---|---|---|
 | AC-H2-1 | Install to "Your cloud is ready": ≤ 5 min (reboot time excluded), ≤ 1 reboot, ≤ 1 UAC prompt; on the clean VM both without WSL and with WSL already installed. | **Manual**, timed; the app logs step timestamps, which the sheet copies. |
-| AC-H2-2 | Join the second PC with the phone-assisted invite (join request approved in the hub PC's app) in ≤ 3 min, and with the invite text. A node enrolled with a token from a `nodes:join` test device stays `pending_approval` and gets no job until approved. | **Manual**, plus a scripted check of the pending node. |
+| AC-H2-2 | Join the second PC with the phone-assisted invite (join request approved in the hub PC's app after comparing the approval phrase) in ≤ 3 min, and with the invite text. A node enrolled with a token from a `nodes:join` test device stays `pending_approval` and gets no job until approved. | **Manual**, plus a scripted check of the pending node. |
 | AC-H2-3 | Pair the iPhone (home-screen path) and the Android phone in ≤ 2 min each, on 4G. The hub reports the connection as relayed. | **Manual**, plus a scripted check of `GET /v1/devices`. |
 | AC-H2-4 | Private chat from the phone on 4G: launch → healthy; first model download with visible progress; with the model cached, service start to healthy ≤ 60 s **(H)**; first token ≤ 3 s after sending **(H)**; a 20-message conversation without error. | **Manual**; the web app's debug panel records the timings. |
 | AC-H2-5 | Transcribe a 30-minute audio file (≈ 30 MB) uploaded from the phone; the transcript arrives within 10 minutes on the reference GPU **(H)**, also when the tab was closed during the job. The same flow passes through the CLI (`p2pc blobs put`, `p2pc templates launch transcribe`). | Manual (phone) + **scripted** (CLI). |
@@ -1421,32 +1575,32 @@ in throwaway `spikes/` directories, and their results amend this spec before the
 |---|---|---|---|---|
 | T2-00 | Workspace scaffold for H2 | — | root `Cargo.toml`, `deny.toml`, CI workflow, new empty crates `p2pc-device`, `p2pc-wsl`, `apps/desktop`, `apps/web`, `templates/`, `deploy/relay`, `deploy/web` | So that no later task edits the root files. Windows CI runner for `p2pc-wsl` and the app. |
 | T2-01 | Proto: JobSpec extension | T2-00 | `p2pc-proto` `api.rs`, `validate/` | §7.1 table, states and `service` view types, blobs, volumes, templates, devices, errors; proptests. |
-| T2-02 | Proto: protocol additions | T2-00 | `p2pc-proto` `protocol.rs`, new `pair.rs`, `device.rs`, `invite.rs`, `lib.rs` (ALPN constants) | §6: capabilities, new messages, stream headers, pairing, invite, check phrase function with vectors; decoder fuzzing (SI-H2-17). |
+| T2-02 | Proto: protocol additions | T2-00 | `p2pc-proto` `protocol.rs`, new `pair.rs`, `device.rs`, `invite.rs`, `lib.rs` (ALPN constants) | §6: capabilities, new messages, stream headers, pairing, invite (the QR payload with the agent NodeId), the three check phrase functions (hub, approval, node; §5.4, §5.5) with vectors; decoder fuzzing (SI-H2-17). |
 | **Server lane** | | | | |
-| T2-10 | Server: devices and principals | T2-01, T2-02 | `p2pc-server` `auth.rs`, `store/devices.rs`, new `devices_api.rs`, migrations, `init.rs`, `recover.rs` | §5.2, §5.5: principals, scopes, pairing tickets REST, revocation (`last_admin_device`), `init --owner-device`, `devices add`, `whoami`, audit; join requests and node approval (§5.4, §5.5, SI-H2-19). |
+| T2-10 | Server: devices and principals | T2-01, T2-02 | `p2pc-server` `auth.rs`, `store/devices.rs`, `store/jobs.rs` (principal columns and idempotency), `store/join_tokens.rs`, `store/audit.rs`, new `devices_api.rs`, migrations, `init.rs`, `recover.rs` | §5.2, §5.5, §5.6: principals, scopes, pairing tickets REST (retry after revocation), revocation (`last_admin_device`), `GET /v1/devices` filtered for non-`admin` devices, `init --owner-device`, `devices add`, `whoami`, audit; **the §5.6 rebuild migration** of `jobs`, `usage_records` (the slice columns and key of §12 too, so the ledger is rebuilt once), `join_tokens` and `audit_events`, with its migration test; join requests (limits, 15-minute approval rule, approval phrase, tokens bound to the agent NodeId) and node approval with the node phrase (§5.4, §5.5, SI-H2-2, SI-H2-16, SI-H2-18, SI-H2-19, SI-H2-20). |
 | T2-11 | Server: `p2pc/pair/1` and `p2pc/device/1` | T2-10 | `gateway/pair.rs`, `gateway/device.rs`, `gateway/limits.rs`, `gateway/mod.rs` | In-process HTTP serving with the device principal, limits that never lock out a valid ticket, active close on revocation (SI-H2-3/4/17). |
-| T2-12 | Server: service jobs | T2-01, T2-02 | `scheduler/`, `jobs_api.rs`, `store/leases.rs`, `store/jobs.rs` | §7.2: restart policy and its 5-per-24-h cap, affinity wait, health from agents, idle cancel, cancel by template launcher and of singleton instances, `kind` filter, capabilities in placement, no lease to `pending_approval` nodes (SI-H2-19). |
+| T2-12 | Server: service jobs | T2-10 | `scheduler/`, `jobs_api.rs`, `store/leases.rs`, `store/jobs.rs` | §7.2: restart policy and its 5-per-24-h cap, affinity wait, health from agents, idle cancel, cancel by template launcher and of singleton instances, `kind` filter, capabilities in placement, no lease to `pending_approval` nodes (SI-H2-19). |
 | T2-13 | Server: service ports | T2-11, T2-12 | new `ports_api.rs`, `gateway/ports.rs`, `conn.rs` | §7.4 upgrade endpoint and hub-opened `PortOpen` streams, idle accounting, traffic counters (SI-H2-5/6). |
 | T2-14 | Server: blobs | T2-01, T2-02 | new `blobs_api.rs`, `store/blobs.rs`, `gc.rs`, `gateway/blob_fetch.rs` | §7.5 (with the tombstone GC) and `BlobFetch` (SI-H2-8). |
 | T2-15 | Server: templates and volumes API | T2-12, T2-50 | new `templates.rs`, `templates_api.rs`, `volumes_api.rs` | §7.6 bundle loading and launch (cap check for capped principals), §7.3 volumes (SI-H2-13/14). |
-| T2-16 | Server: metering additions | T2-12 | `units.rs`, `usage_api.rs`, `store/usage.rs` | §12 daily split, new columns and groups, daily cap reservation of services and `cap_reached`. |
+| T2-16 | Server: metering additions | T2-10, T2-12 | `units.rs`, `usage_api.rs`, `store/leases.rs` (`insert_usage`, `spent_between` replaced by `spent(P, D)`), `store/usage.rs`, `scheduler/tests/props.rs` | §12: service slices at 00:00 UTC (and the catch-up at start), `charge_day`, new groups, the cap query `spent(P, D)` per principal and per slice day, the daily reservation of services and `cap_reached`; invariant 6 of the scheduler property test becomes "exactly one row per finished slice"; the cap property test of SI-H2-20. |
 | **Agent lane** | | | | |
 | T2-20 | Agent: service lifecycle | T2-02 | `p2pc-agent` `executor/`, `sandbox/driver.rs`, `sandbox/engine.rs` | Services with H1's wall-clock enforcement up to 30 days, health state machine, `ServiceHealth`, log ring, `used_cpu_ms` in heartbeats. |
 | T2-21 | Shim and agent: ingress bridge and port streams | T2-20 | `p2pc-shim`, agent new `sandbox/ingress.rs`, `connection/streams.rs` | §11.2 and the stream dispatcher for hub-opened streams (SI-H2-7). |
-| T2-22 | Agent: volumes | T2-21 | agent new `volumes.rs`, `sandbox/engine.rs` (argv), `inventory.rs` | §11.3, `VolumeReport`, `VolumeDelete`, budget, eviction, GC, mounts only into service or template jobs of the account (SI-H2-9). Measures `:U` vs `:idmap` with E11's data. |
-| T2-23 | Agent: blob fetch, share changes, pause, leave | T2-21 | agent new `blobs.rs`, `config.rs`, `main.rs` (subcommands), `connection/session.rs` | `BlobFetch` client, `share set`, `owner_paused`, `leave`, `approval` (`Welcome.pending_approval`, `NodeApproved`), `status --json` additions. |
+| T2-22 | Agent: volumes | T2-21, **O-16** | agent new `volumes.rs`, `sandbox/engine.rs` (argv), `inventory.rs` | **Blocked** until the separate change of §4.3 puts the hard-rule exception in force (O-16). §11.3, `VolumeReport`, `VolumeDelete`, budget, eviction, GC, the no-follow check before every mount, mounts only into service or template jobs of the account (SI-H2-9). Uses E11's `:U` vs `:idmap` result and its answer on whether `:U` follows links. |
+| T2-23 | Agent: blob fetch, share changes, pause, leave | T2-21 | agent new `blobs.rs`, `config.rs`, `main.rs` (subcommands), `connection/session.rs` | `BlobFetch` client, `share set`, `owner_paused`, `leave`, `approval` (`Welcome.pending_approval`, `NodeApproved`), `status --json` additions (`iroh_node_id` before enrollment, the node phrase). |
 | **Device and web lane** | | | | |
 | T2-30 | `p2pc-device` crate | T2-02, E9 | `crates/p2pc-device` | Pairing and invite clients, device connection, HTTP/1.1 over streams, `open_port`; native and `wasm32` builds in CI; a native test client for AC-H2-7. |
 | T2-31 | Web app shell, pairing and key storage | T2-30 | `apps/web` (shell, `/pair`, `/settings`, storage, QR scanner), lint config | §9.1-§9.3, §9.5 lint rules and headers (SI-H2-12). |
 | T2-32 | Web app: home, jobs and chat | T2-31 | `apps/web` pages `/`, `/jobs`, `/chat`, the Markdown-subset renderer | §9.4 chat. |
-| T2-33 | Web app: transcribe, uploads and invites | T2-31 | `apps/web` pages `/transcribe`, `/invite`, upload module | §9.4 transcribe, §5.4 phone side (join request, wait for approval, hand-over). |
+| T2-33 | Web app: transcribe, uploads and invites | T2-31 | `apps/web` pages `/transcribe`, `/invite`, upload module | §9.4 transcribe, §5.4 phone side (join request with the QR's NodeIds and expiry, wait for approval, hand-over). |
 | T2-34 | Web build, manifest and deploy configs | T2-31 | `deploy/web/`, `scripts/web-manifest`, CI | Reproducible build, signed `web-manifest.json`, Cloudflare Pages, Vercel and nginx configs. |
 | **Desktop lane** | | | | |
 | T2-40 | `p2pc-wsl`: checks, download, import, task | T2-00 | `crates/p2pc-wsl` (`checks.rs`, `image.rs`, `import.rs`, `task.rs`) | §8.3 first half. |
 | T2-41 | WSL image: hub in the distro | — | `deploy/wsl/` (`build-rootfs.sh`, `p2pc-run`, `test-distro.sh`, `install.ps1` upgrade list) | §8.5: `p2pc-server` in the image, `p2pc-run`, `hub.enabled`, upgrade carries `/var/lib/p2pc-server`. |
 | T2-42 | Tauri app shell | T2-00 | `apps/desktop` (`src-tauri` core, tray, single instance, autostart, capabilities, DPAPI key) | §8.1, §8.4 states, §8.9. Embeds a placeholder UI until T2-31 lands. |
 | T2-43 | First run | T2-40, T2-41, T2-42, T2-10 | `apps/desktop` `setup/` module and the setup pages in `apps/web/src/desktop/` | §8.2 steps 1-5 (including the opt-in choice of step 1), `setup.json` resume, §8.8 errors. |
-| T2-44 | Join flow | T2-43, T2-30 | `apps/desktop` `invite/` module, `apps/web/src/desktop/join` | §5.4 PC side (relay-only invite listener), invite text, check phrase (SI-H2-16); on the hub PC, approving join requests and pending nodes; `join_pending` and `hub_gone` (§8.8). |
+| T2-44 | Join flow | T2-43, T2-30 | `apps/desktop` `invite/` module, `apps/web/src/desktop/join` | §5.4 PC side (relay-only invite listener, QR with the agent NodeId, approval phrase shown next to it), invite text, hub phrase (SI-H2-16); on the hub PC, approving join requests and pending nodes with the approval and node phrases, the source device and the time; `join_pending` with the node phrase and `hub_gone` (§8.8). |
 | T2-45 | `p2pc-wsl` upgrade and uninstall; app updater | T2-43 | `crates/p2pc-wsl` (`upgrade.rs`, `uninstall.rs`), `apps/desktop` `update/`, `uninstall/`, NSIS hooks | §8.3 second half, §8.7 (the hub deletes the other nodes first), §14.1-§14.2 (opt-in automatic checks), web app verification (§9.6), parity test with `install.ps1` (SI-H2-15). |
 | **Infrastructure and clients lane** | | | | |
 | T2-50 | Templates data and bundle | T2-01, E11 | `templates/`, `scripts/templates-bundle` | The two templates, bundle compiler and signer, bundle tests (SI-H2-13). |
@@ -1459,8 +1613,10 @@ in throwaway `spikes/` directories, and their results amend this spec before the
 | T2-61 | Security pass | all | `docs/security/residual-risks.md`, `SECURITY.md` | §11.5 and §15.2 into the residual risks; internal pentest (AC-H2-11). |
 
 Lanes once T2-01 and T2-02 land:
-- server: T2-10 → T2-11 → T2-13; T2-12 → T2-16; T2-14; then T2-15;
-- agent: T2-20 → T2-21 → T2-22 → T2-23;
+- server: T2-10 → T2-11 and T2-12 (both edit after T2-10's principal storage) → T2-13; T2-12 → T2-16; T2-14; then
+  T2-15;
+- agent: T2-20 → T2-21 → T2-23; T2-22 after T2-21 once O-16 is closed (the hard-rule change, §4.3). Until then the
+  templates cannot keep their models (both use volumes), so the beta needs O-16 closed;
 - device and web: T2-30 → T2-31 → T2-32 / T2-33 → T2-34;
 - desktop: T2-41 and T2-40 (start at once, no proto dependency) → T2-42 → T2-43 → T2-44 → T2-45;
 - infrastructure and clients: T2-53 → T2-54; T2-51 after E12; T2-50 after E11; T2-52 last.
@@ -1477,7 +1633,7 @@ consistent with a beta in 4-6 weeks only if E9, E10 and E11 pass without a desig
 |---|---|---|---|
 | **E9** · iroh WASM in mobile Safari and Chrome Android | WASM size (target ≤ 3 MB compressed **(H)**); pairing through the browser; relay-only connection through n0 and through a plain-HTTP `iroh-relay` behind a TLS PaaS; connect time (p50/p95); chat stream overhead per token; 50 MB upload time on 4G; what happens when the tab goes to the background (how long until the WebSocket drops, reconnect time on return); key persistence across browser restart; iOS Safari vs home-screen storage isolation and Android tab → installed app; hyper's HTTP/1.1 client over an iroh stream in WASM; whether iroh can use a non-extractable WebCrypto key. | Pairing and a streamed chat work on both phones; reconnect ≤ 5 s after returning; 50 MB upload ≤ 2 min on 4G through our relay **(H)**. | A native shell (for example Capacitor) around the same web app, or WebTransport; the spec changes §9 before T2-30. |
 | **E10** · Tauri 2 first run on a clean Windows 11 VM | Time to ready with and without WSL; reboots; UAC prompts; the `wsl --install --no-distribution` path (inbox, Store, already present, too old); SmartScreen and Defender behaviour on the unsigned installer; WebView2 presence; whether the hub's REST is reachable on Windows' loopback through `localhostForwarding`, and never from the LAN; the Windows firewall prompt on the app's first iroh (UDP) bind, for the device endpoint and the invite listener, and what each answer changes; whether the invite listener works relay-only with `direct_addresses = "none"` (§5.4); sleep and resume; the uninstall inventory. | AC-H2-1 targets met: ≤ 5 min (reboot excluded), ≤ 1 reboot, ≤ 1 UAC. | Revisit step order, bundling the image in the installer, or the WSL install path. |
-| **E11** · GPU service in Podman inside the WSL2 distro | Ollama image size and pull time; start to healthy with cached image and model; GPU visible (CUDA, not CPU fallback); the port reachable only through the ingress bridge; model download size, time and **the exact hosts** the egress allowlist needs (Ollama's registry and its CDN; Hugging Face for whisper models); Ollama through `HTTPS_PROXY`; `:U` vs `:idmap` on a model volume; VRAM and tokens/s of candidate default models; whisper.cpp speed on a 30-minute file; that the images load only GGUF. | Healthy ≤ 60 s with cached model **(H)**; downloads work through the egress proxy; no port reachable except through the bridge. | Change the template's image, model or command; a pre-pull step by the agent. |
+| **E11** · GPU service in Podman inside the WSL2 distro | Ollama image size and pull time; start to healthy with cached image and model; GPU visible (CUDA, not CPU fallback); the port reachable only through the ingress bridge; model download size, time and **the exact hosts** the egress allowlist needs (Ollama's registry and its CDN; Hugging Face for whisper models); Ollama through `HTTPS_PROXY`; `:U` vs `:idmap` on a model volume; **whether `:U` follows symbolic links** (a link planted in the volume to a file and to a directory outside it, then a remount: the targets' owners must not change), and that the template images write no symlinks, FIFOs or hard links into their volumes (§11.3); VRAM and tokens/s of candidate default models; whisper.cpp speed on a 30-minute file; that the images load only GGUF. Its volume measurements run in a throwaway `spikes/` directory, never in product code (§17), and feed the decision of O-16. | Healthy ≤ 60 s with cached model **(H)**; downloads work through the egress proxy; no port reachable except through the bridge. | Change the template's image, model or command; a pre-pull step by the agent. |
 | **E12** · relay map (proposed by this spec) | `iroh-relay` in plain-HTTP mode on Railway with native and browser clients; home-relay selection with a mixed map (our HTTP relay plus n0's relays); QUIC address discovery through n0 while relaying through ours; the egress gate opening on a WSL2 node with the production map; relay throughput and cost per GB on the PaaS. | AC-H2-13 passes. | A relay on a host with UDP (and TLS) for production, or n0's paid relays. |
 
 ### 18.2 Open items
@@ -1499,6 +1655,7 @@ consistent with a beta in 4-6 weeks only if E9, E10 and E11 pass without a desig
 | O-13 | UI languages of the beta. | Owner | English; strings externalized. |
 | O-14 | Privacy notice: what the relay and static host see; the GDPR role of the project. | Owner (legal) | Required before public release. |
 | O-15 | Windows 10 support in the app. | Owner | Not in the beta. |
+| O-16 | Putting the persistent-volume exception (§4.3, ADR-015) in force. | Architect | **Open.** ADR-015 is Proposed. When the architect accepts this spec after E11, a separate change amends CONTRIBUTING hard rule 3 and H1 §9's "Never" line together and marks ADR-015 Accepted. Until then hard rule 3 and H1 §9 stand, no code mounts a volume, and T2-22 is blocked; the beta needs it, because both templates keep their models in volumes. |
 
 ## 19. Sources
 

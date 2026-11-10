@@ -73,10 +73,7 @@ expected: do not work around it.
    - rootless on Linux, or root inside the dedicated WSL2 distro with `--userns=auto` on Windows (spec §9.0);
    - all capabilities dropped, `no-new-privileges` and default seccomp;
    - no `--privileged`;
-   - no container-runtime socket and no host paths mounted, except the per-job scratch directories the agent creates.
-     The only other exception (ADR-015) is a persistent volume: a directory the agent creates per account and names by
-     hash, never a path taken from the job, mounted only into that account's service and template jobs, size-limited,
-     and deleted without following links;
+   - no container-runtime socket and no host paths mounted, except the per-job scratch directories the agent creates;
    - limits on CPU, memory, PIDs, disk and wall-clock time.
 4. **Nodes never listen on the network** by default. Agents only connect outbound.
 5. **Secrets:**
