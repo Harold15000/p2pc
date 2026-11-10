@@ -724,10 +724,12 @@ pub mod fixtures {
         job.name = Some("fixture service".into());
         job.finished_at = status.is_terminal().then(t0);
         if status == JobStatus::Running {
-            let mut view = p2pc_proto::api::ServiceView::default();
-            view.health = health;
-            view.ports =
-                serde_json::from_value(serde_json::json!([{"port": 8080, "name": "web"}])).expect("a valid port view");
+            let view = p2pc_proto::api::ServiceView {
+                health,
+                ports: serde_json::from_value(serde_json::json!([{"port": 8080, "name": "web"}]))
+                    .expect("a valid port view"),
+                ..p2pc_proto::api::ServiceView::default()
+            };
             job.service = Some(view);
         }
         job

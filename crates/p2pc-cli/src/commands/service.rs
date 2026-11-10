@@ -35,7 +35,7 @@ pub const DEFAULT_VOLUME_MB: u64 = 1024;
 /// `p2pc service <run|connect|stop|list>`.
 pub async fn run(ctx: &mut Ctx<'_, '_>, args: ServiceArgs) -> Result<u8, CliError> {
     match args.command {
-        ServiceCommand::Run(a) => start(ctx, a).await,
+        ServiceCommand::Run(a) => start(ctx, *a).await,
         ServiceCommand::Connect(a) => connect(ctx, a).await,
         ServiceCommand::Stop(a) => super::jobs::cancel(ctx, a).await,
         ServiceCommand::List(a) => list(ctx, a).await,

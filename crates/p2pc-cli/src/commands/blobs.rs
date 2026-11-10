@@ -165,7 +165,7 @@ fn blob_table(blobs: &[BlobInfo], now: OffsetDateTime) -> Table {
             fmt_age(now, b.created_at),
             // `null` while a job that is not finished keeps it alive.
             b.expires_at
-                .map_or_else(|| "in use".to_string(), |at| crate::output::fmt_time(at)),
+                .map_or_else(|| "in use".to_string(), crate::output::fmt_time),
         ]);
     }
     table

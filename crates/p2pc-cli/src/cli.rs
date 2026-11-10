@@ -118,7 +118,7 @@ pub enum ServiceCommand {
     /// A service keeps running and exposes ports (reach them with `p2pc service connect`). The options of `p2pc run`
     /// apply; --timeout defaults to 30 days, the longest a service may run. A service stops on `p2pc service stop`,
     /// when it has been idle for --idle, or when its time is up.
-    Run(ServiceRunArgs),
+    Run(Box<ServiceRunArgs>),
     /// Forward a local port to a port of a running service, until the service ends.
     ///
     /// Each local TCP connection opens one connection to the service through the hub. It exits when the service ends:
