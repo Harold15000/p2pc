@@ -33,6 +33,9 @@ pub mod import;
 pub mod runner;
 pub mod task;
 
+#[cfg(test)]
+mod parity;
+
 /// The one distro this crate creates, verifies or runs commands in (`$DistroName` in `install.ps1`).
 pub const DISTRO_NAME: &str = "p2pc-node";
 
