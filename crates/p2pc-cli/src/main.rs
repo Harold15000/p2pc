@@ -61,6 +61,7 @@ fn main() -> ExitCode {
             now: OffsetDateTime::now_utc(),
             retry: RetryPolicy::default(),
             tunnel: app::TunnelSettings::default(),
+            poll: p2pc_cli::follow::PollSchedule::default(),
         };
         runtime.block_on(app::run(&args, &mut host))
     };

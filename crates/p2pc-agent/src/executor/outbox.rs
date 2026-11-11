@@ -8,6 +8,11 @@
 //!
 //! - **Back-pressure.** Log chunks queued here are bounded by [`LOG_QUEUE_BYTES`] (8 MiB of encoded chunks per
 //!   run). Past it the **oldest** chunks are dropped and counted; `JobStarted` and `JobFinished` are never dropped.
+//! - **A service's ring** (H2 §11.4). A service's logs are not capped in total, so its queue keeps the **most
+//!   recent** [`SERVICE_LOG_RING_BYTES`] (64 MiB of log bytes) as a ring of [`LOG_SEGMENT_BYTES`] (1 MiB) segments:
+//!   past the cap the oldest whole segment is dropped and counted, and one marker chunk in its place (on `stderr`,
+//!   numbered with the first dropped `seq`, which no chunk sent ever had) records the dropped range. A drop next to a
+//!   marker still queued extends it. `JobStarted`, `ServiceHealth` and `JobFinished` are never dropped.
 //! - **Silence.** A run replaced by a newer epoch, or stopped by `stop_all`, is silenced: its queue is emptied and
 //!   nothing more is ever sent for it (fencing on the node, SI-8; SI-13).
 //! - **Delivery.** Each message goes to the session's job queue as a [`JobFrame`]. A log chunk whose session dies
@@ -21,7 +26,9 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use p2pc_proto::protocol::AgentMsg;
+use p2pc_proto::api::LogStream;
+use p2pc_proto::ids::LeaseId;
+use p2pc_proto::protocol::{AgentMsg, LogData};
 use p2pc_proto::validate::base64_decoded_len;
 use tokio::sync::Notify;
 
@@ -30,12 +37,59 @@ use crate::connection::uplink::{FrameLoss, JobFrame};
 
 /// Most bytes of queued log chunks per run (their encoded size, as they sit in memory).
 pub const LOG_QUEUE_BYTES: usize = 8 * 1024 * 1024;
+/// Most log bytes a service run keeps queued (H2 §11.4: the most recent 64 MiB). Encoded, about 85 MiB of memory,
+/// reached only while the server cannot take them (the agent stops every job after 45 s without it, SI-13).
+pub const SERVICE_LOG_RING_BYTES: u64 = 64 * 1024 * 1024;
+/// The segment of a service's ring (H2 §11.4: 1 MiB): whole segments are dropped, the oldest first.
+pub const LOG_SEGMENT_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug)]
 struct Item {
     msg: AgentMsg,
     /// For a log chunk: its encoded size and its raw size.
     log: Option<(usize, u64)>,
+    /// For a log chunk of a ring: its segment.
+    segment: Option<u64>,
+    /// For a ring's marker: the range it records.
+    marker: Option<Dropped>,
+}
+
+/// A range of log chunks a ring dropped.
+#[derive(Debug, Clone, Copy)]
+struct Dropped {
+    first: u64,
+    last: u64,
+    chunks: u64,
+    bytes: u64,
+}
+
+impl Dropped {
+    fn marker(&self, lease_id: LeaseId, epoch: u64, cap: u64) -> AgentMsg {
+        let text = format!(
+            "\n[p2pc] log chunks {}-{} ({} bytes) were dropped: the service wrote more than the {} MiB the agent \
+             keeps while the server could not take them\n",
+            self.first,
+            self.last,
+            self.bytes,
+            cap / LOG_SEGMENT_BYTES
+        );
+        AgentMsg::LogChunk {
+            lease_id,
+            epoch,
+            stream: LogStream::Stderr,
+            seq: self.first,
+            data_b64: LogData::encode(text.as_bytes()),
+        }
+    }
+}
+
+/// How a run's queue bounds its log chunks.
+#[derive(Debug, Clone, Copy)]
+enum Limit {
+    /// A batch run (H1): at most this many bytes of encoded chunks; the oldest chunks go first.
+    Queue(usize),
+    /// A service run (H2 §11.4): at most `cap` raw bytes, in segments of `segment` raw bytes.
+    Ring { cap: u64, segment: u64 },
 }
 
 #[derive(Debug, Default)]
@@ -48,6 +102,84 @@ struct Inner {
     closed: bool,
     /// Nothing more may be sent.
     silenced: bool,
+    /// A ring's raw bytes queued.
+    ring_bytes: u64,
+    /// The ring's segment being filled, and its raw bytes so far.
+    segment: u64,
+    segment_bytes: u64,
+}
+
+impl Inner {
+    /// Drops the oldest whole segment of a ring, and records it in a marker. False when there is none to drop but
+    /// the one being filled.
+    fn drop_oldest_segment(&mut self, cap: u64) -> bool {
+        let Some(oldest) = self.queue.iter().find_map(|i| i.segment) else {
+            return false;
+        };
+        if oldest == self.segment {
+            return false;
+        }
+        let Some(at) = self.queue.iter().position(|i| i.segment == Some(oldest)) else {
+            return false;
+        };
+        let mut range: Option<Dropped> = None;
+        let mut owner = None;
+        let (mut enc, mut raw) = (0usize, 0u64);
+        self.queue.retain(|i| {
+            if i.segment != Some(oldest) {
+                return true;
+            }
+            if let AgentMsg::LogChunk {
+                lease_id, epoch, seq, ..
+            } = &i.msg
+            {
+                owner.get_or_insert((*lease_id, *epoch));
+                let bytes = i.log.map_or(0, |(_, r)| r);
+                let r = range.get_or_insert(Dropped {
+                    first: *seq,
+                    last: *seq,
+                    chunks: 0,
+                    bytes: 0,
+                });
+                r.first = r.first.min(*seq);
+                r.last = r.last.max(*seq);
+                r.chunks += 1;
+                r.bytes += bytes;
+            }
+            if let Some((e, r)) = i.log {
+                enc += e;
+                raw += r;
+            }
+            false
+        });
+        self.log_bytes -= enc;
+        self.ring_bytes -= raw;
+        let (Some(range), Some((lease_id, epoch))) = (range, owner) else {
+            return true;
+        };
+        self.dropped_chunks += range.chunks;
+        self.dropped_bytes += range.bytes;
+        // Next to a marker still queued: extend it (its `seq` stays the first dropped one).
+        if let Some(prev) = at.checked_sub(1).and_then(|p| self.queue.get_mut(p))
+            && let Some(m) = prev.marker.as_mut()
+        {
+            m.last = m.last.max(range.last);
+            m.chunks += range.chunks;
+            m.bytes += range.bytes;
+            prev.msg = m.marker(lease_id, epoch, cap);
+            return true;
+        }
+        self.queue.insert(
+            at,
+            Item {
+                msg: range.marker(lease_id, epoch, cap),
+                log: None,
+                segment: None,
+                marker: Some(range),
+            },
+        );
+        true
+    }
 }
 
 /// What a run's queue dropped.
@@ -66,7 +198,7 @@ pub struct RunOutbox {
     /// Woken with `notify_waiters` (the sender and the run task may both wait on it); each waiter enables its
     /// `Notified` before it reads the state, so no change is missed.
     changed: Notify,
-    cap: usize,
+    limit: Limit,
     log_bytes_sent: AtomicU64,
 }
 
@@ -77,13 +209,28 @@ impl Default for RunOutbox {
 }
 
 impl RunOutbox {
-    /// A queue that keeps at most `cap` bytes of log chunks.
+    /// A queue that keeps at most `cap` bytes of log chunks (a batch run).
     #[must_use]
     pub fn with_cap(cap: usize) -> Self {
+        Self::limited(Limit::Queue(cap))
+    }
+
+    /// A service run's ring: at most `cap` raw log bytes, dropped in whole segments of `segment` bytes
+    /// ([`SERVICE_LOG_RING_BYTES`] and [`LOG_SEGMENT_BYTES`] in the agent). `cap` is raised to one segment if lower.
+    #[must_use]
+    pub fn ring(cap: u64, segment: u64) -> Self {
+        let segment = segment.max(1);
+        Self::limited(Limit::Ring {
+            cap: cap.max(segment),
+            segment,
+        })
+    }
+
+    fn limited(limit: Limit) -> Self {
         Self {
             inner: Mutex::new(Inner::default()),
             changed: Notify::new(),
-            cap,
+            limit,
             log_bytes_sent: AtomicU64::new(0),
         }
     }
@@ -99,7 +246,12 @@ impl RunOutbox {
             if q.silenced || q.closed {
                 return;
             }
-            q.queue.push_back(Item { msg, log: None });
+            q.queue.push_back(Item {
+                msg,
+                log: None,
+                segment: None,
+                marker: None,
+            });
         }
         self.changed.notify_waiters();
     }
@@ -116,7 +268,31 @@ impl RunOutbox {
             if q.silenced || q.closed {
                 return;
             }
-            while q.log_bytes + size > self.cap {
+            let cap = match self.limit {
+                Limit::Queue(cap) => cap,
+                Limit::Ring { cap, segment } => {
+                    // A new segment when this chunk would not fit in the one being filled.
+                    if q.segment_bytes > 0 && q.segment_bytes + raw > segment {
+                        q.segment += 1;
+                        q.segment_bytes = 0;
+                    }
+                    q.segment_bytes += raw;
+                    q.ring_bytes += raw;
+                    q.log_bytes += size;
+                    let segment = Some(q.segment);
+                    q.queue.push_back(Item {
+                        msg,
+                        log: Some((size, raw)),
+                        segment,
+                        marker: None,
+                    });
+                    while q.ring_bytes > cap && q.drop_oldest_segment(cap) {}
+                    drop(q);
+                    self.changed.notify_waiters();
+                    return;
+                }
+            };
+            while q.log_bytes + size > cap {
                 let Some(at) = q.queue.iter().position(|i| i.log.is_some()) else {
                     break;
                 };
@@ -130,7 +306,7 @@ impl RunOutbox {
                     q.dropped_bytes += bytes;
                 }
             }
-            if q.log_bytes + size > self.cap {
+            if q.log_bytes + size > cap {
                 // A single chunk larger than the whole cap (never with 64 KiB chunks): drop it.
                 q.dropped_chunks += 1;
                 q.dropped_bytes += raw;
@@ -140,6 +316,8 @@ impl RunOutbox {
             q.queue.push_back(Item {
                 msg,
                 log: Some((size, raw)),
+                segment: None,
+                marker: None,
             });
         }
         self.changed.notify_waiters();
@@ -158,6 +336,7 @@ impl RunOutbox {
             q.silenced = true;
             q.queue.clear();
             q.log_bytes = 0;
+            q.ring_bytes = 0;
         }
         self.changed.notify_waiters();
     }
@@ -210,8 +389,11 @@ impl RunOutbox {
                     return None;
                 }
                 if let Some(item) = q.queue.pop_front() {
-                    if let Some((enc, _)) = item.log {
+                    if let Some((enc, raw)) = item.log {
                         q.log_bytes -= enc;
+                        if item.segment.is_some() {
+                            q.ring_bytes -= raw;
+                        }
                     }
                     return Some(item);
                 }
@@ -403,6 +585,98 @@ mod tests {
         // Closed: nothing more is queued.
         q.push(AgentMsg::Unknown);
         assert!(q.next().await.is_none());
+    }
+
+    fn text_of(m: &AgentMsg) -> String {
+        match m {
+            AgentMsg::LogChunk { data_b64, .. } => {
+                String::from_utf8(data_encoding::BASE64.decode(data_b64.as_str().as_bytes()).unwrap()).unwrap()
+            }
+            other => panic!("not a log chunk: {other:?}"),
+        }
+    }
+
+    /// H2 §11.4: a service's queue is a ring of segments. Over its cap, the oldest whole segment goes, counted, and one
+    /// marker in its place, numbered with the first dropped `seq`, records the range; a second drop next to a marker
+    /// still queued extends it.
+    #[tokio::test]
+    async fn a_ring_drops_the_oldest_whole_segment_and_marks_the_range() {
+        // 40 raw bytes, segments of 10: two chunks of 5 bytes per segment.
+        let q = RunOutbox::ring(40, 10);
+        q.push(AgentMsg::Unknown);
+        for s in 0..12 {
+            q.push_log(chunk(s, 5), 5);
+        }
+        q.push(AgentMsg::Unknown);
+        q.close();
+        assert_eq!(q.drops(), Drops { chunks: 4, bytes: 20 });
+        let mut got = Vec::new();
+        while let Some(item) = q.next().await {
+            got.push(item.msg);
+        }
+        let order: Vec<Option<u64>> = got.iter().map(seq).collect();
+        assert_eq!(
+            order,
+            [
+                None,
+                Some(0),
+                Some(4),
+                Some(5),
+                Some(6),
+                Some(7),
+                Some(8),
+                Some(9),
+                Some(10),
+                Some(11),
+                None
+            ]
+        );
+        let marker = text_of(&got[1]);
+        assert!(
+            marker.starts_with("\n[p2pc] log chunks 0-3 (20 bytes) were dropped"),
+            "{marker}"
+        );
+        assert!(matches!(
+            got[1],
+            AgentMsg::LogChunk {
+                stream: LogStream::Stderr,
+                ..
+            }
+        ));
+        assert_eq!(AgentMsg::validate(&got[1]), Ok(()));
+    }
+
+    /// A marker already handed to a session is never changed: the next drop gets a marker of its own.
+    #[tokio::test]
+    async fn a_ring_marker_already_taken_starts_a_new_one() {
+        let q = RunOutbox::ring(20, 10);
+        for s in 0..6 {
+            q.push_log(chunk(s, 5), 5);
+        }
+        let first = q.next().await.unwrap().msg;
+        assert_eq!(seq(&first), Some(0));
+        assert!(text_of(&first).contains("log chunks 0-1 (10 bytes)"));
+        q.push_log(chunk(6, 5), 5);
+        q.close();
+        let mut got = Vec::new();
+        while let Some(item) = q.next().await {
+            got.push(item.msg);
+        }
+        let order: Vec<Option<u64>> = got.iter().map(seq).collect();
+        assert_eq!(order, [Some(2), Some(4), Some(5), Some(6)]);
+        assert!(text_of(&got[0]).contains("log chunks 2-3 (10 bytes)"));
+        assert_eq!(q.drops(), Drops { chunks: 4, bytes: 20 });
+    }
+
+    /// While the server takes them, a ring drops nothing, however much the service writes in total.
+    #[tokio::test]
+    async fn a_ring_that_is_drained_drops_nothing() {
+        let q = RunOutbox::ring(20, 10);
+        for s in 0..1000 {
+            q.push_log(chunk(s, 5), 5);
+            assert_eq!(q.next().await.as_ref().map(|i| seq(&i.msg)), Some(Some(s)));
+        }
+        assert_eq!(q.drops(), Drops::default());
     }
 
     #[tokio::test]

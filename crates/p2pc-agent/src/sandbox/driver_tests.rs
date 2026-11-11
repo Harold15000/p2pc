@@ -2214,3 +2214,507 @@ fn smoke_runs_true_with_the_fixed_argv() {
         assert_eq!(inv.wsl2.unwrap().smoke, Some(SmokeResult { ok: true, detail: None }));
     });
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// Services (H2 §7.2, §11.4): wall-clock limit up to 30 days, health checks, usage samples, uncapped logs
+
+use crate::sandbox::health::{HealthCheck, HealthProbe, ProbeTarget};
+use crate::sandbox::{HealthChange, UsageSample};
+use p2pc_proto::protocol::HealthState;
+
+/// How one health check answers.
+#[derive(Debug, Clone, Copy)]
+enum Probe {
+    Pass,
+    Fail,
+    /// Never answers: the driver's `timeout_s` fails it.
+    Hang,
+}
+
+/// A scripted health probe: the answers in order, then `then` for every later check. Records when each check ran
+/// (seconds since [`mark_t0`]) and what it was for.
+#[derive(Debug)]
+struct FakeProbe {
+    answers: Mutex<VecDeque<Probe>>,
+    then: Probe,
+    calls: Mutex<Vec<(u64, ProbeTarget, HealthCheck)>>,
+}
+
+impl FakeProbe {
+    fn new(answers: impl IntoIterator<Item = Probe>, then: Probe) -> Arc<Self> {
+        Arc::new(Self {
+            answers: Mutex::new(answers.into_iter().collect()),
+            then,
+            calls: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn times(&self) -> Vec<u64> {
+        self.calls.lock().unwrap().iter().map(|(t, _, _)| *t).collect()
+    }
+}
+
+impl HealthProbe for FakeProbe {
+    fn check<'a>(
+        &'a self,
+        target: &'a ProbeTarget,
+        check: &'a HealthCheck,
+    ) -> crate::connection::BoxFuture<'a, Result<(), String>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((now_s(), target.clone(), check.clone()));
+        let answer = self.answers.lock().unwrap().pop_front().unwrap_or(self.then);
+        Box::pin(async move {
+            match answer {
+                Probe::Pass => Ok(()),
+                Probe::Fail => Err("HTTP/1.1 503 Service Unavailable".into()),
+                Probe::Hang => std::future::pending().await,
+            }
+        })
+    }
+}
+
+impl Fx {
+    fn service_cfg(&self, probe: Arc<FakeProbe>) -> DriverConfig {
+        let mut cfg = self.cfg(Platform::Wsl2);
+        cfg.health_probe = Some(probe);
+        cfg
+    }
+
+    fn service_driver(&self, probe: Arc<FakeProbe>, engine: MockEngine) -> PodmanDriver<MockEngine, FsCgroups> {
+        self.driver_with(self.service_cfg(probe), engine)
+    }
+}
+
+/// A service lease: the private chat's shape (one port, an HTTP check), with `health` as given.
+fn service_lease(fx: &Fx, health: Option<serde_json::Value>, timeout_s: u32) -> LeaseContext {
+    let mut service = serde_json::json!({"ports": [{"port": 11434, "name": "api"}]});
+    if let Some(h) = health {
+        service["health"] = h;
+    }
+    let mut lease = fx.lease();
+    lease.job.kind = p2pc_proto::api::JobKind::Service;
+    lease.job.service = Some(serde_json::from_value(service).unwrap());
+    lease.job.timeout_s = timeout_s;
+    lease
+}
+
+fn http_health(interval_s: u32, timeout_s: u32, start_period_s: u32, failure_threshold: u32) -> serde_json::Value {
+    serde_json::json!({"http_get": "/api/version", "port": 11434, "interval_s": interval_s,
+                       "timeout_s": timeout_s, "start_period_s": start_period_s,
+                       "failure_threshold": failure_threshold})
+}
+
+async fn start_collecting(
+    d: &PodmanDriver<MockEngine, FsCgroups>,
+    fx: &Fx,
+    lease: LeaseContext,
+    cancel: CancelHandle,
+) -> (PodmanJob<MockEngine, FsCgroups, ()>, mpsc::Receiver<SandboxEvent>) {
+    let (tx, rx) = events();
+    let mut job = d.prepare(&fx.owner, lease, tx, cancel).await.unwrap();
+    d.start(&mut job).await.unwrap();
+    (job, rx)
+}
+
+/// The health and usage events, in order.
+fn service_events(rx: &mut mpsc::Receiver<SandboxEvent>) -> (Vec<HealthChange>, Vec<UsageSample>) {
+    let (mut health, mut usage) = (Vec::new(), Vec::new());
+    while let Ok(e) = rx.try_recv() {
+        match e {
+            SandboxEvent::Health(h) => health.push(h),
+            SandboxEvent::Usage(u) => usage.push(u),
+            _ => {}
+        }
+    }
+    (health, usage)
+}
+
+fn states(health: &[HealthChange]) -> Vec<HealthState> {
+    health.iter().map(|h| h.state).collect()
+}
+
+/// Ends the job at `at_s` of paused time, as if the service exited with `code`.
+fn exit_at(engine: &MockEngine, at_s: u64, code: i32) -> tokio::task::JoinHandle<()> {
+    let engine = engine.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(at_s)).await;
+        engine.exit(code);
+    })
+}
+
+/// A node without a health probe (no ingress bridge yet) refuses a service as an invalid job, before anything
+/// exists: it could never tell whether the service is up (H1 "must understand", H2 §6.1).
+#[test]
+fn a_service_is_refused_without_a_health_probe() {
+    guarded(Clock::Real, || async {
+        let fx = Fx::new();
+        let engine = MockEngine::with(|s| s.exit_now = Some(0));
+        let d = fx.driver(engine.clone());
+        assert_eq!(
+            run(&d, &fx, service_lease(&fx, None, 3600)).await.0,
+            LeaseReport::Rejected(LeaseRejectReason::InvalidJob)
+        );
+        assert!(engine.calls().is_empty());
+        assert!(fx.data_entries().is_empty());
+    });
+}
+
+/// With a probe, the service rules of H2 §7.1 hold on the node too: 60 s to 30 days, never more.
+#[test]
+fn a_service_timeout_is_checked_against_the_service_range() {
+    guarded(Clock::Real, || async {
+        let fx = Fx::new();
+        for timeout_s in [59, 2_592_001] {
+            let engine = MockEngine::with(|s| s.exit_now = Some(0));
+            let d = fx.service_driver(FakeProbe::new([], Probe::Pass), engine.clone());
+            assert_eq!(
+                run(&d, &fx, service_lease(&fx, None, timeout_s)).await.0,
+                LeaseReport::Rejected(LeaseRejectReason::InvalidJob),
+                "{timeout_s}"
+            );
+            assert!(engine.calls().is_empty());
+        }
+        // A batch job keeps H1's 24 h, also on a node that runs services.
+        let d = fx.service_driver(FakeProbe::new([], Probe::Pass), MockEngine::default());
+        let mut lease = fx.lease();
+        lease.job.timeout_s = 86_401;
+        assert_eq!(
+            run(&d, &fx, lease).await.0,
+            LeaseReport::Rejected(LeaseRejectReason::InvalidJob)
+        );
+    });
+}
+
+/// SI-H2-10, golden argv: a service is the same sandbox as a batch job. Its `podman create` argv has every fixed
+/// argument of H1 §9 (`--network=none` included) and nothing more.
+#[test]
+fn a_service_gets_the_same_fixed_argv_as_a_batch_job() {
+    guarded(Clock::Real, || async {
+        let fx = Fx::new();
+        let argv_of = |engine: &MockEngine, id: &LeaseId| -> Vec<String> {
+            let argv = engine.0.lock().unwrap().create_argv.clone().unwrap();
+            argv.iter().map(|a| a.replace(&id.to_string(), "<lease>")).collect()
+        };
+        let engine = MockEngine::with(|s| s.exit_now = Some(0));
+        let batch = fx.lease();
+        let batch_id = batch.lease_id;
+        finished(run(&fx.driver(engine.clone()), &fx, batch).await.0);
+        let batch_argv = argv_of(&engine, &batch_id);
+
+        let engine = MockEngine::with(|s| s.exit_now = Some(0));
+        let service = service_lease(&fx, None, 600);
+        let service_id = service.lease_id;
+        let d = fx.service_driver(FakeProbe::new([], Probe::Pass), engine.clone());
+        finished(run(&d, &fx, service).await.0);
+        let service_argv = argv_of(&engine, &service_id);
+        assert_eq!(service_argv, batch_argv);
+        assert!(service_argv.contains(&"--network=none".to_string()));
+        assert!(service_argv.contains(&"--cap-drop=all".to_string()));
+    });
+}
+
+/// `starting` from the start, `healthy` at the first passing check; failures in the start period do not count. The
+/// service then runs until it exits by itself, which is its outcome.
+#[test]
+fn a_service_starts_becomes_healthy_and_ends_with_its_own_exit() {
+    guarded(Clock::Paused, || async {
+        let fx = Fx::new();
+        let engine = MockEngine::default();
+        let probe = FakeProbe::new([Probe::Fail, Probe::Fail], Probe::Pass);
+        let d = fx.service_driver(Arc::clone(&probe), engine.clone());
+        let lease = service_lease(&fx, Some(http_health(10, 3, 300, 3)), 3600);
+        let id = lease.lease_id;
+        mark_t0();
+        let (mut job, mut rx) = start_collecting(&d, &fx, lease, CancelHandle::new()).await;
+        let exit = exit_at(&engine, 95, 0);
+        let f = d.wait(&mut job).await.unwrap();
+        exit.await.unwrap();
+        assert_eq!((f.outcome, f.exit_code, f.error), (Outcome::Exited, Some(0), None));
+        assert!(kills(&engine).is_empty(), "never stopped: {:?}", engine.calls());
+        let (health, _) = service_events(&mut rx);
+        assert_eq!(states(&health), [HealthState::Starting, HealthState::Healthy]);
+        assert_eq!(health[1].detail, None);
+        // One check every interval from the start, through the lease's own bridge.
+        assert_eq!(probe.times(), [10, 20, 30, 40, 50, 60, 70, 80, 90]);
+        let (_, target, check) = probe.calls.lock().unwrap()[0].clone();
+        assert_eq!(
+            target,
+            ProbeTarget {
+                lease_id: id,
+                job_dir: fx.jobs_dir().join(id.to_string())
+            }
+        );
+        assert_eq!(
+            check,
+            HealthCheck::Http {
+                port: 11434,
+                path: "/api/version".into()
+            }
+        );
+        d.cleanup(job).await;
+    });
+}
+
+/// Still `starting` when the start period ends: one more check at once, and when it fails the agent stops the
+/// service with the H1 sequence (SIGTERM, grace, SIGKILL) and reports `health_check_failed`.
+#[test]
+fn a_service_still_starting_after_its_start_period_is_stopped() {
+    guarded(Clock::Paused, || async {
+        let fx = Fx::new();
+        let engine = MockEngine::default(); // ignores SIGTERM
+        let probe = FakeProbe::new([], Probe::Fail);
+        let d = fx.service_driver(Arc::clone(&probe), engine.clone());
+        mark_t0();
+        let lease = service_lease(&fx, Some(http_health(10, 3, 25, 3)), 3600);
+        let (mut job, mut rx) = start_collecting(&d, &fx, lease, CancelHandle::new()).await;
+        let f = d.wait(&mut job).await.unwrap();
+        assert_eq!(
+            (f.outcome, f.exit_code, f.error.as_deref()),
+            (Outcome::Error, None, Some(error_code::HEALTH_CHECK_FAILED))
+        );
+        assert_eq!(probe.times(), [10, 20, 25], "the last one when the start period ended");
+        assert_eq!(kills(&engine), ["kill Term at 25s", "kill Kill at 35s"]);
+        let (health, _) = service_events(&mut rx);
+        assert_eq!(states(&health), [HealthState::Starting], "it never became healthy");
+        d.cleanup(job).await;
+    });
+}
+
+/// `failure_threshold` consecutive failed checks after `healthy`: `unhealthy` is reported, then the service is
+/// stopped (`health_check_failed`). A service that obeys SIGTERM stops there.
+#[test]
+fn an_unhealthy_service_is_stopped() {
+    guarded(Clock::Paused, || async {
+        let fx = Fx::new();
+        let engine = MockEngine::with(|s| s.on_term = Some(143));
+        let probe = FakeProbe::new([Probe::Pass, Probe::Fail, Probe::Pass], Probe::Fail);
+        let d = fx.service_driver(Arc::clone(&probe), engine.clone());
+        mark_t0();
+        let lease = service_lease(&fx, Some(http_health(10, 3, 300, 3)), 3600);
+        let (mut job, mut rx) = start_collecting(&d, &fx, lease, CancelHandle::new()).await;
+        let f = d.wait(&mut job).await.unwrap();
+        assert_eq!(
+            (f.outcome, f.error.as_deref()),
+            (Outcome::Error, Some(error_code::HEALTH_CHECK_FAILED))
+        );
+        // Healthy at 10, a failure at 20, a pass at 30 resets the count, then 40, 50 and 60 fail.
+        assert_eq!(probe.times(), [10, 20, 30, 40, 50, 60]);
+        assert_eq!(kills(&engine), ["kill Term at 60s"]);
+        let (health, _) = service_events(&mut rx);
+        assert_eq!(
+            states(&health),
+            [HealthState::Starting, HealthState::Healthy, HealthState::Unhealthy]
+        );
+        let detail = health[2].detail.as_deref().unwrap();
+        assert!(
+            detail.contains("3 consecutive checks failed") && detail.contains("503"),
+            "{detail}"
+        );
+        d.cleanup(job).await;
+    });
+}
+
+/// A check that does not answer fails after its `timeout_s`; with a start period of 0 the first check comes at
+/// once, and it decides.
+#[test]
+fn a_check_that_hangs_fails_at_its_timeout() {
+    guarded(Clock::Paused, || async {
+        let fx = Fx::new();
+        let engine = MockEngine::with(|s| s.on_term = Some(143));
+        let probe = FakeProbe::new([], Probe::Hang);
+        let d = fx.service_driver(Arc::clone(&probe), engine.clone());
+        mark_t0();
+        let lease = service_lease(&fx, Some(http_health(10, 3, 0, 3)), 3600);
+        let (mut job, _rx) = start_collecting(&d, &fx, lease, CancelHandle::new()).await;
+        let f = d.wait(&mut job).await.unwrap();
+        assert_eq!(f.error.as_deref(), Some(error_code::HEALTH_CHECK_FAILED));
+        assert_eq!(probe.times(), [0]);
+        assert_eq!(kills(&engine), ["kill Term at 3s"]);
+        d.cleanup(job).await;
+    });
+}
+
+/// Without a `health` block the service is healthy at its first successful connection to its first port, then not
+/// checked again and never stopped for its health: here it runs to its wall-clock limit (H1's enforcement).
+#[test]
+fn a_service_without_a_health_block_is_healthy_at_its_first_connection() {
+    guarded(Clock::Paused, || async {
+        let fx = Fx::new();
+        let engine = MockEngine::default();
+        let probe = FakeProbe::new([Probe::Fail, Probe::Fail], Probe::Pass);
+        let d = fx.service_driver(Arc::clone(&probe), engine.clone());
+        mark_t0();
+        let lease = service_lease(&fx, None, 600);
+        let (mut job, mut rx) = start_collecting(&d, &fx, lease, CancelHandle::new()).await;
+        let f = d.wait(&mut job).await.unwrap();
+        assert_eq!((f.outcome, f.error), (Outcome::TimedOut, None));
+        assert_eq!(probe.times(), [10, 20, 30]);
+        assert_eq!(probe.calls.lock().unwrap()[0].2, HealthCheck::Tcp { port: 11434 });
+        assert_eq!(kills(&engine), ["kill Term at 600s", "kill Kill at 610s"]);
+        let (health, _) = service_events(&mut rx);
+        assert_eq!(states(&health), [HealthState::Starting, HealthState::Healthy]);
+        d.cleanup(job).await;
+    });
+}
+
+/// A cancel while a check is in flight is a cancel (H1 sequence), not a health failure.
+#[test]
+fn a_cancelled_service_is_cancelled() {
+    guarded(Clock::Paused, || async {
+        let fx = Fx::new();
+        let engine = MockEngine::with(|s| s.on_term = Some(143));
+        let probe = FakeProbe::new([], Probe::Hang);
+        let d = fx.service_driver(Arc::clone(&probe), engine.clone());
+        let cancel = CancelHandle::new();
+        mark_t0();
+        let lease = service_lease(&fx, Some(http_health(10, 60, 300, 3)), 3600);
+        let (mut job, _rx) = start_collecting(&d, &fx, lease, cancel.clone()).await;
+        let canceller = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                cancel.cancel();
+            })
+        };
+        let f = d.wait(&mut job).await.unwrap();
+        canceller.await.unwrap();
+        assert_eq!((f.outcome, f.error), (Outcome::Cancelled, None));
+        assert_eq!(kills(&engine), ["kill Term at 15s"]);
+        d.cleanup(job).await;
+    });
+}
+
+/// H2 §11.4: a service keeps H1's wall-clock enforcement with its 30-day maximum. At exactly 30 days the agent
+/// stops it (SIGTERM, grace, SIGKILL) and the attempt is `timed_out`.
+#[test]
+fn a_service_runs_up_to_its_30_day_limit_and_no_longer() {
+    guarded(Clock::Paused, || async {
+        let fx = Fx::new();
+        let engine = MockEngine::default();
+        let mut cfg = fx.service_cfg(FakeProbe::new([], Probe::Pass));
+        // Measure the disk and sample the usage about once a day, so 30 days of paused time pass in few steps (the
+        // extra second keeps the last sample off the limit's instant).
+        cfg.disk_check_interval = Duration::from_secs(86_400);
+        cfg.usage_interval = Duration::from_secs(86_401);
+        let d = fx.driver_with(cfg, engine.clone());
+        mark_t0();
+        let lease = service_lease(&fx, None, 2_592_000);
+        let (mut job, mut rx) = start_collecting(&d, &fx, lease, CancelHandle::new()).await;
+        let f = d.wait(&mut job).await.unwrap();
+        assert_eq!((f.outcome, f.exit_code, f.error), (Outcome::TimedOut, None, None));
+        assert_eq!(kills(&engine), ["kill Term at 2592000s", "kill Kill at 2592010s"]);
+        assert_eq!(f.usage.wall_ms, 2_592_010_000);
+        let (_, usage) = service_events(&mut rx);
+        assert_eq!(usage.len(), 29, "one sample a day before the limit: {usage:?}");
+        d.cleanup(job).await;
+    });
+}
+
+/// H2 §11.4: a service's cumulative CPU and peak memory, from its lease cgroup, sampled once a minute; a batch job
+/// gets none. An interval under a minute is raised to one.
+#[test]
+fn a_service_samples_its_usage_once_a_minute() {
+    guarded(Clock::Paused, || async {
+        let fx = Fx::new();
+        let engine = MockEngine::default();
+        let mut cfg = fx.service_cfg(FakeProbe::new([], Probe::Pass));
+        cfg.usage_interval = Duration::from_secs(1);
+        let d = fx.driver_with(cfg, engine.clone());
+        mark_t0();
+        let lease = service_lease(&fx, None, 600);
+        let cg = fx.cg.path().join("p2pc").join(lease.lease_id.to_string());
+        let (mut job, mut rx) = start_collecting(&d, &fx, lease, CancelHandle::new()).await;
+        let writer = {
+            let cg = cg.clone();
+            tokio::spawn(async move {
+                // 1.5 s of CPU and 300 MiB at 30 s, 4 s and 512 MiB at 90 s.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                fs::write(cg.join("cpu.stat"), "usage_usec 1500000\n").unwrap();
+                fs::write(cg.join("memory.peak"), format!("{}\n", 300u64 << 20)).unwrap();
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                fs::write(cg.join("cpu.stat"), "usage_usec 4000000\n").unwrap();
+                fs::write(cg.join("memory.peak"), format!("{}\n", 512u64 << 20)).unwrap();
+            })
+        };
+        let exit = exit_at(&engine, 150, 0);
+        d.wait(&mut job).await.unwrap();
+        writer.await.unwrap();
+        exit.await.unwrap();
+        let (_, usage) = service_events(&mut rx);
+        assert_eq!(
+            usage,
+            [
+                UsageSample {
+                    used_cpu_ms: 1500,
+                    max_rss_mb: 300
+                },
+                UsageSample {
+                    used_cpu_ms: 4000,
+                    max_rss_mb: 512
+                }
+            ],
+            "at 60 s and 120 s"
+        );
+        d.cleanup(job).await;
+
+        // A batch job: no usage samples, no health.
+        let engine = MockEngine::default();
+        let d = fx.service_driver(FakeProbe::new([], Probe::Pass), engine.clone());
+        let mut lease = fx.lease();
+        lease.job.timeout_s = 600;
+        let (mut job, mut rx) = start_collecting(&d, &fx, lease, CancelHandle::new()).await;
+        let exit = exit_at(&engine, 150, 0);
+        d.wait(&mut job).await.unwrap();
+        exit.await.unwrap();
+        assert_eq!(service_events(&mut rx), (Vec::new(), Vec::new()));
+        d.cleanup(job).await;
+    });
+}
+
+/// H2 §11.4: a service's logs are not capped at 64 MiB per attempt (the executor keeps the most recent 64 MiB);
+/// a batch job's are, as in H1.
+#[test]
+fn a_service_logs_past_the_batch_cap() {
+    guarded(Clock::Real, || async {
+        let fx = Fx::new();
+        let big = vec![b'x'; usize::try_from(logs::LOG_CAP_BYTES).unwrap() + 4096];
+        for service in [false, true] {
+            let engine = MockEngine::with(|s| {
+                s.exit_now = Some(0);
+                s.stdout = big.clone();
+            });
+            let d = fx.service_driver(FakeProbe::new([], Probe::Pass), engine);
+            let lease = if service {
+                service_lease(&fx, None, 600)
+            } else {
+                fx.lease()
+            };
+            let (tx, mut rx) = events();
+            let counter = tokio::spawn(async move {
+                let (mut bytes, mut markers) = (0usize, 0usize);
+                while let Some(e) = rx.recv().await {
+                    if let SandboxEvent::Log(c) = e {
+                        if c.marker {
+                            markers += 1;
+                        } else {
+                            bytes += c.data.len();
+                        }
+                    }
+                }
+                (bytes, markers)
+            });
+            let f = finished(run_lease(&d, &fx.owner, lease, tx, CancelHandle::new()).await);
+            assert_eq!(f.outcome, Outcome::Exited);
+            let (bytes, markers) = counter.await.unwrap();
+            if service {
+                assert_eq!((bytes, markers), (big.len(), 0));
+                assert!(!f.logs.truncated);
+            } else {
+                assert_eq!((bytes as u64, markers), (logs::LOG_CAP_BYTES, 1));
+                assert!(f.logs.truncated);
+            }
+        }
+    });
+}

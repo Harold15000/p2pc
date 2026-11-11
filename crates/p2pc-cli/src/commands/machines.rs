@@ -8,14 +8,15 @@ use p2pc_proto::ids::NodeId;
 use time::OffsetDateTime;
 
 use crate::app::{CliError, Ctx};
-use crate::cli::{MachineArg, MachineRm, MachinesArgs, MachinesCommand};
+use crate::cli::{MachineApprove, MachineArg, MachineRm, MachinesArgs, MachinesCommand};
 use crate::output::{Table, fmt_age, fmt_cpu, fmt_mib, fmt_time, or_dash, printable, render_kv, wire_name};
 
 /// `p2pc machines [show|drain|resume|rm]`.
 pub async fn run(ctx: &mut Ctx<'_, '_>, args: MachinesArgs) -> Result<u8, CliError> {
     match args.command {
-        None => list(ctx).await,
+        None | Some(MachinesCommand::Ls) => list(ctx).await,
         Some(MachinesCommand::Show(a)) => show(ctx, a).await,
+        Some(MachinesCommand::Approve(a)) => approve(ctx, a).await,
         Some(MachinesCommand::Drain(a)) => drain_or_resume(ctx, a, true).await,
         Some(MachinesCommand::Resume(a)) => drain_or_resume(ctx, a, false).await,
         Some(MachinesCommand::Rm(a)) => remove(ctx, a).await,
@@ -72,6 +73,7 @@ fn node_table(nodes: &[Node], now: OffsetDateTime) -> Table {
         "NAME",
         "ID",
         "STATE",
+        "APPROVAL",
         "PLATFORM",
         "CPU FREE/OFFERED",
         "RAM FREE/OFFERED",
@@ -84,6 +86,7 @@ fn node_table(nodes: &[Node], now: OffsetDateTime) -> Table {
             n.name.clone(),
             n.id.to_string(),
             node_state(n),
+            wire_name(&n.approval),
             wire_name(&n.inventory.platform),
             format!("{}/{}", fmt_cpu(free.cpu), fmt_cpu(offered.cpu)),
             format!("{}/{}", fmt_mib(free.memory_mb), fmt_mib(offered.memory_mb)),
@@ -95,15 +98,15 @@ fn node_table(nodes: &[Node], now: OffsetDateTime) -> Table {
 }
 
 /// A machine found by name or ID. `node` is set when the lookup listed the machines anyway.
-struct Resolved {
-    id: NodeId,
-    node: Option<Node>,
+pub(crate) struct Resolved {
+    pub(crate) id: NodeId,
+    pub(crate) node: Option<Node>,
 }
 
 /// Finds a machine by ID (no request needed) or by name, which lists the machines. The name match ignores case, as
 /// the server's uniqueness rule does, and falls back to the hostname the agent reported. A name that matches more
 /// than one machine is an error that lists them.
-async fn resolve(client: &Client, text: &str) -> Result<Resolved, CliError> {
+pub(crate) async fn resolve(client: &Client, text: &str) -> Result<Resolved, CliError> {
     if let Ok(id) = text.parse::<NodeId>() {
         return Ok(Resolved { id, node: None });
     }
@@ -162,6 +165,7 @@ fn node_details(n: &Node, now: OffsetDateTime) -> String {
         ("id", n.id.to_string()),
         ("hostname", n.hostname.clone()),
         ("state", node_state(n)),
+        ("approval", wire_name(&n.approval)),
         ("platform", wire_name(&inv.platform)),
         ("os", format!("{} ({})", inv.os, inv.arch)),
         ("cpu", format!("{}, {} threads", inv.cpu.model, inv.cpu.cores)),
@@ -199,6 +203,12 @@ fn node_details(n: &Node, now: OffsetDateTime) -> String {
     if !n.labels.is_empty() {
         let labels: Vec<String> = n.labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
         rows.push(("labels", labels.join(", ")));
+    }
+    if let Some(by) = &n.enrolled_by {
+        rows.push(("enrolled by", by.to_string()));
+    }
+    if let Some(phrase) = &n.node_phrase {
+        rows.push(("node phrase", printable(phrase)));
     }
     rows.push(("agent", inv.agent_version.clone()));
     rows.push((
@@ -257,6 +267,62 @@ async fn remove(ctx: &mut Ctx<'_, '_>, args: MachineRm) -> Result<u8, CliError> 
         ctx.print_json(&serde_json::json!({"deleted": found.id}))?;
     } else {
         writeln!(ctx.host.out, "removed {label}")?;
+    }
+    Ok(0)
+}
+
+/// `p2pc nodes approve <node>` (H2 §5.5, §7.8): shows the node phrase, asks, and approves.
+///
+/// The phrase is six words derived from the machine's own key; the owner compares it with the words the joined machine
+/// shows, so that the machine they approve is the one in front of them. Without a phrase there is nothing to compare,
+/// so the command refuses (a hub that does not report it is older than this feature).
+async fn approve(ctx: &mut Ctx<'_, '_>, args: MachineApprove) -> Result<u8, CliError> {
+    // Decided before any request: with no terminal there is nobody to ask.
+    if !args.yes && !ctx.host.stdin_is_tty {
+        return Err(CliError::usage(
+            "refusing to approve a machine without confirmation: there is no terminal to ask, so pass --yes",
+        ));
+    }
+    let client = ctx.client()?;
+    let found = resolve(&client, &args.target).await?;
+    // Always the node as the hub has it now (a name lookup lists the machines, but the approval state and the phrase
+    // are what matter here, and they must be fresh).
+    let node = client.get_node(&found.id).await?;
+    let label = format!("{} ({})", printable(&node.name), node.id);
+    if node.approval.is_approved() {
+        writeln!(ctx.host.err, "{label} is already approved.")?;
+        if ctx.json {
+            ctx.print_json(&serde_json::json!({"approved": node.id, "changed": false}))?;
+        }
+        return Ok(0);
+    }
+    let Some(phrase) = node.node_phrase.as_deref() else {
+        return Err(CliError::usage(format!(
+            "the hub did not report a node phrase for {label}, so there is nothing to compare with the machine's \
+             own screen; update the hub before approving machines"
+        )));
+    };
+    writeln!(ctx.host.err, "Machine {label} is waiting for approval.")?;
+    writeln!(
+        ctx.host.err,
+        "Its node phrase is: {}\nApprove it only if the machine itself shows the same words.",
+        printable(phrase)
+    )?;
+    if !args.yes {
+        write!(ctx.host.err, "Approve {label}? It will start getting jobs. [y/N] ")?;
+        ctx.host.err.flush()?;
+        let mut answer = String::new();
+        ctx.host.stdin.read_line(&mut answer)?;
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            writeln!(ctx.host.err, "Not approved.")?;
+            return Ok(crate::outcome::EXIT_INTERRUPTED);
+        }
+    }
+    client.approve_node(&node.id).await?;
+    if ctx.json {
+        ctx.print_json(&serde_json::json!({"approved": node.id, "changed": true}))?;
+    } else {
+        writeln!(ctx.host.out, "approved {label}")?;
     }
     Ok(0)
 }

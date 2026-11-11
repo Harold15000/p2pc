@@ -265,6 +265,7 @@ async fn list_jobs_sends_filters_and_paging() {
         node_id: Some(node),
         limit: Some(25),
         cursor: Some("abc def".into()),
+        ..JobListParams::default()
     };
     client_for(&server, &ApiKey::generate())
         .list_jobs(&params)

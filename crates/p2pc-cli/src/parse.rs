@@ -155,6 +155,21 @@ pub fn parse_file_arg(text: &str) -> Result<FileArg, String> {
     })
 }
 
+/// Parses a `--input LOCAL[:/inputs/PATH]` argument: the same shape as `--file`.
+pub fn parse_input_arg(text: &str) -> Result<FileArg, String> {
+    parse_file_arg(text).map_err(|_| {
+        "--input needs a local path, for example --input audio.wav or --input audio.wav:/inputs/audio".to_string()
+    })
+}
+
+/// Parses a blob digest: `sha256:<64 lowercase hex>` as a job spec writes it, or the bare hex of the URL.
+pub fn parse_digest(text: &str) -> Result<p2pc_proto::api::Sha256Digest, String> {
+    let hex = text.strip_prefix(p2pc_proto::api::BLOB_REF_PREFIX).unwrap_or(text);
+    hex.parse().map_err(|_| {
+        format!("{text:?} is not a blob digest: use sha256:<64 lowercase hex characters>, as `p2pc blobs ls` shows it")
+    })
+}
+
 /// Parses `key=value`.
 pub fn parse_label(text: &str) -> Result<(String, String), String> {
     match text.split_once('=') {
@@ -216,6 +231,36 @@ mod tests {
         ] {
             assert!(parse_when(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn digests_take_the_prefix_or_not_and_nothing_else() {
+        let hex = "ab".repeat(32);
+        let want = parse_digest(&hex).unwrap();
+        assert_eq!(parse_digest(&format!("sha256:{hex}")).unwrap(), want);
+        for bad in [
+            "",
+            "sha256:",
+            "sha256:abc",
+            &"AB".repeat(32),
+            &format!("sha256:{}", "AB".repeat(32)),
+            &format!("sha512:{hex}"),
+            &format!(" {hex}"),
+            &"g".repeat(64),
+        ] {
+            assert!(parse_digest(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn inputs_split_like_files_and_name_themselves_in_errors() {
+        let a = parse_input_arg("C:/data/a.wav:/inputs/a").unwrap();
+        assert_eq!(
+            (a.local, a.remote),
+            (PathBuf::from("C:/data/a.wav"), Some("/inputs/a".into()))
+        );
+        assert_eq!(parse_input_arg("a.wav").unwrap().remote, None);
+        assert!(parse_input_arg(":/inputs/a").unwrap_err().starts_with("--input"));
     }
 
     fn size(s: &str) -> Result<u64, String> {

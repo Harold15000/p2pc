@@ -243,6 +243,7 @@ fn with_running_cli<T>(
             now: OffsetDateTime::from_unix_timestamp_nanos(1_700_000_100_123_456_789).unwrap(),
             retry: RetryPolicy::immediate(3),
             tunnel: cli.tunnel.clone(),
+            poll: p2pc_cli::follow::PollSchedule::default(),
         };
         runtime.block_on(async { tokio::join!(app::run(&argv, &mut host), test(rx, stop)) })
     };
