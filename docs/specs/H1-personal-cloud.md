@@ -672,7 +672,10 @@ The job cannot change any of these. They are built as an argv, never a shell str
 - then the image, `--`, and the command
 
 **Never:** `--privileged`, host network or namespaces, the Podman socket, or host paths beyond the three per-job
-directories.
+directories. The one exception is H2's persistent volumes (ADR-015): agent-created, per-account directories named
+by hash, never a path from the JobSpec, mounted with `:U` (or `:idmap`) only into service and template jobs of their
+account, size-limited, checked without following links before every mount and deleted without following links
+(H2 §11.1, §11.3, SI-H2-9), and nothing else (amended by O-16, H2 §4.3, 2026-11-11).
 
 ### Shim (`p2pc-shim`, static musl)
 
@@ -796,7 +799,12 @@ directories.
       NodeIds cost nothing to make, so anonymous tunnel peers must never be able to take every REST slot and lock
       out local clients.
 - **Nodes** never listen on a TCP or UDP port that is reachable from outside, beyond what iroh needs for outbound
-  QUIC.
+  QUIC. The one exception (ADR-016, amended by O-16, H2 §4.3, 2026-11-11): on the H2 hub PC, only while the hub is
+  enabled, the hub's own iroh endpoint accepts incoming QUIC on the UDP sockets `p2pc-net` binds for it under the
+  address hygiene below, every ALPN gated by a ticket, a token, a key or a paired NodeId and under pre-auth limits;
+  on a joining PC, the app's relay-only invite listener (no IP transport) accepts the two `p2pc/invite/1` exchanges
+  of one join (open, then hand-over, both from one phone) while the invite is valid. Nothing else listens beyond the
+  loopback REST listener, and agents still only dial out (H2 §10.5).
 - **Address hygiene (from experiment E4, 2026-11-05).** iroh 1.x advertises every local address by default. E4 saw
   the public IP, a Tailscale address and container-bridge addresses, and it picked the Tailscale path on its own.
   Agents and the server therefore MUST:
