@@ -197,11 +197,11 @@ asyncio.run(main())
 
 ```python
 # A file as a job input: uploaded once (the hub is asked first), read-only in the job.
-blob = client.blobs.put("audio.wav")          # a regular file; hashed and sent from one descriptor
+blob = client.blobs.put("audio.wav")  # a regular file; hashed and sent from one descriptor
 job = client.jobs.run(
     image="docker.io/library/python:3.12-slim",
     command=["python", "/inputs/main.py"],
-    inputs={"/inputs/audio": blob},            # a Blob, or a "sha256:<hex>" string; never a path
+    inputs={"/inputs/audio": blob},  # a Blob, or a "sha256:<hex>" string; never a path
 )
 
 # A long-lived service, and a local loopback port that forwards to it.
@@ -210,7 +210,7 @@ svc = client.services.run(
     command=["python", "-m", "http.server", "8000"],
     ports=[8000],
     health_tcp=True,
-    idle_timeout_s=3600,                       # None = never; leave it out for the default
+    idle_timeout_s=3600,  # None = never; leave it out for the default
 )
 with client.services.connect(svc, 8000) as local_port:
     ...  # talk to http://127.0.0.1:{local_port}; the block ends the listener
