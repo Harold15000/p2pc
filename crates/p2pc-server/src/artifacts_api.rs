@@ -4,7 +4,9 @@
 //! `GET /v1/jobs/{id}/outputs/{path}`.
 //!
 //! Every handler first reads the job with the caller's `account_id` and `project_id`: another account's job answers
-//! `404`, exactly like one that does not exist (SI-7).
+//! `404`, exactly like one that does not exist (SI-7). Which jobs the caller reaches is the one access rule of the
+//! job routes (`jobs_api::job_visibility`, H2 §5.5): with `jobs:read` every job of the project; with only
+//! `templates:launch`, the template jobs the caller launched itself, and `404` for every other job.
 //!
 //! **Streaming.** Logs and downloads are streamed from a pipe that a task fills. Those routes opt out of the
 //! whole-request limit (§10) and use an idle limit instead (`http.keepalive_idle_ms`): a write the client does not
@@ -37,10 +39,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream, ReadBuf};
 use utoipa::IntoParams;
 
 use crate::app::{AppState, bad_cursor, page_limit};
-use crate::auth::{Authorized, JobsReadKey};
+use crate::auth::{AnyKey, Authorized, Principal};
 use crate::error::ApiError;
 use crate::extract::ApiQuery;
-use crate::store::{jobs, outputs};
+use crate::jobs_api::{JobRoute, job_visibility, visible_job};
+use crate::store::outputs;
 
 /// Media type of the logs.
 pub const NDJSON: &str = "application/x-ndjson";
@@ -84,20 +87,21 @@ pub struct AttemptParams {
     pub attempt: Option<u32>,
 }
 
-/// The caller's job and the attempt asked for: `404` for a job of another account (SI-7), for one that does not
-/// exist, and for an attempt the job never reached; `422` for attempt 0.
+/// The caller's job and the attempt asked for: `403` for a caller with neither `jobs:read` nor `templates:launch`;
+/// `404` for a job of another account (SI-7), for one outside the caller's view (H2 §5.5: with only
+/// `templates:launch`, any job the caller did not launch from a template), for one that does not exist, and for an
+/// attempt the job never reached; `422` for attempt 0.
 async fn job_attempt(
     state: &AppState,
-    account_id: AccountId,
-    project_id: p2pc_proto::ids::ProjectId,
+    p: &Principal,
     id: &str,
     attempt: Option<u32>,
 ) -> Result<(JobId, u32), ApiError> {
+    // The access rule before the ID: a caller with no access gets `403` whatever it asks for.
+    job_visibility(state, p, JobRoute::Artifacts)?;
     let job_id: JobId = id.parse().map_err(|_| ApiError::not_found())?;
     let mut conn = state.db.acquire().await?;
-    let job = jobs::get(&mut conn, account_id, project_id, job_id)
-        .await?
-        .ok_or_else(ApiError::not_found)?;
+    let job = visible_job(&mut conn, state, p, JobRoute::Artifacts, job_id).await?;
     match attempt {
         None => Ok((job_id, job.attempt)),
         Some(0) => Err(ApiError::field("attempt", ErrorCode::OutOfRange, "attempts start at 1")),
@@ -126,18 +130,18 @@ async fn job_attempt(
     responses(
         (status = 200, description = "NDJSON, one `LogLine` per line, in `seq` order.", content_type = "application/x-ndjson", body = p2pc_proto::api::LogLine),
         (status = 401, description = "Missing or invalid key.", content_type = "application/problem+json", body = Problem),
-        (status = 403, description = "The key lacks `jobs:read`.", content_type = "application/problem+json", body = Problem),
-        (status = 404, description = "No such job in this account, or no such attempt.", content_type = "application/problem+json", body = Problem),
+        (status = 403, description = "The caller has neither `jobs:read` nor `templates:launch`.", content_type = "application/problem+json", body = Problem),
+        (status = 404, description = "No such job in this account, no such attempt, or (for a caller with only `templates:launch`) not a template job it launched.", content_type = "application/problem+json", body = Problem),
         (status = 422, description = "Invalid query (for example `attempt=0`).", content_type = "application/problem+json", body = Problem),
     )
 )]
 pub async fn get_logs(
     State(state): State<AppState>,
-    Authorized { principal: p, .. }: JobsReadKey,
+    Authorized { principal: p, .. }: AnyKey,
     Path(id): Path<String>,
     ApiQuery(q): ApiQuery<LogParams>,
 ) -> Result<Response, ApiError> {
-    let (job_id, attempt) = job_attempt(&state, p.account_id, p.project_id, &id, q.attempt).await?;
+    let (job_id, attempt) = job_attempt(&state, &p, &id, q.attempt).await?;
     let follow = q.follow.unwrap_or(false);
     let since = q.since_seq.unwrap_or(0);
     let (w, r) = tokio::io::duplex(PIPE);
@@ -311,18 +315,18 @@ async fn follow_log(state: &AppState, request: LogRequest, w: &mut DuplexStream)
     responses(
         (status = 200, description = "A page of output files.", body = Page<OutputEntry>),
         (status = 401, description = "Missing or invalid key.", content_type = "application/problem+json", body = Problem),
-        (status = 403, description = "The key lacks `jobs:read`.", content_type = "application/problem+json", body = Problem),
-        (status = 404, description = "No such job in this account, or no such attempt.", content_type = "application/problem+json", body = Problem),
+        (status = 403, description = "The caller has neither `jobs:read` nor `templates:launch`.", content_type = "application/problem+json", body = Problem),
+        (status = 404, description = "No such job in this account, no such attempt, or (for a caller with only `templates:launch`) not a template job it launched.", content_type = "application/problem+json", body = Problem),
         (status = 422, description = "Invalid `limit`, `cursor` or `attempt`.", content_type = "application/problem+json", body = Problem),
     )
 )]
 pub async fn list_outputs(
     State(state): State<AppState>,
-    Authorized { principal: p, .. }: JobsReadKey,
+    Authorized { principal: p, .. }: AnyKey,
     Path(id): Path<String>,
     ApiQuery(q): ApiQuery<OutputListParams>,
 ) -> Result<Json<Page<OutputEntry>>, ApiError> {
-    let (job_id, attempt) = job_attempt(&state, p.account_id, p.project_id, &id, q.attempt).await?;
+    let (job_id, attempt) = job_attempt(&state, &p, &id, q.attempt).await?;
     let limit = page_limit(q.limit)?;
     let after = q
         .cursor
@@ -376,18 +380,18 @@ pub async fn list_outputs(
                 ("Content-Length" = u64, description = "The file's size."),
             )),
         (status = 401, description = "Missing or invalid key.", content_type = "application/problem+json", body = Problem),
-        (status = 403, description = "The key lacks `jobs:read`.", content_type = "application/problem+json", body = Problem),
-        (status = 404, description = "No such job in this account, no such attempt, or no such output.", content_type = "application/problem+json", body = Problem),
+        (status = 403, description = "The caller has neither `jobs:read` nor `templates:launch`.", content_type = "application/problem+json", body = Problem),
+        (status = 404, description = "No such job in this account, no such attempt, no such output, or (for a caller with only `templates:launch`) not a template job it launched.", content_type = "application/problem+json", body = Problem),
         (status = 410, description = "`expired`: the output was deleted after the retention period.", content_type = "application/problem+json", body = Problem),
     )
 )]
 pub async fn download_output(
     State(state): State<AppState>,
-    Authorized { principal: p, .. }: JobsReadKey,
+    Authorized { principal: p, .. }: AnyKey,
     Path((id, path)): Path<(String, String)>,
     ApiQuery(q): ApiQuery<AttemptParams>,
 ) -> Result<Response, ApiError> {
-    let (job_id, attempt) = job_attempt(&state, p.account_id, p.project_id, &id, q.attempt).await?;
+    let (job_id, attempt) = job_attempt(&state, &p, &id, q.attempt).await?;
     // SI-9: the same check as an upload's; anything else is simply not an output.
     validate_output_path(&path).map_err(|_| ApiError::not_found())?;
     let mut conn = state.db.acquire().await?;

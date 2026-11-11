@@ -24,7 +24,11 @@
 //! - **Node loss** (SI-13, server half). A lease is lost only when its node is confirmed dead for it: no contact for
 //!   `lease_ttl_s` (counted from the later of the node's last contact and this server's boot, §6 "Server restart"),
 //!   absent from a fresh `Hello`, or the node was deleted. Then its reservation is released and the job requeued
-//!   with `attempt + 1`, or `lost` when no attempt is left.
+//!   with `attempt + 1`, or `lost` when no attempt is left. A service follows its restart policy instead (H2 §7.2,
+//!   [`service`]).
+//! - **Approval** (H2 §5.5, SI-H2-19). A `pending_approval` node is never a placement candidate, an offer is
+//!   accepted only from an approved node (re-read in the accepting transaction), and a lease found on a pending node
+//!   is ended by the server: see [`Scheduler::tick`].
 //!
 //! # Atomicity
 //!
@@ -40,6 +44,7 @@
 //! inventory changed, lease ended) and every second.
 
 pub mod fit;
+pub mod service;
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -47,7 +52,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use p2pc_proto::api::{JobSpec, JobStatus, LogStream, OutputFile, UsageRecord, transition_allowed};
+use p2pc_proto::api::{
+    JobKind, JobSpec, JobStatus, LogStream, NodeApproval, OutputFile, UsageRecord, transition_allowed,
+};
 use p2pc_proto::ids::{AccountId, JobId, LeaseId, NodeId};
 use p2pc_proto::protocol::{
     AgentMsg, LEASE_ACCEPT_TIMEOUT_S, LeaseJob, LeaseRejectReason, LogData, Outcome, RunningLease, ServerMsg, Usage,
@@ -58,6 +65,7 @@ use tokio::sync::{Notify, broadcast};
 use tokio::task::JoinHandle;
 
 use self::fit::{Candidate, Held, Request, Reserved};
+pub use self::service::OpenConnections;
 use crate::app::AppState;
 use crate::clock::Clock;
 use crate::gateway::{
@@ -112,6 +120,9 @@ pub mod code {
     pub const CANCELLED_UNREACHABLE: &str = "cancelled_unreachable";
     /// The server watchdog fired (§8 "Timeouts").
     pub const WATCHDOG: &str = "watchdog";
+    /// The lease's node is `pending_approval` (H2 §5.5, SI-H2-19): an offer it tried to accept, or a lease found on
+    /// it.
+    pub const PENDING_APPROVAL: &str = "pending_approval";
 }
 
 /// How the scheduler reaches nodes. [`NodeHub`] in the server; a recorder in tests.
@@ -258,6 +269,9 @@ pub struct Timing {
     pub pull_timeout: Duration,
     /// `gpu_hour_units`.
     pub gpu_hour_units: Units,
+    /// `services.volume_affinity_wait_s`: how long a requeued service with a volume waits for the node that holds
+    /// it (H2 §7.2).
+    pub volume_affinity_wait: Duration,
 }
 
 impl Timing {
@@ -268,6 +282,7 @@ impl Timing {
             lease_ttl: Duration::seconds(i64::from(config.nodes.lease_ttl_s)),
             pull_timeout: Duration::seconds(i64::from(config.scheduler.pull_timeout_s)),
             gpu_hour_units: crate::units::gpu_hour_units(config),
+            volume_affinity_wait: Duration::seconds(i64::from(config.services.volume_affinity_wait_s)),
         }
     }
 }
@@ -359,6 +374,31 @@ struct Inner {
     log_seq: Mutex<HashMap<LeaseId, u64>>,
     /// Where the next round of a queue longer than [`MAX_JOBS_PER_TICK`] starts: after this job.
     queue_resume: Mutex<Option<leases::QueuePosition>>,
+    /// The open port connections of every service, which the idle cancel reads (H2 §7.4).
+    connections: OpenConnections,
+}
+
+/// What placement does with a queued job now.
+#[derive(Debug)]
+enum Decision {
+    /// Offer it to this node.
+    Place(fit::Choice),
+    /// No offer now, with the `reason` the job shows while it waits (`None`: it just waits for room, as in H1).
+    Wait(Option<String>),
+}
+
+/// `Job.reason` of a queued job that only `pending_approval` nodes could run (H2 §5.5).
+pub const REASON_WAITING_FOR_APPROVAL: &str = "waiting for approval on the hub PC";
+
+/// `Job.reason` of a queued job that no node will take however long it waits, as far as the owner can act on it.
+fn nowhere_reason(why: fit::Misfit) -> Option<String> {
+    match why {
+        fit::Misfit::PendingApproval => Some(REASON_WAITING_FOR_APPROVAL.to_string()),
+        fit::Misfit::MissingCapability(cap) => Some(format!(
+            "no node can run it: its agent does not support `{cap}` (update the agent)"
+        )),
+        _ => None,
+    }
 }
 
 /// A lease just created by placement, to be sent.
@@ -410,18 +450,19 @@ impl Scheduler {
         logs: Arc<dyn LogSink>,
         outputs: Arc<dyn OutputsFinalizer>,
     ) -> Self {
-        Self::from_parts(
+        Self::build(
             state.db.clone(),
             state.clock.clone(),
             Timing::from_config(&state.config),
             state.kick.clone(),
             link,
-            logs,
-            outputs,
+            (logs, outputs),
+            state.connections.clone(),
         )
     }
 
-    /// The scheduler over explicit parts. Its boot time, for the restart grace, is the clock's time now.
+    /// The scheduler over explicit parts, with its own (empty) count of open port connections. Its boot time, for
+    /// the restart grace, is the clock's time now.
     #[must_use]
     pub fn from_parts(
         db: Db,
@@ -431,6 +472,26 @@ impl Scheduler {
         link: Arc<dyn NodeLink>,
         logs: Arc<dyn LogSink>,
         outputs: Arc<dyn OutputsFinalizer>,
+    ) -> Self {
+        Self::build(
+            db,
+            clock,
+            timing,
+            kick,
+            link,
+            (logs, outputs),
+            OpenConnections::default(),
+        )
+    }
+
+    fn build(
+        db: Db,
+        clock: Arc<dyn Clock>,
+        timing: Timing,
+        kick: Kick,
+        link: Arc<dyn NodeLink>,
+        (logs, outputs): (Arc<dyn LogSink>, Arc<dyn OutputsFinalizer>),
+        connections: OpenConnections,
     ) -> Self {
         let booted_at = clock.now();
         Self {
@@ -445,6 +506,7 @@ impl Scheduler {
                 outputs,
                 log_seq: Mutex::new(HashMap::new()),
                 queue_resume: Mutex::new(None),
+                connections,
             }),
         }
     }
@@ -483,9 +545,10 @@ impl Scheduler {
         }
     }
 
-    /// One scheduling pass: expire unanswered offers, expire leases of nodes silent for `lease_ttl_s`, deliver
-    /// cancels, run the watchdog, send again the `Cancel`s of executions the server ended, forget the log `seq`s of
-    /// ended leases, then place queued jobs FIFO.
+    /// One scheduling pass: expire unanswered offers, expire leases of nodes silent for `lease_ttl_s`, end the leases
+    /// found on `pending_approval` nodes (H2 §5.5), ask idle services to stop (H2 §7.4), deliver cancels, run the
+    /// watchdog, send again the `Cancel`s of executions the server ended, forget the log `seq`s of ended leases, then
+    /// place queued jobs FIFO.
     ///
     /// Each phase runs on its own, and inside a phase each lease, node or job is its own step (its own
     /// transaction): a failure is logged and counted in [`TickReport::errors`], and the rest goes on. One bad row never
@@ -497,6 +560,12 @@ impl Scheduler {
         }
         if let Err(e) = self.expire_silent_nodes(&mut r).await {
             failed(&mut r, "expire silent nodes", &e);
+        }
+        if let Err(e) = self.revoke_on_pending_nodes(&mut r).await {
+            failed(&mut r, "revoke leases on pending nodes", &e);
+        }
+        if let Err(e) = self.stop_idle_services(&mut r).await {
+            failed(&mut r, "stop idle services", &e);
         }
         if let Err(e) = self.deliver_cancels(&mut r).await {
             failed(&mut r, "deliver cancels", &e);
@@ -608,6 +677,20 @@ impl Scheduler {
                 .push((lease.node_id, cancel(lease.id, lease.epoch, code::ACCEPT_TIMEOUT)));
             return Ok(false);
         }
+        // SI-H2-19: no lease reaches a `pending_approval` node. Placement never offers it one; this re-reads the node
+        // in the accepting transaction, so an offer that was in flight when its node stopped being approved is
+        // revoked instead of accepted. It never started and is not the job's fault: no count against the offer cap.
+        if nodes::by_id(tx, lease.node_id)
+            .await?
+            .is_some_and(|n| n.approval == NodeApproval::PendingApproval)
+        {
+            self.fail_offer(tx, lease, code::PENDING_APPROVAL, None, now, fx)
+                .await?;
+            fx.send
+                .push((lease.node_id, cancel(lease.id, lease.epoch, code::PENDING_APPROVAL)));
+            tracing::warn!(lease_id = %lease.id, node_id = %lease.node_id, "offer revoked: its node is pending approval");
+            return Ok(false);
+        }
         if !leases::mark_accepted(tx, lease.id, now).await? {
             return Ok(false);
         }
@@ -626,8 +709,77 @@ impl Scheduler {
         if leases::mark_running(tx, lease.id, now).await? {
             self.move_job(tx, lease, JobStatus::Running, "job_started", now).await?;
             leases::attempt_started(tx, lease.id, now).await?;
+            // H2 §7.2: a running service is `starting` until its first passing check.
+            if lease.job_kind == JobKind::Service {
+                leases::service_started(tx, lease.job_id, now).await?;
+            }
         }
         Ok(())
+    }
+
+    /// The job of `lease` lost its lease with nothing left of it on the server's side (node loss, or a lease the
+    /// server took from a `pending_approval` node): `cancelled` if a cancel was pending; else requeued with
+    /// `attempt + 1`, or `lost`, by the H1 rule for a batch job (attempts left) and by the restart policy for a service
+    /// (H2 §7.2). Nothing if the job already ended. Returns whether it was requeued.
+    async fn job_lost_its_lease(
+        &self,
+        tx: &mut Conn,
+        lease: &LeaseRow,
+        reason: &str,
+        now: OffsetDateTime,
+    ) -> Result<bool> {
+        let job = jobs::get(tx, lease.account_id, lease.project_id, lease.job_id)
+            .await?
+            .ok_or(StoreError::Corrupt("leases.job_id"))?;
+        if job.status.is_terminal() {
+            return Ok(false);
+        }
+        if job.cancel_requested_at.is_some() {
+            transition(tx, &job, JobStatus::Cancelled, "cancelled_by_user", now).await?;
+            service::note_cancelled(tx, lease).await?;
+            if lease.job_kind == JobKind::Service {
+                leases::clear_service_health(tx, lease.job_id, now).await?;
+            }
+            return Ok(false);
+        }
+        let Some(spec) = job
+            .spec_view
+            .service
+            .as_ref()
+            .filter(|_| lease.job_kind == JobKind::Service)
+        else {
+            // H1: only node loss consumes an attempt.
+            return if job.attempt < job.max_attempts {
+                transition(tx, &job, JobStatus::Queued, reason, now).await?;
+                leases::next_attempt(tx, lease.job_id, lease.node_id).await?;
+                Ok(true)
+            } else {
+                transition(tx, &job, JobStatus::Lost, reason, now).await?;
+                Ok(false)
+            };
+        };
+        let state = leases::service_state(tx, lease.job_id).await?;
+        // `last_activity_at` is cleared when an attempt starts and set by its first `healthy`.
+        let became_healthy = lease.started_at.is_some() && state.last_activity_at.is_some();
+        let restart = service::on_node_loss(spec.restart, job.max_attempts, &state, became_healthy, now);
+        if restart.requeue {
+            transition(tx, &job, JobStatus::Queued, reason, now).await?;
+            leases::next_attempt(tx, lease.job_id, lease.node_id).await?;
+        } else {
+            transition(tx, &job, JobStatus::Lost, reason, now).await?;
+            if let Some(error) = restart.error {
+                leases::set_lost_error(tx, lease.job_id, error).await?;
+            }
+        }
+        leases::service_attempt_ended(
+            tx,
+            lease.job_id,
+            restart.unhealthy_attempts,
+            &restart.node_loss_restarts,
+            now,
+        )
+        .await?;
+        Ok(restart.requeue)
     }
 
     /// The node is confirmed dead for `lease` (`reason`: TTL, absent from `Hello`, deleted). An offer is revoked
@@ -655,20 +807,7 @@ impl Scheduler {
                 // from its start (or acceptance) to now, when the loss was decided.
                 let record = self.estimated_record(tx, lease, now).await?;
                 leases::insert_usage(tx, lease.id, &record).await?;
-                let job = jobs::get(tx, lease.account_id, lease.project_id, lease.job_id)
-                    .await?
-                    .ok_or(StoreError::Corrupt("leases.job_id"))?;
-                if !job.status.is_terminal() {
-                    if job.cancel_requested_at.is_some() {
-                        transition(tx, &job, JobStatus::Cancelled, "cancelled_by_user", now).await?;
-                    } else if job.attempt < job.max_attempts {
-                        transition(tx, &job, JobStatus::Queued, reason, now).await?;
-                        leases::next_attempt(tx, lease.job_id, lease.node_id).await?;
-                        requeued = true;
-                    } else {
-                        transition(tx, &job, JobStatus::Lost, reason, now).await?;
-                    }
-                }
+                requeued = self.job_lost_its_lease(tx, lease, reason, now).await?;
                 fx.ended.push(lease.id);
                 fx.kick = true;
                 rearm_on_lease_end(tx, lease, fx).await?;
@@ -709,6 +848,7 @@ impl Scheduler {
         }
         leases::attempt_ended(tx, lease.id, to, reason, now).await?;
         self.move_job(tx, lease, to, reason, now).await?;
+        self.service_ended(tx, lease, to, now).await?;
         // No report will come for this attempt: the ledger gets the server's estimate.
         let record = self.estimated_record(tx, lease, now).await?;
         leases::insert_usage(tx, lease.id, &record).await?;
@@ -766,6 +906,7 @@ impl Scheduler {
         };
         leases::set_result(tx, lease.job_id, outcome, msg.exit_code, error.as_deref()).await?;
         self.move_job(tx, lease, to, reason, now).await?;
+        self.service_ended(tx, lease, to, now).await?;
         // §8 "Reservations are held until confirmed": the node frees the lease's resources only after its cleanup, so
         // the reservation stays held until its first `Heartbeat` that no longer lists the lease ([`Scheduler::on_heartbeat`]).
         if !leases::end(tx, lease.id, LeaseState::Finished, reason, false, now).await? {
@@ -778,6 +919,48 @@ impl Scheduler {
         leases::insert_usage(tx, lease.id, &record).await?;
         fx.ended.push(lease.id);
         tracing::info!(job_id = %lease.job_id, lease_id = %lease.id, status = %to, "job finished");
+        Ok(())
+    }
+
+    /// The attempt of `lease` ended with its job in `to`: a service has no health any more, and one that ended
+    /// `cancelled` says why (H2 §7.2). Nothing for a batch job.
+    async fn service_ended(&self, tx: &mut Conn, lease: &LeaseRow, to: JobStatus, now: OffsetDateTime) -> Result<()> {
+        if lease.job_kind != JobKind::Service {
+            return Ok(());
+        }
+        if to == JobStatus::Cancelled {
+            service::note_cancelled(tx, lease).await?;
+        }
+        leases::clear_service_health(tx, lease.job_id, now).await?;
+        Ok(())
+    }
+
+    /// The server takes an accepted or running lease from a node that is `pending_approval` (H2 §5.5, SI-H2-19): no
+    /// PC keeps work without an `admin`'s approval. The lease is revoked and its node told `Cancel` (again every
+    /// [`CANCEL_RESEND`] until it confirms), the reservation stays held until the execution is confirmed dead, the
+    /// ledger gets the server's estimate, and the job goes on elsewhere exactly as after a node loss
+    /// ([`Self::job_lost_its_lease`]).
+    async fn revoke_for_approval(
+        &self,
+        tx: &mut Conn,
+        lease: &LeaseRow,
+        now: OffsetDateTime,
+        fx: &mut Effects,
+    ) -> Result<()> {
+        let reason = code::PENDING_APPROVAL;
+        if !leases::end(tx, lease.id, LeaseState::Revoked, reason, false, now).await? {
+            return Ok(());
+        }
+        leases::attempt_ended(tx, lease.id, JobStatus::Lost, reason, now).await?;
+        let record = self.estimated_record(tx, lease, now).await?;
+        leases::insert_usage(tx, lease.id, &record).await?;
+        let requeued = self.job_lost_its_lease(tx, lease, reason, now).await?;
+        fx.send.push((lease.node_id, cancel(lease.id, lease.epoch, reason)));
+        leases::mark_cancel_sent(tx, lease.id, now).await?;
+        fx.ended.push(lease.id);
+        fx.kick = true;
+        tracing::warn!(job_id = %lease.job_id, lease_id = %lease.id, node_id = %lease.node_id, requeued,
+            "lease revoked: its node is pending approval");
         Ok(())
     }
 
@@ -889,6 +1072,7 @@ impl Scheduler {
             } => {
                 return self.on_log_chunk(node_id, lease_id, epoch, stream, seq, data_b64).await;
             }
+            AgentMsg::ServiceHealth(health) => return self.on_service_health(node_id, health).await,
             // The gateway handles the rest itself.
             _ => return Ok(()),
         };
@@ -977,7 +1161,14 @@ impl Scheduler {
     /// logged above `debug`. Only leases of `node_id` are looked at, and only finished ones: the ways to end any
     /// other lease (node loss, `Hello`, `lease_ttl_s`, a cancel on an unreachable node) are not this one's. An older
     /// agent lists only the jobs that run, so its finished leases come back at its next heartbeat.
+    ///
+    /// `running[].health` repeats each service lease's last `ServiceHealth` (H2 §6.1): see
+    /// [`Scheduler::heartbeat_health`]. A failure there never keeps the finished leases from being freed: the next
+    /// heartbeat repeats the health anyway.
     pub async fn on_heartbeat(&self, node_id: NodeId, running: &[RunningLease]) -> Result<()> {
+        if let Err(e) = self.heartbeat_health(node_id, running).await {
+            tracing::warn!(error = %e, %node_id, "cannot store the health a heartbeat repeated");
+        }
         let listed: HashSet<(LeaseId, u64)> = running.iter().map(|r| (r.lease_id, r.epoch)).collect();
         let freed = |held: Vec<LeaseRow>| -> Vec<LeaseRow> {
             held.into_iter()
@@ -1087,7 +1278,7 @@ impl Scheduler {
                         self.accept(&mut tx, &l, now, &mut fx).await?;
                     }
                     if l.cancel_requested_at.is_some() {
-                        replies.push(cancel(l.id, l.epoch, code::USER));
+                        replies.push(cancel(l.id, l.epoch, service::cancel_code(&l)));
                         leases::mark_cancel_sent(&mut tx, l.id, now).await?;
                     }
                 }
@@ -1200,6 +1391,54 @@ impl Scheduler {
         Ok(())
     }
 
+    /// H2 §5.5, SI-H2-19: ends every active lease found on a `pending_approval` node. Placement never offers such a
+    /// node a lease and [`Self::accept`] never accepts one from it, and no operation of the spec moves an approved
+    /// node back to `pending_approval`; this is the backstop if a node is found in that state with a lease anyway. An
+    /// offer is revoked (not counted against the offer cap); an accepted or running lease is revoked and its job goes
+    /// on elsewhere ([`Self::revoke_for_approval`]). The pre-pass is read-only.
+    async fn revoke_on_pending_nodes(&self, r: &mut TickReport) -> Result<()> {
+        let due: Vec<LeaseRow> = {
+            let mut conn = self.inner.db.acquire().await?;
+            leases::on_pending_nodes(&mut conn).await?
+        };
+        for lease in due {
+            if let Err(e) = self.revoke_on_pending_node(lease.id).await {
+                failed(r, "revoke a lease on a pending node", &e);
+            }
+        }
+        Ok(())
+    }
+
+    async fn revoke_on_pending_node(&self, id: LeaseId) -> Result<()> {
+        let mut fx = Effects::default();
+        let mut tx = store::begin_immediate(&self.inner.db).await?;
+        let now = self.now();
+        let Some(l) = leases::get(&mut tx, id).await? else {
+            return Ok(());
+        };
+        // Re-read: the node may have been approved, or deleted (its leases are then lost as for any deleted node).
+        let pending = nodes::by_id(&mut tx, l.node_id)
+            .await?
+            .is_some_and(|n| n.approval == NodeApproval::PendingApproval && n.deleted_at.is_none());
+        if !pending {
+            return Ok(());
+        }
+        match l.state {
+            LeaseState::Offered => {
+                self.fail_offer(&mut tx, &l, code::PENDING_APPROVAL, None, now, &mut fx)
+                    .await?;
+                fx.send.push((l.node_id, cancel(l.id, l.epoch, code::PENDING_APPROVAL)));
+            }
+            LeaseState::Accepted | LeaseState::Running => {
+                self.revoke_for_approval(&mut tx, &l, now, &mut fx).await?;
+            }
+            _ => return Ok(()),
+        }
+        tx.commit().await?;
+        self.deliver(fx);
+        Ok(())
+    }
+
     // --- Timers ---------------------------------------------------------------------------------------------------
 
     /// Offers not accepted within 10 s (§6 "Two-phase assignment"): revoked, counted against the offer cap, and the
@@ -1301,7 +1540,8 @@ impl Scheduler {
                 } else if l.cancel_sent_at.is_none_or(|sent| now - sent >= CANCEL_RESEND) {
                     // Again every `CANCEL_RESEND` until `JobFinished` ends the lease: whether this send reaches the
                     // agent is only known from its report.
-                    fx.send.push((l.node_id, cancel(l.id, l.epoch, code::USER)));
+                    fx.send
+                        .push((l.node_id, cancel(l.id, l.epoch, service::cancel_code(&l))));
                     leases::mark_cancel_sent(&mut tx, l.id, now).await?;
                 }
             }
@@ -1442,6 +1682,8 @@ impl Scheduler {
                 };
                 Ok(Candidate {
                     available: n.state == DbState::Online && !n.draining && self.inner.link.is_connected(n.id),
+                    approved: n.approval == NodeApproval::Approved,
+                    features: n.features,
                     node_id: n.id,
                     inventory: n.inventory,
                     labels: BTreeMap::new(),
@@ -1492,11 +1734,16 @@ impl Scheduler {
     /// job that fits nowhere now is skipped, and later jobs still get their turn (no head-of-line blocking). A
     /// read-only snapshot of each account's nodes, and of the (job, node) pairs cooling down, skips jobs that fit
     /// nowhere without a write transaction; every placement is decided again inside its own.
+    ///
+    /// A job that waits for something the owner can act on says so in its `reason` (H2 §5.5, §6.1, §7.2): for
+    /// approval, for an agent capability, or for the node that holds its volume. The reason is written only when it
+    /// changes, so a pass that finds nothing new writes nothing.
     async fn place(&self, r: &mut TickReport) -> Result<()> {
         let queued = self.queue_window().await?;
+        let now = self.now();
         let cooling = {
             let mut conn = self.inner.db.acquire().await?;
-            leases::cooling_pairs(&mut conn, self.now()).await?
+            leases::cooling_pairs(&mut conn, now).await?
         };
         let mut snapshots: HashMap<AccountId, Vec<Candidate>> = HashMap::new();
         for job in queued {
@@ -1513,14 +1760,14 @@ impl Scheduler {
                     }
                 }
             }
-            let snapshot: Vec<Candidate> = snapshots
-                .get(&job.account_id)
-                .map_or(&[][..], Vec::as_slice)
-                .iter()
-                .filter(|c| !cooling.contains(&(job.job_id, c.node_id)))
-                .cloned()
-                .collect();
-            if fit::choose(&snapshot, &job.request, None).is_none() {
+            let snapshot = snapshots.get(&job.account_id).map_or(&[][..], Vec::as_slice);
+            let decision = self.decide(snapshot, &job, &|n| cooling.contains(&(job.job_id, n)), now);
+            if let Decision::Wait(reason) = decision {
+                if reason != job.reason
+                    && let Err(e) = self.note_wait(job.job_id, reason.as_deref()).await
+                {
+                    failed(r, "note why a job waits", &e);
+                }
                 continue;
             }
             r.placements_tried += 1;
@@ -1547,6 +1794,56 @@ impl Scheduler {
         Ok(())
     }
 
+    /// What to do with a queued job, given every node of its account (`candidates`, the cooling ones included) and
+    /// which of them may not be offered this job now (`cooling`, §8 "Offer cap").
+    ///
+    /// H2 §7.2 "Waiting for the same node": a requeued service with a volume goes back to the node that holds the
+    /// volume, which is the node of its last attempt, whenever that node fits. While that node is eligible but offline
+    /// or busy, the job waits for it, up to `volume_affinity_wait_s` after it was requeued; then it is placed like any
+    /// other job (elsewhere, with an empty volume). Every other job follows H1: best fit, the node that just lost it
+    /// last.
+    fn decide(
+        &self,
+        candidates: &[Candidate],
+        job: &leases::QueuedJob,
+        cooling: &dyn Fn(NodeId) -> bool,
+        now: OffsetDateTime,
+    ) -> Decision {
+        if let Some(holder) = job
+            .last_lost_node_id
+            .filter(|_| job.kind == JobKind::Service && job.has_volumes)
+        {
+            match fit::affinity(candidates, &job.request, holder, cooling) {
+                fit::Affinity::Holder(choice) => return Decision::Place(choice),
+                fit::Affinity::Wait => {
+                    let wait = self.inner.timing.volume_affinity_wait;
+                    if now < job.queued_at + wait {
+                        // The same text at every pass, so it is written once.
+                        return Decision::Wait(Some(format!(
+                            "waiting for node {holder}, which holds its volume (up to {} s; then it starts \
+                             elsewhere with an empty volume)",
+                            wait.whole_seconds()
+                        )));
+                    }
+                }
+                fit::Affinity::Elsewhere => {}
+            }
+        }
+        let open: Vec<Candidate> = candidates.iter().filter(|c| !cooling(c.node_id)).cloned().collect();
+        match fit::choose(&open, &job.request, job.last_lost_node_id) {
+            Some(choice) => Decision::Place(choice),
+            None => Decision::Wait(fit::why_nowhere(candidates, &job.request).and_then(nowhere_reason)),
+        }
+    }
+
+    /// Writes why a queued job waits (or that it no longer has a reason to show).
+    async fn note_wait(&self, job_id: JobId, reason: Option<&str>) -> Result<()> {
+        let mut tx = store::begin_immediate(&self.inner.db).await?;
+        leases::set_queue_reason(&mut tx, job_id, reason).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Decides and records one placement, in one transaction: the job is re-read (still queued, no active lease,
     /// under the cap), the nodes and their held reservations too; the best node gets an `offered` lease with the
     /// job's next epoch.
@@ -1557,17 +1854,16 @@ impl Scheduler {
             return Ok(None);
         };
         let cooling: HashSet<NodeId> = leases::cooling_nodes(&mut tx, job_id, now).await?.into_iter().collect();
-        let candidates: Vec<Candidate> = self
-            .candidates(&mut tx, job.account_id)
-            .await?
-            .into_iter()
-            .filter(|c| !cooling.contains(&c.node_id))
-            .collect();
-        let Some(choice) = fit::choose(&candidates, &job.request, job.last_lost_node_id) else {
+        let candidates: Vec<Candidate> = self.candidates(&mut tx, job.account_id).await?;
+        let Decision::Place(choice) = self.decide(&candidates, &job, &|n| cooling.contains(&n), now) else {
             return Ok(None);
         };
         if !leases::bump_epoch(&mut tx, job_id, job.epoch).await? {
             return Ok(None);
+        }
+        // It no longer waits: whatever reason it showed is over.
+        if job.reason.is_some() {
+            leases::set_queue_reason(&mut tx, job_id, None).await?;
         }
         let lease = NewLease {
             id: LeaseId::generate(),
@@ -1651,6 +1947,7 @@ impl Scheduler {
             pools: spec.placement.pools.clone(),
             labels: spec.placement.labels.clone(),
             node_id: spec.placement.node_id,
+            needs: fit::needs(spec.kind, !spec.volumes.is_empty(), !spec.inputs.is_empty()),
         };
         let mut conn = self.inner.db.acquire().await?;
         let mut m = NodeMatch::default();

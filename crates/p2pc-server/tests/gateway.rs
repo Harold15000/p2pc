@@ -1172,17 +1172,25 @@ async fn an_agent_older_than_min_agent_version_is_refused() {
     }
 }
 
-/// H2 §6.1 before the hub serves them: the new agent messages are answered as an unknown type (H1 §6), the connection
-/// stays, and a `Leave` removes nothing.
+/// H2 §6.1 before the hub serves them: `VolumeReport` and `Leave` are answered as an unknown type (H1 §6), the
+/// connection stays, and a `Leave` removes nothing. `ServiceHealth` is served: it goes to [`NodeEvents`] like every
+/// lease message (the scheduler fences and stores it), and gets no answer of its own.
 #[tokio::test]
-async fn h2_agent_messages_are_answered_as_unknown_types_for_now() {
+async fn h2_agent_messages_are_served_or_answered_as_unknown_types() {
     let mut h = start(test_limits()).await;
     let key = SecretKey::generate();
-    let (mut agent, _node_id) = h.joined(&key, "n").await;
+    let (mut agent, node_id) = h.joined(&key, "n").await;
     let lease = LeaseId::generate();
-    for (n, msg) in [
-        json!({"type": "service_health", "lease_id": lease, "epoch": 1, "state": "healthy",
+    agent
+        .send(
+            &json!({"type": "service_health", "lease_id": lease, "epoch": 1, "state": "healthy",
                "since": "2026-11-10T10:00:00Z"}),
+        )
+        .await;
+    agent.heartbeat(1).await;
+    assert_eq!(agent.recv().await, Some(ServerMsg::HeartbeatAck { seq: 1 }));
+    assert_eq!(h.event().await, (node_id, "service_health".to_string()));
+    for (n, msg) in [
         json!({"type": "volume_report", "volumes": []}),
         json!({"type": "leave", "reason": "uninstall"}),
     ]
@@ -1191,10 +1199,11 @@ async fn h2_agent_messages_are_answered_as_unknown_types_for_now() {
     {
         agent.send(msg).await;
         agent.expect_error("unsupported_message").await;
-        let seq = n as u64 + 1;
+        let seq = n as u64 + 2;
         agent.heartbeat(seq).await;
         assert_eq!(agent.recv().await, Some(ServerMsg::HeartbeatAck { seq }));
     }
+    assert_eq!(h.node_count().await, 1, "a Leave removes nothing yet");
 }
 
 /// SI-10 and §6 "Compatibility".

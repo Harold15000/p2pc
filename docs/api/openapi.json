@@ -595,6 +595,7 @@
           "jobs"
         ],
         "summary": "Lists the caller's jobs, newest first (`created_at` descending, then `id`), with cursor pagination.",
+        "description": "With `jobs:read`, every job of the project. With `templates:launch` and no `jobs:read`, the template view (H2\n§5.5): the template jobs the caller launched and the instances of `singleton` templates; no other job is listed.",
         "operationId": "list_jobs",
         "parameters": [
           {
@@ -634,6 +635,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "description": "Only jobs of this kind: `batch` or `service`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -658,7 +668,7 @@
             }
           },
           "403": {
-            "description": "The key lacks `jobs:read`.",
+            "description": "The caller has neither `jobs:read` nor `templates:launch`.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -668,7 +678,7 @@
             }
           },
           "422": {
-            "description": "Invalid `limit`, `cursor`, `status` or `node_id`.",
+            "description": "Invalid `limit`, `cursor`, `status`, `node_id` or `kind`.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -797,7 +807,8 @@
         "tags": [
           "jobs"
         ],
-        "summary": "One job of the caller, with its `attempts` (§7): `[{attempt, node_id, outcome, reason, started_at, ended_at}]`,\noldest first. `outcome` uses the job-state words (`running` while the attempt is in progress). A job of another\naccount answers `404`, exactly like one that does not exist (SI-7).",
+        "summary": "One job of the caller, with its `attempts` (§7): `[{attempt, node_id, outcome, reason, started_at, ended_at}]`,\noldest first. `outcome` uses the job-state words (`running` while the attempt is in progress). A job of another\naccount answers `404`, exactly like one that does not exist (SI-7), and so does a job outside the caller's\ntemplate view (H2 §5.5).",
+        "description": "A service adds `service` (H2 §7.2): `health` and `health_since` while it runs, `ports`, `open_connections`,\n`last_activity_at`, `idle_deadline`, `deadline` and `restarts_24h`.",
         "operationId": "get_job",
         "parameters": [
           {
@@ -832,7 +843,7 @@
             }
           },
           "403": {
-            "description": "The key lacks `jobs:read`.",
+            "description": "The caller has neither `jobs:read` nor `templates:launch`.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -842,7 +853,7 @@
             }
           },
           "404": {
-            "description": "No such job in this account.",
+            "description": "No such job in this account, or (for a caller with only `templates:launch`) not a job of its template view.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -860,7 +871,7 @@
           "jobs"
         ],
         "summary": "Cancels a job. Idempotent.",
-        "description": "- `queued`: becomes `cancelled` at once.\n- `assigned` or `running`: the status does not change yet. `cancel_requested_at` is set (once), and the scheduler\n  delivers the `Cancel` to the node; the job ends `cancelled` when the node reports.\n- Already finished: `200` with the job unchanged.",
+        "description": "- `queued`: becomes `cancelled` at once.\n- `assigned` or `running`: the status does not change yet. `cancel_requested_at` is set (once), and the scheduler\n  delivers the `Cancel` to the node; the job ends `cancelled` when the node reports.\n- Already finished: `200` with the job unchanged.\n\nA **service** stopped this way ends `cancelled` with `reason: \"stopped\"` (H2 §7.2).\n\n**Who may cancel** (H2 §7.2). With `jobs:write`, any job of the caller's account and project, as in H1. Without it\nbut with `templates:launch`, the jobs of the caller's template view: a template job it launched itself, or an\ninstance of a `singleton` template (shared by every launcher, so any of them may stop it). Any other job answers\n`404`.",
         "operationId": "cancel_job",
         "parameters": [
           {
@@ -895,7 +906,7 @@
             }
           },
           "403": {
-            "description": "The key lacks `jobs:write`.",
+            "description": "The caller has neither `jobs:write` nor `templates:launch`.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -905,7 +916,7 @@
             }
           },
           "404": {
-            "description": "No such job in this account.",
+            "description": "No such job in this account, or (for a caller with only `templates:launch`) not a job of its template view.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -989,7 +1000,7 @@
             }
           },
           "403": {
-            "description": "The key lacks `jobs:read`.",
+            "description": "The caller has neither `jobs:read` nor `templates:launch`.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -999,7 +1010,7 @@
             }
           },
           "404": {
-            "description": "No such job in this account, or no such attempt.",
+            "description": "No such job in this account, no such attempt, or (for a caller with only `templates:launch`) not a template job it launched.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1092,7 +1103,7 @@
             }
           },
           "403": {
-            "description": "The key lacks `jobs:read`.",
+            "description": "The caller has neither `jobs:read` nor `templates:launch`.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1102,7 +1113,7 @@
             }
           },
           "404": {
-            "description": "No such job in this account, or no such attempt.",
+            "description": "No such job in this account, no such attempt, or (for a caller with only `templates:launch`) not a template job it launched.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1205,7 +1216,7 @@
             }
           },
           "403": {
-            "description": "The key lacks `jobs:read`.",
+            "description": "The caller has neither `jobs:read` nor `templates:launch`.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1215,7 +1226,7 @@
             }
           },
           "404": {
-            "description": "No such job in this account, no such attempt, or no such output.",
+            "description": "No such job in this account, no such attempt, no such output, or (for a caller with only `templates:launch`) not a template job it launched.",
             "content": {
               "application/problem+json": {
                 "schema": {

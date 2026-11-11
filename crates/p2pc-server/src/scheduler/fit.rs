@@ -24,11 +24,21 @@
 //! to the node idle longest (its last lease offered or released earliest), then to the smaller node ID, so the choice
 //! is deterministic. On a retry, every node other than the one that just lost the lease ranks before it (§8
 //! "Retries"); that node is still used when it is the only one that fits.
+//!
+//! **H2 eligibility** (H2 §5.5, §6.1). A node gets a job only if its agent declared every capability the job needs
+//! (`service_jobs`, `volumes`, `blob_inputs`: [`needs`]) and the node is `approved`: a `pending_approval` node is
+//! never a fit, whatever it offers (SI-H2-19). Both are reported as their own [`Misfit`], so the scheduler can say why
+//! a job waits ([`why_nowhere`]).
+//!
+//! **Volume affinity** ([`affinity`], H2 §7.2). A requeued service with a volume goes back to the node that holds the
+//! volume when that node fits; while that node is eligible but offline or busy, the scheduler waits for it (for a
+//! bounded time, which the caller checks) before it places the job elsewhere.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use p2pc_proto::api::{Capacity, Inventory, POOL_MINE};
+use p2pc_proto::api::{Capacity, Inventory, JobKind, POOL_MINE};
 use p2pc_proto::ids::NodeId;
+use p2pc_proto::protocol::capability;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -61,6 +71,25 @@ pub struct Request {
     pub labels: BTreeMap<String, String>,
     /// A pinned node, if any.
     pub node_id: Option<NodeId>,
+    /// The agent capabilities the job needs (H2 §6.1, see [`needs`]). Empty for an H1 batch job.
+    pub needs: Vec<&'static str>,
+}
+
+/// The agent capabilities a job needs (H2 §6.1): `service_jobs` for a service, `volumes` for a job with volumes,
+/// `blob_inputs` for a job with blob inputs. A lease that needs one goes only to an agent that declared it.
+#[must_use]
+pub fn needs(kind: JobKind, volumes: bool, blob_inputs: bool) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if kind == JobKind::Service {
+        out.push(capability::SERVICE_JOBS);
+    }
+    if volumes {
+        out.push(capability::VOLUMES);
+    }
+    if blob_inputs {
+        out.push(capability::BLOB_INPUTS);
+    }
+    out
 }
 
 /// What a lease holds on its node: the `leases.reserved` JSON.
@@ -152,6 +181,10 @@ pub struct Candidate {
     pub labels: BTreeMap<String, String>,
     /// Online, not draining, and connected now.
     pub available: bool,
+    /// Whether an `admin` approved the node (H2 §5.5). A `pending_approval` node gets no lease (SI-H2-19).
+    pub approved: bool,
+    /// The capabilities its agent declared in its last `Hello` (H2 §6.1).
+    pub features: Vec<String>,
     /// Its held reservations.
     pub held: Held,
     /// When it last got or released work (its enrollment, if never): the tie-break.
@@ -165,8 +198,12 @@ pub enum Misfit {
     Placement,
     /// No ready sandbox driver.
     NoSandbox,
+    /// Its agent did not declare a capability the job needs (H2 §6.1): the capability.
+    MissingCapability(&'static str),
     /// The node offers less than the job asks for, even when idle.
     TooSmall,
+    /// The node could run the job, but no `admin` has approved it yet (H2 §5.5, SI-H2-19).
+    PendingApproval,
     /// Offline, draining or not connected.
     Unavailable,
     /// Not enough free capacity right now.
@@ -174,10 +211,19 @@ pub enum Misfit {
 }
 
 impl Misfit {
-    /// Whether the node could run the job some day (`matching_nodes` of `POST /v1/estimate`).
+    /// Whether the node is ineligible whatever it is doing: it does not count in `matching_nodes` of
+    /// `POST /v1/estimate`, and the volume affinity does not wait for it. A `pending_approval` node is ineligible
+    /// until an `admin` approves it (H2 §5.5).
     #[must_use]
     pub const fn is_static(self) -> bool {
-        matches!(self, Misfit::Placement | Misfit::NoSandbox | Misfit::TooSmall)
+        matches!(
+            self,
+            Misfit::Placement
+                | Misfit::NoSandbox
+                | Misfit::MissingCapability(_)
+                | Misfit::TooSmall
+                | Misfit::PendingApproval
+        )
     }
 }
 
@@ -195,6 +241,9 @@ pub fn fits(c: &Candidate, req: &Request) -> Result<Option<String>, Misfit> {
     if !c.inventory.sandbox.iter().any(|s| s.ready) {
         return Err(Misfit::NoSandbox);
     }
+    if let Some(missing) = req.needs.iter().find(|n| !c.features.iter().any(|f| f == *n)) {
+        return Err(Misfit::MissingCapability(missing));
+    }
     let gpus = offered_gpus(&c.inventory);
     if cpu_milli(c.inventory.offered.cpu) < req.cpu_milli
         || c.inventory.offered.memory_mb < req.memory_mb
@@ -202,6 +251,10 @@ pub fn fits(c: &Candidate, req: &Request) -> Result<Option<String>, Misfit> {
         || gpus.len() < req.gpu as usize
     {
         return Err(Misfit::TooSmall);
+    }
+    // After every other static rule: `PendingApproval` then means "approval is all this node lacks for the job".
+    if !c.approved {
+        return Err(Misfit::PendingApproval);
     }
     if !c.available {
         return Err(Misfit::Unavailable);
@@ -302,6 +355,53 @@ pub fn choose(candidates: &[Candidate], req: &Request, avoid: Option<NodeId>) ->
         })
 }
 
+/// What the affinity of a requeued service to the node that holds its volume asks for (H2 §7.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Affinity {
+    /// The holder fits now: place the job there.
+    Holder(Choice),
+    /// The holder is eligible but offline, busy or cooling down for this job: wait for it (the caller bounds the
+    /// wait).
+    Wait,
+    /// The holder is gone or ineligible (deleted, not approved, too small, another placement): nothing to wait for.
+    Elsewhere,
+}
+
+/// Where a requeued service with a volume goes, as far as `holder` (the node that holds the volume) decides it.
+/// `cooling` says whether a node may not be offered this job right now (§8 "Offer cap").
+#[must_use]
+pub fn affinity(candidates: &[Candidate], req: &Request, holder: NodeId, cooling: &dyn Fn(NodeId) -> bool) -> Affinity {
+    let Some(c) = candidates.iter().find(|c| c.node_id == holder) else {
+        return Affinity::Elsewhere;
+    };
+    match fits(c, req) {
+        Ok(_) if cooling(holder) => Affinity::Wait,
+        Ok(gpu_uuid) => Affinity::Holder(Choice {
+            node_id: holder,
+            gpu_uuid,
+        }),
+        Err(e) if e.is_static() => Affinity::Elsewhere,
+        Err(_) => Affinity::Wait,
+    }
+}
+
+/// Why no node will take `req` however long it waits, when that is something the owner can act on (H2 §5.5, §6.1):
+/// [`Misfit::PendingApproval`] when approval is all a node lacks, else [`Misfit::MissingCapability`] when a node
+/// lacks only a capability. `None` when some node is eligible (the job just waits for room, as in H1) or when no node
+/// comes that close.
+#[must_use]
+pub fn why_nowhere(candidates: &[Candidate], req: &Request) -> Option<Misfit> {
+    let misfits: Vec<Misfit> = candidates.iter().filter_map(|c| fits(c, req).err()).collect();
+    if misfits.len() < candidates.len() || misfits.iter().any(|m| !m.is_static()) {
+        return None;
+    }
+    misfits
+        .iter()
+        .find(|m| matches!(m, Misfit::PendingApproval))
+        .or_else(|| misfits.iter().find(|m| matches!(m, Misfit::MissingCapability(_))))
+        .copied()
+}
+
 #[cfg(test)]
 mod tests {
     use time::macros::datetime;
@@ -343,6 +443,8 @@ mod tests {
             inventory: inv(cpu, mem, gpus),
             labels: BTreeMap::new(),
             available: true,
+            approved: true,
+            features: Vec::new(),
             held: Held::default(),
             idle_since: T,
         }
@@ -628,6 +730,120 @@ mod tests {
         // Alone, `a` is still used.
         assert_eq!(choose(&[a.clone()], &r, Some(a.node_id)).unwrap().node_id, a.node_id);
         assert_eq!(choose(&[], &r, None), None);
+    }
+
+    /// SI-H2-19: a `pending_approval` node never fits, whatever it offers; approval is checked after the other
+    /// static rules, so the misfit says that approval is all the node lacks.
+    #[test]
+    fn a_pending_node_never_fits() {
+        let mut c = node(4.0, 8192, 1);
+        c.approved = false;
+        assert_eq!(fits(&c, &req(1.0, 1024, 0)), Err(Misfit::PendingApproval));
+        assert_eq!(fits(&c, &req(1.0, 1024, 1)), Err(Misfit::PendingApproval));
+        assert_eq!(fits(&c, &req(8.0, 1024, 0)), Err(Misfit::TooSmall));
+        assert!(Misfit::PendingApproval.is_static(), "ineligible, not busy");
+        assert_eq!(choose(&[c.clone()], &req(1.0, 1024, 0), None), None);
+        // Offline and pending: still pending (the approval is what the owner must act on).
+        c.available = false;
+        assert_eq!(fits(&c, &req(1.0, 1024, 0)), Err(Misfit::PendingApproval));
+        let approved = node(4.0, 8192, 0);
+        let picked = choose(&[c, approved.clone()], &req(1.0, 1024, 0), None).unwrap();
+        assert_eq!(picked.node_id, approved.node_id);
+    }
+
+    /// H2 §6.1: a job that needs a capability goes only to an agent that declared it.
+    #[test]
+    fn a_job_needs_the_capabilities_of_its_kind_volumes_and_blob_inputs() {
+        assert!(needs(JobKind::Batch, false, false).is_empty());
+        assert_eq!(needs(JobKind::Service, false, false), ["service_jobs"]);
+        assert_eq!(
+            needs(JobKind::Service, true, true),
+            ["service_jobs", "volumes", "blob_inputs"]
+        );
+        assert_eq!(needs(JobKind::Batch, false, true), ["blob_inputs"]);
+        let h1 = node(4.0, 8192, 0);
+        let mut h2 = node(4.0, 8192, 0);
+        h2.features = vec!["service_jobs".into(), "leave".into()];
+        let mut service = req(1.0, 1024, 0);
+        service.needs = needs(JobKind::Service, false, false);
+        assert_eq!(fits(&h1, &service), Err(Misfit::MissingCapability("service_jobs")));
+        assert_eq!(fits(&h2, &service), Ok(None));
+        assert!(Misfit::MissingCapability("service_jobs").is_static());
+        // A batch job needs none: an H1 agent takes it as before.
+        assert_eq!(fits(&h1, &req(1.0, 1024, 0)), Ok(None));
+        service.needs = needs(JobKind::Service, true, false);
+        assert_eq!(fits(&h2, &service), Err(Misfit::MissingCapability("volumes")));
+        assert_eq!(choose(&[h1, h2], &service, None), None, "no node declares `volumes`");
+    }
+
+    #[test]
+    fn why_nowhere_names_approval_then_a_missing_capability() {
+        let mut service = req(1.0, 1024, 0);
+        service.needs = needs(JobKind::Service, false, false);
+        let h1 = node(4.0, 8192, 0);
+        let mut pending = node(4.0, 8192, 0);
+        pending.features = vec!["service_jobs".into()];
+        pending.approved = false;
+        assert_eq!(why_nowhere(&[], &service), None);
+        assert_eq!(
+            why_nowhere(std::slice::from_ref(&h1), &service),
+            Some(Misfit::MissingCapability("service_jobs"))
+        );
+        assert_eq!(
+            why_nowhere(&[h1.clone(), pending.clone()], &service),
+            Some(Misfit::PendingApproval)
+        );
+        // An eligible node that is only busy or offline: the job just waits, as in H1.
+        let mut offline = pending.clone();
+        offline.approved = true;
+        offline.available = false;
+        assert_eq!(why_nowhere(&[h1.clone(), pending, offline.clone()], &service), None);
+        offline.available = true;
+        assert_eq!(why_nowhere(&[h1, offline], &service), None, "it fits");
+        // Too small is nothing the reasons explain.
+        assert_eq!(why_nowhere(&[node(0.5, 8192, 0)], &req(1.0, 1024, 0)), None);
+    }
+
+    /// H2 §7.2 "Waiting for the same node".
+    #[test]
+    fn affinity_goes_to_the_holder_waits_for_it_or_gives_up() {
+        let r = req(1.0, 1024, 0);
+        let holder = node(4.0, 8192, 0);
+        let other = node(4.0, 8192, 0);
+        let all = [holder.clone(), other.clone()];
+        let never = |_: NodeId| false;
+        assert_eq!(
+            affinity(&all, &r, holder.node_id, &never),
+            Affinity::Holder(Choice {
+                node_id: holder.node_id,
+                gpu_uuid: None
+            })
+        );
+        let cooling = |n: NodeId| n == holder.node_id;
+        assert_eq!(affinity(&all, &r, holder.node_id, &cooling), Affinity::Wait);
+        let mut offline = holder.clone();
+        offline.available = false;
+        assert_eq!(
+            affinity(&[offline, other.clone()], &r, holder.node_id, &never),
+            Affinity::Wait
+        );
+        let mut busy = holder.clone();
+        hold(&mut busy, 3.5, 0, None);
+        assert_eq!(
+            affinity(&[busy, other.clone()], &r, holder.node_id, &never),
+            Affinity::Wait
+        );
+        let mut pending = holder.clone();
+        pending.approved = false;
+        assert_eq!(
+            affinity(&[pending, other.clone()], &r, holder.node_id, &never),
+            Affinity::Elsewhere
+        );
+        assert_eq!(
+            affinity(&[other], &r, holder.node_id, &never),
+            Affinity::Elsewhere,
+            "deleted"
+        );
     }
 
     #[test]

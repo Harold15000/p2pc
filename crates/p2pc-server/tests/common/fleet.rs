@@ -129,6 +129,12 @@ impl Fleet {
     /// The agent restarts: a new connection with the same key, whose `Hello` lists no running lease (so the server
     /// loses its leases at once, §6 "Reconnects").
     pub async fn restart(&self, agent: FakeAgent) -> FakeAgent {
+        self.restart_with(agent, &[]).await
+    }
+
+    /// [`Fleet::restart`] with the capabilities the agent declares in its `Hello` (H2 §6.1). A `Join` carries none,
+    /// so an agent that runs services reconnects once after it joined.
+    pub async fn restart_with(&self, agent: FakeAgent, features: &[&str]) -> FakeAgent {
         let node_id = agent.node_id;
         let key = agent.key.clone();
         agent.conn.close(0u32.into(), b"restart");
@@ -138,7 +144,7 @@ impl Fleet {
                 agent_version: "0.1.0".into(),
                 inventory: super::inventory("node"),
                 running: vec![],
-                features: vec![],
+                features: features.iter().map(ToString::to_string).collect(),
             })
             .await;
         loop {
