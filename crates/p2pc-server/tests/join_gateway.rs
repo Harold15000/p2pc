@@ -6,8 +6,9 @@
 //!
 //! - The token of an approved join request enrolls only the agent NodeId it is bound to: any other NodeId gets H1's
 //!   `invalid_token` answer and the token stays unused.
-//! - A node is created `approved` only when its token carries an `admin`'s approval; a `nodes:join` token gives a
-//!   `pending_approval` node until an `admin` approves it.
+//! - A node is created `approved` only when its token carries an `admin`'s approval; an `admin` device's token
+//!   without `pre_approved` gives a `pending_approval` node until an `admin` approves it.
+//! - A `nodes:join` API key with no `admin` cannot mint a join token at all (`403`), until T2-12.
 
 // Helpers are not `#[test]` functions, so `allow-unwrap-in-tests` does not cover them.
 #![allow(clippy::unwrap_used)]
@@ -131,30 +132,17 @@ async fn the_token_of_a_join_request_enrolls_only_its_bound_agent() {
 async fn a_node_is_approved_at_enrollment_only_with_an_admins_approval() {
     let fleet = Fleet::start().await;
     let app = &fleet.app;
-    // A `nodes:join` API key (the developer profile's power): its node waits for approval.
+    // An API key with `nodes:join` and no `admin` mints nothing: until the scheduler refuses leases to pending nodes
+    // (T2-12), a node of such a token would get work without an `admin`'s approval (SI-H2-19).
     let joiner = app.key_with(&[Scope::NodesJoin]).await;
     let r = app
         .call(Method::POST, "/v1/nodes/join-tokens", Some(&joiner), Some(json!({})))
         .await;
-    assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
-    let token = JoinToken::decode(r.json()["join_token"].as_str().unwrap()).unwrap();
-    let (mut pending, answer) = fleet.join_as(&SecretKey::generate(), token).await;
-    assert!(matches!(answer, Some(ServerMsg::Welcome { .. })), "{answer:?}");
-    pending.sync().await;
-    let id = pending.node_id.unwrap();
-    let v = node(&fleet, id).await;
-    assert_eq!(v["approval"], "pending_approval");
-    assert_eq!(v["enrolled_by"], json!({"kind": "key", "id": &joiner[8..20]}));
-    // The joiner cannot approve its own node; an admin can.
-    let path = format!("/v1/nodes/{id}/approve");
-    let r = app.call(Method::POST, &path, Some(&joiner), None).await;
     assert_problem(&r, StatusCode::FORBIDDEN, "forbidden");
-    let r = app.call(Method::POST, &path, Some(&app.admin), None).await;
-    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
-    assert!(node(&fleet, id).await.get("approval").is_none());
+    assert_eq!(token_rows(&fleet).await, (0, 0));
 
     // The hub PC's own node at first run (§8.2 step 4): the owner device mints a `pre_approved` token of 300 s over
-    // its device connection; the node is approved when it enrolls, and gets a lease.
+    // its device connection; the node is approved when it enrolls.
     let owner = app.add_device(&[Scope::Admin], DeviceLimits::default()).await;
     let r = app
         .device_call(
@@ -166,23 +154,30 @@ async fn a_node_is_approved_at_enrollment_only_with_an_admins_approval() {
         .await;
     assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
     let token = JoinToken::decode(r.json()["join_token"].as_str().unwrap()).unwrap();
-    pending.conn.close(0u32.into(), b"done");
     let (mut own, answer) = fleet.join_as(&SecretKey::generate(), token).await;
     assert!(matches!(answer, Some(ServerMsg::Welcome { .. })), "{answer:?}");
     own.sync().await;
     let v = node(&fleet, own.node_id.unwrap()).await;
     assert!(v.get("approval").is_none(), "{v}");
     assert_eq!(v["enrolled_by"], json!({"kind": "device", "id": owner.to_string()}));
+    own.conn.close(0u32.into(), b"done");
+
     // Without `pre_approved`, the same device's token gives a pending node ("Copy invite").
     let r = app
         .device_call(owner, Method::POST, "/v1/nodes/join-tokens", Some(json!({})))
         .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
     let token = JoinToken::decode(r.json()["join_token"].as_str().unwrap()).unwrap();
     let (mut invited, answer) = fleet.join_as(&SecretKey::generate(), token).await;
     assert!(matches!(answer, Some(ServerMsg::Welcome { .. })), "{answer:?}");
     invited.sync().await;
-    assert_eq!(
-        node(&fleet, invited.node_id.unwrap()).await["approval"],
-        "pending_approval"
-    );
+    let id = invited.node_id.unwrap();
+    assert_eq!(node(&fleet, id).await["approval"], "pending_approval");
+    // A non-`admin` cannot approve it; an `admin` can.
+    let path = format!("/v1/nodes/{id}/approve");
+    let r = app.call(Method::POST, &path, Some(&joiner), None).await;
+    assert_problem(&r, StatusCode::FORBIDDEN, "forbidden");
+    let r = app.call(Method::POST, &path, Some(&app.admin), None).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert!(node(&fleet, id).await.get("approval").is_none());
 }

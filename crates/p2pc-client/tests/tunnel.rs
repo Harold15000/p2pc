@@ -86,7 +86,7 @@ async fn requests_go_through_one_connection_with_one_stream_each() {
     let server = api(key.key_id());
     let (client, tunnel) = tunnel_client(&server, &key);
     let who = client.whoami().await.unwrap();
-    assert_eq!(who.key_id, key.key_id());
+    assert_eq!(who.key_id, Some(key.key_id()));
     let page = client.list_jobs(&JobListParams::default()).await.unwrap();
     assert_eq!(page.items.len(), 1);
     client.get_job(&page.items[0].id).await.unwrap();

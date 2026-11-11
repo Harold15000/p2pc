@@ -366,8 +366,10 @@ pub async fn approve(conn: &mut Conn, account_id: AccountId, id: NodeId) -> Resu
 
 /// Re-enrolls the live node `id` of `account_id` with a new join token (§5 "Re-enrolling the same machine"): the
 /// same node id and name, the inventory (hostname, agent version) refreshed, the project taken from the token, and
-/// the token recorded as the one it was enrolled through. Run it in the `Join` transaction, which then consumes the
-/// token. `None` when no live node of that account has that id (nothing changed).
+/// the token recorded as the one it was enrolled through, with its minter as `enrolled_by` (H2 §5.5: both principal
+/// columns come from the token row in the same `UPDATE`, so they never name the minter of an older token). Its
+/// `approval` is not touched. Run it in the `Join` transaction, which then consumes the token. `None` when no live
+/// node of that account has that id (nothing changed).
 pub async fn reenroll(
     conn: &mut Conn,
     account_id: AccountId,
@@ -377,8 +379,11 @@ pub async fn reenroll(
     token_id: JoinTokenId,
 ) -> Result<Option<NodeRow>, StoreError> {
     let done = sqlx::query(
-        "UPDATE nodes SET project_id = ?, hostname = ?, inventory = ?, agent_version = ?, enrolled_via_token_id = ? \
-         WHERE id = ? AND account_id = ? AND deleted_at IS NULL",
+        "UPDATE nodes SET project_id = ?1, hostname = ?2, inventory = ?3, agent_version = ?4, \
+                enrolled_via_token_id = ?5, \
+                enrolled_by_key_id = (SELECT t.created_by_key_id FROM join_tokens t WHERE t.id = ?5), \
+                enrolled_by_device_id = (SELECT t.created_by_device_id FROM join_tokens t WHERE t.id = ?5) \
+         WHERE id = ?6 AND account_id = ?7 AND deleted_at IS NULL",
     )
     .bind(project_id.to_string())
     .bind(&inventory.hostname)

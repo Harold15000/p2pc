@@ -85,20 +85,30 @@ async fn who_may_mint_a_join_token_and_for_how_long() {
     let admin_device = app.add_device(&[Scope::Admin], DeviceLimits::default()).await;
     let joiner_key = app.key_with(&[Scope::NodesJoin]).await;
     let reader = app.key_with(&[Scope::NodesRead]).await;
-    // The phone profile has no `nodes:join` (SI-H2-19); neither has a reader key.
-    for by in [Minter::Device(phone), Minter::Key(&reader)] {
-        let r = mint(&app, by, json!({})).await;
-        assert_problem(&r, StatusCode::FORBIDDEN, "forbidden");
+    // Only `admin` mints join tokens, with H1's error for everyone else. `nodes:join` is defined but grants nothing
+    // here until the scheduler refuses leases to `pending_approval` nodes (T2-12): an API key or a device with
+    // `nodes:join` and no `admin` gets the same 403 as a reader, whatever it asks for.
+    for by in [
+        Minter::Key(&joiner_key),
+        Minter::Device(joiner),
+        Minter::Device(phone),
+        Minter::Key(&reader),
+    ] {
+        for body in [
+            json!({}),
+            json!({"ttl_s": 900}),
+            json!({"pre_approved": true, "ttl_s": 300}),
+        ] {
+            let r = mint(&app, by, body).await;
+            let v = assert_problem(&r, StatusCode::FORBIDDEN, "forbidden");
+            assert!(v["detail"].as_str().unwrap().contains("`admin`"), "{v}");
+        }
     }
-    // `nodes:join`: at most 900 s, never `pre_approved`.
-    for by in [Minter::Device(joiner), Minter::Key(&joiner_key)] {
-        let r = mint(&app, by, json!({"ttl_s": 901})).await;
-        assert_problem(&r, StatusCode::UNPROCESSABLE_ENTITY, "validation_failed");
-        let r = mint(&app, by, json!({"pre_approved": true, "ttl_s": 300})).await;
-        assert_problem(&r, StatusCode::FORBIDDEN, "forbidden");
-        assert_eq!(mint(&app, by, json!({"ttl_s": 900})).await.status, StatusCode::CREATED);
-        assert_eq!(mint(&app, by, json!({})).await.status, StatusCode::CREATED);
-    }
+    let minted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM join_tokens")
+        .fetch_one(&app.db)
+        .await
+        .unwrap();
+    assert_eq!(minted, 0);
     // `admin`: H1's 24 h, but at most 900 s with `pre_approved`.
     for by in [Minter::Device(admin_device), Minter::Key(&app.admin)] {
         assert_eq!(
@@ -122,6 +132,38 @@ async fn who_may_mint_a_join_token_and_for_how_long() {
     assert_eq!(pre.len(), 2);
 }
 
+/// Inserts a token row minted by `by` straight into the store. The API mints only for `admin` principals for now
+/// (T2-12); the stored approval rule already covers every minter, and this is how the tests reach the others.
+async fn stored_token(app: &TestApp, by: Principal, pre_approved: bool) -> JoinToken {
+    let token = JoinToken::generate(
+        app.state.server.node_id().to_string(),
+        vec![],
+        time::Duration::minutes(15),
+        T0,
+    )
+    .unwrap();
+    let mut tx = store::begin_immediate(&app.db).await.unwrap();
+    join_tokens::insert(
+        &mut tx,
+        app.account_id,
+        &join_tokens::NewJoinToken {
+            id: JoinTokenId::generate(),
+            project_id: app.project_id,
+            code_digest: token.code_hash(),
+            label: None,
+            created_by: by,
+            bound_iroh_node_id: None,
+            pre_approved,
+            expires_at: token.expires_at,
+        },
+        T0,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    token
+}
+
 /// The stored rule of §5.5: a node is `approved` iff its token has `pre_approved`, or a bound NodeId, or was minted
 /// by an `admin` API key; otherwise `pending_approval`.
 #[tokio::test]
@@ -130,13 +172,12 @@ async fn a_node_is_approved_only_with_an_admins_approval_on_its_token() {
     let joiner = app.add_device(&DEVELOPER_DEVICE_PROFILE, DeviceLimits::default()).await;
     let admin_device = app.add_device(&[Scope::Admin], DeviceLimits::default()).await;
     let joiner_key = app.key_with(&[Scope::NodesJoin]).await;
-    let cases: [(Minter<'_>, Value, &str); 6] = [
+    // Through the API: the `admin` minters.
+    let cases: [(Minter<'_>, Value, &str); 4] = [
         (Minter::Key(&app.admin), json!({}), "approved"),
         (Minter::Key(&app.admin), json!({"pre_approved": true}), "approved"),
         (Minter::Device(admin_device), json!({}), "pending_approval"),
         (Minter::Device(admin_device), json!({"pre_approved": true}), "approved"),
-        (Minter::Device(joiner), json!({}), "pending_approval"),
-        (Minter::Key(&joiner_key), json!({}), "pending_approval"),
     ];
     for (i, (by, body, want)) in cases.into_iter().enumerate() {
         let node = enroll_with(&app, by, body, &node_key()).await.unwrap();
@@ -150,6 +191,57 @@ async fn a_node_is_approved_only_with_an_admins_approval_on_its_token() {
             Minter::Key(k) => json!({"kind": "key", "id": &k[8..20]}),
         };
         assert_eq!(v["enrolled_by"], enrolled_by, "case {i}");
+    }
+    // In the store: a token of a non-`admin` principal, key or device, gives a pending node.
+    let joiner_key_id: p2pc_proto::ids::KeyId = joiner_key[8..20].parse().unwrap();
+    for by in [Principal::Device(joiner), Principal::Key(joiner_key_id)] {
+        let token = stored_token(&app, by, false).await;
+        let node = enroll_token(&app, &token, &node_key()).await.unwrap();
+        assert_eq!(node.approval, p2pc_proto::api::NodeApproval::PendingApproval, "{by}");
+        assert_eq!(node.enrolled_by, Some(by));
+    }
+}
+
+/// §5 "Re-enrolling the same machine": a live node that joins again with a new token records that token's minter as
+/// `enrolled_by`, a key or a device, in the same `UPDATE` that records the token.
+#[tokio::test]
+async fn re_enrolling_records_the_new_tokens_minter() {
+    let app = TestApp::new().await;
+    let admin_device = app.add_device(&[Scope::Admin], DeviceLimits::default()).await;
+    let admin_key = Principal::Key(app.admin_key.key_id());
+    let node = enroll_with(&app, Minter::Key(&app.admin), json!({}), &node_key())
+        .await
+        .unwrap();
+    assert_eq!(node.enrolled_by, Some(admin_key));
+    for by in [Principal::Device(admin_device), admin_key] {
+        let token = stored_token(&app, by, true).await;
+        let mut tx = store::begin_immediate(&app.db).await.unwrap();
+        let row = join_tokens::find_by_digest(&mut tx, &token.code_hash())
+            .await
+            .unwrap()
+            .unwrap();
+        let again = nodes::reenroll(
+            &mut tx,
+            app.account_id,
+            node.id,
+            row.project_id,
+            &inventory("box"),
+            row.id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            join_tokens::consume(&mut tx, &token.code_hash(), node.id, T0)
+                .await
+                .unwrap()
+        );
+        tx.commit().await.unwrap();
+        assert_eq!(again.id, node.id, "the same node");
+        assert_eq!(again.enrolled_via_token_id, row.id);
+        assert_eq!(again.enrolled_by, Some(by), "exactly one principal column is set");
+        let r = app.get(&format!("/v1/nodes/{}", node.id), &app.admin).await;
+        assert_eq!(r.json()["enrolled_by"], serde_json::to_value(by).unwrap());
     }
 }
 
@@ -203,8 +295,10 @@ async fn a_bound_token_enrolls_only_its_agent_node_id_and_stays_unused_otherwise
 async fn only_an_admin_approves_a_pending_node_and_approval_is_idempotent() {
     let app = TestApp::new().await;
     let joiner = app.add_device(&DEVELOPER_DEVICE_PROFILE, DeviceLimits::default()).await;
+    let admin_device = app.add_device(&[Scope::Admin], DeviceLimits::default()).await;
     let agent = node_key();
-    let node = enroll_with(&app, Minter::Device(joiner), json!({}), &agent)
+    // "Copy invite" without "Pre-approve": an `admin` device's token gives a node that waits for approval.
+    let node = enroll_with(&app, Minter::Device(admin_device), json!({}), &agent)
         .await
         .unwrap();
     let path = format!("/v1/nodes/{}/approve", node.id);

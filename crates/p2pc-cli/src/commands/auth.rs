@@ -131,8 +131,13 @@ fn print_who(ctx: &mut Ctx<'_, '_>, who: &WhoAmI) -> Result<(), CliError> {
     let mut rows = vec![
         ("account", who.account_id.to_string()),
         ("project", who.project_id.to_string()),
-        ("key", who.key_id.to_string()),
     ];
+    // An API key always has a key ID, shown as in H1. A device principal has none (H2 §5.5): it is named instead.
+    match (who.key_id, who.principal) {
+        (Some(key), _) => rows.push(("key", key.to_string())),
+        (None, Some(principal)) => rows.push(("principal", principal.to_string())),
+        (None, None) => {}
+    }
     if let Some(label) = &who.label {
         rows.push(("label", label.clone()));
     }

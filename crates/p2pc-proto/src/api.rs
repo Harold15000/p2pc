@@ -14,9 +14,10 @@
 //!
 //! **H2 additions** (H2 spec §5, §7, §12) are all additive: every new field of an H1 type is optional on input and
 //! is left out of the output while it has its H1 value, so an H1 peer reads and writes exactly the H1 bytes (pinned
-//! by the `h1_wire_fixtures_are_byte_identical` test). The H1 types keep their field types; the principal change of
-//! `UsageRecord.key_id`, `WhoAmI.key_id` and `JoinTokenInfo.created_by_key_id` belongs to the server task that
-//! stores principals (T2-10).
+//! by the `h1_wire_fixtures_are_byte_identical` test). The H1 types keep their field types, with two exceptions that
+//! the principal change needs (H2 §5.5, T2-10): `WhoAmI.key_id` and `JoinTokenInfo.created_by_key_id` are `Option`,
+//! `null` when the principal is a device. For an API key they serialize exactly as in H1. `UsageRecord.key_id` changes
+//! with the ledger (T2-16).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -1914,8 +1915,21 @@ pub struct JoinTokenInfo {
     /// Optional label.
     #[serde(default)]
     pub label: Option<String>,
-    /// The key that created it.
-    pub created_by_key_id: KeyId,
+    /// The key that created it; `null` when a device did (H2 §5.6), see `created_by`.
+    #[serde(default)]
+    pub created_by_key_id: Option<KeyId>,
+    /// The principal that created it, `{kind, id}` (H2 §5.6). Absent from an H1 server, whose tokens are always
+    /// created by the `created_by_key_id` key. Left out when `null`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<Principal>,
+    /// Minted with the `admin`-only `pre_approved` option: the node it enrolls starts `approved` (H2 §5.4). Left out
+    /// when `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pre_approved: bool,
+    /// The agent NodeId (64 lowercase hex) the token is bound to: the token of an approved join request enrolls no
+    /// other (H2 §5.4). Left out when `null`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_iroh_node_id: Option<String>,
     /// Creation time.
     #[serde(with = "crate::timestamp")]
     #[cfg_attr(feature = "openapi", schema(value_type = String, format = DateTime))]
@@ -1950,7 +1964,34 @@ impl JoinTokenInfo {
         Self {
             id,
             label: None,
-            created_by_key_id,
+            created_by_key_id: Some(created_by_key_id),
+            created_by: None,
+            pre_approved: false,
+            bound_iroh_node_id: None,
+            created_at,
+            expires_at,
+            consumed_at: None,
+            consumed_by_node_id: None,
+            revoked_at: None,
+        }
+    }
+
+    /// An unused, unrevoked token with no label, created by `created_by`, a key or a device (H2 §5.6):
+    /// `created_by_key_id` is the key, or `None` for a device.
+    #[must_use]
+    pub fn by_principal(
+        id: JoinTokenId,
+        created_by: Principal,
+        created_at: OffsetDateTime,
+        expires_at: OffsetDateTime,
+    ) -> Self {
+        Self {
+            id,
+            label: None,
+            created_by_key_id: created_by.key_id(),
+            created_by: Some(created_by),
+            pre_approved: false,
+            bound_iroh_node_id: None,
             created_at,
             expires_at,
             consumed_at: None,
@@ -1971,8 +2012,9 @@ pub struct WhoAmI {
     pub account_id: AccountId,
     /// The key's project.
     pub project_id: ProjectId,
-    /// The key's public ID.
-    pub key_id: KeyId,
+    /// The key's public ID; `null` when the caller is a device (H2 §5.5), see `principal`.
+    #[serde(default)]
+    pub key_id: Option<KeyId>,
     /// The key's scopes.
     pub scopes: Vec<Scope>,
     /// The key's label, if it has one.
@@ -3698,7 +3740,7 @@ mod tests {
         let w = WhoAmI {
             account_id: "acc_01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap(),
             project_id: "prj_01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap(),
-            key_id: "abcdefgh2345".parse().unwrap(),
+            key_id: Some("abcdefgh2345".parse().unwrap()),
             scopes: vec![Scope::JobsRead],
             label: Some("agent".to_string()),
             daily_unit_cap: Some(Units::from_units(5)),
@@ -3898,17 +3940,15 @@ mod tests {
     /// Spec §5 "Listing and revoking": the token list never contains the code.
     #[test]
     fn join_token_info_and_create_shapes() {
-        let info = JoinTokenInfo {
-            id: "jtk_01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap(),
-            label: Some("laptop".into()),
-            created_by_key_id: "abcdefgh2345".parse().unwrap(),
-            created_at: time::macros::datetime!(2026-11-05 10:00:00 UTC),
-            expires_at: time::macros::datetime!(2026-11-05 10:15:00 UTC),
-            consumed_at: None,
-            consumed_by_node_id: None,
-            revoked_at: None,
-        };
+        let mut info = JoinTokenInfo::new(
+            "jtk_01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap(),
+            "abcdefgh2345".parse().unwrap(),
+            time::macros::datetime!(2026-11-05 10:00:00 UTC),
+            time::macros::datetime!(2026-11-05 10:15:00 UTC),
+        );
+        info.label = Some("laptop".into());
         let v = serde_json::to_value(&info).unwrap();
+        assert_eq!(v["created_by_key_id"], "abcdefgh2345");
         assert_eq!(
             keys_of(&v),
             [
@@ -4585,10 +4625,62 @@ mod tests {
     fn whoami_principal_is_additive() {
         let mut w: WhoAmI = serde_json::from_str(H1_FIXTURES[5].1).unwrap();
         assert_eq!(w.principal, None);
-        w.principal = Some(Principal::Key(w.key_id));
+        let key = w.key_id.unwrap();
+        w.principal = Some(Principal::Key(key));
         let v = serde_json::to_value(&w).unwrap();
         assert_eq!(v["principal"], json!({"kind": "key", "id": "abcdefgh2345"}));
+        assert_eq!(v["key_id"], "abcdefgh2345");
         assert_eq!(serde_json::from_value::<WhoAmI>(v).unwrap(), w);
+        // A device (H2 §5.5): `key_id` stays in the body, as `null`.
+        let dev: DeviceId = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap();
+        w.key_id = None;
+        w.principal = Some(Principal::Device(dev));
+        let v = serde_json::to_value(&w).unwrap();
+        assert_eq!(v["key_id"], serde_json::Value::Null);
+        assert_eq!(v["principal"], json!({"kind": "device", "id": dev.to_string()}));
+        assert_eq!(serde_json::from_value::<WhoAmI>(v).unwrap(), w);
+    }
+
+    /// H2 §5.6: a token names its minter. A key's token keeps H1's `created_by_key_id`; a device's has it `null`.
+    /// `pre_approved` and `bound_iroh_node_id` are left out at their H1 values.
+    #[test]
+    fn join_token_info_names_a_key_or_a_device() {
+        // A row ID from the ULID spec's example, not a secret.
+        let id: JoinTokenId = "jtk_01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap(); // gitleaks:allow
+        let (at, until) = (
+            time::macros::datetime!(2026-11-05 10:00:00 UTC),
+            time::macros::datetime!(2026-11-05 10:15:00 UTC),
+        );
+        let key: KeyId = "abcdefgh2345".parse().unwrap();
+        let by_key = JoinTokenInfo::by_principal(id, Principal::Key(key), at, until);
+        let v = serde_json::to_value(&by_key).unwrap();
+        assert_eq!(v["created_by_key_id"], "abcdefgh2345");
+        assert_eq!(v["created_by"], json!({"kind": "key", "id": "abcdefgh2345"}));
+        assert!(
+            v.get("pre_approved").is_none() && v.get("bound_iroh_node_id").is_none(),
+            "{v}"
+        );
+        assert_eq!(serde_json::from_value::<JoinTokenInfo>(v).unwrap(), by_key);
+        let dev: DeviceId = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap();
+        let mut by_device = JoinTokenInfo::by_principal(id, Principal::Device(dev), at, until);
+        by_device.pre_approved = true;
+        by_device.bound_iroh_node_id = Some("ab".repeat(32));
+        let v = serde_json::to_value(&by_device).unwrap();
+        assert_eq!(v["created_by_key_id"], serde_json::Value::Null);
+        assert_eq!(v["created_by"], json!({"kind": "device", "id": dev.to_string()}));
+        assert_eq!(v["pre_approved"], true);
+        assert_eq!(v["bound_iroh_node_id"], "ab".repeat(32));
+        assert_eq!(serde_json::from_value::<JoinTokenInfo>(v).unwrap(), by_device);
+        // An H1 server's listing still parses: the new fields default.
+        let h1 = json!({
+            "id": id, "label": null, "created_by_key_id": "abcdefgh2345",
+            "created_at": "2026-11-05T10:00:00Z", "expires_at": "2026-11-05T10:15:00Z",
+            "consumed_at": null, "consumed_by_node_id": null, "revoked_at": null,
+        });
+        assert_eq!(
+            serde_json::from_value::<JoinTokenInfo>(h1).unwrap(),
+            JoinTokenInfo::new(id, key, at, until)
+        );
     }
 
     #[test]

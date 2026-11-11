@@ -2068,7 +2068,7 @@
           "nodes"
         ],
         "summary": "Creates a single-use join token. The token is in the response, once.",
-        "description": "`admin` principals mint tokens as in H1. A `nodes:join` principal (H2 §5.4) mints tokens of at most 900 s, and\nthe node such a token enrolls starts `pending_approval`. `pre_approved` (`admin` only, at most 900 s) makes the\nnode start `approved`; without it, a token minted by an `admin` **device** also gives a `pending_approval` node,\nwhile a token of an `admin` API key enrolls as in H1 (H2 §5.5).",
+        "description": "Only `admin` principals mint tokens, as in H1. `pre_approved` (at most 900 s) makes the node start `approved`;\nwithout it, a token minted by an `admin` **device** gives a `pending_approval` node, while a token of an `admin`\nAPI key enrolls as in H1 (H2 §5.5).",
         "operationId": "create_join_token",
         "requestBody": {
           "content": {
@@ -2102,7 +2102,7 @@
             }
           },
           "403": {
-            "description": "The caller lacks the admin or nodes:join scope, or asks for `pre_approved` without admin.",
+            "description": "The caller lacks the admin scope.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2112,7 +2112,7 @@
             }
           },
           "422": {
-            "description": "Invalid `label` or `ttl_s` (1-86400, default 900; at most 900 for a nodes:join caller or with `pre_approved`).",
+            "description": "Invalid `label` or `ttl_s` (1-86400, default 900; at most 900 with `pre_approved`).",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -4264,11 +4264,17 @@
         "description": "A join token as listed by `GET /v1/nodes/join-tokens` (§5 \"Listing and revoking\"). Never contains the token or\nits code.",
         "required": [
           "id",
-          "created_by_key_id",
           "created_at",
           "expires_at"
         ],
         "properties": {
+          "bound_iroh_node_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The agent NodeId (64 lowercase hex) the token is bound to: the token of an approved join request enrolls no\nother (H2 §5.4). Left out when `null`."
+          },
           "consumed_at": {
             "type": [
               "string",
@@ -4293,9 +4299,27 @@
             "format": "date-time",
             "description": "Creation time."
           },
+          "created_by": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Principal",
+                "description": "The principal that created it, `{kind, id}` (H2 §5.6). Absent from an H1 server, whose tokens are always\ncreated by the `created_by_key_id` key. Left out when `null`."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "created_by_key_id": {
-            "$ref": "#/components/schemas/KeyId",
-            "description": "The key that created it."
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/KeyId",
+                "description": "The key that created it; `null` when a device did (H2 §5.6), see `created_by`."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "expires_at": {
             "type": "string",
@@ -4312,6 +4336,10 @@
               "null"
             ],
             "description": "Optional label."
+          },
+          "pre_approved": {
+            "type": "boolean",
+            "description": "Minted with the `admin`-only `pre_approved` option: the node it enrolls starts `approved` (H2 §5.4). Left out\nwhen `false`."
           },
           "revoked_at": {
             "type": [
@@ -5110,11 +5138,17 @@
               "description": "A join token as listed by `GET /v1/nodes/join-tokens` (§5 \"Listing and revoking\"). Never contains the token or\nits code.",
               "required": [
                 "id",
-                "created_by_key_id",
                 "created_at",
                 "expires_at"
               ],
               "properties": {
+                "bound_iroh_node_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "The agent NodeId (64 lowercase hex) the token is bound to: the token of an approved join request enrolls no\nother (H2 §5.4). Left out when `null`."
+                },
                 "consumed_at": {
                   "type": [
                     "string",
@@ -5139,9 +5173,27 @@
                   "format": "date-time",
                   "description": "Creation time."
                 },
+                "created_by": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Principal",
+                      "description": "The principal that created it, `{kind, id}` (H2 §5.6). Absent from an H1 server, whose tokens are always\ncreated by the `created_by_key_id` key. Left out when `null`."
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
                 "created_by_key_id": {
-                  "$ref": "#/components/schemas/KeyId",
-                  "description": "The key that created it."
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/KeyId",
+                      "description": "The key that created it; `null` when a device did (H2 §5.6), see `created_by`."
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 },
                 "expires_at": {
                   "type": "string",
@@ -5158,6 +5210,10 @@
                     "null"
                   ],
                   "description": "Optional label."
+                },
+                "pre_approved": {
+                  "type": "boolean",
+                  "description": "Minted with the `admin`-only `pre_approved` option: the node it enrolls starts `approved` (H2 §5.4). Left out\nwhen `false`."
                 },
                 "revoked_at": {
                   "type": [
@@ -6605,7 +6661,6 @@
         "required": [
           "account_id",
           "project_id",
-          "key_id",
           "scopes"
         ],
         "properties": {
@@ -6643,8 +6698,15 @@
             "description": "When the key expires, if it does."
           },
           "key_id": {
-            "$ref": "#/components/schemas/KeyId",
-            "description": "The key's public ID."
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/KeyId",
+                "description": "The key's public ID; `null` when the caller is a device (H2 §5.5), see `principal`."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "label": {
             "type": [

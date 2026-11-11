@@ -798,7 +798,7 @@ pub mod fixtures {
         WhoAmI {
             account_id: AccountId::generate(),
             project_id: ProjectId::generate(),
-            key_id,
+            key_id: Some(key_id),
             scopes,
             label: None,
             daily_unit_cap: None,

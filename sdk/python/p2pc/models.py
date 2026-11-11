@@ -931,12 +931,14 @@ class WhoAmI(_Response):
     """``GET /v1/whoami``: the presented key and its limits. Never its secret.
 
     ``principal`` is ``None`` from an H1 server, whose callers are always the ``key_id`` key.
+    ``key_id`` is the API key's ID; it is ``None`` only when the caller is a paired device (H2
+    spec §5.5), which ``principal`` then names. A caller that uses an API key always gets its ID.
     """
 
     account_id: str
     project_id: str
-    key_id: str
     scopes: list[str]
+    key_id: str | None = None
     label: str | None = None
     daily_unit_cap: int | None = None
     allowed_images: list[str] | None = None
@@ -1010,11 +1012,20 @@ class CreateJoinToken(_Request):
 
 
 class JoinTokenInfo(_Response):
-    """A join token as listed by ``GET /v1/nodes/join-tokens``. Never the token or its code."""
+    """A join token as listed by ``GET /v1/nodes/join-tokens``. Never the token or its code.
+
+    ``created_by`` names the principal that minted it (H2 spec §5.6); it is ``None`` from an H1
+    server, whose tokens are always minted by the ``created_by_key_id`` key. ``created_by_key_id``
+    is ``None`` when a paired device minted the token. ``pre_approved`` and ``bound_iroh_node_id``
+    (H2 spec §5.4) keep their H1 values, ``False`` and ``None``, when the server leaves them out.
+    """
 
     id: str
     label: str | None = None
-    created_by_key_id: str
+    created_by_key_id: str | None = None
+    created_by: Principal | None = None
+    pre_approved: bool = False
+    bound_iroh_node_id: str | None = None
     created_at: datetime
     expires_at: datetime
     consumed_at: datetime | None = None

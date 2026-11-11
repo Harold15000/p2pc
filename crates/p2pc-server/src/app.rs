@@ -351,29 +351,18 @@ pub async fn openapi_json() -> Response {
         (status = 401, description = "Missing or invalid key.", content_type = "application/problem+json", body = Problem),
     )
 )]
-pub async fn whoami(Authorized { principal: p, .. }: AnyKey) -> Json<Value> {
-    // `WhoAmI.key_id` is not optional in `p2pc-proto` yet, while H2 §5.5 says it is `null` for a device. The body is
-    // built from the shared type (so its shape and formats stay H1's), and a device's `key_id` is then set to `null`:
-    // the stand-in ID below never reaches the response.
-    let key_id = p.key_id().unwrap_or_else(KeyId::generate);
-    let who = WhoAmI {
+pub async fn whoami(Authorized { principal: p, .. }: AnyKey) -> Json<WhoAmI> {
+    Json(WhoAmI {
         account_id: p.account_id,
         project_id: p.project_id,
-        key_id,
+        key_id: p.id.key_id(),
         scopes: p.scopes,
         label: p.label,
         daily_unit_cap: p.daily_unit_cap,
         allowed_images: p.allowed_images,
         expires_at: p.expires_at,
         principal: Some(p.id),
-    };
-    let mut body = serde_json::to_value(&who).unwrap_or(Value::Null);
-    if p.id.key_id().is_none()
-        && let Some(map) = body.as_object_mut()
-    {
-        map.insert("key_id".to_string(), Value::Null);
-    }
-    Json(body)
+    })
 }
 
 /// `limit` and `cursor`.

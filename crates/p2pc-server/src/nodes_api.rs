@@ -13,7 +13,7 @@ use p2pc_proto::api::{
     AuditKind, CreateJoinToken, JoinTokenInfo, JoinTokenResponse, Node, NodeState, Page, Problem, Scope, ServerInfo,
 };
 use p2pc_proto::auth::{DEFAULT_JOIN_TOKEN_TTL, JoinToken, MAX_JOIN_TOKEN_TTL};
-use p2pc_proto::ids::{JoinTokenId, KeyId, NodeId};
+use p2pc_proto::ids::{JoinTokenId, NodeId};
 use p2pc_proto::protocol::{NodeApproved, ServerMsg, capability};
 use p2pc_proto::validate::ErrorCode;
 use p2pc_proto::validate::keys::MAX_RESTRICTED_JOIN_TOKEN_TTL_S;
@@ -62,12 +62,21 @@ pub async fn get_server(State(state): State<AppState>, _key: AnyKey) -> Json<Ser
     Json(state.server.info())
 }
 
+/// Who may mint a join token: `admin` principals only, as in H1.
+///
+/// TODO(T2-12): also accept `nodes:join` (`p.has_scope(Scope::NodesJoin)`, H2 §5.4) once the scheduler refuses
+/// leases to `pending_approval` nodes. Until then a node enrolled with a non-`admin`'s token would be stored
+/// `pending_approval` and still get work (SI-H2-19), so the scope stays defined but grants nothing here. The rules
+/// for such callers in [`create_join_token`] (no `pre_approved`, at most 900 s) are already written for that day.
+fn may_mint_join_token(p: &crate::auth::Principal) -> bool {
+    p.is_admin()
+}
+
 /// Creates a single-use join token. The token is in the response, once.
 ///
-/// `admin` principals mint tokens as in H1. A `nodes:join` principal (H2 §5.4) mints tokens of at most 900 s, and
-/// the node such a token enrolls starts `pending_approval`. `pre_approved` (`admin` only, at most 900 s) makes the
-/// node start `approved`; without it, a token minted by an `admin` **device** also gives a `pending_approval` node,
-/// while a token of an `admin` API key enrolls as in H1 (H2 §5.5).
+/// Only `admin` principals mint tokens, as in H1. `pre_approved` (at most 900 s) makes the node start `approved`;
+/// without it, a token minted by an `admin` **device** gives a `pending_approval` node, while a token of an `admin`
+/// API key enrolls as in H1 (H2 §5.5).
 #[utoipa::path(
     post,
     path = "/v1/nodes/join-tokens",
@@ -76,8 +85,8 @@ pub async fn get_server(State(state): State<AppState>, _key: AnyKey) -> Json<Ser
     responses(
         (status = 201, description = "The token (`p2pc_join_…`), shown only this once.", body = JoinTokenResponse),
         (status = 401, description = "Missing or invalid key (also when the key was revoked or expired during the request).", content_type = "application/problem+json", body = Problem),
-        (status = 403, description = "The caller lacks the admin or nodes:join scope, or asks for `pre_approved` without admin.", content_type = "application/problem+json", body = Problem),
-        (status = 422, description = "Invalid `label` or `ttl_s` (1-86400, default 900; at most 900 for a nodes:join caller or with `pre_approved`).", content_type = "application/problem+json", body = Problem),
+        (status = 403, description = "The caller lacks the admin scope.", content_type = "application/problem+json", body = Problem),
+        (status = 422, description = "Invalid `label` or `ttl_s` (1-86400, default 900; at most 900 with `pre_approved`).", content_type = "application/problem+json", body = Problem),
     )
 )]
 pub async fn create_join_token(
@@ -85,8 +94,8 @@ pub async fn create_join_token(
     Authorized { principal: p, .. }: AnyKey,
     ApiJson(body): ApiJson<CreateJoinToken>,
 ) -> Result<Response, ApiError> {
-    if !p.has_scope(Scope::NodesJoin) {
-        return Err(ApiError::forbidden(Scope::NodesJoin));
+    if !may_mint_join_token(&p) {
+        return Err(ApiError::forbidden(Scope::Admin));
     }
     // `pre_approved` carries an `admin`'s approval of the node: only an `admin` may set it (H2 §7.3).
     if body.pre_approved && !p.is_admin() {
@@ -120,7 +129,7 @@ pub async fn create_join_token(
     // §5 "Re-checked at the point of use", with the time read once the write lock is held.
     let now = state.clock.now();
     let caller = recheck_caller(&mut tx, &state, &p, now).await?;
-    if !caller.has_scope(Scope::NodesJoin) || (body.pre_approved && !caller.is_admin()) {
+    if !may_mint_join_token(&caller) || (body.pre_approved && !caller.is_admin()) {
         return Err(ApiError::forbidden(Scope::Admin));
     }
     let token = JoinToken::generate(
@@ -163,40 +172,18 @@ pub async fn create_join_token(
     Ok(no_store((StatusCode::CREATED, Json(body)).into_response()))
 }
 
-/// The public view of a join token (never the code or its digest): H1's [`JoinTokenInfo`], plus `created_by`
-/// (`{kind, id}`), `pre_approved` and `bound_iroh_node_id` (H2 §5.4, §5.6).
-///
-/// `JoinTokenInfo.created_by_key_id` is not optional in `p2pc-proto` yet; for a token minted by a device it is
-/// `null` here, as `GET /v1/whoami`'s `key_id` (the stand-in ID used to build the shared shape never reaches the
-/// response).
-pub fn join_token_view(row: &store::join_tokens::JoinTokenRow) -> Value {
-    let key = row.created_by.key_id();
-    let mut info = JoinTokenInfo::new(
-        row.id,
-        key.unwrap_or_else(KeyId::generate),
-        row.created_at,
-        row.expires_at,
-    );
+/// The public view of a join token (never the code or its digest): `created_by_key_id` as in H1 (`null` for a token
+/// minted by a device), plus `created_by` (`{kind, id}`), `pre_approved` and `bound_iroh_node_id` (H2 §5.4, §5.6).
+pub fn join_token_view(row: &store::join_tokens::JoinTokenRow) -> JoinTokenInfo {
+    // A constructor, then the fields: a field added to the shared type does not break this (CONTRIBUTING rule 7).
+    let mut info = JoinTokenInfo::by_principal(row.id, row.created_by, row.created_at, row.expires_at);
     info.label.clone_from(&row.label);
+    info.pre_approved = row.pre_approved;
+    info.bound_iroh_node_id.clone_from(&row.bound_iroh_node_id);
     info.consumed_at = row.consumed_at;
     info.consumed_by_node_id = row.consumed_by_node_id;
     info.revoked_at = row.revoked_at;
-    let mut v = serde_json::to_value(&info).unwrap_or(Value::Null);
-    if let Some(map) = v.as_object_mut() {
-        if key.is_none() {
-            map.insert("created_by_key_id".to_string(), Value::Null);
-        }
-        map.insert(
-            "created_by".to_string(),
-            serde_json::to_value(row.created_by).unwrap_or(Value::Null),
-        );
-        map.insert("pre_approved".to_string(), Value::Bool(row.pre_approved));
-        map.insert(
-            "bound_iroh_node_id".to_string(),
-            row.bound_iroh_node_id.clone().map_or(Value::Null, Value::String),
-        );
-    }
-    v
+    info
 }
 
 /// The account's join tokens, in creation order. Never contains a token or a code.
@@ -216,7 +203,7 @@ pub async fn list_join_tokens(
     State(state): State<AppState>,
     Authorized { principal: p, .. }: AdminKey,
     ApiQuery(q): ApiQuery<PageParams>,
-) -> Result<Json<Page<Value>>, ApiError> {
+) -> Result<Json<Page<JoinTokenInfo>>, ApiError> {
     let limit = page_limit(q.limit)?;
     let after = q
         .cursor
