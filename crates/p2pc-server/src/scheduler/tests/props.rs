@@ -15,7 +15,11 @@
 //!    after the server's boot), or was explicit: absent from a `Hello`, or the node was deleted; and every requeue
 //!    in `job_events` has one of those reasons;
 //! 6. `usage_records` has exactly one row per finished attempt: reported by its node, or estimated by the server when
-//!    the attempt ended with no report (the server ended it, or it was lost).
+//!    the attempt ended with no report (the server ended it, or it was lost);
+//! 7. no lease ever reaches a `pending_approval` node (H2 §5.5, SI-H2-19). One node starts pending, and nodes are
+//!    approved and (as no API does) turned pending again at random: no `Lease` is ever sent to a node that is pending,
+//!    no offer is accepted from one, no lease on one was offered or accepted after it turned pending, and after a
+//!    scheduling pass no active lease is left on one.
 //!
 //! 256 cases run by default. More locally: `PROPTEST_CASES=5000 cargo test -p p2pc-server --lib scheduler::tests::props`.
 
@@ -52,6 +56,11 @@ enum Op {
     EarlyOffline(u8),
     Restart,
     Delete(u8),
+    /// An `admin` approves a node (`POST /v1/nodes/{id}/approve`).
+    Approve(u8),
+    /// A node's row turns `pending_approval`, whatever it holds. No operation of the spec does this: it is what the
+    /// scheduler's backstop is for.
+    Unapprove(u8),
 }
 
 fn op() -> impl Strategy<Value = Op> {
@@ -73,6 +82,8 @@ fn op() -> impl Strategy<Value = Op> {
         2 => any::<u8>().prop_map(Op::EarlyOffline),
         1 => Just(Op::Restart),
         1 => any::<u8>().prop_map(Op::Delete),
+        2 => any::<u8>().prop_map(Op::Approve),
+        1 => any::<u8>().prop_map(Op::Unapprove),
     ]
 }
 
@@ -94,6 +105,8 @@ struct Model {
     lost_seen: HashSet<LeaseId>,
     /// Revoked leases already checked.
     revoked_seen: HashSet<LeaseId>,
+    /// The nodes that are `pending_approval` now, and since when.
+    pending: HashMap<NodeId, OffsetDateTime>,
 }
 
 impl Model {
@@ -158,6 +171,7 @@ async fn step(fx: &Fx, m: &mut Model, op: &Op) {
                 return;
             }
             m.contact(node, now);
+            let was_offer = fx.lease(lease_id).await.state == LeaseState::Offered;
             let msg = match *op {
                 Op::Accept(_) => AgentMsg::LeaseAccepted { lease_id, epoch },
                 Op::Reject(_) => AgentMsg::LeaseRejected {
@@ -192,6 +206,14 @@ async fn step(fx: &Fx, m: &mut Model, op: &Op) {
                 },
             };
             m.sched.on_agent_message(node, msg).await.unwrap();
+            // 7. No offer is accepted from a pending node, by any message that implies the acceptance.
+            if was_offer && m.pending.contains_key(&node) {
+                let l = fx.lease(lease_id).await;
+                assert!(
+                    l.accepted_at.is_none() && !matches!(l.state, LeaseState::Accepted | LeaseState::Running),
+                    "a pending node got lease {lease_id}: {l:?}"
+                );
+            }
         }
         Op::Stale(i, kind) => {
             let Some((node, lease_id, epoch)) = m.pick_lease(i) else {
@@ -347,10 +369,55 @@ async fn step(fx: &Fx, m: &mut Model, op: &Op) {
             );
             fx.link.sent.lock().unwrap().extend(before.into_iter().chain(after));
         }
+        Op::Approve(n) => {
+            let node = m.pick_node(n);
+            let mut conn = fx.db.acquire().await.unwrap();
+            nodes::approve(&mut conn, fx.account, node).await.unwrap();
+            m.pending.remove(&node);
+        }
+        Op::Unapprove(n) => {
+            let node = m.pick_node(n);
+            fx.set_approval(node, false).await;
+            m.pending.entry(node).or_insert(now);
+        }
     }
     for (node, msg) in fx.link.take() {
         if let ServerMsg::Lease { lease_id, epoch, .. } = msg {
+            // 7. Approval does not change inside a step, so this is the node's approval when the lease was sent.
+            assert!(
+                !m.pending.contains_key(&node),
+                "lease {lease_id} was sent to the pending node {node}"
+            );
             m.leases.push((node, lease_id, epoch));
+        }
+    }
+}
+
+/// Invariant 7 (SI-H2-19) against the database: every lease on a node that is pending now was offered, and accepted
+/// if it was, no later than the second the node turned pending; and after a scheduling pass (`ticked`) none of them
+/// is still active.
+async fn check_no_lease_on_pending_nodes(fx: &Fx, m: &Model, ticked: bool) {
+    for (node, since) in &m.pending {
+        let rows: Vec<(String, String, i64, Option<i64>)> =
+            sqlx::query_as("SELECT id, state, offered_at_ms / 1000, accepted_at FROM leases WHERE node_id = ?")
+                .bind(node.to_string())
+                .fetch_all(&fx.db)
+                .await
+                .unwrap();
+        for (id, state, offered, accepted) in rows {
+            let since = since.unix_timestamp();
+            assert!(
+                offered <= since,
+                "lease {id} was offered to {node} after it turned pending"
+            );
+            assert!(
+                accepted.is_none_or(|at| at <= since),
+                "lease {id} was accepted from {node} after it turned pending"
+            );
+            assert!(
+                !ticked || !["offered", "accepted", "running"].contains(&state.as_str()),
+                "lease {id} is still {state} on the pending node {node} after a pass"
+            );
         }
     }
 }
@@ -466,8 +533,15 @@ async fn check_invariants(fx: &Fx, m: &mut Model) {
     .await
     .unwrap();
     for r in requeues {
+        // The fourth reason is the backstop of invariant 7: a lease taken from a node found pending.
         assert!(
-            [code::NODE_LOST, code::ABSENT_FROM_HELLO, code::NODE_DELETED].contains(&r.as_str()),
+            [
+                code::NODE_LOST,
+                code::ABSENT_FROM_HELLO,
+                code::NODE_DELETED,
+                code::PENDING_APPROVAL
+            ]
+            .contains(&r.as_str()),
             "requeued for {r}"
         );
     }
@@ -518,12 +592,15 @@ async fn run(ops: Vec<Op>) -> Coverage {
     let fx = Fx::new().await;
     let mut offered = HashMap::new();
     let mut ids = Vec::new();
-    for (cpu, mem, gpus) in [(2.0, 2048, 1), (1.5, 1024, 0), (4.0, 4096, 1)] {
+    for (cpu, mem, gpus) in [(2.0, 2048, 1), (1.5, 1024, 0), (4.0, 4096, 1), (4.0, 8192, 1)] {
         let id = fx.node(cpu, mem, gpus).await;
         let uuids = (0..gpus).map(|i| format!("GPU-{id}-{i}")).collect();
         offered.insert(id, (fit::cpu_milli(cpu), mem, uuids));
         ids.push(id);
     }
+    // The last node, the largest, enrolled with a token of a non-`admin` principal: it waits for approval.
+    let waiting = ids[3];
+    fx.set_approval(waiting, false).await;
     let mut m = Model {
         sched: fx.sched.clone(),
         last_contact: ids.iter().map(|n| (*n, T0)).collect(),
@@ -536,10 +613,12 @@ async fn run(ops: Vec<Op>) -> Coverage {
         terminal: HashMap::new(),
         lost_seen: HashSet::new(),
         revoked_seen: HashSet::new(),
+        pending: HashMap::from([(waiting, T0)]),
     };
     for op in &ops {
         step(&fx, &mut m, op).await;
         check_invariants(&fx, &mut m).await;
+        check_no_lease_on_pending_nodes(&fx, &m, matches!(op, Op::Tick)).await;
     }
     coverage(&fx).await
 }
@@ -595,6 +674,7 @@ fn the_generated_sequences_reach_every_lease_outcome() {
         "revoked:rejected",
         "revoked:watchdog",
         "revoked:cancelled_unreachable",
+        "revoked:pending_approval",
         "requeue",
     ] {
         assert!(
