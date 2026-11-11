@@ -233,7 +233,8 @@ impl Scheduler {
             let floor = lease.started_at.unwrap_or(now).min(now);
             let since = since.unwrap_or(now).clamp(floor, now);
             leases::set_health(tx, lease.job_id, reported, since, now).await?;
-            tracing::info!(job_id = %lease.job_id, lease_id = %lease.id, health = ?reported, "service health changed");
+            // `debug`: an agent decides how often this changes, so it must not fill the log.
+            tracing::debug!(job_id = %lease.job_id, lease_id = %lease.id, health = ?reported, "service health changed");
         }
         Ok(())
     }

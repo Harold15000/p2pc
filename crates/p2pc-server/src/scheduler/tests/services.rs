@@ -258,6 +258,39 @@ mt_test!(
 
 // --- Capabilities (H2 §6.1) --------------------------------------------------------------------------------------
 
+// `POST /v1/estimate` counts what placement would use: a pending node and an agent without a needed capability are
+// ineligible, so they are not matching nodes.
+mt_test!(
+    the_estimate_counts_only_approved_nodes_with_the_needed_capabilities,
+    async {
+        let fx = Fx::new().await;
+        let _h1 = fx.node(4.0, 8192, 0).await;
+        let _h2 = fx.h2_node(4.0, 8192).await;
+        let pending = fx.h2_node(4.0, 8192).await;
+        fx.set_approval(pending, false).await;
+        let batch: JobSpec = serde_json::from_value(serde_json::json!({
+            "image": "docker.io/library/alpine:3", "command": ["true"], "resources": {"cpu": 1, "memory_mb": 512},
+        }))
+        .unwrap();
+        let service: JobSpec = serde_json::from_value(serde_json::json!({
+            "kind": "service", "image": "docker.io/library/nginx:1.27", "command": ["nginx"],
+            "resources": {"cpu": 1, "memory_mb": 512}, "service": {"ports": [{"port": 8080, "name": "http"}]},
+        }))
+        .unwrap();
+        let m = fx.sched.match_spec(fx.account, &batch).await.unwrap();
+        assert_eq!((m.matching_nodes, m.free_nodes), (2, 2), "the two approved nodes");
+        let m = fx.sched.match_spec(fx.account, &service).await.unwrap();
+        assert_eq!(
+            (m.matching_nodes, m.free_nodes),
+            (1, 1),
+            "the approved node with `service_jobs`"
+        );
+        fx.set_approval(pending, true).await;
+        let m = fx.sched.match_spec(fx.account, &service).await.unwrap();
+        assert_eq!((m.matching_nodes, m.free_nodes), (2, 2));
+    }
+);
+
 mt_test!(a_service_goes_only_to_an_agent_that_declared_service_jobs, async {
     let fx = Fx::new().await;
     let h1 = fx.node(4.0, 8192, 0).await;
