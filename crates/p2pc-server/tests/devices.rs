@@ -869,9 +869,9 @@ async fn an_admin_with_a_blob_quota_cannot_revoke_a_device_without_one() {
     assert_eq!(r.status, StatusCode::OK);
 }
 
-/// SI-H2-18, SI-H2-19 (the routes that exist with T2-10): the default phone profile is exactly four scopes, with no
-/// `nodes:join`, and a phone-profile device reaches none of the developer or admin routes. The job routes' template
-/// view and the blob routes get their negative tests with T2-12 and T2-14.
+/// SI-H2-18, SI-H2-19: the default phone profile is exactly four scopes, with no `nodes:join`, and a phone-profile
+/// device reaches none of the developer or admin routes. The template view of the job routes has its negative test
+/// per route in `template_view.rs`; the blob routes get theirs with T2-14.
 #[tokio::test]
 async fn the_phone_profile_reaches_only_what_its_scopes_allow() {
     assert_eq!(

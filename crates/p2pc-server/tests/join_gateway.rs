@@ -8,7 +8,9 @@
 //!   `invalid_token` answer and the token stays unused.
 //! - A node is created `approved` only when its token carries an `admin`'s approval; an `admin` device's token
 //!   without `pre_approved` gives a `pending_approval` node until an `admin` approves it.
-//! - A `nodes:join` API key with no `admin` cannot mint a join token at all (`403`), until T2-12.
+//! - A principal with `nodes:join` and no `admin`, an API key or a developer device, mints a token whose node starts
+//!   `pending_approval`: it connects and reports like any node, and gets **no lease** until an `admin` approves it,
+//!   and one after (SI-H2-19, end to end).
 
 // Helpers are not `#[test]` functions, so `allow-unwrap-in-tests` does not cover them.
 #![allow(clippy::unwrap_used)]
@@ -19,10 +21,11 @@ use axum::http::{Method, StatusCode};
 use common::fleet::Fleet;
 use common::{DeviceLimits, assert_problem};
 use iroh::SecretKey;
-use p2pc_proto::api::{PHONE_PROFILE, Scope};
+use p2pc_proto::api::{DEVELOPER_DEVICE_PROFILE, PHONE_PROFILE, Scope};
 use p2pc_proto::auth::JoinToken;
+use p2pc_proto::ids::DeviceId;
 use p2pc_proto::invite::{ListenerNonce, node_phrase};
-use p2pc_proto::protocol::ServerMsg;
+use p2pc_proto::protocol::{AgentMsg, ServerMsg};
 use p2pc_server::clock::Clock;
 use p2pc_server::devices_api::ed25519_node_id;
 use serde_json::{Value, json};
@@ -132,13 +135,7 @@ async fn the_token_of_a_join_request_enrolls_only_its_bound_agent() {
 async fn a_node_is_approved_at_enrollment_only_with_an_admins_approval() {
     let fleet = Fleet::start().await;
     let app = &fleet.app;
-    // An API key with `nodes:join` and no `admin` mints nothing: until the scheduler refuses leases to pending nodes
-    // (T2-12), a node of such a token would get work without an `admin`'s approval (SI-H2-19).
     let joiner = app.key_with(&[Scope::NodesJoin]).await;
-    let r = app
-        .call(Method::POST, "/v1/nodes/join-tokens", Some(&joiner), Some(json!({})))
-        .await;
-    assert_problem(&r, StatusCode::FORBIDDEN, "forbidden");
     assert_eq!(token_rows(&fleet).await, (0, 0));
 
     // The hub PC's own node at first run (§8.2 step 4): the owner device mints a `pre_approved` token of 300 s over
@@ -180,4 +177,102 @@ async fn a_node_is_approved_at_enrollment_only_with_an_admins_approval() {
     let r = app.call(Method::POST, &path, Some(&app.admin), None).await;
     assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
     assert!(node(&fleet, id).await.get("approval").is_none());
+}
+
+/// Who mints the token of [`a_pending_node_gets_no_lease_until_an_admin_approves_it`]: a principal with `nodes:join`
+/// and no `admin`.
+enum Joiner {
+    Key(String),
+    Device(DeviceId),
+}
+
+impl Joiner {
+    async fn call(&self, app: &common::TestApp, uri: &str, body: Option<Value>) -> common::Resp {
+        match self {
+            Joiner::Key(key) => app.call(Method::POST, uri, Some(key), body).await,
+            Joiner::Device(device) => app.device_call(*device, Method::POST, uri, body).await,
+        }
+    }
+
+    fn principal(&self) -> Value {
+        match self {
+            Joiner::Key(key) => json!({"kind": "key", "id": &key[8..20]}),
+            Joiner::Device(device) => json!({"kind": "device", "id": device.to_string()}),
+        }
+    }
+}
+
+/// SI-H2-19, end to end: a node enrolled with a token of a non-`admin` `nodes:join` principal gets no lease until an
+/// `admin` approves it, and gets one after the approval. Through the REST API, the real agent gateway and the
+/// scheduler as `serve` wires them.
+async fn a_pending_node_gets_no_lease_until_an_admin_approves_it(fleet: &Fleet, by: Joiner) {
+    let app = &fleet.app;
+    let r = by.call(app, "/v1/nodes/join-tokens", Some(json!({}))).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
+    let token = JoinToken::decode(r.json()["join_token"].as_str().unwrap()).unwrap();
+    // The node enrolls and connects like any node.
+    let (mut agent, answer) = fleet.join_as(&SecretKey::generate(), token).await;
+    assert!(matches!(answer, Some(ServerMsg::Welcome { .. })), "{answer:?}");
+    agent.sync().await;
+    let id = agent.node_id.unwrap();
+    let v = node(fleet, id).await;
+    assert_eq!(
+        (v["approval"].as_str(), v["state"].as_str()),
+        (Some("pending_approval"), Some("online"))
+    );
+    assert_eq!(v["enrolled_by"], by.principal());
+    // A job is waiting, and the node could run it: pass after pass, across the offer cooldown, nothing is offered.
+    let job = fleet
+        .submit(json!({"image": "docker.io/library/alpine:3", "command": ["true"],
+            "resources": {"cpu": 1, "memory_mb": 256}}))
+        .await;
+    for _ in 0..3 {
+        let report = fleet.scheduler.tick().await;
+        assert_eq!((report.errors, report.offered), (0, 0));
+        let got = agent.sync().await;
+        assert!(got.is_empty(), "a pending node was sent {got:?}");
+        app.clock.advance(time::Duration::seconds(61));
+    }
+    let leases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM leases")
+        .fetch_one(&app.db)
+        .await
+        .unwrap();
+    assert_eq!(leases, 0, "not even an offer");
+    let v = app.get(&format!("/v1/jobs/{job}"), &app.admin).await.json();
+    assert_eq!(v["status"], "queued");
+    assert_eq!(v["reason"], "waiting for approval on the hub PC");
+    // The principal that enrolled it cannot approve it (SI-H2-19), and the node still gets nothing.
+    let approve = format!("/v1/nodes/{id}/approve");
+    let r = by.call(app, &approve, None).await;
+    assert_problem(&r, StatusCode::FORBIDDEN, "forbidden");
+    assert_eq!(fleet.scheduler.tick().await.offered, 0);
+    assert!(agent.sync().await.is_empty());
+    // An `admin` approves it: the next pass offers the job, and it runs there.
+    let r = app.call(Method::POST, &approve, Some(&app.admin), None).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    let report = fleet.scheduler.tick().await;
+    assert_eq!((report.errors, report.offered), (0, 1));
+    let (lease_id, epoch) = agent.next_lease().await;
+    agent.send(&AgentMsg::LeaseAccepted { lease_id, epoch }).await;
+    agent.sync().await;
+    let v = app.get(&format!("/v1/jobs/{job}"), &app.admin).await.json();
+    assert_eq!((v["status"].as_str(), v["reason"].as_str()), (Some("assigned"), None));
+    assert_eq!(v["node_id"], id.to_string());
+}
+
+#[tokio::test]
+async fn a_node_of_a_nodes_join_api_key_gets_no_lease_until_an_admin_approves_it() {
+    let fleet = Fleet::start().await;
+    let key = fleet.app.key_with(&[Scope::NodesJoin]).await;
+    a_pending_node_gets_no_lease_until_an_admin_approves_it(&fleet, Joiner::Key(key)).await;
+}
+
+#[tokio::test]
+async fn a_node_of_a_developer_device_gets_no_lease_until_an_admin_approves_it() {
+    let fleet = Fleet::start().await;
+    let device = fleet
+        .app
+        .add_device(&DEVELOPER_DEVICE_PROFILE, DeviceLimits::default())
+        .await;
+    a_pending_node_gets_no_lease_until_an_admin_approves_it(&fleet, Joiner::Device(device)).await;
 }

@@ -2079,7 +2079,7 @@
           "nodes"
         ],
         "summary": "Creates a single-use join token. The token is in the response, once.",
-        "description": "Only `admin` principals mint tokens, as in H1. `pre_approved` (at most 900 s) makes the node start `approved`;\nwithout it, a token minted by an `admin` **device** gives a `pending_approval` node, while a token of an `admin`\nAPI key enrolls as in H1 (H2 §5.5).",
+        "description": "- An `admin` principal mints as in H1 (up to 24 h). `pre_approved` (at most 900 s) makes the node start\n  `approved`; without it, a token minted by an `admin` **device** gives a `pending_approval` node, while a token of\n  an `admin` API key enrolls as in H1 (H2 §5.5).\n- A principal with `nodes:join` and no `admin` mints tokens of at most 900 s, never `pre_approved`. Their node\n  starts `pending_approval`: it connects and reports like any node, and gets no work until an `admin` approves it\n  (`POST /v1/nodes/{id}/approve`).",
         "operationId": "create_join_token",
         "requestBody": {
           "content": {
@@ -2113,7 +2113,7 @@
             }
           },
           "403": {
-            "description": "The caller lacks the admin scope.",
+            "description": "The caller has neither `admin` nor `nodes:join`, or sets `pre_approved` without `admin`.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2123,7 +2123,7 @@
             }
           },
           "422": {
-            "description": "Invalid `label` or `ttl_s` (1-86400, default 900; at most 900 with `pre_approved`).",
+            "description": "Invalid `label` or `ttl_s` (1-86400, default 900; at most 900 with `pre_approved` or for a caller without `admin`).",
             "content": {
               "application/problem+json": {
                 "schema": {

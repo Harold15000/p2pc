@@ -85,15 +85,8 @@ async fn who_may_mint_a_join_token_and_for_how_long() {
     let admin_device = app.add_device(&[Scope::Admin], DeviceLimits::default()).await;
     let joiner_key = app.key_with(&[Scope::NodesJoin]).await;
     let reader = app.key_with(&[Scope::NodesRead]).await;
-    // Only `admin` mints join tokens, with H1's error for everyone else. `nodes:join` is defined but grants nothing
-    // here until the scheduler refuses leases to `pending_approval` nodes (T2-12): an API key or a device with
-    // `nodes:join` and no `admin` gets the same 403 as a reader, whatever it asks for.
-    for by in [
-        Minter::Key(&joiner_key),
-        Minter::Device(joiner),
-        Minter::Device(phone),
-        Minter::Key(&reader),
-    ] {
+    // Without `nodes:join` (the default phone profile has none, SI-H2-19): nothing, whatever is asked for.
+    for by in [Minter::Device(phone), Minter::Key(&reader)] {
         for body in [
             json!({}),
             json!({"ttl_s": 900}),
@@ -101,14 +94,54 @@ async fn who_may_mint_a_join_token_and_for_how_long() {
         ] {
             let r = mint(&app, by, body).await;
             let v = assert_problem(&r, StatusCode::FORBIDDEN, "forbidden");
-            assert!(v["detail"].as_str().unwrap().contains("`admin`"), "{v}");
+            assert!(v["detail"].as_str().unwrap().contains("`nodes:join`"), "{v}");
         }
     }
-    let minted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM join_tokens")
+    let minted = async || -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM join_tokens")
+            .fetch_one(&app.db)
+            .await
+            .unwrap()
+    };
+    assert_eq!(minted().await, 0);
+    // `nodes:join` without `admin`, an API key or a device: tokens of at most 900 s and nothing else (SI-H2-18).
+    for by in [Minter::Key(&joiner_key), Minter::Device(joiner)] {
+        for body in [
+            json!({}),
+            json!({"ttl_s": 900}),
+            json!({"ttl_s": 1, "label": "spare PC"}),
+        ] {
+            let r = mint(&app, by, body).await;
+            assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
+            let token = JoinToken::decode(r.json()["join_token"].as_str().unwrap()).unwrap();
+            assert!(token.expires_at <= T0 + time::Duration::seconds(900));
+        }
+        for ttl_s in [901, 86_400] {
+            let r = mint(&app, by, json!({"ttl_s": ttl_s})).await;
+            assert_problem(&r, StatusCode::UNPROCESSABLE_ENTITY, "validation_failed");
+        }
+        // `pre_approved` carries an `admin`'s approval: only an `admin` sets it.
+        for body in [
+            json!({"pre_approved": true}),
+            json!({"pre_approved": true, "ttl_s": 300}),
+        ] {
+            let r = mint(&app, by, body).await;
+            let v = assert_problem(&r, StatusCode::FORBIDDEN, "forbidden");
+            assert!(v["detail"].as_str().unwrap().contains("`admin`"), "{v}");
+        }
+        // It mints; it does not list, revoke or approve.
+        let r = match by {
+            Minter::Key(k) => app.get("/v1/nodes/join-tokens", k).await,
+            Minter::Device(d) => app.device_call(d, Method::GET, "/v1/nodes/join-tokens", None).await,
+        };
+        assert_problem(&r, StatusCode::FORBIDDEN, "forbidden");
+    }
+    assert_eq!(minted().await, 6);
+    let pre_approved: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM join_tokens WHERE pre_approved = 1")
         .fetch_one(&app.db)
         .await
         .unwrap();
-    assert_eq!(minted, 0);
+    assert_eq!(pre_approved, 0);
     // `admin`: H1's 24 h, but at most 900 s with `pre_approved`.
     for by in [Minter::Device(admin_device), Minter::Key(&app.admin)] {
         assert_eq!(
@@ -132,8 +165,8 @@ async fn who_may_mint_a_join_token_and_for_how_long() {
     assert_eq!(pre.len(), 2);
 }
 
-/// Inserts a token row minted by `by` straight into the store. The API mints only for `admin` principals for now
-/// (T2-12); the stored approval rule already covers every minter, and this is how the tests reach the others.
+/// Inserts a token row minted by `by` straight into the store, `pre_approved` or not: the stored approval rule covers
+/// every combination, including the ones the API refuses to mint.
 async fn stored_token(app: &TestApp, by: Principal, pre_approved: bool) -> JoinToken {
     let token = JoinToken::generate(
         app.state.server.node_id().to_string(),
@@ -172,12 +205,14 @@ async fn a_node_is_approved_only_with_an_admins_approval_on_its_token() {
     let joiner = app.add_device(&DEVELOPER_DEVICE_PROFILE, DeviceLimits::default()).await;
     let admin_device = app.add_device(&[Scope::Admin], DeviceLimits::default()).await;
     let joiner_key = app.key_with(&[Scope::NodesJoin]).await;
-    // Through the API: the `admin` minters.
-    let cases: [(Minter<'_>, Value, &str); 4] = [
+    // Through the API: the `admin` minters, and the `nodes:join` ones, whose node always waits for approval.
+    let cases: [(Minter<'_>, Value, &str); 6] = [
         (Minter::Key(&app.admin), json!({}), "approved"),
         (Minter::Key(&app.admin), json!({"pre_approved": true}), "approved"),
         (Minter::Device(admin_device), json!({}), "pending_approval"),
         (Minter::Device(admin_device), json!({"pre_approved": true}), "approved"),
+        (Minter::Key(&joiner_key), json!({}), "pending_approval"),
+        (Minter::Device(joiner), json!({}), "pending_approval"),
     ];
     for (i, (by, body, want)) in cases.into_iter().enumerate() {
         let node = enroll_with(&app, by, body, &node_key()).await.unwrap();
@@ -200,6 +235,15 @@ async fn a_node_is_approved_only_with_an_admins_approval_on_its_token() {
         assert_eq!(node.approval, p2pc_proto::api::NodeApproval::PendingApproval, "{by}");
         assert_eq!(node.enrolled_by, Some(by));
     }
+    // The audit log names the non-`admin` minters of the tokens above.
+    let minters: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT actor_key_id, actor_device_id FROM audit_events WHERE kind = 'join_token_created' ORDER BY seq",
+    )
+    .fetch_all(&app.db)
+    .await
+    .unwrap();
+    assert!(minters.contains(&(Some(joiner_key_id.to_string()), None)));
+    assert!(minters.contains(&(None, Some(joiner.to_string()))));
 }
 
 /// §5 "Re-enrolling the same machine": a live node that joins again with a new token records that token's minter as
