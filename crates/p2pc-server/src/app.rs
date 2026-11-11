@@ -16,7 +16,7 @@ use p2pc_proto::api::{
 };
 use p2pc_proto::auth::{ApiKey, Secret, SecretHash, hash_secret};
 use p2pc_proto::ids::{AccountId, KeyId};
-use p2pc_proto::validate::{ErrorCode, check_no_escalation};
+use p2pc_proto::validate::{ErrorCode, PrincipalLimits, check_limits_no_escalation};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use time::OffsetDateTime;
@@ -25,18 +25,18 @@ use tower_http::timeout::{RequestBodyTimeoutLayer, TimeoutLayer};
 use utoipa::IntoParams;
 
 use crate::audit_queue::AuthFailureQueue;
-use crate::auth::{AdminKey, AnyKey, Authorized, recheck_caller, require_api_key};
+use crate::auth::{AdminKey, AnyKey, Authorized, recheck_caller, require_api_key, require_device};
 use crate::clock::Clock;
 use crate::config::Config;
 use crate::error::{self, ApiError};
 use crate::extract::{ApiJson, ApiQuery};
 use crate::gateway::{NodeHub, ServerIdentity};
-use crate::jobs_api;
 use crate::node_directory::{EmptyNodeDirectory, NodeDirectory};
 use crate::nodes_api;
 use crate::store::audit::NewEvent;
 use crate::store::keys::{KeyCursor, MAX_DAILY_UNIT_CAP_MILLI, NewKey, Revoke};
 use crate::store::{self, Db, StoreError};
+use crate::{devices_api, jobs_api, join_requests_api};
 
 /// Default page size of list endpoints.
 pub const DEFAULT_PAGE_LIMIT: u32 = 50;
@@ -71,6 +71,8 @@ pub struct AppState {
     /// Staged and published outputs (T10b): the gateway's uploads, the scheduler's `OutputsFinalizer`, and the
     /// outputs endpoints.
     pub outputs: crate::outputs::OutputStore,
+    /// Live device connections (H2 §5.5): a revocation and the liveness sweep close them.
+    pub devices: crate::devices_api::DeviceSessions,
 }
 
 impl AppState {
@@ -107,6 +109,7 @@ impl AppState {
             hub: NodeHub::new(),
             nodes: Arc::new(EmptyNodeDirectory),
             kick: crate::scheduler::Kick::default(),
+            devices: crate::devices_api::DeviceSessions::default(),
         })
     }
 }
@@ -122,9 +125,30 @@ pub enum LoadError {
     Identity(#[from] crate::identity::IdentityError),
 }
 
-/// The full router with its layers.
+/// Which transport a router serves, and so how its requests are authenticated (H2 §5.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    /// The TCP REST listener and `p2pc/http/1`: API keys only.
+    Keys,
+    /// `p2pc/device/1`, served in-process: the device the transport attached, never a header.
+    Devices,
+}
+
+/// The full router with its layers, for the TCP REST listener and `p2pc/http/1`: every request is authenticated by
+/// API key ([`require_api_key`]). No header can turn a request into a device request (SI-H2-3).
 pub fn router(state: AppState) -> Router {
-    let authenticated = Router::new()
+    build(state, Transport::Keys)
+}
+
+/// The same API for requests of `p2pc/device/1` streams (H2 §6.3), which the device transport (T2-11) serves
+/// in-process after attaching a [`crate::auth::DeviceConnection`] to each request: authenticated by
+/// [`require_device`], with the same routes, limits and layers as [`router`].
+pub fn device_router(state: AppState) -> Router {
+    build(state, Transport::Devices)
+}
+
+fn build(state: AppState, transport: Transport) -> Router {
+    let authenticated: Router<AppState> = Router::new()
         .route("/v1/whoami", get(whoami))
         .route("/v1/keys", get(list_keys).post(create_key))
         .route("/v1/keys/{key_id}", delete(revoke_key))
@@ -135,6 +159,26 @@ pub fn router(state: AppState) -> Router {
             get(nodes_api::list_join_tokens).post(nodes_api::create_join_token),
         )
         .route("/v1/nodes/join-tokens/{id}", delete(nodes_api::revoke_join_token))
+        .route(
+            "/v1/nodes/join-requests",
+            get(join_requests_api::list_join_requests).post(join_requests_api::create_join_request),
+        )
+        .route(
+            "/v1/nodes/join-requests/{id}",
+            get(join_requests_api::get_join_request).delete(join_requests_api::reject_join_request),
+        )
+        .route(
+            "/v1/nodes/join-requests/{id}/reveal",
+            post(join_requests_api::reveal_join_request),
+        )
+        .route(
+            "/v1/nodes/join-requests/{id}/approve",
+            post(join_requests_api::approve_join_request),
+        )
+        .route(
+            "/v1/nodes/join-requests/{id}/token",
+            post(join_requests_api::join_request_token),
+        )
         .route("/v1/nodes", get(nodes_api::list_nodes))
         .route(
             "/v1/nodes/{id}",
@@ -142,13 +186,45 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/nodes/{id}/drain", post(nodes_api::drain_node))
         .route("/v1/nodes/{id}/resume", post(nodes_api::resume_node))
+        .route("/v1/nodes/{id}/approve", post(nodes_api::approve_node))
+        .route(
+            "/v1/devices/pairing-tickets",
+            get(devices_api::list_pairing_tickets).post(devices_api::create_pairing_ticket),
+        )
+        .route(
+            "/v1/devices/pairing-tickets/{id}",
+            delete(devices_api::revoke_pairing_ticket),
+        )
+        .route("/v1/devices", get(devices_api::list_devices))
+        .route(
+            "/v1/devices/{id}",
+            get(devices_api::get_device).delete(devices_api::revoke_device),
+        )
         .route("/v1/jobs", get(jobs_api::list_jobs).post(jobs_api::create_job))
         .route("/v1/jobs/{id}", get(jobs_api::get_job))
         .route("/v1/jobs/{id}/cancel", post(jobs_api::cancel_job))
         .route("/v1/jobs/{id}/outputs", get(crate::artifacts_api::list_outputs))
         .route("/v1/estimate", post(jobs_api::estimate))
-        .route("/v1/usage", get(crate::usage_api::get_usage))
-        .route_layer(middleware::from_fn_with_state(state.clone(), require_api_key));
+        .route("/v1/usage", get(crate::usage_api::get_usage));
+    // Streaming routes opt out of the whole-request limit by being added here instead of to `bounded`. Each bounds
+    // itself with an idle limit (`http.keepalive_idle_ms`): no data taken or sent for that long ends the stream
+    // (§10, see `artifacts_api`). Logs in both modes (a 64 MiB page can outlast 30 s on a slow link) and downloads.
+    let streaming: Router<AppState> = Router::new()
+        .route("/v1/jobs/{id}/logs", get(crate::artifacts_api::get_logs))
+        .route(
+            "/v1/jobs/{id}/outputs/{*path}",
+            get(crate::artifacts_api::download_output),
+        );
+    let (authenticated, streaming) = match transport {
+        Transport::Keys => (
+            authenticated.route_layer(middleware::from_fn_with_state(state.clone(), require_api_key)),
+            streaming.route_layer(middleware::from_fn_with_state(state.clone(), require_api_key)),
+        ),
+        Transport::Devices => (
+            authenticated.route_layer(middleware::from_fn_with_state(state.clone(), require_device)),
+            streaming.route_layer(middleware::from_fn_with_state(state.clone(), require_device)),
+        ),
+    };
     let public = Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/openapi.json", get(openapi_json));
@@ -159,16 +235,6 @@ pub fn router(state: AppState) -> Router {
         StatusCode::REQUEST_TIMEOUT,
         http.request_timeout(),
     ));
-    // Streaming routes opt out of the whole-request limit by being added here instead of to `bounded`. Each bounds
-    // itself with an idle limit (`http.keepalive_idle_ms`): no data taken or sent for that long ends the stream
-    // (§10, see `artifacts_api`). Logs in both modes (a 64 MiB page can outlast 30 s on a slow link) and downloads.
-    let streaming: Router<AppState> = Router::new()
-        .route("/v1/jobs/{id}/logs", get(crate::artifacts_api::get_logs))
-        .route(
-            "/v1/jobs/{id}/outputs/{*path}",
-            get(crate::artifacts_api::download_output),
-        )
-        .route_layer(middleware::from_fn_with_state(state.clone(), require_api_key));
     let app = bounded
         .merge(streaming)
         // After routing, so `MatchedPath` is known: hands the route template to the request log (see `log_request`).
@@ -272,14 +338,16 @@ pub async fn openapi_json() -> Response {
     resp
 }
 
-/// Who the presented key is, and its limits. `daily_unit_cap: null` means the key is uncapped; `p2pc mcp` refuses
-/// such a key. Never contains the secret.
+/// Who the caller is, and its limits. `daily_unit_cap: null` means the caller is uncapped; `p2pc mcp` refuses such a
+/// key. Never contains the secret.
+///
+/// `principal` names the caller, `{kind, id}` (H2 §5.5). `key_id` stays: the key for an API key, `null` for a device.
 #[utoipa::path(
     get,
     path = "/v1/whoami",
     tag = "auth",
     responses(
-        (status = 200, description = "The key's account, project, ID, scopes and limits (`label`, `daily_unit_cap`, `allowed_images`, `expires_at`; `null` means no limit). Never the secret.", body = WhoAmI),
+        (status = 200, description = "The caller's account, project, ID, scopes and limits (`label`, `daily_unit_cap`, `allowed_images`, `expires_at`; `null` means no limit), and `principal` (`{kind, id}`, H2 §5.5). `key_id` is `null` for a device. Never the secret.", body = WhoAmI),
         (status = 401, description = "Missing or invalid key.", content_type = "application/problem+json", body = Problem),
     )
 )]
@@ -287,13 +355,13 @@ pub async fn whoami(Authorized { principal: p, .. }: AnyKey) -> Json<WhoAmI> {
     Json(WhoAmI {
         account_id: p.account_id,
         project_id: p.project_id,
-        key_id: p.key_id,
+        key_id: p.id.key_id(),
         scopes: p.scopes,
         label: p.label,
         daily_unit_cap: p.daily_unit_cap,
         allowed_images: p.allowed_images,
         expires_at: p.expires_at,
-        principal: None,
+        principal: Some(p.id),
     })
 }
 
@@ -329,10 +397,16 @@ pub(crate) fn bad_cursor() -> ApiError {
     )
 }
 
-/// The §5 "No escalation" rule for a key-creation request, with `p2pc-proto`'s [`check_no_escalation`]: `403
-/// escalation_denied` listing every field that exceeds the creator.
+/// The §5 "No escalation" rule for a key-creation request by a key: `403 escalation_denied` listing every field that
+/// exceeds the creator. See [`ensure_limits_no_escalation`], which serves every principal.
 pub fn ensure_no_escalation(creator: &ApiKeyInfo, request: &CreateApiKey) -> Result<(), ApiError> {
-    check_no_escalation(creator, request).map_err(|denied| ApiError::escalation_denied(&denied))
+    ensure_limits_no_escalation(&creator.into(), &request.into())
+}
+
+/// The §5 "No escalation" rule for any principal (H2 §5.2, §5.5), with `p2pc-proto`'s [`check_limits_no_escalation`]:
+/// `403 escalation_denied` listing every field of `asked` that exceeds `creator`.
+pub fn ensure_limits_no_escalation(creator: &PrincipalLimits, asked: &PrincipalLimits) -> Result<(), ApiError> {
+    check_limits_no_escalation(creator, asked).map_err(|denied| ApiError::escalation_denied(&denied))
 }
 
 /// Validates a key-creation body at `now`: the `p2pc-proto` rules, a storable `daily_unit_cap`, and an `expires_at`
@@ -414,14 +488,14 @@ pub async fn create_key(
     // creator that expired while waiting for the lock is refused, and so is an `expires_at` that has passed.
     let creator = recheck_caller(&mut tx, &state, &p, now).await?;
     check_new_key(&body, now)?;
-    ensure_no_escalation(&creator.info(), &body)?;
+    ensure_limits_no_escalation(&creator.limits(), &PrincipalLimits::from(&body))?;
     let row = store::keys::insert(&mut tx, p.account_id, &new, now).await?;
-    let event = NewEvent {
-        kind: AuditKind::KeyCreated,
-        actor_key_id: Some(p.key_id),
-        subject_id: Some(row.key_id.to_string()),
-        detail: detail(serde_json::json!({ "scopes": row.scopes, "project_id": row.project_id })),
-    };
+    let event = NewEvent::new(
+        AuditKind::KeyCreated,
+        Some(p.id),
+        Some(row.key_id.to_string()),
+        detail(serde_json::json!({ "scopes": row.scopes, "project_id": row.project_id })),
+    );
     store::audit::append(&mut tx, p.account_id, &event, now).await?;
     tx.commit().await?;
     tracing::info!(key_id = %row.key_id, "API key created");
@@ -513,17 +587,12 @@ pub async fn revoke_key(
     let target = store::keys::get(&mut tx, p.account_id, key_id)
         .await?
         .ok_or_else(ApiError::not_found)?;
-    if target.key_id != p.key_id {
-        ensure_no_escalation(&caller.info(), &as_request(&target))?;
+    if p.key_id() != Some(target.key_id) {
+        ensure_limits_no_escalation(&caller.limits(), &PrincipalLimits::from(&as_request(&target)))?;
     }
     match store::keys::revoke(&mut tx, p.account_id, key_id, now).await? {
         Revoke::Revoked => {
-            let event = NewEvent {
-                kind: AuditKind::KeyRevoked,
-                actor_key_id: Some(p.key_id),
-                subject_id: Some(key_id.to_string()),
-                detail: Map::new(),
-            };
+            let event = NewEvent::new(AuditKind::KeyRevoked, Some(p.id), Some(key_id.to_string()), Map::new());
             store::audit::append(&mut tx, p.account_id, &event, now).await?;
             tx.commit().await?;
             tracing::info!(%key_id, "API key revoked");

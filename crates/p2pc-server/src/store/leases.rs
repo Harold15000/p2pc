@@ -16,8 +16,8 @@
 
 use std::collections::BTreeMap;
 
-use p2pc_proto::api::{JobStatus, UsageGroupBy, UsageRecord};
-use p2pc_proto::ids::{AccountId, JobId, KeyId, LeaseId, NodeId, ProjectId};
+use p2pc_proto::api::{JobStatus, Principal, UsageGroupBy, UsageRecord};
+use p2pc_proto::ids::{AccountId, JobId, LeaseId, NodeId, ProjectId};
 use p2pc_proto::units::Units;
 use time::OffsetDateTime;
 
@@ -902,30 +902,37 @@ pub async fn set_result(
     Ok(())
 }
 
-/// The key that submitted a job (for the ledger).
-pub async fn job_key(conn: &mut Conn, job_id: JobId) -> Result<KeyId, StoreError> {
-    let key: String = sqlx::query_scalar("SELECT key_id FROM jobs WHERE job_id = ?")
-        .bind(job_id.to_string())
-        .fetch_one(&mut *conn)
-        .await?;
-    parse_col(&key, "jobs.key_id")
+/// The principal that submitted a job: an API key or a device (H2 §5.6).
+pub async fn job_principal(conn: &mut Conn, job_id: JobId) -> Result<Principal, StoreError> {
+    let (key, device): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT key_id, device_id FROM jobs WHERE job_id = ?")
+            .bind(job_id.to_string())
+            .fetch_one(&mut *conn)
+            .await?;
+    super::jobs::principal_cols(key.as_deref(), device.as_deref(), "jobs.key_id/device_id")
 }
 
 // --- Usage ledger -------------------------------------------------------------------------------------------------
 
-/// Appends one usage record (one finished attempt).
+/// Appends one usage record (one finished attempt), as **one slice** (H2 §12): a batch attempt is one slice from its
+/// start to its end, the attempt's last, charged to the UTC day of its job's creation, exactly as H1 counts it.
+///
+/// The principal (key or device), `kind` and `template_id` come from the job's own row, never from `rec`, so a ledger
+/// row always names the principal that submitted the job (H2 §5.6). Cutting service attempts at midnight is T2-16's.
 pub async fn insert_usage(conn: &mut Conn, lease_id: LeaseId, rec: &UsageRecord) -> Result<(), StoreError> {
     let int = |v: u64, c: &'static str| i64::try_from(v).map_err(|_| StoreError::Corrupt(c));
-    sqlx::query(
-        "INSERT INTO usage_records (job_id, attempt, lease_id, node_id, key_id, account_id, project_id, started_at, \
-         ended_at, reserved_cpu_ms, reserved_gpu_ms, used_cpu_ms, max_rss_mb, units, estimated) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    let done = sqlx::query(
+        "INSERT INTO usage_records (job_id, attempt, lease_id, node_id, key_id, device_id, account_id, project_id, \
+         kind, template_id, started_at, ended_at, slice_start, slice_end, last_slice, charge_day, reserved_cpu_ms, \
+         reserved_gpu_ms, used_cpu_ms, max_rss_mb, units, estimated) \
+         SELECT ?1, ?2, ?3, ?4, j.key_id, j.device_id, ?5, ?6, j.kind, j.template_id, ?7, ?8, ?7, ?8, 1, \
+                j.created_at - ((j.created_at % 86400) + 86400) % 86400, ?9, ?10, ?11, ?12, ?13, ?14 \
+         FROM jobs j WHERE j.job_id = ?1",
     )
     .bind(rec.job_id.to_string())
     .bind(i64::from(rec.attempt))
     .bind(lease_id.to_string())
     .bind(rec.node_id.to_string())
-    .bind(rec.key_id.to_string())
     .bind(rec.account_id.to_string())
     .bind(rec.project_id.to_string())
     .bind(ts(rec.started_at))
@@ -937,11 +944,18 @@ pub async fn insert_usage(conn: &mut Conn, lease_id: LeaseId, rec: &UsageRecord)
     .bind(int(rec.units.milli(), "usage_records.units")?)
     .bind(rec.estimated)
     .execute(&mut *conn)
-    .await?;
-    Ok(())
+    .await?
+    .rows_affected();
+    if done == 1 {
+        Ok(())
+    } else {
+        Err(StoreError::Corrupt("usage_records.job_id"))
+    }
 }
 
-/// What a key spent on jobs created in `[from, to)` (Unix seconds), in milli-units. Every attempt that ended has a
+/// What a principal (an API key or a device, H2 §5.6) spent on jobs created in `[from, to)` (Unix seconds), in
+/// milli-units. The device branch is H1's rule applied to the device column; `spent(P, D)` of H2 §12 replaces this
+/// in T2-16. Every attempt that ended has a
 /// usage row (reported, or estimated by the server when it ended with no report, §11), so per job:
 /// - a terminal job counts its usage rows; with none, nothing if it was cancelled before it ever ran, and its
 ///   reservation otherwise;
@@ -952,10 +966,11 @@ pub async fn insert_usage(conn: &mut Conn, lease_id: LeaseId, rec: &UsageRecord)
 pub async fn spent_between(
     conn: &mut Conn,
     account_id: AccountId,
-    key_id: KeyId,
+    principal: Principal,
     from: i64,
     to: i64,
 ) -> Result<u64, StoreError> {
+    let (key, device) = super::jobs::principal_binds(principal);
     let total: i64 = sqlx::query_scalar(
         "SELECT COALESCE(SUM(CASE \
              WHEN status IN ('succeeded', 'failed', 'timed_out', 'cancelled', 'lost') THEN \
@@ -968,12 +983,14 @@ pub async fn spent_between(
              ELSE units_reserved \
                   + COALESCE((SELECT SUM(u.units) FROM usage_records u WHERE u.job_id = jobs.job_id), 0) \
              END), 0) \
-         FROM jobs WHERE account_id = ?1 AND key_id = ?2 AND created_at >= ?3 AND created_at < ?4",
+         FROM jobs WHERE account_id = ?1 AND created_at >= ?3 AND created_at < ?4 \
+           AND ((?2 IS NOT NULL AND key_id = ?2) OR (?5 IS NOT NULL AND device_id = ?5))",
     )
     .bind(account_id.to_string())
-    .bind(key_id.to_string())
+    .bind(key)
     .bind(from)
     .bind(to)
+    .bind(device)
     .fetch_one(&mut *conn)
     .await?;
     u64_col(total, "usage_records.units")
@@ -1058,7 +1075,7 @@ pub async fn usage_report(
                       reserved_cpu_ms, reserved_gpu_ms, used_cpu_ms, max_rss_mb, units, estimated \
                FROM usage_records \
                WHERE account_id = ?1 AND project_id = ?2 AND ended_at >= ?3 AND ended_at < ?4) \
-         WHERE ?6 IS NULL OR g > ?6 \
+         WHERE g IS NOT NULL AND (?6 IS NULL OR g > ?6) \
          GROUP BY g ORDER BY g LIMIT ?7",
     )
     .bind(account_id.to_string())

@@ -257,7 +257,7 @@ mod tests {
             job_id: JobId::generate(),
             account_id: f.account,
             project_id: f.project,
-            key_id: f.key,
+            principal: p2pc_proto::api::Principal::Key(f.key),
             spec: spec(),
             files_meta: vec![],
             spec_hash: format!("sha256:{}", "0".repeat(64)),
@@ -532,7 +532,7 @@ mod tests {
             let (account, key) = (f.account, f.key);
             async move {
                 let mut c = db.acquire().await.unwrap();
-                crate::store::leases::spent_between(&mut c, account, key, day.0, day.1)
+                crate::store::leases::spent_between(&mut c, account, p2pc_proto::api::Principal::Key(key), day.0, day.1)
                     .await
                     .unwrap()
             }

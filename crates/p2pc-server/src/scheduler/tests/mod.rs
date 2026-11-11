@@ -160,7 +160,9 @@ impl Fx {
             project_id: project,
             code_digest: hash_secret(&Secret::generate()),
             label: None,
-            created_by_key_id: api_key.key_id(),
+            created_by: p2pc_proto::api::Principal::Key(api_key.key_id()),
+            bound_iroh_node_id: None,
+            pre_approved: false,
             expires_at: T0 + Duration::hours(1),
         };
         join_tokens::insert(&mut conn, account, &jt, T0).await.unwrap();
@@ -262,7 +264,7 @@ impl Fx {
             job_id: JobId::generate(),
             account_id: self.account,
             project_id: self.project,
-            key_id: self.key,
+            principal: p2pc_proto::api::Principal::Key(self.key),
             units_reserved: estimate_units(&spec.resources, spec.timeout_s, Units::from_units(10)),
             files_meta: p2pc_proto::api::FileMeta::compute_all(&spec).unwrap(),
             spec,
@@ -1266,7 +1268,9 @@ mt_test!(lost_attempts_are_billed_with_an_estimate, async {
         let (account, key, day) = (fx.account, fx.key, crate::units::utc_day(fx.now()));
         async move {
             let mut c = db.acquire().await.unwrap();
-            leases::spent_between(&mut c, account, key, day.0, day.1).await.unwrap()
+            leases::spent_between(&mut c, account, p2pc_proto::api::Principal::Key(key), day.0, day.1)
+                .await
+                .unwrap()
         }
     };
     // Attempts 1 and 2 are lost: the node goes silent 30 s after the start, the loss is decided 60 s later.
@@ -1742,9 +1746,15 @@ mt_test!(server_ended_attempts_get_an_estimated_usage_row, async {
     // The cap counts the estimate, not the whole reservation (1 vCPU × 100 s = 28 milli-units).
     let day = crate::units::utc_day(fx.now());
     let mut conn = fx.db.acquire().await.unwrap();
-    let spent = leases::spent_between(&mut conn, fx.account, fx.key, day.0, day.1)
-        .await
-        .unwrap();
+    let spent = leases::spent_between(
+        &mut conn,
+        fx.account,
+        p2pc_proto::api::Principal::Key(fx.key),
+        day.0,
+        day.1,
+    )
+    .await
+    .unwrap();
     assert_eq!(spent, 89 + 10);
 });
 
@@ -2643,11 +2653,18 @@ mt_test!(
             .connect_with(options)
             .await
             .unwrap();
-        let (last, before) = crate::store::MIGRATOR.migrations.split_last().unwrap();
-        assert!(
-            last.description.contains("finished lease holds"),
-            "the migration under test is the last one"
-        );
+        // The migration under test runs last, on a database that has every other migration: the fixture code is
+        // today's, so it needs today's tables (the H2 rebuild of `jobs` and `usage_records` among them), and no
+        // later migration changes `leases` itself.
+        let last = crate::store::MIGRATOR
+            .migrations
+            .iter()
+            .find(|m| m.description.contains("finished lease holds"))
+            .unwrap();
+        let before = crate::store::MIGRATOR
+            .migrations
+            .iter()
+            .filter(|m| m.version != last.version);
         for m in before {
             sqlx::raw_sql(m.sql.clone()).execute(&db).await.unwrap();
         }

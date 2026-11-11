@@ -468,6 +468,7 @@ async fn audit(
     let event = NewEvent {
         kind,
         actor_key_id: None,
+        actor_device_id: None,
         subject_id: Some(subject),
         detail: match detail {
             serde_json::Value::Object(map) => map,

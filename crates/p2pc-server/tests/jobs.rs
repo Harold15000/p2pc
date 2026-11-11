@@ -1166,7 +1166,7 @@ async fn a_page_of_jobs_with_large_files_is_small() {
             job_id: JobId::generate(),
             account_id: app.account_id,
             project_id: app.project_id,
-            key_id: app.admin_key.key_id(),
+            principal: p2pc_proto::api::Principal::Key(app.admin_key.key_id()),
             spec,
             files_meta: files_meta.clone(),
             spec_hash: format!("sha256:{}", "0".repeat(64)),

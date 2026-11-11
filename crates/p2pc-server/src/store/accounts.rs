@@ -51,3 +51,18 @@ pub async fn owner(conn: &mut Conn) -> Result<Option<AccountId>, StoreError> {
         .await?;
     id.map(|s| parse_col(&s, "accounts.account_id")).transpose()
 }
+
+/// `project_id` when it is a project of `account_id` (for `p2pc-server devices add --project`, H2 §5.3).
+pub async fn project_of(
+    conn: &mut Conn,
+    account_id: AccountId,
+    project_id: ProjectId,
+) -> Result<Option<ProjectId>, StoreError> {
+    let id: Option<String> =
+        sqlx::query_scalar("SELECT project_id FROM projects WHERE account_id = ? AND project_id = ?")
+            .bind(account_id.to_string())
+            .bind(project_id.to_string())
+            .fetch_optional(&mut *conn)
+            .await?;
+    id.map(|s| parse_col(&s, "projects.project_id")).transpose()
+}

@@ -3,9 +3,9 @@
 //! Join tokens (spec §5 "Join tokens"). Only the versioned SHA-256 digest of the 16-byte code is stored; the token
 //! string is returned once by `POST /v1/nodes/join-tokens` and never again.
 
-use p2pc_proto::api::JoinTokenInfo;
+use p2pc_proto::api::Principal;
 use p2pc_proto::auth::SecretHash;
-use p2pc_proto::ids::{AccountId, JoinTokenId, KeyId, NodeId, ProjectId};
+use p2pc_proto::ids::{AccountId, JoinTokenId, NodeId, ProjectId};
 use time::OffsetDateTime;
 
 use super::{Conn, StoreError, decode_digest, from_ts, from_ts_opt, parse_col, ts};
@@ -23,8 +23,12 @@ pub struct JoinTokenRow {
     pub code_digest: SecretHash,
     /// Optional label.
     pub label: Option<String>,
-    /// The key that created it.
-    pub created_by_key_id: KeyId,
+    /// The principal that minted it: an API key or a device (H2 §5.6).
+    pub created_by: Principal,
+    /// The agent NodeId it is bound to, for the token of a join request (H2 §5.4): it enrolls no other.
+    pub bound_iroh_node_id: Option<String>,
+    /// Minted with the `admin`-only `pre_approved` option: its node starts `approved` (H2 §5.4).
+    pub pre_approved: bool,
     /// Creation time.
     pub created_at: OffsetDateTime,
     /// Expiry: the only one that counts.
@@ -38,18 +42,6 @@ pub struct JoinTokenRow {
 }
 
 impl JoinTokenRow {
-    /// The public view: never the code or its digest.
-    #[must_use]
-    pub fn info(&self) -> JoinTokenInfo {
-        // A constructor, then the fields: a field added to the shared type does not break this (CONTRIBUTING rule 7).
-        let mut info = JoinTokenInfo::new(self.id, self.created_by_key_id, self.created_at, self.expires_at);
-        info.label.clone_from(&self.label);
-        info.consumed_at = self.consumed_at;
-        info.consumed_by_node_id = self.consumed_by_node_id;
-        info.revoked_at = self.revoked_at;
-        info
-    }
-
     /// Whether a `Join` may consume it at `now`: unused, not revoked and not expired (an expiry equal to `now` counts
     /// as expired).
     #[must_use]
@@ -69,8 +61,12 @@ pub struct NewJoinToken {
     pub code_digest: SecretHash,
     /// Optional label.
     pub label: Option<String>,
-    /// The creating key.
-    pub created_by_key_id: KeyId,
+    /// The minting principal.
+    pub created_by: Principal,
+    /// The agent NodeId the token is bound to (join requests only, H2 §5.4).
+    pub bound_iroh_node_id: Option<String>,
+    /// The `admin`-only option: the node starts `approved` (H2 §5.4).
+    pub pre_approved: bool,
     /// Expiry.
     pub expires_at: OffsetDateTime,
 }
@@ -120,7 +116,10 @@ type Row = (
     String,
     String,
     Option<String>,
-    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i64,
     i64,
     i64,
     Option<i64>,
@@ -131,22 +130,26 @@ type Row = (
 macro_rules! select_tokens {
     ($tail:literal) => {
         concat!(
-            "SELECT id, account_id, project_id, code_digest, label, created_by_key_id, created_at, expires_at, \
-             consumed_at, consumed_by_node_id, revoked_at FROM join_tokens ",
+            "SELECT id, account_id, project_id, code_digest, label, created_by_key_id, created_by_device_id, \
+             bound_iroh_node_id, pre_approved, created_at, expires_at, consumed_at, consumed_by_node_id, revoked_at \
+             FROM join_tokens ",
             $tail
         )
     };
 }
 
 fn decode(row: Row) -> Result<JoinTokenRow, StoreError> {
-    let (id, account, project, digest, label, by, created, expires, consumed, node, revoked) = row;
+    let (id, account, project, digest, label, by_key, by_device, bound, pre, created, expires, consumed, node, revoked) =
+        row;
     Ok(JoinTokenRow {
         id: parse_col(&id, "join_tokens.id")?,
         account_id: parse_col(&account, "join_tokens.account_id")?,
         project_id: parse_col(&project, "join_tokens.project_id")?,
         code_digest: decode_digest(&digest, "join_tokens.code_digest")?,
         label,
-        created_by_key_id: parse_col(&by, "join_tokens.created_by_key_id")?,
+        created_by: super::jobs::principal_cols(by_key.as_deref(), by_device.as_deref(), "join_tokens.created_by")?,
+        bound_iroh_node_id: bound,
+        pre_approved: pre != 0,
         created_at: from_ts(created, "join_tokens.created_at")?,
         expires_at: from_ts(expires, "join_tokens.expires_at")?,
         consumed_at: from_ts_opt(consumed, "join_tokens.consumed_at")?,
@@ -164,16 +167,21 @@ pub async fn insert(
     token: &NewJoinToken,
     now: OffsetDateTime,
 ) -> Result<JoinTokenRow, StoreError> {
+    let (by_key, by_device) = super::jobs::principal_binds(token.created_by);
     sqlx::query(
-        "INSERT INTO join_tokens (id, account_id, project_id, code_digest, label, created_by_key_id, created_at, \
-         expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO join_tokens (id, account_id, project_id, code_digest, label, created_by_key_id, \
+         created_by_device_id, bound_iroh_node_id, pre_approved, created_at, expires_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(token.id.to_string())
     .bind(account_id.to_string())
     .bind(token.project_id.to_string())
     .bind(token.code_digest.to_stored())
     .bind(token.label.clone())
-    .bind(token.created_by_key_id.to_string())
+    .bind(by_key)
+    .bind(by_device)
+    .bind(token.bound_iroh_node_id.clone())
+    .bind(token.pre_approved)
     .bind(ts(now))
     .bind(ts(token.expires_at))
     .execute(&mut *conn)
@@ -230,6 +238,10 @@ pub async fn list(
 /// Marks the token with `digest` consumed by `node_id`, atomically (SI-11): the single `UPDATE` only matches an
 /// unused, unrevoked, unexpired row, judged by the row's own columns. Returns whether it matched. Run it in the
 /// transaction that inserts the node.
+///
+/// A token bound to an agent NodeId (a join request's, H2 §5.4) matches only when `node_id`'s row has that NodeId:
+/// any other NodeId gets the invalid-token answer and the token stays unused (the caller's transaction, which
+/// inserted the node, is dropped).
 pub async fn consume(
     conn: &mut Conn,
     digest: &SecretHash,
@@ -238,7 +250,9 @@ pub async fn consume(
 ) -> Result<bool, StoreError> {
     let done = sqlx::query(
         "UPDATE join_tokens SET consumed_at = ?1, consumed_by_node_id = ?2 \
-         WHERE code_digest = ?3 AND consumed_at IS NULL AND revoked_at IS NULL AND expires_at > ?1",
+         WHERE code_digest = ?3 AND consumed_at IS NULL AND revoked_at IS NULL AND expires_at > ?1 \
+           AND (bound_iroh_node_id IS NULL \
+                OR bound_iroh_node_id = (SELECT n.iroh_node_id FROM nodes n WHERE n.id = ?2))",
     )
     .bind(ts(now))
     .bind(node_id.to_string())

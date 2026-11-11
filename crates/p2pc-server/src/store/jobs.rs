@@ -13,8 +13,8 @@
 //! decoded into a [`JobSpec`] (whose `Debug` redacts the values) and never logged. `tests/read_path_sql.rs` checks the
 //! SQL strings of this crate for it.
 
-use p2pc_proto::api::{FileMeta, Job, JobAttempt, JobSpec, JobSpecView, JobStatus};
-use p2pc_proto::ids::{AccountId, JobId, KeyId, NodeId, ProjectId};
+use p2pc_proto::api::{FileMeta, Job, JobAttempt, JobSpec, JobSpecView, JobStatus, Principal};
+use p2pc_proto::ids::{AccountId, JobId, NodeId, ProjectId};
 use p2pc_proto::units::Units;
 use time::OffsetDateTime;
 
@@ -31,8 +31,8 @@ pub struct JobRow {
     pub account_id: AccountId,
     /// Owning project.
     pub project_id: ProjectId,
-    /// The key that submitted it.
-    pub key_id: KeyId,
+    /// The principal that submitted it: an API key or a device (H2 §5.6).
+    pub principal: Principal,
     /// What the API shows of the spec (env values `<redacted>`, files as `{path, size, sha256}`, no idempotency key),
     /// read from the `spec_view` column. The row has no `spec`: it is never loaded with a job (see [`load_spec`]).
     pub spec_view: JobSpecView,
@@ -105,8 +105,8 @@ pub struct NewJob {
     pub account_id: AccountId,
     /// Owning project.
     pub project_id: ProjectId,
-    /// The submitting key.
-    pub key_id: KeyId,
+    /// The submitting principal: an API key or a device (H2 §5.6).
+    pub principal: Principal,
     /// The validated, normalized spec.
     pub spec: JobSpec,
     /// `{path, size, sha256}` of its input files.
@@ -123,7 +123,8 @@ struct Raw {
     job_id: String,
     account_id: String,
     project_id: String,
-    key_id: String,
+    key_id: Option<String>,
+    device_id: Option<String>,
     spec_view: String,
     spec_hash: String,
     status: String,
@@ -148,7 +149,7 @@ struct Raw {
 macro_rules! select_jobs {
     ($tail:literal) => {
         concat!(
-            "SELECT job_id, account_id, project_id, key_id, spec_view, spec_hash, status, attempt, \
+            "SELECT job_id, account_id, project_id, key_id, device_id, spec_view, spec_hash, status, attempt, \
              max_attempts, idempotency_key, units_reserved, node_id, exit_code, outcome, error, reason, \
              cancel_requested_at, created_at, updated_at, started_at, finished_at FROM jobs ",
             $tail
@@ -173,7 +174,7 @@ fn decode(raw: Raw) -> Result<JobRow, StoreError> {
         job_id: parse_col(&raw.job_id, "jobs.job_id")?,
         account_id: parse_col(&raw.account_id, "jobs.account_id")?,
         project_id: parse_col(&raw.project_id, "jobs.project_id")?,
-        key_id: parse_col(&raw.key_id, "jobs.key_id")?,
+        principal: principal_cols(raw.key_id.as_deref(), raw.device_id.as_deref(), "jobs.key_id/device_id")?,
         spec_view: serde_json::from_str(&raw.spec_view).map_err(|_| StoreError::Corrupt("jobs.spec_view"))?,
         spec_hash: raw.spec_hash,
         status: parse_status(&raw.status)?,
@@ -199,6 +200,24 @@ fn decode(raw: Raw) -> Result<JobRow, StoreError> {
     })
 }
 
+/// The principal stored in a `(key_id, device_id)` pair of columns, exactly one of them set (H2 §5.6).
+pub(crate) fn principal_cols(
+    key_id: Option<&str>,
+    device_id: Option<&str>,
+    column: &'static str,
+) -> Result<Principal, StoreError> {
+    match (key_id, device_id) {
+        (Some(k), None) => Ok(Principal::Key(parse_col(k, column)?)),
+        (None, Some(d)) => Ok(Principal::Device(parse_col(d, column)?)),
+        _ => Err(StoreError::Corrupt(column)),
+    }
+}
+
+/// The `(key_id, device_id)` columns of a principal, for binding.
+pub(crate) fn principal_binds(p: Principal) -> (Option<String>, Option<String>) {
+    (p.key_id().map(|k| k.to_string()), p.device_id().map(|d| d.to_string()))
+}
+
 fn json<T: serde::Serialize>(value: &T, column: &'static str) -> Result<String, StoreError> {
     serde_json::to_string(value).map_err(|_| StoreError::Corrupt(column))
 }
@@ -207,7 +226,10 @@ fn json<T: serde::Serialize>(value: &T, column: &'static str) -> Result<String, 
 ///
 /// Call it inside the `BEGIN IMMEDIATE` transaction that checked the idempotency key and the cap. That transaction
 /// is what keeps two identical submissions from both inserting; if one ever got past it, the unique index on
-/// `(key_id, idempotency_key)` refuses the second insert with an error.
+/// `(key_id, idempotency_key)` or `(device_id, idempotency_key)` refuses the second insert with an error.
+///
+/// `kind` and `template_id` are copied from the spec into their own columns (H2 §5.6), for the `kind` filter and the
+/// template view.
 pub async fn insert(conn: &mut Conn, job: &NewJob, now: OffsetDateTime) -> Result<JobRow, StoreError> {
     let units = i64::try_from(job.units_reserved.milli()).map_err(|_| StoreError::Corrupt("jobs.units_reserved"))?;
     // The redacted view that every API read will serve, built once, here, from the file metadata computed at
@@ -215,15 +237,20 @@ pub async fn insert(conn: &mut Conn, job: &NewJob, now: OffsetDateTime) -> Resul
     // and the idempotency key is not part of it.
     let view = JobSpecView::from_stored_with_meta(&job.spec, &job.files_meta)
         .map_err(|_| StoreError::Corrupt("jobs.files_meta"))?;
+    let (key, device) = principal_binds(job.principal);
     sqlx::query(
-        "INSERT INTO jobs (job_id, account_id, project_id, key_id, name, spec, files_meta, spec_view, spec_hash, \
-         status, attempt, max_attempts, idempotency_key, units_reserved, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 1, ?, ?, ?, ?, ?)",
+        "INSERT INTO jobs (job_id, account_id, project_id, key_id, device_id, kind, template_id, name, spec, \
+         files_meta, spec_view, spec_hash, status, attempt, max_attempts, idempotency_key, units_reserved, \
+         created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 1, ?, ?, ?, ?, ?)",
     )
     .bind(job.job_id.to_string())
     .bind(job.account_id.to_string())
     .bind(job.project_id.to_string())
-    .bind(job.key_id.to_string())
+    .bind(key)
+    .bind(device)
+    .bind(job.spec.kind.as_str())
+    .bind(job.spec.template.as_ref().map(|t| t.id.clone()))
     .bind(job.spec.name.clone())
     .bind(json(&job.spec, "jobs.spec")?)
     .bind(json(&job.files_meta, "jobs.files_meta")?)
@@ -280,27 +307,35 @@ pub async fn load_spec(
         .transpose()
 }
 
-/// The job that `key_id` submitted with this idempotency key, if any.
+/// The job that `principal` submitted with this idempotency key, if any.
 ///
-/// Idempotency keys are scoped to the **API key** (spec §7): a job of another key with the same idempotency key is
-/// invisible here, so a replay can never confirm or deny anything about someone else's job. The account and project
-/// filters are kept as well (SI-7).
+/// Idempotency keys are scoped to the **principal** (spec §7, H2 §5.6): a job of another key or device with the same
+/// idempotency key is invisible here, so a replay can never confirm or deny anything about someone else's job. The
+/// account and project filters are kept as well (SI-7). Each branch reads the column of its own partial unique index.
 pub async fn find_by_idempotency_key(
     conn: &mut Conn,
     account_id: AccountId,
     project_id: ProjectId,
-    key_id: KeyId,
+    principal: Principal,
     idempotency_key: &str,
 ) -> Result<Option<JobRow>, StoreError> {
-    let raw: Option<Raw> = sqlx::query_as(select_jobs!(
-        "WHERE account_id = ? AND project_id = ? AND key_id = ? AND idempotency_key = ?"
-    ))
-    .bind(account_id.to_string())
-    .bind(project_id.to_string())
-    .bind(key_id.to_string())
-    .bind(idempotency_key)
-    .fetch_optional(&mut *conn)
-    .await?;
+    let (sql, id) = match principal {
+        Principal::Key(k) => (
+            select_jobs!("WHERE account_id = ? AND project_id = ? AND idempotency_key = ? AND key_id = ?"),
+            k.to_string(),
+        ),
+        Principal::Device(d) => (
+            select_jobs!("WHERE account_id = ? AND project_id = ? AND idempotency_key = ? AND device_id = ?"),
+            d.to_string(),
+        ),
+    };
+    let raw: Option<Raw> = sqlx::query_as(sql)
+        .bind(account_id.to_string())
+        .bind(project_id.to_string())
+        .bind(idempotency_key)
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await?;
     raw.map(decode).transpose()
 }
 

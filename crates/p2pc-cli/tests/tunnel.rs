@@ -302,7 +302,7 @@ fn the_proxy_tunnels_local_connections_and_never_adds_the_key() {
                 .build()
                 .unwrap();
             let who = client.whoami().await.unwrap();
-            assert_eq!(who.key_id, key.key_id());
+            assert_eq!(who.key_id, Some(key.key_id()));
             stop.ctrl_c.send(()).unwrap();
         });
     // Ctrl-C: 130, as spec §7 says for SIGINT.

@@ -8,7 +8,12 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use p2pc_proto::api::{DEFAULT_BLOBS_QUOTA_MB, DEFAULT_MAX_BLOB_MB};
 use p2pc_proto::auth::MAX_RELAYS;
+use p2pc_proto::device::{
+    DEFAULT_PORT_IDLE, DEFAULT_STREAM_ADMIN_RESERVE, DEFAULT_STREAM_BUDGET, DEFAULT_STREAMS_PER_DEVICE,
+    DeviceStreamBudget,
+};
 use p2pc_proto::net::DirectAddresses;
 use p2pc_proto::protocol::{AGENT_LEASE_TTL_MARGIN_S, DEFAULT_HEARTBEAT_INTERVAL_S, DEFAULT_LEASE_TTL_S};
 use p2pc_proto::validate::{DEFAULT_ALLOWED_REGISTRIES, ImageRef};
@@ -58,6 +63,213 @@ pub struct Config {
     /// Logs and artifacts (spec §12).
     #[serde(default)]
     pub storage: StorageConfig,
+    /// Paired devices and `p2pc/device/1` (H2 §5, §6.3).
+    #[serde(default)]
+    pub devices: DevicesConfig,
+    /// Service jobs and their ports (H2 §7.2, §7.4).
+    #[serde(default)]
+    pub services: ServicesConfig,
+    /// Blobs (H2 §7.5).
+    #[serde(default)]
+    pub blobs: BlobsConfig,
+}
+
+/// The `[devices]` table: pairing and the device protocol (H2 §5.2, §6.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DevicesConfig {
+    /// The web app's origin, which pairing QR codes point to (`<origin>/pair#p2pc_pair_…`, H2 §5.2, §9.6): `https`
+    /// (plain `http` only on a loopback host, for development), no credentials, no path. Unset (the default) until the
+    /// project has an official origin or the owner self-hosts one (§9.6 item 3); pairing tickets need it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_app_origin: Option<String>,
+    /// Most concurrent streams per device across its connections (§6.3, default 16).
+    #[serde(default = "default_streams_per_device")]
+    pub device_streams_per_device: u32,
+    /// Most device streams in total, separate from `http.max_connections` (§6.3, default 96).
+    #[serde(default = "default_stream_budget")]
+    pub device_stream_budget: u32,
+    /// Streams of the budget usable only by `admin` devices (§6.3, default 32): at least `device_streams_per_device`,
+    /// below `device_stream_budget`.
+    #[serde(default = "default_stream_admin_reserve")]
+    pub device_stream_admin_reserve: u32,
+}
+
+/// Largest `devices.device_stream_budget`.
+pub const MAX_DEVICE_STREAM_BUDGET: u32 = 65_536;
+
+fn default_streams_per_device() -> u32 {
+    DEFAULT_STREAMS_PER_DEVICE as u32
+}
+fn default_stream_budget() -> u32 {
+    DEFAULT_STREAM_BUDGET as u32
+}
+fn default_stream_admin_reserve() -> u32 {
+    DEFAULT_STREAM_ADMIN_RESERVE as u32
+}
+
+impl Default for DevicesConfig {
+    fn default() -> Self {
+        Self {
+            web_app_origin: None,
+            device_streams_per_device: default_streams_per_device(),
+            device_stream_budget: default_stream_budget(),
+            device_stream_admin_reserve: default_stream_admin_reserve(),
+        }
+    }
+}
+
+impl DevicesConfig {
+    /// The device stream budget of §6.3.
+    #[must_use]
+    pub fn stream_budget(&self) -> DeviceStreamBudget {
+        DeviceStreamBudget {
+            streams_per_device: self.device_streams_per_device as usize,
+            budget: self.device_stream_budget as usize,
+            admin_reserve: self.device_stream_admin_reserve as usize,
+        }
+    }
+
+    /// The parsed `web_app_origin`. Validated at load, so a loaded config has a usable one or none.
+    #[must_use]
+    pub fn web_app_origin(&self) -> Option<url::Url> {
+        self.web_app_origin.as_deref().and_then(|o| url::Url::parse(o).ok())
+    }
+
+    fn problems(&self, out: &mut Vec<String>) {
+        if let Some(origin) = &self.web_app_origin
+            && !web_app_origin_ok(origin)
+        {
+            out.push(format!(
+                "devices.web_app_origin = {origin:?} must be an https:// origin (http:// only on a loopback host), \
+                 without credentials, path, query or fragment"
+            ));
+        }
+        if self.device_stream_budget > MAX_DEVICE_STREAM_BUDGET {
+            out.push(format!(
+                "devices.device_stream_budget must be at most {MAX_DEVICE_STREAM_BUDGET}"
+            ));
+        }
+        if let Err(e) = self.stream_budget().validate() {
+            out.push(format!("devices: {e}"));
+        }
+    }
+}
+
+/// An origin for pairing links: what `PairingTicket::link` accepts, and nothing more than an origin.
+fn web_app_origin_ok(text: &str) -> bool {
+    let Ok(url) = url::Url::parse(text) else {
+        return false;
+    };
+    let loopback = match url.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => return false,
+    };
+    (url.scheme() == "https" || (url.scheme() == "http" && loopback))
+        && url.username().is_empty()
+        && url.password().is_none()
+        && matches!(url.path(), "" | "/")
+        && url.query().is_none()
+        && url.fragment().is_none()
+}
+
+/// The `[services]` table: service jobs and their ports (H2 §7.2, §7.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServicesConfig {
+    /// An upgraded port connection closes after this long with no byte in either direction (§7.4, default 600).
+    #[serde(default = "default_port_idle_s")]
+    pub port_idle_s: u32,
+    /// Most upgraded port connections on the TCP listener and `p2pc/http/1` together (§7.4), below
+    /// `http.max_connections`, so the rest stays for other requests. Unset: 64, or less when `http.max_connections`
+    /// is small (see [`Config::port_conn_budget`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port_conn_budget: Option<u32>,
+    /// How long a requeued service with a volume waits for the node that holds it (§7.2, default 900).
+    #[serde(default = "default_volume_affinity_wait_s")]
+    pub volume_affinity_wait_s: u32,
+}
+
+/// Default `services.port_conn_budget` (§7.4).
+pub const DEFAULT_PORT_CONN_BUDGET: u32 = 64;
+/// Default `services.volume_affinity_wait_s` (§7.2).
+pub const DEFAULT_VOLUME_AFFINITY_WAIT_S: u32 = 900;
+/// Largest `services.port_idle_s` and `services.volume_affinity_wait_s` (one day).
+pub const MAX_SERVICE_WAIT_S: u32 = 86_400;
+
+fn default_port_idle_s() -> u32 {
+    DEFAULT_PORT_IDLE.as_secs() as u32
+}
+fn default_volume_affinity_wait_s() -> u32 {
+    DEFAULT_VOLUME_AFFINITY_WAIT_S
+}
+
+impl Default for ServicesConfig {
+    fn default() -> Self {
+        Self {
+            port_idle_s: default_port_idle_s(),
+            port_conn_budget: None,
+            volume_affinity_wait_s: default_volume_affinity_wait_s(),
+        }
+    }
+}
+
+impl ServicesConfig {
+    fn problems(&self, out: &mut Vec<String>) {
+        if !(1..=MAX_SERVICE_WAIT_S).contains(&self.port_idle_s) {
+            out.push(format!("services.port_idle_s must be 1-{MAX_SERVICE_WAIT_S}"));
+        }
+        if self.volume_affinity_wait_s > MAX_SERVICE_WAIT_S {
+            out.push(format!(
+                "services.volume_affinity_wait_s must be 0-{MAX_SERVICE_WAIT_S}"
+            ));
+        }
+    }
+}
+
+/// The `[blobs]` table (H2 §7.5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobsConfig {
+    /// Largest blob upload, in MiB (default 2,048).
+    #[serde(default = "default_max_blob_mb")]
+    pub max_blob_mb: u64,
+    /// The account's blob quota, in MiB (default 20,480; on the hub PC the app sets it from the disk arithmetic of
+    /// §8.2). At least `max_blob_mb`.
+    #[serde(default = "default_blobs_quota_mb")]
+    pub blobs_quota_mb: u64,
+}
+
+/// Largest `blobs.blobs_quota_mb` (and so `max_blob_mb`): 1 PiB, whose bytes still fit in an `i64`.
+pub const MAX_BLOBS_QUOTA_MB: u64 = 1 << 30;
+
+fn default_max_blob_mb() -> u64 {
+    DEFAULT_MAX_BLOB_MB
+}
+fn default_blobs_quota_mb() -> u64 {
+    DEFAULT_BLOBS_QUOTA_MB
+}
+
+impl Default for BlobsConfig {
+    fn default() -> Self {
+        Self {
+            max_blob_mb: default_max_blob_mb(),
+            blobs_quota_mb: default_blobs_quota_mb(),
+        }
+    }
+}
+
+impl BlobsConfig {
+    fn problems(&self, out: &mut Vec<String>) {
+        if !(1..=MAX_BLOBS_QUOTA_MB).contains(&self.blobs_quota_mb) {
+            out.push(format!("blobs.blobs_quota_mb must be 1-{MAX_BLOBS_QUOTA_MB}"));
+        }
+        if self.max_blob_mb == 0 || self.max_blob_mb > self.blobs_quota_mb {
+            out.push("blobs.max_blob_mb must be at least 1 and at most blobs.blobs_quota_mb".to_string());
+        }
+    }
 }
 
 /// The `[storage]` table: logs and artifacts (spec §12).
@@ -420,6 +632,9 @@ impl Config {
             log: LogConfig::default(),
             http: HttpConfig::default(),
             storage: StorageConfig::default(),
+            devices: DevicesConfig::default(),
+            services: ServicesConfig::default(),
+            blobs: BlobsConfig::default(),
         }
     }
 
@@ -462,6 +677,15 @@ impl Config {
     /// The config as TOML text.
     pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
         toml::to_string_pretty(self)
+    }
+
+    /// The effective `services.port_conn_budget` (H2 §7.4): the configured value, or 64 kept below
+    /// `http.max_connections` (at least 1 with one REST connection left, 0 only with a single REST connection).
+    #[must_use]
+    pub fn port_conn_budget(&self) -> u32 {
+        self.services
+            .port_conn_budget
+            .unwrap_or_else(|| DEFAULT_PORT_CONN_BUDGET.min(self.http.max_connections.saturating_sub(1)))
     }
 
     /// Path of the SQLite database.
@@ -509,6 +733,19 @@ impl Config {
         }
         self.http.problems(&mut out);
         self.storage.problems(&mut out);
+        self.devices.problems(&mut out);
+        self.services.problems(&mut out);
+        self.blobs.problems(&mut out);
+        // H2 §7.4: upgraded port connections on the TCP listener and `p2pc/http/1` leave REST slots for other
+        // requests.
+        if let Some(budget) = self.services.port_conn_budget
+            && (budget == 0 || budget >= self.http.max_connections)
+        {
+            out.push(format!(
+                "services.port_conn_budget = {budget} must be at least 1 and below http.max_connections = {}",
+                self.http.max_connections
+            ));
+        }
         // §10 "Tunnel budget": tunnelled streams always leave REST connections for local clients.
         if self.iroh.tunnel_max_streams == 0 || self.iroh.tunnel_max_streams >= self.http.max_connections {
             out.push(format!(
@@ -582,6 +819,92 @@ mod tests {
             assert!(err.to_string().contains("storage.retention_days"), "{err}");
         }
         assert!(parse("data_dir = \"/x\"\n[storage]\nretention = 1\n").is_err());
+    }
+
+    /// H2 §5-§12: every new key has its default, and its relations are checked at start.
+    #[test]
+    fn h2_keys_default_and_their_relations_are_checked() {
+        let c = parse("data_dir = \"/x\"\n").unwrap();
+        assert_eq!(c.devices.web_app_origin, None);
+        assert_eq!(c.devices.web_app_origin(), None);
+        assert_eq!(c.devices.stream_budget(), DeviceStreamBudget::default());
+        assert_eq!(
+            (
+                c.devices.device_streams_per_device,
+                c.devices.device_stream_budget,
+                c.devices.device_stream_admin_reserve
+            ),
+            (16, 96, 32)
+        );
+        assert_eq!(
+            (
+                c.services.port_idle_s,
+                c.port_conn_budget(),
+                c.services.volume_affinity_wait_s
+            ),
+            (600, 64, 900)
+        );
+        // Unset, the port budget stays below a small REST cap; set, it must be below it.
+        let small = parse("data_dir = \"/x\"\n[iroh]\ntunnel_max_streams = 4\n[http]\nmax_connections = 10\n").unwrap();
+        assert_eq!(small.port_conn_budget(), 9);
+        assert_eq!((c.blobs.max_blob_mb, c.blobs.blobs_quota_mb), (2048, 20_480));
+        for good in [
+            "https://app.example.invalid",
+            "https://app.example.invalid/",
+            "http://127.0.0.1:5173",
+        ] {
+            let c = parse(&format!("data_dir = \"/x\"\n[devices]\nweb_app_origin = \"{good}\"\n")).unwrap();
+            assert!(c.devices.web_app_origin().is_some(), "{good}");
+        }
+        for (text, needle) in [
+            (
+                "[devices]\nweb_app_origin = \"http://app.example.invalid\"\n",
+                "devices.web_app_origin",
+            ),
+            (
+                "[devices]\nweb_app_origin = \"https://u:p@app.example.invalid\"\n",
+                "devices.web_app_origin",
+            ),
+            (
+                "[devices]\nweb_app_origin = \"https://app.example.invalid/pair\"\n",
+                "devices.web_app_origin",
+            ),
+            ("[devices]\nweb_app_origin = \"nope\"\n", "devices.web_app_origin"),
+            (
+                "[devices]\ndevice_streams_per_device = 0\n",
+                "device_streams_per_device",
+            ),
+            (
+                "[devices]\ndevice_stream_admin_reserve = 8\n",
+                "device_stream_admin_reserve",
+            ),
+            (
+                "[devices]\ndevice_stream_admin_reserve = 96\n",
+                "device_stream_admin_reserve",
+            ),
+            ("[services]\nport_idle_s = 0\n", "services.port_idle_s"),
+            ("[services]\nport_conn_budget = 256\n", "services.port_conn_budget"),
+            ("[services]\nport_conn_budget = 0\n", "services.port_conn_budget"),
+            (
+                "[services]\nvolume_affinity_wait_s = 86401\n",
+                "services.volume_affinity_wait_s",
+            ),
+            ("[blobs]\nmax_blob_mb = 0\n", "blobs.max_blob_mb"),
+            ("[blobs]\nmax_blob_mb = 30000\n", "blobs.max_blob_mb"),
+            ("[blobs]\nblobs_quota_mb = 0\n", "blobs.blobs_quota_mb"),
+        ] {
+            let err = parse(&format!("data_dir = \"/x\"\n{text}")).unwrap_err();
+            assert!(err.to_string().contains(needle), "{text}: {err}");
+        }
+        // Unknown keys in the new tables are errors too.
+        assert!(parse("data_dir = \"/x\"\n[devices]\nweb_origin = \"https://a.example.invalid\"\n").is_err());
+        // A full H2 config round-trips.
+        let mut c = Config::new(PathBuf::from("/srv/p2pc"));
+        c.devices.web_app_origin = Some("https://app.example.invalid".into());
+        c.devices.device_stream_budget = 200;
+        c.services.port_idle_s = 120;
+        c.blobs.blobs_quota_mb = 4096;
+        assert_eq!(parse(&c.to_toml().unwrap()).unwrap(), c);
     }
 
     /// §10 "Tunnel budget": the default is accepted, and a budget that reaches the REST cap is refused.

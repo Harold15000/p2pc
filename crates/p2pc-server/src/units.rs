@@ -13,7 +13,8 @@
 //! - a job cancelled before it ever ran counts nothing ("never ran" is sticky: no `running` event, T04 review);
 //! - any other job counts its **reservation**: it is queued or running, or it ended with no report.
 
-use p2pc_proto::ids::{AccountId, KeyId};
+use p2pc_proto::api::Principal;
+use p2pc_proto::ids::AccountId;
 use p2pc_proto::units::Units;
 use time::OffsetDateTime;
 
@@ -37,16 +38,16 @@ pub fn gpu_hour_units(config: &Config) -> Units {
     Units::from_units(u64::from(config.gpu_hour_units))
 }
 
-/// Milli-units `key_id` has spent on jobs created in the UTC day of `now`: used by finished jobs, reserved by the
-/// others (see the module docs).
+/// Milli-units `principal` (an API key or a device) has spent on jobs created in the UTC day of `now`: used by
+/// finished jobs, reserved by the others (see the module docs).
 pub async fn spent_today(
     conn: &mut Conn,
     account_id: AccountId,
-    key_id: KeyId,
+    principal: Principal,
     now: OffsetDateTime,
 ) -> Result<Units, StoreError> {
     let (from, to) = utc_day(now);
-    let milli = store::leases::spent_between(conn, account_id, key_id, from, to).await?;
+    let milli = store::leases::spent_between(conn, account_id, principal, from, to).await?;
     Ok(Units::from_milli(milli))
 }
 

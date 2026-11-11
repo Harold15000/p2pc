@@ -17,8 +17,10 @@ use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use p2pc_proto::api::Scope;
 use p2pc_proto::auth::ApiKey;
-use p2pc_proto::ids::{AccountId, ProjectId};
-use p2pc_server::app::{AppState, router};
+use p2pc_proto::ids::{AccountId, DeviceId, ProjectId};
+use p2pc_server::app::{AppState, device_router, router};
+use p2pc_server::auth::DeviceConnection;
+use p2pc_server::clock::Clock;
 use p2pc_server::clock::ManualClock;
 use p2pc_server::config::Config;
 use p2pc_server::store::{self, Db};
@@ -149,6 +151,83 @@ impl TestApp {
 
     pub async fn key_with(&self, scopes: &[Scope]) -> String {
         self.create_key(serde_json::json!({ "scopes": scopes })).await.0
+    }
+
+    /// A request on the device router (H2 §6.3), as the `p2pc/device/1` transport serves it: the device the
+    /// transport authenticated is attached as a request extension, never as a header.
+    pub async fn device_call(&self, device: DeviceId, method: Method, uri: &str, body: Option<Value>) -> Resp {
+        let mut req = Request::builder().method(method).uri(uri);
+        let body = match body {
+            Some(v) => {
+                req = req.header(header::CONTENT_TYPE, "application/json");
+                Body::from(serde_json::to_vec(&v).unwrap())
+            }
+            None => Body::empty(),
+        };
+        let mut req = req.body(body).unwrap();
+        req.extensions_mut().insert(DeviceConnection { device_id: device });
+        self.send_on(device_router(self.state.clone()), req).await
+    }
+
+    /// Sends `req` through `router`.
+    pub async fn send_on(&self, router: Router, req: Request<Body>) -> Resp {
+        let resp = router.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        Resp { status, headers, body }
+    }
+
+    /// Registers a device straight in the store (as `devices add` does) in the default project, with `limits`.
+    pub async fn add_device(&self, scopes: &[Scope], limits: DeviceLimits) -> DeviceId {
+        let mut tx = store::begin_immediate(&self.db).await.unwrap();
+        let new = store::devices::NewDevice {
+            device_id: DeviceId::generate(),
+            project_id: self.project_id,
+            iroh_node_id: node_key(),
+            label: Some("test device".into()),
+            platform: "test".into(),
+            scopes: scopes.to_vec(),
+            daily_unit_cap: limits.daily_unit_cap,
+            allowed_images: limits.allowed_images,
+            blobs_quota_mb: limits.blobs_quota_mb,
+            expires_at: limits.expires_at,
+            paired_by: None,
+        };
+        let row = store::devices::insert(&mut tx, self.account_id, &new, self.clock.now())
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        row.device_id
+    }
+}
+
+/// Limits of a test device.
+#[derive(Debug, Clone, Default)]
+pub struct DeviceLimits {
+    pub daily_unit_cap: Option<p2pc_proto::units::Units>,
+    pub allowed_images: Option<Vec<String>>,
+    pub blobs_quota_mb: Option<u64>,
+    pub expires_at: Option<OffsetDateTime>,
+}
+
+/// A fresh iroh NodeId: 64 lowercase hex characters of a valid Ed25519 public key.
+pub fn node_key() -> String {
+    loop {
+        let bytes = *p2pc_proto::invite::HubNonce::generate().as_bytes();
+        if iroh::PublicKey::from_bytes(&bytes).is_ok() {
+            return data_encoding::HEXLOWER.encode(&bytes);
+        }
+    }
+}
+
+/// 64 hex characters that are **not** an Ed25519 point (some 32-byte strings do not decompress).
+pub fn not_a_point() -> String {
+    loop {
+        let bytes = *p2pc_proto::invite::HubNonce::generate().as_bytes();
+        if iroh::PublicKey::from_bytes(&bytes).is_err() {
+            return data_encoding::HEXLOWER.encode(&bytes);
+        }
     }
 }
 

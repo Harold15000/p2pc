@@ -675,3 +675,53 @@ def test_an_output_file_without_a_member_the_server_always_sends_is_refused(miss
 def test_an_output_file_refuses_a_negative_size() -> None:
     with pytest.raises(ValidationError):
         OutputFile.model_validate({**OUTPUT_ENTRY, "size": -1})
+
+
+def test_a_device_principal_has_no_key_id() -> None:
+    """H2 spec §5.5, §5.6: for a paired device the key IDs are null and the principal names it."""
+    from p2pc.models import JoinTokenInfo, WhoAmI
+
+    device = {"kind": "device", "id": "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"}
+    me = WhoAmI.model_validate(
+        {
+            "account_id": "acc_1",
+            "project_id": "prj_1",
+            "key_id": None,
+            "scopes": ["nodes:read"],
+            "principal": device,
+        }
+    )
+    assert me.key_id is None
+    assert me.principal is not None
+    assert (me.principal.kind, me.principal.id) == ("device", device["id"])
+    token = JoinTokenInfo.model_validate(
+        {
+            "id": "jtk_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "label": None,
+            "created_by_key_id": None,
+            "created_by": device,
+            "pre_approved": True,
+            "bound_iroh_node_id": "ab" * 32,
+            "created_at": "2026-11-05T10:00:00Z",
+            "expires_at": "2026-11-05T10:15:00Z",
+        }
+    )
+    assert token.created_by_key_id is None
+    assert token.created_by is not None
+    assert token.created_by.kind == "device"
+    assert (token.pre_approved, token.bound_iroh_node_id) == (True, "ab" * 32)
+    # An H1 server's listing still parses: the new fields keep their H1 values.
+    h1 = JoinTokenInfo.model_validate(
+        {
+            "id": "jtk_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "created_by_key_id": "abcdefghijkl",
+            "created_at": "2026-11-05T10:00:00Z",
+            "expires_at": "2026-11-05T10:15:00Z",
+        }
+    )
+    assert (h1.created_by_key_id, h1.created_by, h1.pre_approved, h1.bound_iroh_node_id) == (
+        "abcdefghijkl",
+        None,
+        False,
+        None,
+    )

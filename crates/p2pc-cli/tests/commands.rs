@@ -57,7 +57,7 @@ fn login_checks_the_key_stores_it_and_whoami_then_uses_it() {
     for expected in [
         who.account_id.to_string(),
         who.project_id.to_string(),
-        who.key_id.to_string(),
+        who.key_id.unwrap().to_string(),
         "admin, jobs:write".to_string(),
     ] {
         assert!(login.stdout.contains(&expected), "{expected} in {}", login.stdout);
@@ -94,7 +94,7 @@ fn login_checks_the_key_stores_it_and_whoami_then_uses_it() {
     };
     let whoami = again.run(&["whoami"]);
     assert_eq!(whoami.code, 0, "{whoami:?}");
-    assert!(whoami.stdout.contains(&who.key_id.to_string()));
+    assert!(whoami.stdout.contains(&who.key_id.unwrap().to_string()));
     assert_eq!(server.requests_to("GET /v1/whoami").len(), 2);
 
     // `--json` is the API's JSON.
@@ -1117,15 +1117,18 @@ fn join_token_create_token_only_prints_just_the_token() {
 #[test]
 fn join_token_list_and_revoke() {
     let (unused, used) = (JoinTokenId::generate(), JoinTokenId::generate());
-    let info = |id: JoinTokenId, consumed: Option<NodeId>| JoinTokenInfo {
-        id,
-        label: Some("l".into()),
-        created_by_key_id: KeyId::generate(),
-        created_at: fixtures::t0(),
-        expires_at: fixtures::t0() + time::Duration::hours(1),
-        consumed_at: consumed.map(|_| fixtures::t0()),
-        consumed_by_node_id: consumed,
-        revoked_at: None,
+    // A constructor, then the fields: a field added to the shared type does not break this (CONTRIBUTING rule 7).
+    let info = |id: JoinTokenId, consumed: Option<NodeId>| {
+        let mut info = JoinTokenInfo::new(
+            id,
+            KeyId::generate(),
+            fixtures::t0(),
+            fixtures::t0() + time::Duration::hours(1),
+        );
+        info.label = Some("l".into());
+        info.consumed_at = consumed.map(|_| fixtures::t0());
+        info.consumed_by_node_id = consumed;
+        info
     };
     let node = NodeId::generate();
     let page = Page {

@@ -108,6 +108,24 @@ impl Fleet {
         agent
     }
 
+    /// A `Join` with `token` from a new connection of the agent whose iroh key is `key` (so the test knows its NodeId
+    /// beforehand, as for a join request, H2 §5.4). Returns the agent and the server's first answer; `None` means it
+    /// closed without one.
+    pub async fn join_as(&self, key: &SecretKey, token: JoinToken) -> (FakeAgent, Option<ServerMsg>) {
+        let mut agent = FakeAgent::connect(self.addr(), key).await;
+        agent
+            .send(&AgentMsg::Join {
+                token,
+                inventory: super::inventory("node"),
+            })
+            .await;
+        let answer = agent.recv().await;
+        if let Some(ServerMsg::Welcome { node_id, .. }) = &answer {
+            agent.node_id = Some(*node_id);
+        }
+        (agent, answer)
+    }
+
     /// The agent restarts: a new connection with the same key, whose `Hello` lists no running lease (so the server
     /// loses its leases at once, §6 "Reconnects").
     pub async fn restart(&self, agent: FakeAgent) -> FakeAgent {

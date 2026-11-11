@@ -10,12 +10,13 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use p2pc_proto::api::{
-    AuditKind, CreateJoinToken, JoinTokenInfo, JoinTokenResponse, Node, NodeState, Page, Problem, ServerInfo,
+    AuditKind, CreateJoinToken, JoinTokenInfo, JoinTokenResponse, Node, NodeState, Page, Problem, Scope, ServerInfo,
 };
 use p2pc_proto::auth::{DEFAULT_JOIN_TOKEN_TTL, JoinToken, MAX_JOIN_TOKEN_TTL};
 use p2pc_proto::ids::{JoinTokenId, NodeId};
-use p2pc_proto::protocol::ServerMsg;
+use p2pc_proto::protocol::{NodeApproved, ServerMsg, capability};
 use p2pc_proto::validate::ErrorCode;
+use p2pc_proto::validate::keys::MAX_RESTRICTED_JOIN_TOKEN_TTL_S;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use time::Duration;
@@ -61,7 +62,21 @@ pub async fn get_server(State(state): State<AppState>, _key: AnyKey) -> Json<Ser
     Json(state.server.info())
 }
 
+/// Who may mint a join token: `admin` principals only, as in H1.
+///
+/// TODO(T2-12): also accept `nodes:join` (`p.has_scope(Scope::NodesJoin)`, H2 §5.4) once the scheduler refuses
+/// leases to `pending_approval` nodes. Until then a node enrolled with a non-`admin`'s token would be stored
+/// `pending_approval` and still get work (SI-H2-19), so the scope stays defined but grants nothing here. The rules
+/// for such callers in [`create_join_token`] (no `pre_approved`, at most 900 s) are already written for that day.
+fn may_mint_join_token(p: &crate::auth::Principal) -> bool {
+    p.is_admin()
+}
+
 /// Creates a single-use join token. The token is in the response, once.
+///
+/// Only `admin` principals mint tokens, as in H1. `pre_approved` (at most 900 s) makes the node start `approved`;
+/// without it, a token minted by an `admin` **device** gives a `pending_approval` node, while a token of an `admin`
+/// API key enrolls as in H1 (H2 §5.5).
 #[utoipa::path(
     post,
     path = "/v1/nodes/join-tokens",
@@ -70,21 +85,35 @@ pub async fn get_server(State(state): State<AppState>, _key: AnyKey) -> Json<Ser
     responses(
         (status = 201, description = "The token (`p2pc_join_…`), shown only this once.", body = JoinTokenResponse),
         (status = 401, description = "Missing or invalid key (also when the key was revoked or expired during the request).", content_type = "application/problem+json", body = Problem),
-        (status = 403, description = "The key lacks the admin scope.", content_type = "application/problem+json", body = Problem),
-        (status = 422, description = "Invalid `label` or `ttl_s` (1-86400, default 900).", content_type = "application/problem+json", body = Problem),
+        (status = 403, description = "The caller lacks the admin scope.", content_type = "application/problem+json", body = Problem),
+        (status = 422, description = "Invalid `label` or `ttl_s` (1-86400, default 900; at most 900 with `pre_approved`).", content_type = "application/problem+json", body = Problem),
     )
 )]
 pub async fn create_join_token(
     State(state): State<AppState>,
-    Authorized { principal: p, .. }: AdminKey,
+    Authorized { principal: p, .. }: AnyKey,
     ApiJson(body): ApiJson<CreateJoinToken>,
 ) -> Result<Response, ApiError> {
+    if !may_mint_join_token(&p) {
+        return Err(ApiError::forbidden(Scope::Admin));
+    }
+    // `pre_approved` carries an `admin`'s approval of the node: only an `admin` may set it (H2 §7.3).
+    if body.pre_approved && !p.is_admin() {
+        return Err(ApiError::forbidden(Scope::Admin));
+    }
     let ttl_s = body.ttl_s.unwrap_or(DEFAULT_JOIN_TOKEN_TTL.whole_seconds() as u32);
     if ttl_s == 0 || i64::from(ttl_s) > MAX_JOIN_TOKEN_TTL.whole_seconds() {
         return Err(ApiError::field(
             "ttl_s",
             ErrorCode::OutOfRange,
             format!("must be 1-{}", MAX_JOIN_TOKEN_TTL.whole_seconds()),
+        ));
+    }
+    if (body.pre_approved || !p.is_admin()) && ttl_s > MAX_RESTRICTED_JOIN_TOKEN_TTL_S {
+        return Err(ApiError::field(
+            "ttl_s",
+            ErrorCode::OutOfRange,
+            format!("must be at most {MAX_RESTRICTED_JOIN_TOKEN_TTL_S} with pre_approved or for a nodes:join caller"),
         ));
     }
     if let Some(label) = &body.label
@@ -99,7 +128,10 @@ pub async fn create_join_token(
     let mut tx = store::begin_immediate(&state.db).await?;
     // §5 "Re-checked at the point of use", with the time read once the write lock is held.
     let now = state.clock.now();
-    recheck_caller(&mut tx, &state, &p, now).await?;
+    let caller = recheck_caller(&mut tx, &state, &p, now).await?;
+    if !may_mint_join_token(&caller) || (body.pre_approved && !caller.is_admin()) {
+        return Err(ApiError::forbidden(Scope::Admin));
+    }
     let token = JoinToken::generate(
         state.server.node_id().to_string(),
         state.server.relays().to_vec(),
@@ -115,16 +147,22 @@ pub async fn create_join_token(
         project_id: p.project_id,
         code_digest: token.code_hash(),
         label: body.label.clone(),
-        created_by_key_id: p.key_id,
+        created_by: p.id,
+        bound_iroh_node_id: None,
+        pre_approved: body.pre_approved,
         expires_at: token.expires_at,
     };
     let row = store::join_tokens::insert(&mut tx, p.account_id, &new, now).await?;
-    let event = NewEvent {
-        kind: AuditKind::JoinTokenCreated,
-        actor_key_id: Some(p.key_id),
-        subject_id: Some(row.id.to_string()),
-        detail: detail(serde_json::json!({ "ttl_s": ttl_s, "project_id": row.project_id })),
-    };
+    let event = NewEvent::new(
+        AuditKind::JoinTokenCreated,
+        Some(p.id),
+        Some(row.id.to_string()),
+        detail(serde_json::json!({
+            "ttl_s": ttl_s,
+            "project_id": row.project_id,
+            "pre_approved": row.pre_approved,
+        })),
+    );
     store::audit::append(&mut tx, p.account_id, &event, now).await?;
     tx.commit().await.map_err(store::StoreError::from)?;
     tracing::info!(join_token_id = %row.id, "join token created");
@@ -132,6 +170,20 @@ pub async fn create_join_token(
     debug_assert_eq!(token.expires_at, row.expires_at);
     let body = JoinTokenResponse::new(row.id, token);
     Ok(no_store((StatusCode::CREATED, Json(body)).into_response()))
+}
+
+/// The public view of a join token (never the code or its digest): `created_by_key_id` as in H1 (`null` for a token
+/// minted by a device), plus `created_by` (`{kind, id}`), `pre_approved` and `bound_iroh_node_id` (H2 §5.4, §5.6).
+pub fn join_token_view(row: &store::join_tokens::JoinTokenRow) -> JoinTokenInfo {
+    // A constructor, then the fields: a field added to the shared type does not break this (CONTRIBUTING rule 7).
+    let mut info = JoinTokenInfo::by_principal(row.id, row.created_by, row.created_at, row.expires_at);
+    info.label.clone_from(&row.label);
+    info.pre_approved = row.pre_approved;
+    info.bound_iroh_node_id.clone_from(&row.bound_iroh_node_id);
+    info.consumed_at = row.consumed_at;
+    info.consumed_by_node_id = row.consumed_by_node_id;
+    info.revoked_at = row.revoked_at;
+    info
 }
 
 /// The account's join tokens, in creation order. Never contains a token or a code.
@@ -166,7 +218,7 @@ pub async fn list_join_tokens(
         .then(|| rows.last().map(|r| TokenCursor::after(r).encode()))
         .flatten();
     Ok(Json(Page {
-        items: rows.iter().map(store::join_tokens::JoinTokenRow::info).collect(),
+        items: rows.iter().map(join_token_view).collect(),
         next_cursor,
     }))
 }
@@ -197,12 +249,12 @@ pub async fn revoke_join_token(
     recheck_caller(&mut tx, &state, &p, now).await?;
     match store::join_tokens::revoke(&mut tx, p.account_id, id, now).await? {
         Revoke::Revoked => {
-            let event = NewEvent {
-                kind: AuditKind::JoinTokenRevoked,
-                actor_key_id: Some(p.key_id),
-                subject_id: Some(id.to_string()),
-                detail: Map::new(),
-            };
+            let event = NewEvent::new(
+                AuditKind::JoinTokenRevoked,
+                Some(p.id),
+                Some(id.to_string()),
+                Map::new(),
+            );
             store::audit::append(&mut tx, p.account_id, &event, now).await?;
             tx.commit().await.map_err(store::StoreError::from)?;
             tracing::info!(join_token_id = %id, "join token revoked");
@@ -422,12 +474,7 @@ pub async fn delete_node(
     if !store::nodes::soft_delete(&mut tx, p.account_id, id, now).await? {
         return Err(ApiError::not_found());
     }
-    let event = NewEvent {
-        kind: AuditKind::NodeDeleted,
-        actor_key_id: Some(p.key_id),
-        subject_id: Some(id.to_string()),
-        detail: Map::new(),
-    };
+    let event = NewEvent::new(AuditKind::NodeDeleted, Some(p.id), Some(id.to_string()), Map::new());
     store::audit::append(&mut tx, p.account_id, &event, now).await?;
     tx.commit().await.map_err(store::StoreError::from)?;
     // Ordering, against the gateway's sessions (see `gateway::hub`): `deleted_at` is committed **before** the
@@ -442,4 +489,59 @@ pub async fn delete_node(
         .await;
     tracing::info!(node_id = %id, "node deleted");
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Approves a `pending_approval` node (H2 §5.5): from then on the scheduler may offer it leases. Idempotent: approving
+/// an approved node changes nothing and is not audited again. `admin` only.
+///
+/// The node is told `NodeApproved{}` when it is connected and declared the `approval` capability; an agent without
+/// it simply starts getting leases.
+#[utoipa::path(
+    post,
+    path = "/v1/nodes/{id}/approve",
+    tag = "nodes",
+    params(("id" = String, Path, description = "The node ID (`node_…`).")),
+    responses(
+        (status = 200, description = "The node, now approved.", body = Node),
+        (status = 401, description = "Missing or invalid key (also when the caller was revoked or expired during the request).", content_type = "application/problem+json", body = Problem),
+        (status = 403, description = "The caller lacks the admin scope.", content_type = "application/problem+json", body = Problem),
+        (status = 404, description = "No such node in this account.", content_type = "application/problem+json", body = Problem),
+    )
+)]
+pub async fn approve_node(
+    State(state): State<AppState>,
+    Authorized { principal: p, .. }: AdminKey,
+    Path(id): Path<String>,
+) -> Result<Json<Node>, ApiError> {
+    let id = parse_node_id(&id)?;
+    let mut tx = store::begin_immediate(&state.db).await?;
+    let now = state.clock.now();
+    // Approval grants power: the approving principal must still be live (§5 "Re-checked at the point of use").
+    recheck_caller(&mut tx, &state, &p, now).await?;
+    let changed = store::nodes::approve(&mut tx, p.account_id, id)
+        .await?
+        .ok_or_else(ApiError::not_found)?;
+    if changed {
+        let event = NewEvent::new(AuditKind::NodeApproved, Some(p.id), Some(id.to_string()), Map::new());
+        store::audit::append(&mut tx, p.account_id, &event, now).await?;
+    }
+    let row = store::nodes::get(&mut tx, p.account_id, id)
+        .await?
+        .ok_or_else(ApiError::not_found)?;
+    let held = store::leases::held_for_account(&mut tx, p.account_id).await?;
+    tx.commit().await.map_err(store::StoreError::from)?;
+    if changed {
+        tracing::info!(node_id = %id, "node approved");
+        if row.features.iter().any(|f| f == capability::APPROVAL) {
+            match state.hub.send(id, ServerMsg::NodeApproved(NodeApproved {})) {
+                Ok(()) | Err(SendError::NotConnected) => {}
+                Err(SendError::Full) => {
+                    tracing::warn!(node_id = %id, "NodeApproved not sent: the node's queue is full")
+                }
+            }
+        }
+        // An eligible node appeared: the offer cap re-arms (§8).
+        crate::scheduler::node_changed(&state.db, &state.kick, p.account_id).await;
+    }
+    Ok(Json(view(&state, &row, &held)))
 }
