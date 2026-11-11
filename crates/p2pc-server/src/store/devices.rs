@@ -715,8 +715,8 @@ pub async fn list_tickets(
     rows.into_iter().map(decode_ticket).collect()
 }
 
-/// Whether `account_id` has a ticket that a `Pair` could consume at `now`: `p2pc/pair/1` is served only then
-/// (§5.3, §10.5).
+/// Whether any account has a ticket that a `Pair` could consume at `now`: the hub serves `p2pc/pair/1` only then
+/// (§5.3, §10.5). Protocol side, before there is a principal: it reads no ticket, only whether one is open.
 pub async fn any_open_ticket(conn: &mut Conn, now: OffsetDateTime) -> Result<bool, StoreError> {
     let n: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pairing_tickets WHERE consumed_at IS NULL AND revoked_at IS NULL AND expires_at > ?",

@@ -391,7 +391,21 @@ pub async fn deliver(
 
 /// The expiry sweep: every open request past its 15 minutes becomes `expired`. Bookkeeping only: no transition
 /// depends on it (see the module docs). Returns how many it closed.
+///
+/// It reads first and writes only when there is something to close. The device liveness sweep calls it every 2 s
+/// (H2 §5.5), and an `UPDATE` that matches nothing would still take SQLite's write lock: behind another writer it
+/// could wait for the busy timeout and delay the next pass, which is what closes revoked devices within 5 s.
 pub async fn expire(conn: &mut Conn, now: OffsetDateTime) -> Result<u64, StoreError> {
+    let due: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM join_requests \
+         WHERE state IN ('awaiting_reveal', 'pending', 'approved') AND expires_at <= ?1",
+    )
+    .bind(ts(now))
+    .fetch_one(&mut *conn)
+    .await?;
+    if due == 0 {
+        return Ok(0);
+    }
     let done = sqlx::query(
         "UPDATE join_requests SET state = 'expired', closed_at = ?1 \
          WHERE state IN ('awaiting_reveal', 'pending', 'approved') AND expires_at <= ?1",
