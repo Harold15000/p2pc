@@ -466,3 +466,24 @@ async fn the_limits_bound_one_stolen_phone() {
         "too_many_join_requests",
     );
 }
+
+/// SI-H2-16: two requests with identical inputs get different hub nonces **and different phrases**, so a phrase
+/// cannot be precomputed from what the requester controls.
+#[tokio::test]
+async fn identical_requests_show_different_approval_phrases() {
+    let app = TestApp::new().await;
+    let phone = app.add_device(&PHONE_PROFILE, DeviceLimits::default()).await;
+    let (b, nonce, _) = body(&app);
+    let mut phrases = Vec::new();
+    for _ in 0..2 {
+        let created = create(&app, phone, &b).await;
+        assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+        let id = created.json()["id"].as_str().unwrap().to_string();
+        let r = reveal(&app, phone, &id, &hex(&nonce)).await;
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+        let phrase = r.json()["approval_phrase"].as_str().unwrap().to_string();
+        assert_eq!(phrase.split(' ').count(), 6);
+        phrases.push(phrase);
+    }
+    assert_ne!(phrases[0], phrases[1]);
+}

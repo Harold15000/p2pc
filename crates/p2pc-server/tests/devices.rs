@@ -800,3 +800,151 @@ async fn devices_add_and_revoke_work_offline_and_are_audited() {
     assert_eq!(kinds.iter().filter(|k| *k == "device_added_offline").count(), 1);
     assert_eq!(kinds.iter().filter(|k| *k == "device_revoked_offline").count(), 1);
 }
+
+/// §5.3, §10.5: the hub serves `p2pc/pair/1` only while a pairing ticket is open. The gateway (T2-11) asks the store;
+/// a ticket stops counting once it is consumed, revoked or expired.
+#[tokio::test]
+async fn a_ticket_is_open_only_until_it_is_consumed_revoked_or_expired() {
+    let app = new_app().await;
+    let open = |app: &TestApp| {
+        let (db, now) = (app.db.clone(), app.clock.now());
+        async move {
+            let mut conn = db.acquire().await.unwrap();
+            store::devices::any_open_ticket(&mut conn, now).await.unwrap()
+        }
+    };
+    assert!(!open(&app).await);
+    let (t, _) = ticket(&app, json!({})).await;
+    assert!(open(&app).await);
+    paired(pair(&app, &t.code_hash(), &node_key()).await);
+    assert!(!open(&app).await, "consumed");
+    let (_, v) = ticket(&app, json!({})).await;
+    let path = format!("/v1/devices/pairing-tickets/{}", v["id"].as_str().unwrap());
+    assert_eq!(
+        app.call(Method::DELETE, &path, Some(&app.admin), None).await.status,
+        StatusCode::NO_CONTENT
+    );
+    assert!(!open(&app).await, "revoked");
+    ticket(&app, json!({"expires_in_s": 30})).await;
+    app.clock.advance(Duration::seconds(29));
+    assert!(open(&app).await);
+    app.clock.advance(Duration::seconds(1));
+    assert!(!open(&app).await, "expired at its expiry");
+}
+
+/// SI-H2-18: an `admin` with a blob quota could not have created a device without one, so it cannot revoke it.
+#[tokio::test]
+async fn an_admin_with_a_blob_quota_cannot_revoke_a_device_without_one() {
+    let app = new_app().await;
+    let quota = app
+        .add_device(
+            &[Scope::Admin],
+            DeviceLimits {
+                blobs_quota_mb: Some(100),
+                ..DeviceLimits::default()
+            },
+        )
+        .await;
+    let unbound = app.add_device(&PHONE_PROFILE, DeviceLimits::default()).await;
+    let within = app
+        .add_device(
+            &PHONE_PROFILE,
+            DeviceLimits {
+                blobs_quota_mb: Some(50),
+                ..DeviceLimits::default()
+            },
+        )
+        .await;
+    let r = app
+        .device_call(quota, Method::DELETE, &format!("/v1/devices/{unbound}"), None)
+        .await;
+    let v = assert_problem(&r, StatusCode::FORBIDDEN, "escalation_denied");
+    assert_eq!(v["errors"][0]["field"], "blobs_quota_mb");
+    let r = app
+        .device_call(quota, Method::DELETE, &format!("/v1/devices/{within}"), None)
+        .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    // The device that was refused is still live.
+    let r = app.device_call(unbound, Method::GET, "/v1/whoami", None).await;
+    assert_eq!(r.status, StatusCode::OK);
+}
+
+/// SI-H2-18, SI-H2-19 (the routes that exist with T2-10): the default phone profile is exactly four scopes, with no
+/// `nodes:join`, and a phone-profile device reaches none of the developer or admin routes. The job routes' template
+/// view and the blob routes get their negative tests with T2-12 and T2-14.
+#[tokio::test]
+async fn the_phone_profile_reaches_only_what_its_scopes_allow() {
+    assert_eq!(
+        PHONE_PROFILE,
+        [
+            Scope::NodesRead,
+            Scope::TemplatesLaunch,
+            Scope::BlobsWrite,
+            Scope::NodesInvite
+        ]
+    );
+    let app = new_app().await;
+    let phone = app.add_device(&PHONE_PROFILE, DeviceLimits::default()).await;
+    let other = app.add_device(&PHONE_PROFILE, DeviceLimits::default()).await;
+    let node = p2pc_proto::ids::NodeId::generate();
+    let key = app.admin_key.key_id();
+    let job = json!({"image": "python:3.12-slim", "command": ["true"], "resources": {"cpu": 1, "memory_mb": 512}});
+    let forbidden: Vec<(Method, String, Option<Value>)> = vec![
+        (Method::POST, "/v1/jobs".into(), Some(job.clone())),
+        (Method::POST, "/v1/estimate".into(), Some(job)),
+        (
+            Method::GET,
+            "/v1/usage?from=2026-11-01T00:00:00Z&to=2026-11-02T00:00:00Z".into(),
+            None,
+        ),
+        (Method::POST, "/v1/nodes/join-tokens".into(), Some(json!({}))),
+        (Method::GET, "/v1/nodes/join-tokens".into(), None),
+        (Method::POST, "/v1/devices/pairing-tickets".into(), Some(json!({}))),
+        (Method::GET, "/v1/devices/pairing-tickets".into(), None),
+        (Method::POST, format!("/v1/nodes/{node}/drain"), None),
+        (Method::POST, format!("/v1/nodes/{node}/resume"), None),
+        (Method::POST, format!("/v1/nodes/{node}/approve"), None),
+        (Method::DELETE, format!("/v1/nodes/{node}"), None),
+        (Method::GET, "/v1/keys".into(), None),
+        (Method::POST, "/v1/keys".into(), Some(json!({"scopes": ["admin"]}))),
+        (Method::DELETE, format!("/v1/keys/{key}"), None),
+        (Method::GET, "/v1/audit".into(), None),
+        (
+            Method::POST,
+            "/v1/nodes/join-requests/jrq_01ARZ3NDEKTSV4RRFFQ69G5FAV/approve".into(),
+            None,
+        ),
+    ];
+    for (method, uri, body) in forbidden {
+        let r = app.device_call(phone, method.clone(), &uri, body).await;
+        assert_problem(&r, StatusCode::FORBIDDEN, "forbidden");
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{method} {uri}");
+    }
+    // Another device is as invisible as an unknown one.
+    for method in [Method::GET, Method::DELETE] {
+        let r = app
+            .device_call(phone, method, &format!("/v1/devices/{other}"), None)
+            .await;
+        assert_problem(&r, StatusCode::NOT_FOUND, "not_found");
+    }
+    // What it may do: see the PCs, see itself, open a join request (tested in `join_requests.rs`).
+    for uri in [
+        "/v1/nodes",
+        "/v1/whoami",
+        "/v1/devices",
+        "/v1/server",
+        "/v1/nodes/join-requests",
+    ] {
+        let r = app.device_call(phone, Method::GET, uri, None).await;
+        assert_eq!(r.status, StatusCode::OK, "{uri}: {:?}", r.body);
+    }
+    // Nothing was created or removed by the refused calls.
+    let counts: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM jobs), (SELECT COUNT(*) FROM join_tokens), \
+                (SELECT COUNT(*) FROM pairing_tickets), (SELECT COUNT(*) FROM api_keys WHERE revoked_at IS NULL)",
+    )
+    .fetch_one(&app.db)
+    .await
+    .unwrap();
+    assert_eq!(counts, (0, 0, 0, 1));
+}

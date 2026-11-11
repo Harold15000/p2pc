@@ -437,6 +437,58 @@ async fn the_rebuild_keeps_every_h1_row_value_trigger_and_number() {
         assert_eq!(total.attempts, 3);
         assert_eq!(total.units.milli(), 800 + 300 + 1500);
     }
+
+    // Last, because it adds a row: the rebuilt ledger's own constraints (§5.6, §12), on a copy of an H1 row that
+    // differs only in the columns under test. An earlier slice of the same attempt (`last_slice = 0`, a later
+    // `slice_start`) is accepted with exactly one principal, and refused with both, with neither, as a second last
+    // slice, or at a `slice_start` the attempt already has.
+    let device = p2pc_proto::ids::DeviceId::generate().to_string();
+    sqlx::query(
+        "INSERT INTO devices (device_id, account_id, project_id, iroh_node_id, scopes, created_at) \
+         VALUES (?, ?, ?, ?, '[\"admin\"]', 0)",
+    )
+    .bind(&device)
+    .bind(fx.account.to_string())
+    .bind(fx.project.to_string())
+    .bind("cd".repeat(32))
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    // `?1`: keep the key (1) or not (0); `?2`: the device or NULL; `?3`: last_slice; `?4`: seconds after the start.
+    let slice = "INSERT INTO usage_records (job_id, attempt, lease_id, node_id, key_id, device_id, account_id, \
+                 project_id, kind, started_at, ended_at, slice_start, slice_end, last_slice, charge_day, \
+                 reserved_cpu_ms, reserved_gpu_ms, used_cpu_ms, max_rss_mb, units) \
+                 SELECT job_id, attempt, lease_id, node_id, CASE ?1 WHEN 1 THEN key_id END, ?2, account_id, \
+                        project_id, kind, started_at, ended_at, started_at + ?4, slice_end, ?3, charge_day, 0, 0, 0, 0, 0 \
+                 FROM usage_records WHERE ended_at - started_at > 10 ORDER BY id LIMIT 1";
+    let refused: [(i64, Option<&str>, i64, i64, &str); 4] = [
+        (1, Some(&device), 0, 1, "CHECK constraint failed"),
+        (0, None, 0, 1, "CHECK constraint failed"),
+        (1, None, 1, 1, "UNIQUE constraint failed"),
+        (1, None, 0, 0, "UNIQUE constraint failed"),
+    ];
+    for (keep_key, dev, last, offset, want) in refused {
+        let err = sqlx::query(slice)
+            .bind(keep_key)
+            .bind(dev)
+            .bind(last)
+            .bind(offset)
+            .execute(&mut conn)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains(want),
+            "{keep_key}/{dev:?}/{last}/{offset}: {err}"
+        );
+    }
+    sqlx::query(slice)
+        .bind(1_i64)
+        .bind(None::<&str>)
+        .bind(0_i64)
+        .bind(1_i64)
+        .execute(&mut conn)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -511,4 +563,84 @@ async fn principal_columns_take_exactly_one_principal() {
     .execute(&mut conn)
     .await;
     assert!(r.is_err(), "an event has at most one actor");
+}
+
+/// The same upgrade as the server does it: an H1 database **file**, created and migrated by sqlx's own migrator
+/// restricted to the H1 migrations, is opened by `store::open`, which runs the H2 migrations through the embedded
+/// migrator (its transaction, its bookkeeping table, a pool with `foreign_keys = ON`). Every H1 row survives, no
+/// foreign key dangles, and a second open applies nothing.
+#[tokio::test]
+async fn store_open_upgrades_an_h1_database_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("p2pc.db");
+    let h1_only = sqlx::migrate::Migrator {
+        migrations: MIGRATOR
+            .iter()
+            .filter(|m| m.version < FIRST_H2)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into(),
+        ..sqlx::migrate::Migrator::DEFAULT
+    };
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&path)
+        .create_if_missing(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .foreign_keys(true);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    h1_only.run(&pool).await.unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    let fx = fill_h1(&mut conn).await;
+    let rows_before = h1_rows(&mut conn).await;
+    let applied_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    drop(conn);
+    pool.close().await;
+
+    let db = store::open(&path, store::OpenMode::Existing).await.unwrap();
+    let mut conn = db.acquire().await.unwrap();
+    assert_eq!(h1_rows(&mut conn).await, rows_before);
+    let fk: Vec<(String, i64, String, i64)> = sqlx::query_as("PRAGMA foreign_key_check")
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+    assert!(fk.is_empty(), "{fk:?}");
+    let applied: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE success")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(applied, applied_before + 2, "the two H2 migrations were applied");
+    // The H2 code works on it: a device can be registered next to the H1 keys.
+    let device = store::devices::NewDevice {
+        device_id: p2pc_proto::ids::DeviceId::generate(),
+        project_id: fx.project,
+        iroh_node_id: "ef".repeat(32),
+        label: None,
+        platform: String::new(),
+        scopes: vec![p2pc_proto::api::Scope::Admin],
+        daily_unit_cap: None,
+        allowed_images: None,
+        blobs_quota_mb: None,
+        expires_at: None,
+        paired_by: Some(Principal::Key(fx.k1)),
+    };
+    store::devices::insert(&mut conn, fx.account, &device, datetime!(2026-11-10 00:00:00 UTC))
+        .await
+        .unwrap();
+    drop(conn);
+    db.close().await;
+    // Reopening applies nothing twice.
+    let db = store::open(&path, store::OpenMode::Existing).await.unwrap();
+    let again: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(again, applied);
+    db.close().await;
 }
