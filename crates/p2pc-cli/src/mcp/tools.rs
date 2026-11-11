@@ -9,8 +9,9 @@ use std::time::Duration;
 
 use p2pc_client::{Client, DownloadError, Error, ListParams, fetch_all};
 use p2pc_proto::api::{
-    DEFAULT_DISK_MB, DEFAULT_TIMEOUT_S, Egress, InputFile, Job, JobSpec, LogLine, MAX_PAGE_LIMIT, Node, OutputFile,
-    Outputs, Placement, REDACTED, Resources, Retry,
+    BLOB_REF_PREFIX, BlobInput, BlobRef, DEFAULT_DISK_MB, DEFAULT_MAX_BLOB_MB, DEFAULT_TIMEOUT_S, Egress, InputFile,
+    Job, JobSpec, LogLine, MAX_PAGE_LIMIT, Node, OutputFile, Outputs, Placement, REDACTED, Resources, Retry,
+    Sha256Digest,
 };
 use p2pc_proto::ids::JobId;
 use p2pc_proto::validate::{FieldError, ValidationErrors};
@@ -18,6 +19,7 @@ use rmcp::model::JsonObject;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
+use super::upload::{ReadError, read_exact_hashed};
 use super::{
     MAX_INLINE_FILE_BYTES, MAX_INLINE_TOTAL_BYTES, MAX_LOG_BYTES, MAX_WAIT_S, McpConfig, Scrubber, UNTRUSTED_NOTE,
 };
@@ -234,6 +236,9 @@ struct JobInput {
     env: BTreeMap<String, String>,
     #[serde(default)]
     files: Vec<FileInput>,
+    /// Blobs by digest (H2 §7.8). Never a local path: a file reaches a job only through `p2pc_blob_put`.
+    #[serde(default)]
+    inputs: Vec<BlobInputArg>,
     #[serde(default)]
     egress: EgressInput,
     #[serde(default)]
@@ -268,6 +273,14 @@ struct FileInput {
     path: String,
     content: Option<String>,
     content_b64: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BlobInputArg {
+    path: String,
+    /// `sha256:<64 lowercase hex>`; anything else (a path, a URL) is refused when the job is built.
+    blob: String,
 }
 
 #[derive(Default, Deserialize)]
@@ -311,6 +324,17 @@ impl JobInput {
                 content_b64,
             });
         }
+        let mut inputs = Vec::with_capacity(self.inputs.len());
+        for input in self.inputs {
+            let blob = BlobRef::from_str(&input.blob).map_err(|_| {
+                ToolError::invalid(format!(
+                    "inputs: `blob` of {} must be a digest `sha256:<64 lowercase hex>`, as p2pc_blob_put returns it; \
+                     a local path is never accepted here. nothing was sent",
+                    input.path
+                ))
+            })?;
+            inputs.push(BlobInput { path: input.path, blob });
+        }
         let spec = JobSpec {
             name: self.name,
             image: self.image,
@@ -339,7 +363,7 @@ impl JobInput {
             kind: p2pc_proto::api::JobKind::Batch,
             service: None,
             volumes: Vec::new(),
-            inputs: Vec::new(),
+            inputs,
             template: None,
         };
         // The same checks as the server's, minus the registry policy that only the server knows.
@@ -372,6 +396,13 @@ struct ResultsInput {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NoInput {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BlobPutInput {
+    /// Relative to the upload directory (an absolute path under it is accepted too).
+    path: String,
+}
 
 fn parse_job_id(text: &str) -> Result<JobId, ToolError> {
     JobId::from_str(text)
@@ -437,6 +468,7 @@ impl Tools {
             "p2pc_results" => self.results(args).await,
             "p2pc_cancel" => self.cancel(args).await,
             "p2pc_machines" => self.machines(args).await,
+            "p2pc_blob_put" => self.blob_put(args).await,
             _ => return None,
         };
         Some(match outcome {
@@ -556,6 +588,67 @@ impl Tools {
         .map_err(|e| ToolError::client(&e, "nodes:read"))?;
         let machines: Vec<Value> = nodes.iter().map(machine).collect();
         Ok(Reply::ok(json!({"machines": machines})))
+    }
+
+    /// `p2pc_blob_put` (H2 §7.8, SI-H2-21): uploads a file of the upload directory as a blob.
+    ///
+    /// The path rules and the safe open come first, before the hub is asked anything. The size from `fstat` is held
+    /// against the hub's `max_blob_mb`; the hash reads the descriptor; and, if the hub lacks the blob, the descriptor
+    /// is read again into a private temporary copy that is what the client uploads (the client opens the file it
+    /// uploads by path, which must never be a path the agent named). Both reads stop at the size that was checked,
+    /// and the second must give the same hash: a file that changes while it is read is refused. The answer never
+    /// holds file contents.
+    async fn blob_put(&self, args: JsonObject) -> Result<Reply, ToolError> {
+        let input = parse_args::<BlobPutInput>(args)?;
+        let Some(dir) = self.config.upload_dir.clone() else {
+            return Err(ToolError::new(
+                "path_not_allowed",
+                "no upload directory is configured: start `p2pc mcp` with --upload-dir",
+            ));
+        };
+        let opened = blocking(move || dir.open(&input.path))
+            .await?
+            .map_err(|e| ToolError::new("path_not_allowed", e.0))?;
+        let size = opened.size;
+        let max_mb = self
+            .client
+            .server_info()
+            .await
+            .map_err(|e| ToolError::client(&e, "blobs:write"))?
+            .max_blob_mb
+            .unwrap_or(DEFAULT_MAX_BLOB_MB);
+        if size > max_mb.saturating_mul(1024 * 1024) {
+            return Err(ToolError::new(
+                "path_not_allowed",
+                format!("the file is larger than the hub's limit for a blob ({max_mb} MiB); nothing was uploaded"),
+            ));
+        }
+
+        let mut file = opened.file;
+        let (file, digest) = blocking(move || {
+            let digest = read_exact_hashed(&mut file, size, None::<&mut std::fs::File>)?;
+            Ok::<_, ReadError>((file, digest))
+        })
+        .await?
+        .map_err(read_failure)?;
+        let blob = format!("{BLOB_REF_PREFIX}{digest}");
+
+        let present = match self.client.head_blob(&digest).await {
+            Ok(found) => found.is_some(),
+            // A `HEAD` answer has no body: a refusal there says nothing, and the upload's own answer does.
+            Err(Error::Unexpected(u)) if u.status.is_some_and(|s| (400..500).contains(&s)) => false,
+            Err(e) => return Err(ToolError::client(&e, "blobs:write")),
+        };
+        if !present {
+            let copy = blocking(move || stage(file, size, &digest))
+                .await?
+                .map_err(read_failure)?;
+            self.client
+                .put_blob(&copy.path, &digest, size)
+                .await
+                .map_err(|e| ToolError::client(&e, "blobs:write"))?;
+        }
+        Ok(Reply::ok(json!({"blob": blob, "size": size, "uploaded": !present})))
     }
 
     async fn logs(&self, args: JsonObject) -> Result<Reply, ToolError> {
@@ -692,6 +785,55 @@ impl Tools {
         }
         let saved = self.client.save_output(id, None, file, job_dir).await?;
         Ok(Fetched::Saved(saved))
+    }
+}
+
+/// Runs blocking work (file reads) off the async threads.
+async fn blocking<T, F>(work: F) -> Result<T, ToolError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|_| ToolError::new("io", "reading the file was interrupted"))
+}
+
+/// A private temporary copy of the upload, removed when dropped.
+struct StagedCopy {
+    path: PathBuf,
+    // Removes the directory (and the copy) on drop.
+    _dir: tempfile::TempDir,
+}
+
+/// Copies the descriptor to a new file in a private (0700) temporary directory, from its start, and checks that the
+/// copy has the hash that was announced: the bytes uploaded are the bytes that were hashed.
+fn stage(mut file: std::fs::File, size: u64, digest: &Sha256Digest) -> Result<StagedCopy, ReadError> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let dir = tempfile::Builder::new().prefix("p2pc-blob-").tempdir()?;
+    let path = dir.path().join("blob");
+    let mut out = std::fs::File::create(&path)?;
+    file.seek(SeekFrom::Start(0))?;
+    let again = read_exact_hashed(&mut file, size, Some(&mut out))?;
+    out.flush()?;
+    if &again != digest {
+        // Same length, other bytes: the file was rewritten between the two reads.
+        return Err(ReadError::Io(std::io::Error::other(
+            "the file changed while it was read",
+        )));
+    }
+    Ok(StagedCopy { path, _dir: dir })
+}
+
+/// A file that changed or could not be read is `path_not_allowed` (the file may not be uploaded as it is) or `io`.
+fn read_failure(e: ReadError) -> ToolError {
+    match e {
+        ReadError::Shrank | ReadError::Grew => ToolError::new(
+            "path_not_allowed",
+            format!("{e}; nothing was uploaded. Write the file completely, then ask again."),
+        ),
+        ReadError::Io(io) => ToolError::new("io", format!("the file could not be read: {io}")),
     }
 }
 

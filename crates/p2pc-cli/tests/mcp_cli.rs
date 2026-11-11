@@ -144,6 +144,98 @@ fn the_secret_never_appears_in_a_refusal() {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// The upload directory at start-up (SI-H2-21): an unsafe one stops the start, before anything is served
+// ---------------------------------------------------------------------------------------------------------------
+
+#[cfg(unix)]
+mod upload_dir_start_up {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    use super::*;
+
+    /// `p2pc mcp --upload-dir <dir>` with a good key, a `home` and a configuration directory `config`.
+    fn start(dir: &Path, home: &Path, config: &Path) -> common::Out {
+        let cli = Cli::new();
+        let server = whoami_server(whoami_body(
+            &cli.key,
+            vec![Scope::JobsWrite, Scope::JobsRead],
+            Some(Some(5000)),
+        ));
+        let dir = dir.display().to_string();
+        cli.with_server(&server)
+            .with_env("HOME", &home.display().to_string())
+            .with_env("P2PC_CONFIG_DIR", &config.display().to_string())
+            .run(&["mcp", "--upload-dir", &dir])
+    }
+
+    fn private_dir(parent: &Path, name: &str) -> std::path::PathBuf {
+        let dir = parent.join(name);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    fn assert_refused(out: &common::Out, needle: &str) {
+        assert_eq!(out.code, 125, "{out:?}");
+        assert!(out.stdout.is_empty(), "stdout carries the protocol only: {out:?}");
+        assert!(out.stderr.contains(needle), "{needle} in {}", out.stderr);
+        assert!(out.stderr.contains("upload directory"), "{}", out.stderr);
+    }
+
+    #[test]
+    fn a_directory_with_group_or_other_access_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let home = private_dir(root.path(), "home");
+        let config = private_dir(root.path(), "config");
+        for mode in [0o750, 0o705, 0o755, 0o777] {
+            let dir = private_dir(&home, &format!("up{mode:o}"));
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_refused(&start(&dir, &home, &config), "grants access");
+        }
+    }
+
+    #[test]
+    fn the_home_directory_itself_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let home = private_dir(root.path(), "home");
+        let config = private_dir(root.path(), "config");
+        assert_refused(&start(&home, &home, &config), "home directory");
+    }
+
+    #[test]
+    fn a_directory_that_contains_or_lies_inside_the_credentials_directory_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let home = private_dir(root.path(), "home");
+        // The credentials directory is inside the directory offered.
+        let config = private_dir(&home, "config");
+        assert_refused(&start(&home, &root.path().join("elsewhere"), &config), "contains");
+        // The directory offered is the credentials directory, and one inside it.
+        assert_refused(
+            &start(&config, &root.path().join("elsewhere"), &config),
+            "configuration directory",
+        );
+        assert_refused(
+            &start(&config.join("uploads"), &root.path().join("elsewhere"), &config),
+            "configuration directory",
+        );
+    }
+
+    #[test]
+    fn a_symbolic_link_and_a_file_are_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let home = private_dir(root.path(), "home");
+        let config = private_dir(root.path(), "config");
+        let real = private_dir(&home, "real");
+        let link = home.join("link");
+        symlink(&real, &link).unwrap();
+        assert_refused(&start(&link, &home, &config), "symbolic link");
+        let file = home.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert_refused(&start(&file, &home, &config), "not a directory");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // The real binary over stdio
 // ---------------------------------------------------------------------------------------------------------------
 
@@ -154,6 +246,8 @@ struct Process {
     stdin: Option<ChildStdin>,
     stdout: Receiver<String>,
     stderr: Receiver<String>,
+    /// The user's home directory (the default upload directory is `<home>/p2pc-uploads`), apart from the config dir.
+    home: tempfile::TempDir,
 }
 
 const GUARD: Duration = Duration::from_secs(20);
@@ -173,13 +267,14 @@ fn lines_of(reader: impl std::io::Read + Send + 'static) -> Receiver<String> {
 
 impl Process {
     fn spawn(server: &MockServer, key: &ApiKey, config_dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Self {
+        let home = tempfile::tempdir().unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_p2pc"));
         command
             .arg("mcp")
             .args(args)
             .env_clear()
             .env("P2PC_CONFIG_DIR", config_dir)
-            .env("HOME", config_dir)
+            .env("HOME", home.path())
             .env("P2PC_SERVER", server.url())
             .env("P2PC_API_KEY", key.expose())
             .env("RUST_BACKTRACE", "0")
@@ -199,6 +294,7 @@ impl Process {
             stdin,
             stdout,
             stderr,
+            home,
         }
     }
 
@@ -272,8 +368,16 @@ fn the_binary_serves_mcp_on_stdout_only_and_exits_cleanly_when_stdin_closes() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names.len(), 7, "{names:?}");
-    assert!(names.contains(&"p2pc_run") && names.contains(&"p2pc_machines"));
+    assert_eq!(names.len(), 8, "{names:?}");
+    assert!(names.contains(&"p2pc_run") && names.contains(&"p2pc_machines") && names.contains(&"p2pc_blob_put"));
+    // `p2pc mcp` created the default upload directory, private to the user (SI-H2-21).
+    let uploads = p.home.path().join("p2pc-uploads");
+    assert!(uploads.is_dir(), "the default upload directory was not created");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&uploads).unwrap().permissions().mode() & 0o777, 0o700);
+    }
 
     // A real tool call, through the binary, to the mock REST server.
     p.send(json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "p2pc_machines", "arguments": {}}}));
