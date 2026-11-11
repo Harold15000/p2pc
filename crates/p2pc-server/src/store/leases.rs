@@ -1040,7 +1040,8 @@ pub struct ServiceState {
     /// When the running attempt last became `healthy`, on the hub's clock; `None` while it is not healthy.
     pub healthy_since: Option<OffsetDateTime>,
     /// The last activity the idle timeout counts from: the attempt's first `healthy`, then the traffic the port
-    /// relay records (H2 §7.4). `None` until the attempt becomes healthy.
+    /// relay records (H2 §7.4). `None` until the attempt becomes healthy: the restart policy reads `Some` as "this
+    /// attempt became healthy", so nothing may write it for an attempt that never did (no port connects before then).
     pub last_activity_at: Option<OffsetDateTime>,
     /// Consecutive attempts that never became healthy.
     pub unhealthy_attempts: u32,
