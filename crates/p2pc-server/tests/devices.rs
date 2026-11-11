@@ -948,3 +948,137 @@ async fn the_phone_profile_reaches_only_what_its_scopes_allow() {
     .unwrap();
     assert_eq!(counts, (0, 0, 0, 1));
 }
+
+/// H1 §5 "Re-checked at the point of use", for pairing: the device takes its power from the ticket's creator, which is
+/// reloaded inside the pairing transaction. A ticket whose creator, key or device, was revoked since pairs nothing and
+/// gets the one `invalid_ticket` answer; the ticket stays unused.
+#[tokio::test]
+async fn a_ticket_of_a_revoked_creator_pairs_nothing() {
+    let app = new_app().await;
+    let (key, key_json) = app.create_key(json!({"scopes": ["admin"]})).await;
+    let device = app.add_device(&[Scope::Admin], DeviceLimits::default()).await;
+    let r = app
+        .call(Method::POST, "/v1/devices/pairing-tickets", Some(&key), Some(json!({})))
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
+    let by_key = PairingTicket::decode(r.json()["ticket"].as_str().unwrap()).unwrap();
+    let r = app
+        .device_call(device, Method::POST, "/v1/devices/pairing-tickets", Some(json!({})))
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
+    let by_device = PairingTicket::decode(r.json()["ticket"].as_str().unwrap()).unwrap();
+    // Both creators are revoked while their tickets are still open.
+    let path = format!("/v1/keys/{}", key_json["id"].as_str().unwrap());
+    assert_eq!(
+        app.call(Method::DELETE, &path, Some(&app.admin), None).await.status,
+        StatusCode::NO_CONTENT
+    );
+    let path = format!("/v1/devices/{device}");
+    assert_eq!(
+        app.call(Method::DELETE, &path, Some(&app.admin), None).await.status,
+        StatusCode::NO_CONTENT
+    );
+    let before = device_rows(&app).await;
+    for t in [&by_key, &by_device] {
+        assert_eq!(pair(&app, &t.code_hash(), &node_key()).await, PairOutcome::Invalid);
+    }
+    assert_eq!(device_rows(&app).await, before, "no device was created");
+    let consumed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pairing_tickets WHERE consumed_at IS NOT NULL")
+        .fetch_one(&app.db)
+        .await
+        .unwrap();
+    assert_eq!(consumed, 0, "the tickets stay unused");
+    // A ticket of a live creator still pairs.
+    let (t, _) = ticket(&app, json!({})).await;
+    paired(pair(&app, &t.code_hash(), &node_key()).await);
+}
+
+/// A NodeId whose device has expired without being revoked may be registered again: the dead row is revoked, and that
+/// revocation is audited as `device_revoked` with `{"reason": "expired_replaced"}`, in the same transaction.
+#[tokio::test]
+async fn replacing_an_expired_device_audits_its_revocation() {
+    let app = new_app().await;
+    let node = node_key();
+    let device = |expires_at| store::devices::NewDevice {
+        device_id: DeviceId::generate(),
+        project_id: app.project_id,
+        iroh_node_id: node.clone(),
+        label: None,
+        platform: String::new(),
+        scopes: PHONE_PROFILE.to_vec(),
+        daily_unit_cap: None,
+        allowed_images: None,
+        blobs_quota_mb: None,
+        expires_at,
+        paired_by: None,
+    };
+    /// `(subject_id, actor_key_id, actor_device_id, detail)` of a `device_revoked` event.
+    type Revoked = (Option<String>, Option<String>, Option<String>, String);
+    let replaced = |app: &TestApp| {
+        let db = app.db.clone();
+        async move {
+            let rows: Vec<Revoked> = sqlx::query_as(
+                "SELECT subject_id, actor_key_id, actor_device_id, detail FROM audit_events \
+                 WHERE kind = 'device_revoked' ORDER BY seq",
+            )
+            .fetch_all(&db)
+            .await
+            .unwrap();
+            rows
+        }
+    };
+    let mut tx = store::begin_immediate(&app.db).await.unwrap();
+    let old = store::devices::insert(
+        &mut tx,
+        app.account_id,
+        &device(Some(T0 + Duration::minutes(5))),
+        app.clock.now(),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    // While it is live, the NodeId is taken, and nothing is audited.
+    let mut tx = store::begin_immediate(&app.db).await.unwrap();
+    let err = store::devices::insert(&mut tx, app.account_id, &device(None), app.clock.now())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, store::devices::InsertError::NodeIdInUse), "{err}");
+    drop(tx);
+    assert!(replaced(&app).await.is_empty());
+
+    // Expired: a rolled-back replacement leaves no trace, a committed one revokes and audits together.
+    app.clock.advance(Duration::minutes(5));
+    let mut tx = store::begin_immediate(&app.db).await.unwrap();
+    store::devices::insert(&mut tx, app.account_id, &device(None), app.clock.now())
+        .await
+        .unwrap();
+    drop(tx);
+    assert!(
+        replaced(&app).await.is_empty(),
+        "the event is in the caller's transaction"
+    );
+    let mut tx = store::begin_immediate(&app.db).await.unwrap();
+    let new = store::devices::insert(&mut tx, app.account_id, &device(None), app.clock.now())
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_ne!(new.device_id, old.device_id);
+    let events = replaced(&app).await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    let (subject, actor_key, actor_device, detail) = &events[0];
+    assert_eq!(subject.as_deref(), Some(old.device_id.to_string().as_str()));
+    assert_eq!((actor_key, actor_device), (&None, &None), "no principal did it");
+    assert_eq!(
+        serde_json::from_str::<Value>(detail).unwrap(),
+        json!({"reason": "expired_replaced"})
+    );
+    let mut conn = app.db.acquire().await.unwrap();
+    let old = store::devices::get(&mut conn, app.account_id, old.device_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(old.revoked_at, Some(app.clock.now()));
+    // The admin sees it in the audit log.
+    let r = app.get("/v1/audit?kind=device_revoked", &app.admin).await;
+    assert_eq!(r.json()["items"][0]["detail"], json!({"reason": "expired_replaced"}));
+}

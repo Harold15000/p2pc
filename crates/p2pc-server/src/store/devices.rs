@@ -10,7 +10,7 @@
 //! there is a REST principal: [`by_id_for_auth`] (the device transport attaches a device ID it authenticated),
 //! [`live_by_iroh_node_id`] (the device check of `p2pc/device/1`) and [`pair`] (the code is the credential).
 
-use p2pc_proto::api::{DeviceInfo, PairingTicketInfo, Principal, Scope};
+use p2pc_proto::api::{AuditKind, DeviceInfo, PairingTicketInfo, Principal, Scope};
 use p2pc_proto::auth::SecretHash;
 use p2pc_proto::ids::{AccountId, DeviceId, PairingTicketId, ProjectId};
 use p2pc_proto::units::Units;
@@ -235,8 +235,10 @@ pub enum InsertError {
 }
 
 /// Inserts a device for `account_id`. A device that is not revoked but has expired, with the same NodeId, is revoked
-/// first (it is dead already; only one unrevoked device per NodeId exists, so the device check is one lookup). A live
-/// device with that NodeId is refused ([`InsertError::NodeIdInUse`]). Run it in the caller's write transaction.
+/// first (it is dead already; only one unrevoked device per NodeId exists, so the device check is one lookup), and
+/// that revocation is audited in the same transaction as `device_revoked` with `{"reason": "expired_replaced"}` and
+/// no actor, so no device row ever changes without a trace. A live device with that NodeId is refused
+/// ([`InsertError::NodeIdInUse`]). Run it in the caller's write transaction.
 pub async fn insert(
     conn: &mut Conn,
     account_id: AccountId,
@@ -253,6 +255,13 @@ pub async fn insert(
             .execute(&mut *conn)
             .await
             .map_err(StoreError::from)?;
+        let event = super::audit::NewEvent::new(
+            AuditKind::DeviceRevoked,
+            None,
+            Some(existing.device_id.to_string()),
+            serde_json::Map::from_iter([("reason".to_string(), serde_json::json!("expired_replaced"))]),
+        );
+        super::audit::append(conn, existing.account_id, &event, now).await?;
     }
     let cap = i64_of(device.daily_unit_cap.map(Units::milli), "devices.daily_unit_cap")?;
     let images = device.allowed_images.as_ref().map(json).transpose()?;
@@ -773,7 +782,8 @@ pub enum PairOutcome {
     /// idempotent"). Nothing changed.
     Again(Box<DeviceRow>),
     /// `invalid_ticket`: unknown, expired, revoked, used by another NodeId, or used by this NodeId whose device has
-    /// since been revoked or has expired; or a NodeId that is already another live device. One answer for all.
+    /// since been revoked or has expired; a ticket whose creator is no longer live; or a NodeId that is already
+    /// another live device. One answer for all.
     Invalid,
 }
 
@@ -784,7 +794,8 @@ pub enum PairOutcome {
 ///    against `dummy` so the work is the same.
 /// 2. A consumed ticket answers again only to the NodeId whose device it created, while that device is live: a
 ///    consumed ticket never revives a revoked device.
-/// 3. Otherwise the row's own expiry and revocation decide, never the ticket's payload.
+/// 3. Otherwise the row's own expiry and revocation decide, never the ticket's payload, and the ticket's creator is
+///    reloaded: it must still be live.
 /// 4. The device is inserted with the ticket's project, scopes and limits, and the one `UPDATE … WHERE consumed_at IS
 ///    NULL AND expires_at > now AND revoked_at IS NULL` consumes the ticket in the same transaction: of two concurrent
 ///    `Pair`s for one ticket, exactly one creates a device.
@@ -817,6 +828,15 @@ pub async fn pair(
         });
     }
     if !ticket.is_redeemable(now) {
+        return Ok(PairOutcome::Invalid);
+    }
+    // H1 §5: power is re-checked at the point of use. The device takes its power from the ticket's creator, so the
+    // creator must still be live now, in this transaction (as the approver of a join request's token, H2 §5.4). A
+    // ticket whose creator was revoked or has expired pairs nothing, with the same answer as any other bad ticket.
+    if crate::auth::reload(conn, ticket.account_id, ticket.created_by, now)
+        .await?
+        .is_none()
+    {
         return Ok(PairOutcome::Invalid);
     }
     let new = NewDevice {
