@@ -673,15 +673,17 @@ async fn run(inner: &Inner, control: &mut Control, node: &NodeRow) {
             | AgentMsg::LeaseRejected { .. }
             | AgentMsg::JobStarted { .. }
             | AgentMsg::LogChunk { .. }
-            | AgentMsg::JobFinished { .. }) => {
+            | AgentMsg::JobFinished { .. }
+            // H2 §6.1: the health of a service lease, fenced and stored by the scheduler like any lease message.
+            | AgentMsg::ServiceHealth(_)) => {
                 inner
                     .hub()
                     .touch(node_id, inner.state.clock.now(), inner.limits.last_seen_flush);
                 inner.events.on_message(node_id, msg).await;
                 None
             }
-            // The H2 messages (§6.1) are not served yet: answered exactly as an unknown type (H1 §6).
-            AgentMsg::Unknown | AgentMsg::ServiceHealth(_) | AgentMsg::VolumeReport(_) | AgentMsg::Leave(_) => {
+            // The other H2 messages (§6.1) are not served yet: answered exactly as an unknown type (H1 §6).
+            AgentMsg::Unknown | AgentMsg::VolumeReport(_) | AgentMsg::Leave(_) => {
                 Some(error(error_code::UNSUPPORTED_MESSAGE, UNSUPPORTED_MESSAGE))
             }
             // One `Join` or `Hello` per connection.

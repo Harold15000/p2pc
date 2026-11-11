@@ -73,6 +73,12 @@ pub struct AppState {
     pub outputs: crate::outputs::OutputStore,
     /// Live device connections (H2 §5.5): a revocation and the liveness sweep close them.
     pub devices: crate::devices_api::DeviceSessions,
+    /// The open port connections of every service (H2 §7.4): counted by the port relay (T2-13), read by the
+    /// scheduler's idle cancel and by `GET /v1/jobs/{id}`.
+    pub connections: crate::scheduler::OpenConnections,
+    /// Which templates are `singleton` (H2 §7.6), for the template view of the job routes (§5.5). Until the template
+    /// bundle is loaded (T2-15) it is [`jobs_api::NoTemplates`]: no template, so no singleton instance.
+    pub templates: Arc<dyn jobs_api::TemplateCatalog>,
 }
 
 impl AppState {
@@ -110,6 +116,8 @@ impl AppState {
             nodes: Arc::new(EmptyNodeDirectory),
             kick: crate::scheduler::Kick::default(),
             devices: crate::devices_api::DeviceSessions::default(),
+            connections: crate::scheduler::OpenConnections::default(),
+            templates: Arc::new(jobs_api::NoTemplates),
         })
     }
 }

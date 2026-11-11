@@ -6,30 +6,127 @@
 //!
 //! **Secrets.** A job's `env` values and input file contents live in the stored spec and nowhere else. No handler
 //! logs the spec, a body or a header, and every response is built with `JobSpecView`, which redacts them (§7).
+//!
+//! **Who sees which job** (H2 §5.5 "Template view"). One function, [`job_visibility`], decides it for every job
+//! route: `jobs:read`, `jobs:write` and `services:connect` keep H1's project-wide rule for their routes; a principal
+//! without them but with `templates:launch` gets the narrow template view (the template jobs it launched and, except
+//! for logs and outputs, the instances of `singleton` templates); anyone else gets `403`. A job outside the view
+//! answers `404`, exactly like one that does not exist, and is left out of listings ([`visible_job`],
+//! [`jobs::list`]).
+
+use std::fmt;
 
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use p2pc_proto::api::{Estimate, Job, JobSpec, JobStatus, Page, Problem};
+use p2pc_proto::api::{Estimate, Job, JobKind, JobSpec, JobStatus, Page, Problem, REASON_STOPPED, Scope, ServiceView};
 use p2pc_proto::ids::{JobId, NodeId};
 use p2pc_proto::units::estimate_units;
-use p2pc_proto::validate::{ErrorCode, ImageRef, Limits, image_allowed};
+use p2pc_proto::validate::{ErrorCode, H2Features, ImageRef, Limits, image_allowed};
 use serde::Deserialize;
+use time::{Duration, OffsetDateTime};
 use utoipa::IntoParams;
 
 use crate::app::{AppState, bad_cursor, page_limit};
-use crate::auth::{Authorized, JobsReadKey, JobsWriteKey, recheck_caller};
+use crate::auth::{AnyKey, Authorized, JobsReadKey, JobsWriteKey, Principal, recheck_caller};
 use crate::error::ApiError;
 use crate::extract::{ApiJson, ApiQuery};
+use crate::scheduler::service::RESTART_WINDOW;
 use crate::spec_hash::spec_hash;
-use crate::store;
 use crate::store::job_state::transition;
-use crate::store::jobs::{self, JobCursor, JobRow, ListFilter, NewJob};
+use crate::store::jobs::{self, JobCursor, JobRow, ListFilter, NewJob, Visibility};
+use crate::store::{self, Conn, leases};
 use crate::units::{check_cap, gpu_hour_units, spent_today};
 
 /// The header that carries an idempotency key (§7), as an alternative to the `idempotency_key` field.
 pub const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
+
+/// Which templates are `singleton` (H2 §7.6): an instance of one is shared by every principal that may launch it, so
+/// the template view shows it to all of them (§5.5). T2-15 implements this over the template bundle the hub serves.
+pub trait TemplateCatalog: Send + Sync + fmt::Debug + 'static {
+    /// The ids of the `singleton` templates of the bundle the hub serves now.
+    fn singleton_ids(&self) -> Vec<String>;
+}
+
+/// No template bundle is loaded: no template is `singleton`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoTemplates;
+
+impl TemplateCatalog for NoTemplates {
+    fn singleton_ids(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// A job route, as far as access to it goes (H2 §5.5 "Template view").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobRoute {
+    /// `GET /v1/jobs` and `GET /v1/jobs/{id}`.
+    State,
+    /// `GET /v1/jobs/{id}/logs` and `GET /v1/jobs/{id}/outputs[/{path}]`.
+    Artifacts,
+    /// `POST /v1/jobs/{id}/cancel`.
+    Cancel,
+    /// `POST /v1/jobs/{id}/ports/{port}/connect` (T2-13).
+    Port,
+}
+
+impl JobRoute {
+    /// The H1 scope that gives project-wide access to the route.
+    #[must_use]
+    pub const fn project_scope(self) -> Scope {
+        match self {
+            JobRoute::State | JobRoute::Artifacts => Scope::JobsRead,
+            JobRoute::Cancel => Scope::JobsWrite,
+            JobRoute::Port => Scope::ServicesConnect,
+        }
+    }
+}
+
+/// Which jobs of its account and project `p` reaches through `route`: **the one access rule of the job routes** (H2
+/// §5.5 "Template view", §7.2 "Who can stop a service").
+///
+/// - With the route's H1 scope (`jobs:read` for state, logs and outputs; `jobs:write` for cancel; `services:connect`
+///   for ports; `admin` covers all), every job of the project, as in H1. The template view never narrows it.
+/// - Without it but with `templates:launch`, the template view: the template jobs `p` launched itself and every
+///   instance of a `singleton` template, whoever launched it. Logs and outputs are narrower still: only the jobs `p`
+///   launched, so a singleton instance launched by someone else shows its state but not its logs or outputs.
+/// - Otherwise `403 forbidden`, naming the H1 scope.
+pub fn job_visibility(state: &AppState, p: &Principal, route: JobRoute) -> Result<Visibility, ApiError> {
+    let scope = route.project_scope();
+    if p.has_scope(scope) {
+        return Ok(Visibility::Project);
+    }
+    if !p.has_scope(Scope::TemplatesLaunch) {
+        return Err(ApiError::forbidden(scope));
+    }
+    Ok(Visibility::Template {
+        launched_by: p.id,
+        singletons: (route != JobRoute::Artifacts).then(|| state.templates.singleton_ids()),
+    })
+}
+
+/// The job `id` of `p`'s account and project, if `route` lets `p` reach it ([`job_visibility`]). A job of another
+/// account or project, one outside the caller's view and one that does not exist all answer the same `404` (SI-7,
+/// H2 §5.5). Through the template view, a port is reachable only on a template **service** (H2 §7.4).
+pub async fn visible_job(
+    conn: &mut Conn,
+    state: &AppState,
+    p: &Principal,
+    route: JobRoute,
+    id: JobId,
+) -> Result<JobRow, ApiError> {
+    let visible = job_visibility(state, p, route)?;
+    let row = jobs::get(conn, p.account_id, p.project_id, id)
+        .await?
+        .filter(|row| visible.allows(row))
+        .ok_or_else(ApiError::not_found)?;
+    if route == JobRoute::Port && visible != Visibility::Project && row.spec_view.kind != JobKind::Service {
+        return Err(ApiError::not_found());
+    }
+    Ok(row)
+}
 
 /// A request body checked, normalized and measured, ready to be stored.
 #[derive(Debug)]
@@ -74,6 +171,12 @@ fn prepare(state: &AppState, mut spec: JobSpec, headers: &HeaderMap) -> Result<P
     }
     let limits = Limits {
         allowed_registries: Some(state.config.allowed_registries.clone()),
+        // Service jobs are served from T2-12 on. Volumes and blob inputs stay refused until their own tasks (T2-15,
+        // T2-14) turn them on.
+        h2: H2Features {
+            services: true,
+            ..H2Features::default()
+        },
         ..Limits::default()
     };
     spec.validate(&limits).map_err(|e| ApiError::validation(&e))?;
@@ -199,7 +302,7 @@ pub async fn create_job(
     job_response(StatusCode::CREATED, &row)
 }
 
-/// `status`, `node_id`, `limit` and `cursor`.
+/// `status`, `node_id`, `kind`, `limit` and `cursor`.
 #[derive(Debug, Deserialize, IntoParams)]
 #[serde(deny_unknown_fields)]
 #[into_params(parameter_in = Query)]
@@ -213,9 +316,14 @@ pub struct JobListParams {
     pub status: Option<String>,
     /// Only jobs of this node.
     pub node_id: Option<String>,
+    /// Only jobs of this kind: `batch` or `service`.
+    pub kind: Option<String>,
 }
 
 /// Lists the caller's jobs, newest first (`created_at` descending, then `id`), with cursor pagination.
+///
+/// With `jobs:read`, every job of the project. With `templates:launch` and no `jobs:read`, the template view (H2
+/// §5.5): the template jobs the caller launched and the instances of `singleton` templates; no other job is listed.
 #[utoipa::path(
     get,
     path = "/v1/jobs",
@@ -224,15 +332,16 @@ pub struct JobListParams {
     responses(
         (status = 200, description = "A page of jobs. `spec.env` values are `<redacted>` and `spec.files` have no content.", body = Page<Job>),
         (status = 401, description = "Missing or invalid key.", content_type = "application/problem+json", body = Problem),
-        (status = 403, description = "The key lacks `jobs:read`.", content_type = "application/problem+json", body = Problem),
-        (status = 422, description = "Invalid `limit`, `cursor`, `status` or `node_id`.", content_type = "application/problem+json", body = Problem),
+        (status = 403, description = "The caller has neither `jobs:read` nor `templates:launch`.", content_type = "application/problem+json", body = Problem),
+        (status = 422, description = "Invalid `limit`, `cursor`, `status`, `node_id` or `kind`.", content_type = "application/problem+json", body = Problem),
     )
 )]
 pub async fn list_jobs(
     State(state): State<AppState>,
-    Authorized { principal: p, .. }: JobsReadKey,
+    Authorized { principal: p, .. }: AnyKey,
     ApiQuery(q): ApiQuery<JobListParams>,
 ) -> Result<Json<Page<Job>>, ApiError> {
+    let visible = job_visibility(&state, &p, JobRoute::State)?;
     let limit = page_limit(q.limit)?;
     let after = q
         .cursor
@@ -257,12 +366,25 @@ pub async fn list_jobs(
                 .map_err(|_| ApiError::field("node_id", ErrorCode::InvalidFormat, "not a node ID"))
         })
         .transpose()?;
+    let kind = match q.kind.as_deref() {
+        None => None,
+        Some("batch") => Some(JobKind::Batch),
+        Some("service") => Some(JobKind::Service),
+        Some(_) => {
+            return Err(ApiError::field(
+                "kind",
+                ErrorCode::InvalidFormat,
+                "must be `batch` or `service`",
+            ));
+        }
+    };
     let mut conn = state.db.acquire().await?;
     let mut rows = jobs::list(
         &mut conn,
         p.account_id,
         p.project_id,
-        ListFilter { status, node_id },
+        &visible,
+        ListFilter { status, node_id, kind },
         after,
         limit + 1,
     )
@@ -276,9 +398,64 @@ pub async fn list_jobs(
     Ok(Json(Page { items, next_cursor }))
 }
 
+/// The `service` member of `GET /v1/jobs/{id}` (H2 §7.2), for a service: its health while it runs, its ports, the
+/// open connections, the idle and wall-clock deadlines and the node-loss restarts of the last 24 h. `None` for a batch
+/// job.
+///
+/// `last_activity_at` is what the idle timeout counts from: the attempt's first `healthy`, then the traffic the port
+/// relay records. `cap_deadline`, `setup` and `traffic` belong to the metering, template and port tasks and stay
+/// `null` here.
+async fn service_view(
+    conn: &mut Conn,
+    state: &AppState,
+    row: &JobRow,
+    now: OffsetDateTime,
+) -> Result<Option<ServiceView>, ApiError> {
+    let Some(spec) = row
+        .spec_view
+        .service
+        .as_ref()
+        .filter(|_| row.spec_view.kind == JobKind::Service)
+    else {
+        return Ok(None);
+    };
+    let st = leases::service_state(conn, row.job_id).await?;
+    let running = row.status == JobStatus::Running;
+    let open_connections = state.connections.count(row.job_id);
+    let idle_deadline = spec
+        .idle_timeout_s
+        .zip(st.last_activity_at)
+        .filter(|_| running && open_connections == 0)
+        .map(|(timeout, at)| at + Duration::seconds(i64::from(timeout)));
+    let deadline = row
+        .started_at
+        .filter(|_| running)
+        .map(|at| at + Duration::seconds(i64::from(row.spec_view.timeout_s)));
+    let restarts = st
+        .node_loss_restarts
+        .iter()
+        .filter(|at| now.unix_timestamp() - **at < RESTART_WINDOW.whole_seconds())
+        .count();
+    Ok(Some(ServiceView {
+        health: st.health.filter(|_| running),
+        health_since: st.health_since.filter(|_| running),
+        ports: spec.ports.clone(),
+        open_connections,
+        last_activity_at: st.last_activity_at,
+        idle_deadline,
+        deadline,
+        restarts_24h: u32::try_from(restarts).unwrap_or(u32::MAX),
+        ..ServiceView::default()
+    }))
+}
+
 /// One job of the caller, with its `attempts` (§7): `[{attempt, node_id, outcome, reason, started_at, ended_at}]`,
 /// oldest first. `outcome` uses the job-state words (`running` while the attempt is in progress). A job of another
-/// account answers `404`, exactly like one that does not exist (SI-7).
+/// account answers `404`, exactly like one that does not exist (SI-7), and so does a job outside the caller's
+/// template view (H2 §5.5).
+///
+/// A service adds `service` (H2 §7.2): `health` and `health_since` while it runs, `ports`, `open_connections`,
+/// `last_activity_at`, `idle_deadline`, `deadline` and `restarts_24h`.
 #[utoipa::path(
     get,
     path = "/v1/jobs/{id}",
@@ -287,23 +464,24 @@ pub async fn list_jobs(
     responses(
         (status = 200, description = "The job, with its `attempts` (oldest first; refused or unanswered offers are not attempts). `spec.env` values are `<redacted>` and `spec.files` have no content.", body = Job),
         (status = 401, description = "Missing or invalid key.", content_type = "application/problem+json", body = Problem),
-        (status = 403, description = "The key lacks `jobs:read`.", content_type = "application/problem+json", body = Problem),
-        (status = 404, description = "No such job in this account.", content_type = "application/problem+json", body = Problem),
+        (status = 403, description = "The caller has neither `jobs:read` nor `templates:launch`.", content_type = "application/problem+json", body = Problem),
+        (status = 404, description = "No such job in this account, or (for a caller with only `templates:launch`) not a job of its template view.", content_type = "application/problem+json", body = Problem),
     )
 )]
 pub async fn get_job(
     State(state): State<AppState>,
-    Authorized { principal: p, .. }: JobsReadKey,
+    Authorized { principal: p, .. }: AnyKey,
     Path(id): Path<String>,
 ) -> Result<Json<Job>, ApiError> {
+    // The access rule before the ID: a caller with no access gets `403` whatever it asks for.
+    job_visibility(&state, &p, JobRoute::State)?;
     let id = parse_job_id(&id)?;
     let mut conn = state.db.acquire().await?;
-    let row = jobs::get(&mut conn, p.account_id, p.project_id, id)
-        .await?
-        .ok_or_else(ApiError::not_found)?;
+    let row = visible_job(&mut conn, &state, &p, JobRoute::State, id).await?;
     let mut job = row.to_job();
     // Only here: lists of jobs leave the attempts out (§7).
     job.attempts = Some(jobs::attempts(&mut conn, p.account_id, p.project_id, id).await?);
+    job.service = service_view(&mut conn, &state, &row, state.clock.now()).await?;
     Ok(Json(job))
 }
 
@@ -313,6 +491,13 @@ pub async fn get_job(
 /// - `assigned` or `running`: the status does not change yet. `cancel_requested_at` is set (once), and the scheduler
 ///   delivers the `Cancel` to the node; the job ends `cancelled` when the node reports.
 /// - Already finished: `200` with the job unchanged.
+///
+/// A **service** stopped this way ends `cancelled` with `reason: "stopped"` (H2 §7.2).
+///
+/// **Who may cancel** (H2 §7.2). With `jobs:write`, any job of the caller's account and project, as in H1. Without it
+/// but with `templates:launch`, the jobs of the caller's template view: a template job it launched itself, or an
+/// instance of a `singleton` template (shared by every launcher, so any of them may stop it). Any other job answers
+/// `404`.
 #[utoipa::path(
     post,
     path = "/v1/jobs/{id}/cancel",
@@ -321,32 +506,51 @@ pub async fn get_job(
     responses(
         (status = 200, description = "The job after the request.", body = Job),
         (status = 401, description = "Missing or invalid key, or the key was revoked or expired while the request was in flight.", content_type = "application/problem+json", body = Problem),
-        (status = 403, description = "The key lacks `jobs:write`.", content_type = "application/problem+json", body = Problem),
-        (status = 404, description = "No such job in this account.", content_type = "application/problem+json", body = Problem),
+        (status = 403, description = "The caller has neither `jobs:write` nor `templates:launch`.", content_type = "application/problem+json", body = Problem),
+        (status = 404, description = "No such job in this account, or (for a caller with only `templates:launch`) not a job of its template view.", content_type = "application/problem+json", body = Problem),
     )
 )]
 pub async fn cancel_job(
     State(state): State<AppState>,
-    Authorized { principal: p, .. }: JobsWriteKey,
+    Authorized { principal: p, .. }: AnyKey,
     Path(id): Path<String>,
 ) -> Result<Json<Job>, ApiError> {
+    // The access rule before the ID and before the write lock: a caller with no access gets `403` and takes nothing.
+    job_visibility(&state, &p, JobRoute::Cancel)?;
     let id = parse_job_id(&id)?;
     let mut tx = store::begin_immediate(&state.db).await?;
     let now = state.clock.now();
-    recheck_caller(&mut tx, &state, &p, now).await?;
-    let job = jobs::get(&mut tx, p.account_id, p.project_id, id)
-        .await?
-        .ok_or_else(ApiError::not_found)?;
+    // The caller's current row decides what it may reach (§5 "Re-checked at the point of use").
+    let caller = recheck_caller(&mut tx, &state, &p, now).await?;
+    let job = visible_job(&mut tx, &state, &caller, JobRoute::Cancel, id).await?;
+    let service = job.spec_view.kind == JobKind::Service;
+    let reread = async |tx: &mut Conn| {
+        jobs::get(tx, p.account_id, p.project_id, id)
+            .await?
+            .ok_or_else(ApiError::not_found)
+    };
     let job = match job.status {
-        JobStatus::Queued => transition(&mut tx, &job, JobStatus::Cancelled, "cancelled_by_user", now).await?,
+        JobStatus::Queued => {
+            let cancelled = transition(&mut tx, &job, JobStatus::Cancelled, "cancelled_by_user", now).await?;
+            if service {
+                // H2 §7.2: stopped by a principal → `cancelled`, `reason: "stopped"`.
+                leases::set_cancelled_reason(&mut tx, id, REASON_STOPPED).await?;
+                reread(&mut tx).await?
+            } else {
+                cancelled
+            }
+        }
         JobStatus::Assigned | JobStatus::Running => {
-            // Only the first request sets the time; asking again changes nothing.
-            if jobs::request_cancel(&mut tx, p.account_id, p.project_id, id, now).await? {
+            // Only the first request sets the time (and, for a service, why it stops); asking again changes nothing.
+            let requested = if service {
+                leases::request_stop(&mut tx, id, REASON_STOPPED, now).await?
+            } else {
+                jobs::request_cancel(&mut tx, p.account_id, p.project_id, id, now).await?
+            };
+            if requested {
                 tracing::info!(job_id = %id, principal = %p.id, "job cancel requested");
             }
-            jobs::get(&mut tx, p.account_id, p.project_id, id)
-                .await?
-                .ok_or_else(ApiError::not_found)?
+            reread(&mut tx).await?
         }
         // Finished: nothing to do.
         JobStatus::Succeeded | JobStatus::Failed | JobStatus::TimedOut | JobStatus::Cancelled | JobStatus::Lost => job,

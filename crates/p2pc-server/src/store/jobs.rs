@@ -13,7 +13,7 @@
 //! decoded into a [`JobSpec`] (whose `Debug` redacts the values) and never logged. `tests/read_path_sql.rs` checks the
 //! SQL strings of this crate for it.
 
-use p2pc_proto::api::{FileMeta, Job, JobAttempt, JobSpec, JobSpecView, JobStatus, Principal};
+use p2pc_proto::api::{FileMeta, Job, JobAttempt, JobKind, JobSpec, JobSpecView, JobStatus, Principal};
 use p2pc_proto::ids::{AccountId, JobId, NodeId, ProjectId};
 use p2pc_proto::units::Units;
 use time::OffsetDateTime;
@@ -229,7 +229,7 @@ fn json<T: serde::Serialize>(value: &T, column: &'static str) -> Result<String, 
 /// `(key_id, idempotency_key)` or `(device_id, idempotency_key)` refuses the second insert with an error.
 ///
 /// `kind` and `template_id` are copied from the spec into their own columns (H2 §5.6), for the `kind` filter and the
-/// template view.
+/// template view. A service also gets its `service_state` row.
 pub async fn insert(conn: &mut Conn, job: &NewJob, now: OffsetDateTime) -> Result<JobRow, StoreError> {
     let units = i64::try_from(job.units_reserved.milli()).map_err(|_| StoreError::Corrupt("jobs.units_reserved"))?;
     // The redacted view that every API read will serve, built once, here, from the file metadata computed at
@@ -264,6 +264,10 @@ pub async fn insert(conn: &mut Conn, job: &NewJob, now: OffsetDateTime) -> Resul
     .execute(&mut *conn)
     .await?;
     super::job_state::record_creation(conn, job.job_id, now).await?;
+    // The hub's state of a service (health, restart counters, H2 §7.2), one row from the start.
+    if job.spec.kind == JobKind::Service {
+        super::leases::create_service_state(conn, job.job_id, now).await?;
+    }
     get(conn, job.account_id, job.project_id, job.job_id)
         .await?
         .ok_or(StoreError::Corrupt("jobs"))
@@ -346,6 +350,40 @@ pub struct ListFilter {
     pub status: Option<JobStatus>,
     /// Only jobs of this node.
     pub node_id: Option<NodeId>,
+    /// Only jobs of this kind (H2 §7.2).
+    pub kind: Option<JobKind>,
+}
+
+/// Which jobs of its account and project a principal reaches (H2 §5.5 "Template view").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Visibility {
+    /// Every job of the project (H1: `jobs:read`, `jobs:write`, `services:connect`).
+    Project,
+    /// Only template jobs (`template` set): the ones `launched_by` launched and, when `singletons` is given, every
+    /// instance of those `singleton` templates, whoever launched it.
+    Template {
+        /// The principal whose own launches are visible.
+        launched_by: Principal,
+        /// The ids of the `singleton` templates whose instances are visible too; `None` when the route shows only
+        /// the principal's own launches (logs and outputs).
+        singletons: Option<Vec<String>>,
+    },
+}
+
+impl Visibility {
+    /// Whether `row`, a job of the principal's account and project, is visible.
+    #[must_use]
+    pub fn allows(&self, row: &JobRow) -> bool {
+        match self {
+            Visibility::Project => true,
+            Visibility::Template {
+                launched_by,
+                singletons,
+            } => row.spec_view.template.as_ref().is_some_and(|t| {
+                row.principal == *launched_by || singletons.as_ref().is_some_and(|ids| ids.contains(&t.id))
+            }),
+        }
+    }
 }
 
 /// Position after which a listing continues: `(created_at, job_id)` of the last job returned. The listing order is
@@ -390,22 +428,42 @@ impl JobCursor {
     }
 }
 
-/// The jobs of the principal's account and project, newest first (`created_at` descending, then `job_id`), starting
-/// after `after`, at most `limit` of them.
+/// The jobs of the principal's account and project that `visible` shows it (H2 §5.5), newest first (`created_at`
+/// descending, then `job_id`), starting after `after`, at most `limit` of them.
+///
+/// The template view is part of the query, never a filter over a page: a job the principal may not see takes no
+/// place in a page and moves no cursor. `template_id` is the job's own column, copied from its spec at creation.
 pub async fn list(
     conn: &mut Conn,
     account_id: AccountId,
     project_id: ProjectId,
+    visible: &Visibility,
     filter: ListFilter,
     after: Option<JobCursor>,
     limit: u32,
 ) -> Result<Vec<JobRow>, StoreError> {
     let (at, id) = after.map_or((None, None), |c| (Some(c.created_at), Some(c.job_id.to_string())));
+    // ?9: 1 for the template view. ?10, ?11: the launcher's key or device. ?12: a JSON array of singleton ids.
+    let (template_view, launcher, singletons) = match visible {
+        Visibility::Project => (false, (None, None), "[]".to_string()),
+        Visibility::Template {
+            launched_by,
+            singletons,
+        } => (
+            true,
+            principal_binds(*launched_by),
+            json(&singletons.clone().unwrap_or_default(), "jobs.template_id")?,
+        ),
+    };
     let rows: Vec<Raw> = sqlx::query_as(select_jobs!(
         "WHERE account_id = ?1 AND project_id = ?2 \
            AND (?3 IS NULL OR status = ?3) \
            AND (?4 IS NULL OR node_id = ?4) \
            AND (?5 IS NULL OR created_at < ?5 OR (created_at = ?5 AND job_id > ?6)) \
+           AND (?8 IS NULL OR kind = ?8) \
+           AND (?9 = 0 OR (template_id IS NOT NULL \
+                           AND ((?10 IS NOT NULL AND key_id = ?10) OR (?11 IS NOT NULL AND device_id = ?11) \
+                                OR template_id IN (SELECT value FROM json_each(?12))))) \
          ORDER BY created_at DESC, job_id ASC LIMIT ?7"
     ))
     .bind(account_id.to_string())
@@ -415,6 +473,11 @@ pub async fn list(
     .bind(at)
     .bind(id)
     .bind(i64::from(limit))
+    .bind(filter.kind.map(JobKind::as_str))
+    .bind(template_view)
+    .bind(launcher.0)
+    .bind(launcher.1)
+    .bind(singletons)
     .fetch_all(&mut *conn)
     .await?;
     rows.into_iter().map(decode).collect()

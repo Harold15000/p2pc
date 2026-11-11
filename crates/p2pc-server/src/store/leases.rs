@@ -16,12 +16,12 @@
 
 use std::collections::BTreeMap;
 
-use p2pc_proto::api::{JobStatus, Principal, UsageGroupBy, UsageRecord};
+use p2pc_proto::api::{JobKind, JobStatus, Principal, ServiceHealth, UsageGroupBy, UsageRecord};
 use p2pc_proto::ids::{AccountId, JobId, LeaseId, NodeId, ProjectId};
 use p2pc_proto::units::Units;
 use time::OffsetDateTime;
 
-use super::{Conn, StoreError, from_ts_ms, from_ts_opt, parse_col, ts, ts_ms};
+use super::{Conn, StoreError, from_ts, from_ts_ms, from_ts_opt, parse_col, ts, ts_ms};
 use crate::scheduler::fit::{Request, Reserved};
 
 /// The `leases.state` column.
@@ -115,6 +115,11 @@ pub struct LeaseRow {
     pub cancel_requested_at: Option<OffsetDateTime>,
     /// The job's `timeout_s`.
     pub timeout_s: u32,
+    /// The job's kind: `batch` or `service` (H2 §7.1).
+    pub job_kind: JobKind,
+    /// The job's user-visible `reason`. For a service with a cancel request it is why it is being stopped
+    /// (`stopped`, `idle_timeout`, `cap_reached`, H2 §7.2), which the `Cancel` and the final state repeat.
+    pub job_reason: Option<String>,
 }
 
 impl LeaseRow {
@@ -153,6 +158,8 @@ struct RawLease {
     job_status: String,
     cancel_requested_at: Option<i64>,
     timeout_s: Option<i64>,
+    job_kind: String,
+    job_reason: Option<String>,
 }
 
 macro_rules! select_leases {
@@ -161,7 +168,7 @@ macro_rules! select_leases {
             "SELECT l.id, l.job_id, l.node_id, l.epoch, l.attempt, l.state, l.reserved, l.offered_at_ms, l.accepted_at, \
              l.started_at, l.ended_at, l.confirmed_dead_at, l.cancel_sent_at, j.account_id, j.project_id, \
              j.epoch AS job_epoch, j.status AS job_status, j.cancel_requested_at, \
-             json_extract(j.spec_view, '$.timeout_s') AS timeout_s \
+             json_extract(j.spec_view, '$.timeout_s') AS timeout_s, j.kind AS job_kind, j.reason AS job_reason \
              FROM leases l JOIN jobs j ON j.job_id = l.job_id ",
             $tail
         )
@@ -181,6 +188,15 @@ fn status(text: &str) -> Result<JobStatus, StoreError> {
         .into_iter()
         .find(|s| s.as_str() == text)
         .ok_or(StoreError::Corrupt("jobs.status"))
+}
+
+/// A stored `jobs.kind`.
+fn kind(text: &str) -> Result<JobKind, StoreError> {
+    match text {
+        "batch" => Ok(JobKind::Batch),
+        "service" => Ok(JobKind::Service),
+        _ => Err(StoreError::Corrupt("jobs.kind")),
+    }
 }
 
 fn decode(raw: RawLease) -> Result<LeaseRow, StoreError> {
@@ -204,6 +220,8 @@ fn decode(raw: RawLease) -> Result<LeaseRow, StoreError> {
         job_status: status(&raw.job_status)?,
         cancel_requested_at: from_ts_opt(raw.cancel_requested_at, "jobs.cancel_requested_at")?,
         timeout_s: u32_col(raw.timeout_s.unwrap_or(0), "jobs.spec_view.timeout_s")?,
+        job_kind: kind(&raw.job_kind)?,
+        job_reason: raw.job_reason,
     })
 }
 
@@ -349,6 +367,20 @@ pub async fn accepted_or_running(conn: &mut Conn) -> Result<Vec<LeaseRow>, Store
 pub async fn held_after_offer(conn: &mut Conn) -> Result<Vec<LeaseRow>, StoreError> {
     let rows: Vec<RawLease> = sqlx::query_as(select_leases!(
         "WHERE l.confirmed_dead_at IS NULL AND l.state <> 'offered' ORDER BY l.offered_at_ms, l.id"
+    ))
+    .fetch_all(&mut *conn)
+    .await?;
+    decode_all(rows)
+}
+
+/// Active leases (offered, accepted or running) on live nodes that are `pending_approval` (H2 §5.5, SI-H2-19). No
+/// operation of the spec moves an approved node back to `pending_approval`, so this is empty unless the placement
+/// guard was bypassed (a row edited by hand, a future path): the scheduler ends what it finds.
+pub async fn on_pending_nodes(conn: &mut Conn) -> Result<Vec<LeaseRow>, StoreError> {
+    let rows: Vec<RawLease> = sqlx::query_as(select_leases!(
+        "JOIN nodes n ON n.id = l.node_id \
+         WHERE l.state IN ('offered', 'accepted', 'running') AND n.approval = 'pending_approval' \
+           AND n.deleted_at IS NULL ORDER BY l.offered_at_ms, l.id"
     ))
     .fetch_all(&mut *conn)
     .await?;
@@ -673,6 +705,14 @@ pub struct QueuedJob {
     pub timeout_s: u32,
     /// Its place in the FIFO queue: `(created_at, job_id)`.
     pub position: QueuePosition,
+    /// `batch` or `service`.
+    pub kind: JobKind,
+    /// Whether it has volumes (H2 §7.1).
+    pub has_volumes: bool,
+    /// Its user-visible `reason` (why it waits), if any.
+    pub reason: Option<String>,
+    /// When it last became `queued`: its creation, or its latest requeue (the start of the affinity wait, H2 §7.2).
+    pub queued_at: OffsetDateTime,
 }
 
 /// A position in the FIFO queue of queued jobs: `(created_at, job_id)` of a job.
@@ -700,6 +740,11 @@ struct RawQueued {
     placement: Option<String>,
     timeout_s: Option<i64>,
     created_at: i64,
+    kind: String,
+    volumes: Option<i64>,
+    blob_inputs: Option<i64>,
+    reason: Option<String>,
+    queued_at: Option<i64>,
 }
 
 /// The `placement` of the redacted view.
@@ -722,7 +767,11 @@ macro_rules! select_queued {
              json_extract(spec_view, '$.resources.disk_mb') AS disk_mb, \
              json_extract(spec_view, '$.resources.gpu') AS gpu, \
              json_extract(spec_view, '$.placement') AS placement, \
-             json_extract(spec_view, '$.timeout_s') AS timeout_s, created_at \
+             json_extract(spec_view, '$.timeout_s') AS timeout_s, created_at, kind, \
+             json_array_length(spec_view, '$.volumes') AS volumes, \
+             json_array_length(spec_view, '$.inputs') AS blob_inputs, reason, \
+             (SELECT MAX(e.at) FROM job_events e WHERE e.job_id = jobs.job_id AND e.to_status = 'queued') \
+                 AS queued_at \
              FROM jobs WHERE status = 'queued' AND offer_count < ?1 \
                AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.job_id = jobs.job_id \
                                AND l.state IN ('offered', 'accepted', 'running')) ",
@@ -734,6 +783,9 @@ macro_rules! select_queued {
 fn decode_queued(raw: RawQueued) -> Result<QueuedJob, StoreError> {
     let placement: PlacementCols = serde_json::from_str(raw.placement.as_deref().unwrap_or("{}"))
         .map_err(|_| StoreError::Corrupt("jobs.spec_view.placement"))?;
+    let kind = kind(&raw.kind)?;
+    let has_volumes = raw.volumes.unwrap_or(0) > 0;
+    let has_blob_inputs = raw.blob_inputs.unwrap_or(0) > 0;
     Ok(QueuedJob {
         job_id: parse_col(&raw.job_id, "jobs.job_id")?,
         account_id: parse_col(&raw.account_id, "jobs.account_id")?,
@@ -753,8 +805,13 @@ fn decode_queued(raw: RawQueued) -> Result<QueuedJob, StoreError> {
             pools: placement.pools,
             labels: placement.labels,
             node_id: placement.node_id,
+            needs: crate::scheduler::fit::needs(kind, has_volumes, has_blob_inputs),
         },
         timeout_s: u32_col(raw.timeout_s.unwrap_or(0), "jobs.spec_view.timeout_s")?,
+        kind,
+        has_volumes,
+        reason: raw.reason,
+        queued_at: from_ts(raw.queued_at.unwrap_or(raw.created_at), "job_events.at")?,
         position: QueuePosition {
             created_at: raw.created_at,
             job_id: raw.job_id,
@@ -826,8 +883,10 @@ pub async fn bump_epoch(conn: &mut Conn, job_id: JobId, expected: u64) -> Result
 
 /// §8 "Offer cap" (amended 2026-11-05): an eligible node of `account_id` changed (it connected or reconnected, sent
 /// an `InventoryUpdate`, was resumed, or joined). Every queued job of the account gets a fresh offer budget and loses
-/// its cap reason (the only `reason` a queued job carries), so a job is never stuck once the node it waited for is
-/// ready. One statement: one atomic step. Returns how many jobs were re-armed. Only this account's jobs change.
+/// its cap reason, so a job is never stuck once the node it waited for is ready. (A queued job under the cap may
+/// carry another reason, why it waits, H2 §5.5 and §7.2: placement writes it again at its next pass if it still
+/// holds, [`set_queue_reason`].) One statement: one atomic step. Returns how many jobs were re-armed. Only this
+/// account's jobs change.
 pub async fn rearm_offers(conn: &mut Conn, account_id: AccountId) -> Result<u64, StoreError> {
     Ok(sqlx::query(
         "UPDATE jobs SET offer_count = 0, reason = NULL \
@@ -860,6 +919,62 @@ pub async fn set_reason(conn: &mut Conn, job_id: JobId, reason: Option<&str>) ->
     .bind(job_id.to_string())
     .execute(&mut *conn)
     .await?;
+    Ok(())
+}
+
+/// Sets why a **queued** job waits (H2 §5.5, §6.1, §7.2: for approval, for a capability, for the node that holds its
+/// volume), or clears it. Only a job that is still queued changes, and only when the text differs, so a tick that
+/// finds nothing new writes nothing. Whether it changed.
+pub async fn set_queue_reason(conn: &mut Conn, job_id: JobId, reason: Option<&str>) -> Result<bool, StoreError> {
+    let n = sqlx::query("UPDATE jobs SET reason = ?1 WHERE job_id = ?2 AND status = 'queued' AND reason IS NOT ?1")
+        .bind(reason)
+        .bind(job_id.to_string())
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+    Ok(n == 1)
+}
+
+/// Asks an `assigned` or `running` job to stop, for `reason` (H2 §7.2: `stopped`, `idle_timeout`, `cap_reached`):
+/// the cancel request and the user-visible reason, in one statement, once. The scheduler then delivers the `Cancel`
+/// with that reason, and the job ends `cancelled` with it. Whether this call set it.
+pub async fn request_stop(
+    conn: &mut Conn,
+    job_id: JobId,
+    reason: &str,
+    now: OffsetDateTime,
+) -> Result<bool, StoreError> {
+    let n = sqlx::query(
+        "UPDATE jobs SET cancel_requested_at = ?1, updated_at = ?1, reason = ?2 \
+         WHERE job_id = ?3 AND status IN ('assigned', 'running') AND cancel_requested_at IS NULL",
+    )
+    .bind(ts(now))
+    .bind(reason)
+    .bind(job_id.to_string())
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+    Ok(n == 1)
+}
+
+/// Sets the `reason` of a job that just ended `cancelled` (H2 §7.2 "Ends of a service"), after the transition, which
+/// clears it. Only a cancelled job changes.
+pub async fn set_cancelled_reason(conn: &mut Conn, job_id: JobId, reason: &str) -> Result<(), StoreError> {
+    sqlx::query("UPDATE jobs SET reason = ? WHERE job_id = ? AND status = 'cancelled'")
+        .bind(reason)
+        .bind(job_id.to_string())
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// Sets the `error` of a job that just ended `lost` (H2 §7.2: `restart_limit`). Only a lost job changes.
+pub async fn set_lost_error(conn: &mut Conn, job_id: JobId, error: &str) -> Result<(), StoreError> {
+    sqlx::query("UPDATE jobs SET error = ? WHERE job_id = ? AND status = 'lost'")
+        .bind(error)
+        .bind(job_id.to_string())
+        .execute(&mut *conn)
+        .await?;
     Ok(())
 }
 
@@ -910,6 +1025,222 @@ pub async fn job_principal(conn: &mut Conn, job_id: JobId) -> Result<Principal, 
             .fetch_one(&mut *conn)
             .await?;
     super::jobs::principal_cols(key.as_deref(), device.as_deref(), "jobs.key_id/device_id")
+}
+
+// --- Service state (H2 §7.2) ----------------------------------------------------------------------------------------
+
+/// The hub's state of a service job, from `service_state` (H2 §13): the health of its current attempt and the
+/// counters of the restart policy. The model pull and the cap reservation of the same row are T2-15's and T2-16's.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ServiceState {
+    /// The health of the running attempt, as its agent last reported it; `None` while no attempt runs.
+    pub health: Option<ServiceHealth>,
+    /// Since when `health` has its value.
+    pub health_since: Option<OffsetDateTime>,
+    /// When the running attempt last became `healthy`, on the hub's clock; `None` while it is not healthy.
+    pub healthy_since: Option<OffsetDateTime>,
+    /// The last activity the idle timeout counts from: the attempt's first `healthy`, then the traffic the port
+    /// relay records (H2 §7.4). `None` until the attempt becomes healthy: the restart policy reads `Some` as "this
+    /// attempt became healthy", so nothing may write it for an attempt that never did (no port connects before then).
+    pub last_activity_at: Option<OffsetDateTime>,
+    /// Consecutive attempts that never became healthy.
+    pub unhealthy_attempts: u32,
+    /// The node-loss restarts of the last 24 h, oldest first (Unix seconds).
+    pub node_loss_restarts: Vec<i64>,
+    /// Whether the hub's model pull is running (`setup_state = 'pulling'`, H2 §7.6): the idle cancel waits for it.
+    pub pulling: bool,
+}
+
+fn health_str(h: ServiceHealth) -> &'static str {
+    match h {
+        ServiceHealth::Starting => "starting",
+        ServiceHealth::Healthy => "healthy",
+        ServiceHealth::Unhealthy => "unhealthy",
+    }
+}
+
+type StateRaw = (
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    i64,
+    String,
+    Option<String>,
+);
+
+fn decode_state(raw: StateRaw) -> Result<ServiceState, StoreError> {
+    let (health, health_since, healthy_since, last_activity_at, unhealthy, restarts, setup) = raw;
+    Ok(ServiceState {
+        health: match health.as_deref() {
+            None => None,
+            Some("starting") => Some(ServiceHealth::Starting),
+            Some("healthy") => Some(ServiceHealth::Healthy),
+            Some("unhealthy") => Some(ServiceHealth::Unhealthy),
+            Some(_) => return Err(StoreError::Corrupt("service_state.health")),
+        },
+        health_since: from_ts_opt(health_since, "service_state.health_since")?,
+        healthy_since: from_ts_opt(healthy_since, "service_state.healthy_since")?,
+        last_activity_at: from_ts_opt(last_activity_at, "service_state.last_activity_at")?,
+        unhealthy_attempts: u32_col(unhealthy, "service_state.unhealthy_attempts")?,
+        node_loss_restarts: serde_json::from_str(&restarts)
+            .map_err(|_| StoreError::Corrupt("service_state.node_loss_restarts"))?,
+        pulling: setup.as_deref() == Some("pulling"),
+    })
+}
+
+/// The service state of a job; the empty state for a job without a row (a batch job, or a service created before
+/// its row was). Protocol-side: the caller found `job_id` from a lease or read the job with its account first.
+pub async fn service_state(conn: &mut Conn, job_id: JobId) -> Result<ServiceState, StoreError> {
+    let raw: Option<StateRaw> = sqlx::query_as(
+        "SELECT health, health_since, healthy_since, last_activity_at, unhealthy_attempts, node_loss_restarts, \
+                setup_state FROM service_state WHERE job_id = ?",
+    )
+    .bind(job_id.to_string())
+    .fetch_optional(&mut *conn)
+    .await?;
+    raw.map_or_else(|| Ok(ServiceState::default()), decode_state)
+}
+
+/// Creates the service state row of a new service job (nothing if it exists).
+pub async fn create_service_state(conn: &mut Conn, job_id: JobId, now: OffsetDateTime) -> Result<(), StoreError> {
+    sqlx::query("INSERT INTO service_state (job_id, updated_at) VALUES (?, ?) ON CONFLICT (job_id) DO NOTHING")
+        .bind(job_id.to_string())
+        .bind(ts(now))
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// A service attempt started (`JobStarted`): its health is `starting`, and the idle timeout has nothing to count
+/// from until it becomes healthy (H2 §7.2).
+pub async fn service_started(conn: &mut Conn, job_id: JobId, now: OffsetDateTime) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO service_state (job_id, health, health_since, updated_at) VALUES (?1, 'starting', ?2, ?2) \
+         ON CONFLICT (job_id) DO UPDATE SET health = 'starting', health_since = ?2, healthy_since = NULL, \
+             last_activity_at = NULL, updated_at = ?2",
+    )
+    .bind(job_id.to_string())
+    .bind(ts(now))
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Records the health an agent reported for the running attempt. `since` is what `health_since` shows; `now` is the
+/// hub's clock, which the restart policy and the idle timeout count from: an attempt that becomes `healthy` records
+/// it (`healthy_since`), and its first `healthy` starts the idle timeout (`last_activity_at`).
+pub async fn set_health(
+    conn: &mut Conn,
+    job_id: JobId,
+    health: ServiceHealth,
+    since: OffsetDateTime,
+    now: OffsetDateTime,
+) -> Result<(), StoreError> {
+    let healthy = health == ServiceHealth::Healthy;
+    sqlx::query(
+        "UPDATE service_state SET health = ?1, health_since = ?2, \
+             healthy_since = CASE WHEN ?3 THEN COALESCE(healthy_since, ?4) ELSE NULL END, \
+             last_activity_at = CASE WHEN ?3 THEN COALESCE(last_activity_at, ?4) ELSE last_activity_at END, \
+             updated_at = ?4 \
+         WHERE job_id = ?5",
+    )
+    .bind(health_str(health))
+    .bind(ts(since))
+    .bind(healthy)
+    .bind(ts(now))
+    .bind(job_id.to_string())
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// An attempt that was healthy for 10 minutes resets the count of attempts that never became healthy (H2 §7.2).
+pub async fn reset_unhealthy_attempts(conn: &mut Conn, job_id: JobId, now: OffsetDateTime) -> Result<(), StoreError> {
+    sqlx::query("UPDATE service_state SET unhealthy_attempts = 0, updated_at = ? WHERE job_id = ?")
+        .bind(ts(now))
+        .bind(job_id.to_string())
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// The attempt of a service was lost with its node: no health until the next one starts, and the restart counters as
+/// the restart policy left them (`unhealthy_attempts`, and the node-loss restarts of the last 24 h).
+pub async fn service_attempt_ended(
+    conn: &mut Conn,
+    job_id: JobId,
+    unhealthy_attempts: u32,
+    node_loss_restarts: &[i64],
+    now: OffsetDateTime,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO service_state (job_id, unhealthy_attempts, node_loss_restarts, updated_at) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT (job_id) DO UPDATE SET health = NULL, health_since = NULL, healthy_since = NULL, \
+             unhealthy_attempts = ?2, node_loss_restarts = ?3, updated_at = ?4",
+    )
+    .bind(job_id.to_string())
+    .bind(i64::from(unhealthy_attempts))
+    .bind(json(&node_loss_restarts, "service_state.node_loss_restarts")?)
+    .bind(ts(now))
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// The attempt of a service ended some other way than a node loss: no health until the next one starts. The restart
+/// counters stay.
+pub async fn clear_service_health(conn: &mut Conn, job_id: JobId, now: OffsetDateTime) -> Result<(), StoreError> {
+    sqlx::query(
+        "UPDATE service_state SET health = NULL, health_since = NULL, healthy_since = NULL, updated_at = ? \
+         WHERE job_id = ?",
+    )
+    .bind(ts(now))
+    .bind(job_id.to_string())
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// A running service the idle timeout may stop (H2 §7.4 "Idle accounting").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdleCandidate {
+    /// Its current lease.
+    pub lease_id: LeaseId,
+    /// The service.
+    pub job_id: JobId,
+    /// `service.idle_timeout_s`.
+    pub idle_timeout_s: u32,
+    /// What the timeout counts from.
+    pub last_activity_at: OffsetDateTime,
+}
+
+/// Running services with an idle timeout and an activity to count it from, that nobody asked to stop and whose
+/// model pull is not running: the idle cancel's input, read-only. A service that never became healthy is not here
+/// (its start period bounds it), nor is one with `idle_timeout_s: null`.
+pub async fn idle_candidates(conn: &mut Conn) -> Result<Vec<IdleCandidate>, StoreError> {
+    let rows: Vec<(String, String, i64, i64)> = sqlx::query_as(
+        "SELECT l.id, l.job_id, json_extract(j.spec_view, '$.service.idle_timeout_s'), s.last_activity_at \
+         FROM leases l JOIN jobs j ON j.job_id = l.job_id JOIN service_state s ON s.job_id = l.job_id \
+         WHERE l.state = 'running' AND l.epoch = j.epoch AND j.status = 'running' AND j.kind = 'service' \
+           AND j.cancel_requested_at IS NULL AND s.last_activity_at IS NOT NULL \
+           AND (s.setup_state IS NULL OR s.setup_state <> 'pulling') \
+           AND json_extract(j.spec_view, '$.service.idle_timeout_s') IS NOT NULL \
+         ORDER BY l.offered_at_ms, l.id",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    rows.into_iter()
+        .map(|(lease, job, timeout, at)| {
+            Ok(IdleCandidate {
+                lease_id: parse_col(&lease, "leases.id")?,
+                job_id: parse_col(&job, "leases.job_id")?,
+                idle_timeout_s: u32_col(timeout, "jobs.spec_view.service.idle_timeout_s")?,
+                last_activity_at: from_ts(at, "service_state.last_activity_at")?,
+            })
+        })
+        .collect()
 }
 
 // --- Usage ledger -------------------------------------------------------------------------------------------------

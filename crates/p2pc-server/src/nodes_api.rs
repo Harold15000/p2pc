@@ -62,21 +62,24 @@ pub async fn get_server(State(state): State<AppState>, _key: AnyKey) -> Json<Ser
     Json(state.server.info())
 }
 
-/// Who may mint a join token: `admin` principals only, as in H1.
+/// Who may mint a join token (H2 §5.4, §7.3): an `admin` principal, as in H1, or one with `nodes:join`.
 ///
-/// TODO(T2-12): also accept `nodes:join` (`p.has_scope(Scope::NodesJoin)`, H2 §5.4) once the scheduler refuses
-/// leases to `pending_approval` nodes. Until then a node enrolled with a non-`admin`'s token would be stored
-/// `pending_approval` and still get work (SI-H2-19), so the scope stays defined but grants nothing here. The rules
-/// for such callers in [`create_join_token`] (no `pre_approved`, at most 900 s) are already written for that day.
+/// A node enrolled with a token of a non-`admin` principal is stored `pending_approval`, and the scheduler gives a
+/// pending node no lease until an `admin` approves it (SI-H2-19: never a placement candidate, no offer accepted from
+/// it, `scheduler::fit` and `Scheduler::accept`). So `nodes:join` lets its holder enroll a machine, never give it
+/// work.
 fn may_mint_join_token(p: &crate::auth::Principal) -> bool {
-    p.is_admin()
+    p.has_scope(Scope::NodesJoin)
 }
 
 /// Creates a single-use join token. The token is in the response, once.
 ///
-/// Only `admin` principals mint tokens, as in H1. `pre_approved` (at most 900 s) makes the node start `approved`;
-/// without it, a token minted by an `admin` **device** gives a `pending_approval` node, while a token of an `admin`
-/// API key enrolls as in H1 (H2 §5.5).
+/// - An `admin` principal mints as in H1 (up to 24 h). `pre_approved` (at most 900 s) makes the node start
+///   `approved`; without it, a token minted by an `admin` **device** gives a `pending_approval` node, while a token of
+///   an `admin` API key enrolls as in H1 (H2 §5.5).
+/// - A principal with `nodes:join` and no `admin` mints tokens of at most 900 s, never `pre_approved`. Their node
+///   starts `pending_approval`: it connects and reports like any node, and gets no work until an `admin` approves it
+///   (`POST /v1/nodes/{id}/approve`).
 #[utoipa::path(
     post,
     path = "/v1/nodes/join-tokens",
@@ -85,8 +88,8 @@ fn may_mint_join_token(p: &crate::auth::Principal) -> bool {
     responses(
         (status = 201, description = "The token (`p2pc_join_…`), shown only this once.", body = JoinTokenResponse),
         (status = 401, description = "Missing or invalid key (also when the key was revoked or expired during the request).", content_type = "application/problem+json", body = Problem),
-        (status = 403, description = "The caller lacks the admin scope.", content_type = "application/problem+json", body = Problem),
-        (status = 422, description = "Invalid `label` or `ttl_s` (1-86400, default 900; at most 900 with `pre_approved`).", content_type = "application/problem+json", body = Problem),
+        (status = 403, description = "The caller has neither `admin` nor `nodes:join`, or sets `pre_approved` without `admin`.", content_type = "application/problem+json", body = Problem),
+        (status = 422, description = "Invalid `label` or `ttl_s` (1-86400, default 900; at most 900 with `pre_approved` or for a caller without `admin`).", content_type = "application/problem+json", body = Problem),
     )
 )]
 pub async fn create_join_token(
@@ -95,7 +98,7 @@ pub async fn create_join_token(
     ApiJson(body): ApiJson<CreateJoinToken>,
 ) -> Result<Response, ApiError> {
     if !may_mint_join_token(&p) {
-        return Err(ApiError::forbidden(Scope::Admin));
+        return Err(ApiError::forbidden(Scope::NodesJoin));
     }
     // `pre_approved` carries an `admin`'s approval of the node: only an `admin` may set it (H2 §7.3).
     if body.pre_approved && !p.is_admin() {
@@ -129,7 +132,10 @@ pub async fn create_join_token(
     // §5 "Re-checked at the point of use", with the time read once the write lock is held.
     let now = state.clock.now();
     let caller = recheck_caller(&mut tx, &state, &p, now).await?;
-    if !may_mint_join_token(&caller) || (body.pre_approved && !caller.is_admin()) {
+    if !may_mint_join_token(&caller) {
+        return Err(ApiError::forbidden(Scope::NodesJoin));
+    }
+    if body.pre_approved && !caller.is_admin() {
         return Err(ApiError::forbidden(Scope::Admin));
     }
     let token = JoinToken::generate(

@@ -29,6 +29,7 @@ use crate::store::{OpenMode, accounts, join_tokens, keys, open};
 
 pub(crate) const T0: OffsetDateTime = datetime!(2026-11-05 10:00:00 UTC);
 pub(crate) const TTL: Duration = Duration::seconds(60);
+pub(crate) const AFFINITY_WAIT: Duration = Duration::seconds(900);
 
 /// Records every message and knows which nodes are connected.
 /// A tick in a test must not have failed any step.
@@ -128,6 +129,7 @@ pub(crate) fn timing() -> Timing {
         lease_ttl: TTL,
         pull_timeout: Duration::seconds(600),
         gpu_hour_units: Units::from_units(10),
+        volume_affinity_wait: AFFINITY_WAIT,
     }
 }
 
@@ -509,6 +511,9 @@ macro_rules! mt_test {
         }
     };
 }
+
+// After `mt_test!`, which it uses.
+mod services;
 
 // --- Placement -------------------------------------------------------------------------------------------------
 
