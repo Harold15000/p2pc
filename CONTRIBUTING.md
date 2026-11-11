@@ -89,9 +89,9 @@ expected: do not work around it.
    app's relay-only invite listener (no IP transport) accepts the two `p2pc/invite/1` exchanges of one join (open,
    then hand-over, both from one phone) while the invite is valid. Nothing else listens beyond the loopback REST
    listener, and every agent still only dials out. The invite-listener clause is subject to E10 (H2 spec §18), which
-   is pending: no code builds the invite listener until E10 passes. If E10 fails, that clause lapses until one
-   reviewed change amends hard rule 4, H1 §10 and ADR-016 together. A joining-PC listener with an IP transport is
-   never covered.
+   is pending: no code builds the invite listener until E10's invite-listener check passes. If that check fails, that
+   clause lapses until one reviewed change amends hard rule 4, H1 §10 and ADR-016 together. A joining-PC listener
+   with an IP transport is never covered.
 5. **Secrets:**
    - API keys and enrollment codes are stored only as hashes and shown once.
    - Never put secrets in logs, errors, panics, test fixtures or the repo. Use `secrecy` or redaction.

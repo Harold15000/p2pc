@@ -806,9 +806,9 @@ and deleted without following links (H2 §11.1, §11.3, SI-H2-9), and nothing el
   on a joining PC, the app's relay-only invite listener (no IP transport) accepts the two `p2pc/invite/1` exchanges
   of one join (open, then hand-over, both from one phone) while the invite is valid. Nothing else listens beyond the
   loopback REST listener, and agents still only dial out (H2 §10.5). The invite-listener clause is subject to E10
-  (H2 §18), which is pending: no code builds the invite listener until E10 passes. If E10 fails, that clause lapses
-  until one reviewed change amends hard rule 4, H1 §10 and ADR-016 together. A joining-PC listener with an IP
-  transport is never covered.
+  (H2 §18), which is pending: no code builds the invite listener until E10's invite-listener check passes. If that
+  check fails, that clause lapses until one reviewed change amends hard rule 4, H1 §10 and ADR-016 together. A
+  joining-PC listener with an IP transport is never covered.
 - **Address hygiene (from experiment E4, 2026-11-05).** iroh 1.x advertises every local address by default. E4 saw
   the public IP, a Tailscale address and container-bridge addresses, and it picked the Tailscale path on its own.
   Agents and the server therefore MUST:
