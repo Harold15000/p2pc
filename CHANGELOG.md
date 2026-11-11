@@ -11,6 +11,12 @@ changes; they are listed under **Changed** or **Removed**.
 - H2 workspace scaffold: empty crates `p2pc-device` and `p2pc-wsl`, and placeholder directories `apps/desktop`,
   `apps/web`, `templates/`, `deploy/relay` and `deploy/web`. No behaviour change.
 
+### Changed
+
+- Hard rules 3 and 4 (CONTRIBUTING, H1 §9 and §10) each gain the one bounded H2 exception: agent-created per-account
+  persistent volumes (ADR-015) and inbound iroh on the hub PC and a joining PC's relay-only invite listener (ADR-016),
+  both now Accepted (O-16).
+
 ### Security
 
 - RUSTSEC-2026-0462: upgraded `rmcp` to 3.9.0 (unbounded response buffering in its Streamable HTTP clients).
