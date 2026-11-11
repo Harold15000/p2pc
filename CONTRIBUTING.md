@@ -87,7 +87,9 @@ expected: do not work around it.
    ALPN behind a ticket, a token, a key or a paired NodeId and under pre-auth limits; on a PC that is joining, the
    app's relay-only invite listener (no IP transport) accepts the two `p2pc/invite/1` exchanges of one join (open,
    then hand-over, both from one phone) while the invite is valid. Nothing else listens beyond the loopback REST
-   listener, and every agent still only dials out.
+   listener, and every agent still only dials out. The invite-listener clause is in force subject to E10 (H2 spec
+   §18), which is pending: if E10 shows that a relay-only listener is impossible, that clause is amended before the
+   listener is built.
 5. **Secrets:**
    - API keys and enrollment codes are stored only as hashes and shown once.
    - Never put secrets in logs, errors, panics, test fixtures or the repo. Use `secrecy` or redaction.
