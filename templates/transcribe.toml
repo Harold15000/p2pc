@@ -1,0 +1,87 @@
+# Transcribe audio: whisper.cpp as a batch job (H2 spec §7.6 "Templates shipped with the beta").
+#
+# OPEN ITEMS (T2-50 follow-ups; the release build refuses a placeholder digest, so none of this can ship by accident):
+#  - The image digest is a PLACEHOLDER (all zeros). Take the digest of `ghcr.io/ggml-org/whisper.cpp:main-cuda` (an
+#    upstream image with ffmpeg and CUDA) from the registry (`skopeo inspect` or `crane digest`) and write it in, or
+#    publish our own build by digest if E11 prefers one.
+#  - `transcribe.sh` was tested with fake ffmpeg, whisper-cli and curl programs only. Run it once on a test node with
+#    the real image (and a container runtime) before the first release: the program paths and flags are the upstream
+#    image's, and the model download hosts below were not re-checked against it here.
+#  - Models are downloaded without a checksum. E11 should record the SHA-256 of base, small and medium so the script
+#    can verify them.
+
+id = "transcribe"
+version = 1
+title = "Transcribe audio"
+description = "Turn a recording into text with Whisper, on your own computers. You get the transcript as plain text and as subtitles (SRT and VTT). The medium model needs about 5 GB of video memory."
+kind = "batch"
+ui = "transcribe"
+licenses = [
+  "whisper.cpp: MIT",
+  "Whisper models: MIT",
+  "FFmpeg in the image: LGPL-2.1-or-later, or GPL when built with GPL parts",
+]
+# Image plus the default `small` model, in MiB. An estimate: confirm with the real digest.
+download_mb = 4500
+
+[requirements]
+gpu = "preferred"
+min_vram_mb = 2048
+
+# The recording. It becomes the file /inputs/audio, read-only.
+[[params]]
+name = "audio"
+label = "Audio file"
+type = "blob"
+target = "input:/inputs/audio"
+
+# The spoken language, or `auto` to let the model detect it. The script checks it again before using it.
+[[params]]
+name = "language"
+label = "Language"
+type = "enum"
+values = ["auto", "en", "es", "fr", "de", "it", "pt", "nl", "pl", "ru", "uk", "tr", "ar", "hi", "zh", "ja", "ko"]
+default = "auto"
+target = "env:LANGUAGE"
+
+[[params]]
+name = "model"
+label = "Model"
+type = "enum"
+values = ["base", "small", "medium"]
+default = "small"
+target = "env:MODEL"
+
+[spec]
+name = "Transcribe audio"
+# PLACEHOLDER digest: see the open items above.
+image = "ghcr.io/ggml-org/whisper.cpp@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+command = ["/bin/sh", "/inputs/.template/transcribe.sh"]
+# One hour fits the daily caps this template is meant for (it is a batch job, 1 s to 24 h).
+timeout_s = 3600
+
+# The two values below are the defaults; the parameters replace them whole.
+[spec.env]
+LANGUAGE = "auto"
+MODEL = "small"
+
+[spec.resources]
+cpu = 4
+memory_mb = 4096
+gpu = 1
+disk_mb = 4096
+
+# Fixed by the template: where the script downloads a model from (Hugging Face, which serves files from its own CDN
+# hosts under hf.co).
+[spec.egress]
+allow = ["huggingface.co", "hf.co"]
+
+# The fixed script, read-only in the container. `from` is read from this directory by the bundle compiler.
+[[spec.files]]
+path = "/inputs/.template/transcribe.sh"
+from = "transcribe/transcribe.sh"
+
+[[spec.volumes]]
+name = "tpl:transcribe/models"
+mount = "/volumes/models"
+max_mb = 5120

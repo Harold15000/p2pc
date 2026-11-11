@@ -1,0 +1,113 @@
+# Private AI chat: Ollama as a service (H2 spec §7.6 "Templates shipped with the beta").
+#
+# OPEN ITEMS (T2-50 follow-ups; the release build refuses a placeholder digest, so none of this can ship by accident):
+#  - The image digest is a PLACEHOLDER (all zeros). Take the current one from the registry (`skopeo inspect` or
+#    `crane digest docker.io/ollama/ollama:<tag>`) and write it in. Ollama images must be pinned by digest: an old tag
+#    can no longer pull current models (E11). The image is about 5.1 GB.
+#  - The model CDN host in `egress.allow` (Ollama's registry redirects blob downloads to an object-storage host) and
+#    the model list were not re-checked against the registry here. E11 confirmed that `gemma3:1b` runs on a 16 GB GPU.
+#    Confirm the host, the tags and each model's license on a test node before the first release.
+
+id = "private-chat"
+version = 1
+title = "Private AI chat"
+description = "Chat with an open language model that runs on your own computers. Nothing you type leaves your cloud; the model is downloaded once and kept."
+kind = "service"
+ui = "chat"
+singleton = true
+# Shown in the UI before launch: the image, then the models.
+licenses = [
+  "Ollama: MIT",
+  "Qwen3 models (qwen3:4b, qwen3:1.7b): Apache-2.0",
+  "Gemma 3 model (gemma3:1b): Gemma Terms of Use",
+]
+# About 5.1 GB of image plus about 2.5 GiB for the default model, in MiB.
+download_mb = 7500
+
+[requirements]
+gpu = "preferred"
+min_vram_mb = 4096
+
+# The model the hub downloads at launch (the `pull` target). The default is at most about 4 B parameters, Apache-2.0,
+# about 2.5 GiB. Other values are smaller choices for a computer with little memory.
+[[params]]
+name = "model"
+label = "Model"
+type = "enum"
+values = ["qwen3:4b", "qwen3:1.7b", "gemma3:1b"]
+default = "qwen3:4b"
+target = "pull"
+
+# Stop the chat after this many idle seconds (900 s to 24 h).
+[[params]]
+name = "idle_timeout_s"
+label = "Stop after idle seconds"
+type = "int"
+min = 900
+max = 86400
+default = 3600
+target = "field:service.idle_timeout_s"
+
+[spec]
+kind = "service"
+name = "Private AI chat"
+# PLACEHOLDER digest: see the open items above.
+image = "docker.io/ollama/ollama@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+command = ["/bin/ollama", "serve"]
+# The longest a service may run: 30 days. After it the chat UI offers "Restart".
+timeout_s = 2592000
+
+[spec.env]
+OLLAMA_HOST = "127.0.0.1:11434"
+OLLAMA_MODELS = "/volumes/models"
+
+[spec.resources]
+cpu = 4
+memory_mb = 8192
+gpu = 1
+disk_mb = 2048
+
+# Fixed by the template. Ollama's registry and the host its downloads are redirected to.
+[spec.egress]
+allow = [
+  "registry.ollama.ai",
+  # UNVERIFIED: the object-storage host behind Ollama's registry. Confirm in E11.
+  "dd20bb891979d25aebc8bec07b2b3bbc.r2.cloudflarestorage.com",
+]
+
+[spec.retry]
+max_attempts = 3
+
+[spec.service]
+idle_timeout_s = 3600
+restart = "on_node_loss"
+
+[[spec.service.ports]]
+port = 11434
+name = "api"
+
+[spec.service.health]
+http_get = "/api/version"
+port = 11434
+interval_s = 10
+timeout_s = 3
+start_period_s = 600
+failure_threshold = 3
+
+[[spec.volumes]]
+name = "tpl:private-chat/models"
+mount = "/volumes/models"
+max_mb = 20480
+
+# What a non-admin principal may send to the service (§7.4): the chat and the model list, nothing else. No route pulls,
+# creates, copies, pushes or deletes a model: only the hub downloads models, and only an admin's raw connection can
+# write one.
+[[allowed_routes]]
+port = 11434
+method = "POST"
+path = "/api/chat"
+
+[[allowed_routes]]
+port = 11434
+method = "GET"
+path = "/api/tags"
