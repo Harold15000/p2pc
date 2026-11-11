@@ -191,7 +191,7 @@ slice is defined in §12). The Linux installers are unchanged.
 | Node enrollment | **Changed.** A node enrolled with a join token minted by a non-`admin` principal starts `pending_approval` and gets no lease until an `admin` principal approves it. Tokens minted by `admin` API keys enroll as in H1. A token minted by an `admin` **device** (the hub PC's "Copy invite") also starts its node `pending_approval`, unless it was minted with the `pre_approved` option, which only the hub PC's app uses: for its own node at first run (§8.2 step 4) and as the explicit option of "Copy invite" (15 minutes, single use; `join_tokens.pre_approved`). A join token minted for an approved join request is bound to the joining agent's NodeId and enrolls no other (`join_tokens.bound_iroh_node_id`, §5.4). The stored rule: a node is created `approved` iff its token has `pre_approved = 1`, or a `bound_iroh_node_id`, or was created by an `admin` API key; otherwise `pending_approval` (§5.5). | §5.4, §5.5 |
 | Sandbox and hard rules | **In force since O-16 (2026-11-11).** Hard rule 3 (CONTRIBUTING) and H1 §9 ("never … host paths beyond the three per-job directories") have exactly one exception, recorded in ADR-015 (**Accepted**): **persistent volumes**. A volume is a directory the agent creates itself, per account, named by a hash of the volume name (never a path taken from the JobSpec); it is mounted only into service jobs and template jobs of that account, is size-limited (`max_mb`, H1's fail-closed measurement), is checked without following links before every mount, and is deleted without following links. **The exception took effect when the architect accepted this spec after E11 part 1, through a separate change that amended CONTRIBUTING hard rule 3 and H1 §9's "Never" line together and marked ADR-015 Accepted** (the same change put the listening exception below in force, O-16). Nothing else in hard rule 3 changes and services need no exception from it: every job, services included, has a finite wall-clock limit (`timeout_s`, at most 30 days). | §7.1, §11.1, §11.3 |
 | Phoning home (hard rule 6) | The app's daily update check and its web app verification fetch are **opt-in**: an explicit yes/no at first run with nothing preselected, and a Settings toggle. Without it the app checks for updates and verifies the web app only when the user clicks "Check for updates" or "Verify web app". | §3, §8.2, §9.6, §14.1 |
-| Listening (hard rule 4, H1 §10) | **In force since O-16 (2026-11-11).** Hard rule 4 (CONTRIBUTING: "nodes never listen on the network") and H1 §10 ("nodes never listen on a TCP or UDP port that is reachable from outside, beyond what iroh needs for outbound QUIC") have exactly one bounded exception, recorded in ADR-016 (**Accepted**): **the hub PC accepts inbound iroh connections**. The hub PC is also a node, and H2 does not read the rules as covering agents only. On that PC, only while the hub is enabled, the hub's own iroh endpoint accepts incoming QUIC on the UDP sockets `p2pc-net` binds for that endpoint under H1's address hygiene, with every ALPN behind a ticket, a token, a key or a paired NodeId and under pre-auth limits; on a PC that is joining, the app's relay-only invite listener (no IP transport) accepts the two `p2pc/invite/1` exchanges of one join (open, then hand-over, both from one phone) while the invite is valid. Nothing else listens beyond the loopback REST listener, and every agent still only dials out (§10.5). **The exception took effect through the same separate change as the volume exception (O-16), which amended CONTRIBUTING hard rules 3 and 4, H1 §9 and H1 §10 together and marked ADR-015 and ADR-016 Accepted.** The invite-listener clause is in force subject to E10, which is pending: if E10 shows that a relay-only listener is impossible, that clause and ADR-016 are amended before T2-44 builds the listener (T2-44 depends on E10, §17). | §5.4, §10.5, O-16 |
+| Listening (hard rule 4, H1 §10) | **In force since O-16 (2026-11-11).** Hard rule 4 (CONTRIBUTING: "nodes never listen on the network") and H1 §10 ("nodes never listen on a TCP or UDP port that is reachable from outside, beyond what iroh needs for outbound QUIC") have exactly one bounded exception, recorded in ADR-016 (**Accepted**): **the hub PC accepts inbound iroh connections**. The hub PC is also a node, and H2 does not read the rules as covering agents only. On that PC, only while the hub is enabled, the hub's own iroh endpoint accepts incoming QUIC on the UDP sockets `p2pc-net` binds for that endpoint under H1's address hygiene, with every ALPN behind a ticket, a token, a key or a paired NodeId and under pre-auth limits; on a PC that is joining, the app's relay-only invite listener (no IP transport) accepts the two `p2pc/invite/1` exchanges of one join (open, then hand-over, both from one phone) while the invite is valid. Nothing else listens beyond the loopback REST listener, and every agent still only dials out (§10.5). **The exception took effect through the same separate change as the volume exception (O-16), which amended CONTRIBUTING hard rules 3 and 4, H1 §9 and H1 §10 together and marked ADR-015 and ADR-016 Accepted.** The invite-listener clause is subject to E10 (§18), which is pending: no code builds the invite listener until E10 passes (T2-44 depends on E10, §17). If E10 fails, that clause lapses until one reviewed change amends hard rule 4, H1 §10 and ADR-016 together. A joining-PC listener with an IP transport is never covered. | §5.4, §10.5, O-16 |
 | `Join` failure limits (H1 §6 "Before `Join`") | **Changed: a fix of pre-existing H1 behaviour.** H1's 60 failed `Join`s a minute in total no longer refuses a `Join` without looking at its token: a `Join` with a valid token that gets a slot enrolls whatever the failure counters say, as for pairing and invites. The connection, pending and per-NodeId limits are unchanged. | §6.1, T2-17 |
 | Agent protocol | New messages and server-opened streams behind the agent capabilities `service_jobs`, `volumes`, `blob_inputs`, `leave`, `share_update`, `approval` in `Hello.features`. No new ALPN. | §6.1 |
 | New ALPNs | `p2pc/pair/1` and `p2pc/device/1` on the hub; `p2pc/invite/1` on a joining PC's app. | §6 |
@@ -765,18 +765,19 @@ cursor pagination, request bodies reject unknown fields, responses may grow.
 
 ### 7.1 JobSpec extension
 
-A service job, as the "Private AI chat" template produces it (digests and hosts are placeholders until E11):
+A service job, as the "Private AI chat" template produces it (digests and hosts are placeholders until T2-50
+records them, §17):
 
 ```json
 {
   "kind": "service",
   "name": "Private AI chat",
-  "image": "docker.io/ollama/ollama@sha256:<pinned in E11>",
+  "image": "docker.io/ollama/ollama@sha256:<pinned in T2-50>",
   "command": ["/bin/ollama", "serve"],
   "env": {"OLLAMA_HOST": "127.0.0.1:11434", "OLLAMA_MODELS": "/volumes/models"},
   "resources": {"cpu": 4, "memory_mb": 8192, "gpu": 1, "disk_mb": 2048},
   "timeout_s": 2592000,
-  "egress": {"allow": ["registry.ollama.ai", "<model CDN host, from E11>"]},
+  "egress": {"allow": ["registry.ollama.ai", "<model CDN host, from T2-50>"]},
   "service": {
     "ports": [{"port": 11434, "name": "api"}],
     "health": {"http_get": "/api/version", "port": 11434, "interval_s": 10, "timeout_s": 3,
@@ -796,7 +797,7 @@ A batch job with a blob input (the "Transcribe audio" template, abridged):
 ```json
 {
   "kind": "batch",
-  "image": "<whisper image>@sha256:<pinned in E11>",
+  "image": "<whisper image>@sha256:<pinned in T2-50>",
   "command": ["/bin/sh", "/inputs/.template/transcribe.sh"],
   "env": {"LANGUAGE": "auto", "MODEL": "small"},
   "inputs": [{"path": "/inputs/audio", "blob": "sha256:<64 hex>"}],
@@ -1205,8 +1206,8 @@ output) apply to every new command.
   - `D`, the share of step 3, split with one formula: jobs `offered.disk_mb = min(50 GiB, D / 2)` and volumes
     `volumes_mb = D − that`;
   - `I`, the node's container image store: an allowance of 16 GiB **(H)** for the template images (CUDA builds of
-    Ollama and whisper.cpp) plus a few job images; E11 measures the template images and fixes `I`. H1's per-image size
-    cap still applies, and H1's disk floor protects the owner's disk if images grow past `I`;
+    Ollama and whisper.cpp) plus a few job images; T2-50 measures the template images and fixes `I` (§17). H1's
+    per-image size cap still applies, and H1's disk floor protects the owner's disk if images grow past `I`;
   - `B`, on the hub PC only, the hub's blob quota (`blobs_quota_mb`, §7.5);
   - the 20 GiB floor of step 2, which stays free.
 
@@ -1677,6 +1678,9 @@ exception it needs, in force since O-16 (below).
   - **The joining PC's invite listener** (§5.4) falls under the same exception: an endpoint of the app on a PC whose
     agent is installed, relay-only with no IP transport (§5.4), accepting the two `p2pc/invite/1` exchanges of one join
     (`InviteOpen`, then `Invite`, both from the one phone it binds to) under the §6.2 limits while the invite is valid.
+    It is subject to E10 (§18), which is pending: no code builds the invite listener until E10 passes. If E10 fails,
+    this clause lapses until one reviewed change amends hard rule 4, H1 §10 and ADR-016 together. A joining-PC listener
+    with an IP transport is never covered.
   - **In force since O-16 (2026-11-11).** Like the volume exception (§4.3, ADR-015), this one took effect through the
     separate O-16 change, which amended hard rule 4 and H1 §10 together with hard rule 3 and H1 §9 and marked
     ADR-015 and ADR-016 Accepted. Nothing beyond these bounds accepts a connection. SI-H2-11 probes the bounds.
@@ -1692,15 +1696,16 @@ Podman runs as root of the appliance with `--userns=auto` (H1 §9.0), not as a r
 unprivileged.
 
 **Added arguments:**
-- `-v <volume dir>:<mount>:rw,U` per volume (§11.3): the one host path beyond the three per-job directories, allowed
-  by the hard-rule exception of §4.3 ("Sandbox and hard rules", ADR-015, in force since O-16), and nothing
-  more. `<volume dir>` is always the agent's own
-  `/var/lib/p2pc/volumes/<account_id>/<hash>/data`, never a string from the JobSpec, only for a service or template job
-  of that account, and only after the check of §11.3 "Check before every mount" passed. E11 part 2 measures whether `:U`
-  (a recursive chown on each mount, because `--userns=auto` may pick another range each time) is cheap enough for a
-  model directory, or whether `:idmap` replaces it. **`:U` did not follow a symbolic link** in E11 part 1: after a
-  mount, a planted link to a root-owned file outside the volume was re-owned itself and its target kept its owner
-  (consistent with `lchown`); E11 part 2 checks a link to a directory and a remount.
+- `-v <volume dir>:<mount>:rw,U` per volume (§11.3): the one host path beyond the three per-job directories, allowed by
+  the hard-rule exception of §4.3 ("Sandbox and hard rules", ADR-015, in force since O-16), and nothing more.
+  `<volume dir>` is always the agent's own `/var/lib/p2pc/volumes/<account_id>/<hash>/data`, never a string from the
+  JobSpec, only for a service or template job of that account, and only after the check of §11.3 "Check before every
+  mount" passed. `:U` is a recursive chown on each mount (`--userns=auto` may pick another range each time); in E11 part
+  2a it took 0.58 s on 2,000 files (2 GiB), and 0.37 s on a remount. **`:U` did not follow a symbolic link** in E11
+  parts 1 and 2a: links planted in the volume to a root-owned file, to a root-owned directory and (nested) to that
+  directory, all outside the volume, were re-owned themselves, and every target kept its owner across two mounts in
+  different user namespaces (consistent with `lchown`). `:idmap` is not used: in E11 part 2a the container could not
+  write to an `:idmap` volume; it replaces `:U` only if a later E11 run shows it works.
 - `--label p2pc.kind=service` for services (orphan sweeps and `doctor`).
 - `/.p2pc/ports.json` (in the existing read-only `/.p2pc` mount): the ports the shim may forward.
 - With `ports.json`, the agent's `ingress.sock` in the same directory (§11.2).
@@ -1769,13 +1774,13 @@ Volumes rest on the exception to hard rule 3 (§4.3, ADR-015 **Accepted**), in f
   verifies it and walks the whole tree without following links: `openat(O_NOFOLLOW | O_DIRECTORY)` for directories
   and `fstatat(AT_SYMLINK_NOFOLLOW)` (an lstat) for every entry. Any symbolic link, any entry that is neither a
   directory nor a regular file (FIFO, socket, device), and any regular file with more than one hard link (a chown
-  through it would reach its other name) refuses the mount: the lease fails before start with
-  `error="volume_unsafe"` (a `start_failed`-class error, H1 §9 "Podman failures are not job exits") and the volume is
-  kept for the owner to delete (`VolumeDelete`), never repaired in place. The walk uses H1's entry budget of the disk
-  measurement; over it the mount is refused the same way. The walk runs only after the lock is free (no container
-  of an earlier lease exists, as Podman confirmed, even across an agent restart; "One holder at a time", above) and
-  is taken for the new lease, so nothing can change the tree between the walk and the mount. E11 part 2 confirms that
-  the template images write no links into their volumes.
+  through it would reach its other name) refuses the mount: the lease fails before start with `error="volume_unsafe"`
+  (a `start_failed`-class error, H1 §9 "Podman failures are not job exits") and the volume is kept for the owner to
+  delete (`VolumeDelete`), never repaired in place. The walk uses H1's entry budget of the disk measurement; over it
+  the mount is refused the same way. The walk runs only after the lock is free (no container of an earlier lease
+  exists, as Podman confirmed, even across an agent restart; "One holder at a time", above) and is taken for the new
+  lease, so nothing can change the tree between the walk and the mount. T2-50 checks that the template images write
+  no links into their volumes (§17).
 - **Deletion** walks the tree with `openat(O_NOFOLLOW)` and `unlinkat`, never following a link (SI-H2-9).
 - **Namespace.** `tpl:` volumes are created only by template launches (§7.1), so an arbitrary image cannot read or
   plant files in a template's model cache.
@@ -1804,7 +1809,7 @@ Volumes rest on the exception to hard rule 3 (§4.3, ADR-015 **Accepted**), in f
   reviewed, but they are not our code.
 - Model files come from the internet: the template's declared models, which only the hub pulls (§7.6); no
   non-`admin` principal reaches a template service's model-writing routes (§7.4). The default
-  models are GGUF files read as data **(H: E11 confirms that the
+  models are GGUF files read as data **(H: T2-50 confirms that the
   chosen images load only GGUF and do not execute code from model files)**.
 - These go into `docs/security/residual-risks.md` (task T2-61).
 
@@ -2118,7 +2123,7 @@ start.
 | **Agent lane** | | | | |
 | T2-20 | Agent: service lifecycle | T2-02 | `p2pc-agent` `executor/`, `sandbox/driver.rs`, `sandbox/engine.rs` | Services with H1's wall-clock enforcement up to 30 days, health state machine, `ServiceHealth`, log ring, `used_cpu_ms` and `max_rss_mb` in heartbeats. |
 | T2-21 | Shim and agent: ingress bridge and port streams | T2-20 | `p2pc-shim`, agent new `sandbox/ingress.rs`, `connection/streams.rs` | §11.2 (health checks read only the status line, at most 1 KiB) and the stream dispatcher for hub-opened streams (SI-H2-7). |
-| T2-22 | Agent: volumes | T2-21, E11 part 2 | agent new `volumes.rs`, `sandbox/engine.rs` (argv), `inventory.rs` | §11.3, `VolumeReport`, `VolumeDelete`, budget, eviction, GC, the persisted one-holder lock released only when Podman confirms the container gone (across agent restarts, after the orphan sweep), the no-follow check before every mount, mounts only into service or template jobs of the account (SI-H2-9). Uses E11 part 2's `:U` vs `:idmap` result and its answer on whether `:U` follows a link to a directory (part 1 answered it for a link to a file). |
+| T2-22 | Agent: volumes | T2-21 | agent new `volumes.rs`, `sandbox/engine.rs` (argv), `inventory.rs` | §11.3, `VolumeReport`, `VolumeDelete`, budget, eviction, GC, the persisted one-holder lock released only when Podman confirms the container gone (across agent restarts, after the orphan sweep), the no-follow check before every mount, mounts only into service or template jobs of the account (SI-H2-9). Uses `:U`, per E11 parts 1 and 2a (done): it follows no link, to a file or a directory, across a remount; `:idmap` was not usable (§11.1). |
 | T2-23 | Agent: blob fetch, share changes, pause, leave | T2-21 | agent new `blobs.rs`, `config.rs`, `main.rs` (subcommands), `connection/session.rs` | `BlobFetch` client, `share set`, `owner_paused`, `leave`, `approval` (`Welcome.pending_approval`, `NodeApproved`), `status --json` additions (`iroh_node_id` before enrollment, the node phrase). |
 | **Device and web lane** | | | | |
 | T2-30 | `p2pc-device` crate | T2-02, E9 | `crates/p2pc-device` | Pairing and invite clients, device connection, HTTP/1.1 over streams, `open_port`; native and `wasm32` builds in CI; a native test client for AC-H2-7. |
@@ -2134,23 +2139,23 @@ start.
 | T2-44 | Join flow | T2-43, T2-30, E10 | `apps/desktop` `invite/` module, `apps/web/src/desktop/join` | §5.4 PC side (relay-only invite listener built through `p2pc-net` with `direct_addresses = "none"`, no IP transport, with the §6.2 limits and its binding to one phone, QR with the agent NodeId and the listener commitment, the approval phrase shown after `InviteReveal`), invite text (pending by default, the explicit "Pre-approve" option on the hub PC only), hub phrase (SI-H2-16); on the hub PC, approving join requests and pending nodes with the approval and node phrases, the source device and the time; `join_pending` with the node phrase and `hub_gone` (§8.8). |
 | T2-45 | `p2pc-wsl` upgrade and uninstall; app updater | T2-43 | `crates/p2pc-wsl` (`upgrade.rs`, `uninstall.rs`), `apps/desktop` `update/`, `uninstall/`, NSIS hooks | §8.3 second half, §8.7 (the hub deletes the other nodes first; failed-upgrade backups kept unless the box is ticked), §14.1-§14.2 (opt-in automatic checks, template bundle delivery), web app verification with the signed manifest and its high-water mark (§9.6, SI-H2-22), parity test with `install.ps1` (SI-H2-15). |
 | **Infrastructure and clients lane** | | | | |
-| T2-50 | Templates data and bundle | T2-01, E11 | `templates/`, `scripts/templates-bundle` | The two templates (with `allowed_routes` and the `pull` parameter), bundle compiler and signer, bundle tests (SI-H2-13). |
+| T2-50 | Templates data and bundle | T2-01, E11 part 2a (done) | `templates/`, `scripts/templates-bundle` | The two templates (with `allowed_routes` and the `pull` parameter), bundle compiler and signer, bundle tests (SI-H2-13). Its recorded checks, moved from E11 (§18), amend this spec before it lands: template image sizes and digests (they fix `I`, §8.2), the exact egress hosts of model downloads, that the template images write no links into their volumes and load only GGUF, VRAM and tokens/s of candidate models, whisper.cpp speed on a 30-minute file, and the default model (O-5). |
 | T2-51 | Relay deployment and relay-map rules | E12 | `deploy/relay/`, `p2pc-net` (relay-map validation), `p2pc-agent` `doctor.rs` | §10.2-§10.3. |
 | T2-52 | Release pipeline | T2-45, T2-34, T2-50 | `.github/workflows/`, `scripts/release/` | Tauri artifacts and `latest.json` per channel, signed versions, image hash pinning, signed web manifest and template bundle. |
 | T2-53 | CLI and client additions | T2-01 | `p2pc-cli` commands, `p2pc-client` | §7.8 CLI (including `nodes approve`, `devices pair --cap/--image` and the percent-encoded name of `volumes rm`); tested against the mock server, which learns the new endpoints. |
 | T2-54 | Python SDK and MCP additions | T2-53 | `sdk/python`, `p2pc-cli/src/mcp` | §7.8 SDK and MCP, including the upload-directory rule of `p2pc_blob_put` (SI-H2-21). |
 | **Closing** | | | | |
-| T2-60 | Acceptance suite and docs | all | `tests/acceptance-h2/`, `docs/` | §16, the beta guide, the self-hosting guide, OpenAPI drift; update README.md's statements of hard rules 3 and 4 for the two exceptions when H2 ships. |
+| T2-60 | Acceptance suite and docs | all | `tests/acceptance-h2/`, `docs/` | §16 (including E11 part 2b, §18), the beta guide, the self-hosting guide, OpenAPI drift; update README.md's statements of hard rules 3 and 4 for the two exceptions when H2 ships. |
 | T2-61 | Security pass | all | `docs/security/residual-risks.md`, `SECURITY.md` | §11.5 and §15.2 into the residual risks; internal pentest (AC-H2-11). |
 
 Lanes once T2-01 and T2-02 land:
 - server: T2-17 at once (H1 code only); T2-10 → T2-11 (after T2-17) and T2-12 (both edit
   after T2-10's principal storage) → T2-13 → T2-14 → T2-15 (after T2-16 and T2-50 too); T2-12 → T2-16, beside T2-13
   and T2-14;
-- agent: T2-20 → T2-21 → T2-23; T2-22 after T2-21 and E11 part 2;
+- agent: T2-20 → T2-21 → T2-23; T2-22 after T2-21;
 - device and web: T2-30 → T2-31 → T2-32 / T2-33 → T2-34;
 - desktop: T2-40, T2-41 and T2-42 start at once (no proto dependency) → T2-43 → T2-44 (after E10 too) → T2-45;
-- infrastructure and clients: T2-53 → T2-54; T2-51 after E12; T2-50 after E11; T2-52 last.
+- infrastructure and clients: T2-53 → T2-54; T2-51 after E12; T2-50 after E11 part 2a (done); T2-52 last.
 
 Critical path **(H)**: T2-00 (1 d) → T2-01/T2-02 (3 d) → T2-10 (3 d) → T2-11 or T2-12 (3 d) → T2-13 (3 d) → T2-14
 (3 d) → T2-15 (2 d) → T2-60 (3 d), about 21 working days plus review rounds; T2-16 (after T2-12) runs beside T2-13 and
@@ -2165,7 +2170,7 @@ consistent with a beta in 4-6 weeks only if E9, E10 and E11 pass without a desig
 |---|---|---|---|
 | **E9** · iroh WASM in mobile Safari and Chrome Android | WASM size (target ≤ 3 MB compressed **(H)**); pairing through the browser; relay-only connection through n0 and through a plain-HTTP `iroh-relay` behind a TLS PaaS; connect time (p50/p95); chat stream overhead per token; 50 MB upload time on 4G; what happens when the tab goes to the background (how long until the WebSocket drops, reconnect time on return); key persistence across browser restart; iOS Safari vs home-screen storage isolation and Android tab → installed app; hyper's HTTP/1.1 client over an iroh stream in WASM; whether iroh can use a non-extractable WebCrypto key. | Pairing and a streamed chat work on both phones; reconnect ≤ 5 s after returning; 50 MB upload ≤ 2 min on 4G through our relay **(H)**. | A native shell (for example Capacitor) around the same web app, or WebTransport; the spec changes §9 before T2-30. |
 | **E10** · Tauri 2 first run on a clean Windows 11 VM | Time to ready with and without WSL; reboots; UAC prompts; the `wsl --install --no-distribution` path (inbox, Store, already present, too old); SmartScreen and Defender behaviour on the unsigned installer; WebView2 presence; whether the hub's REST is reachable on Windows' loopback through `localhostForwarding`, and never from the LAN; the Windows firewall prompt on the app's first iroh (UDP) bind, for the device endpoint, and what each answer changes; whether the invite listener works relay-only with `direct_addresses = "none"`, with no IP transport (§5.4; if not, this spec and ADR-016 are amended before T2-44 builds the listener); whether the hub's UDP sockets get any unsolicited packet from the LAN under NAT networking, and under mirrored networking whether the Hyper-V firewall drops it (§10.5); sleep and resume; the uninstall inventory. | AC-H2-1 targets met: ≤ 5 min (reboot excluded), ≤ 1 reboot, ≤ 1 UAC. | Revisit step order, bundling the image in the installer, or the WSL install path. |
-| **E11** · GPU service in Podman inside the WSL2 distro | Ollama and whisper.cpp image sizes on disk (they fix the image allowance `I` of §8.2) and pull time; start to healthy with cached image and model; GPU visible (CUDA, not CPU fallback); the port reachable only through the ingress bridge; model download size, time and **the exact hosts** the egress allowlist needs (Ollama's registry and its CDN; Hugging Face for whisper models); Ollama through `HTTPS_PROXY`; `:U` vs `:idmap` on a model volume; **whether `:U` follows symbolic links** (a link planted in the volume to a file and to a directory outside it, then a remount: the targets' owners must not change), and that the template images write no symlinks, FIFOs or hard links into their volumes (§11.3); VRAM and tokens/s of candidate default models; whisper.cpp speed on a 30-minute file; that the images load only GGUF. Its volume measurements run in a throwaway `spikes/` directory, never in product code (§17). **Part 1 (2026-11-10, done; it fed the decision of O-16):** Podman 4.9.3 in the WSL2 node distro ran an Ollama GPU service with `--userns=auto`, `--cap-drop=all`, `no-new-privileges` and a CDI GPU: the Ollama image is about 5.1 GB; the GPU was visible (CDI, 27 of 27 layers on the GPU); `gemma3:1b` is 769 MB, gave its first answer in 4.7 s and used 2.75 GB of VRAM. One symlink to a root-owned regular file outside the volume was planted inside a directory, which was then mounted with `:U` under `--userns=auto`; afterwards the target's owner was unchanged (0:0) and only the link itself was re-owned. **Part 2 (pending):** everything else in this row, including the link to a directory outside the volume, the remount, `:U` vs `:idmap` cost, image sizes and digests, the egress hosts, the default model (O-5), that the template images write no links, and the service launched by the agent with `--network=none` and the ingress bridge. Part 2 is an acceptance test, not a precondition of O-16; it is a precondition of T2-22 and T2-50 (§17). | Healthy ≤ 60 s with cached model **(H)**; downloads work through the egress proxy; no port reachable except through the bridge. | Change the template's image, model or command; a pre-pull step by the agent. |
+| **E11** · GPU service in Podman inside the WSL2 distro | Ollama and whisper.cpp image sizes on disk (they fix the image allowance `I` of §8.2) and pull time; start to healthy with cached image and model; GPU visible (CUDA, not CPU fallback); the port reachable only through the ingress bridge; model download size, time and **the exact hosts** the egress allowlist needs (Ollama's registry and its CDN; Hugging Face for whisper models); Ollama through `HTTPS_PROXY`; `:U` vs `:idmap` on a model volume; **whether `:U` follows symbolic links** (a link planted in the volume to a file and to a directory outside it, then a remount: the targets' owners must not change), and that the template images write no symlinks, FIFOs or hard links into their volumes (§11.3); VRAM and tokens/s of candidate default models; whisper.cpp speed on a 30-minute file; that the images load only GGUF. Its volume measurements run in a throwaway `spikes/` directory, never in product code (§17). **Part 1 (2026-11-10, done; it fed the decision of O-16):** Podman 4.9.3 in the WSL2 node distro ran an Ollama GPU service with `--userns=auto`, `--cap-drop=all`, `no-new-privileges` and a CDI GPU: the Ollama image is about 5.1 GB; the GPU was visible (CDI, 27 of 27 layers on the GPU); `gemma3:1b` (a test vehicle, not an O-5 candidate: O-5 needs an Apache-2.0 or MIT model) is 769 MB, gave its first answer in 4.7 s and used 2.75 GB of VRAM. One symlink to a root-owned regular file outside the volume was planted inside a directory, which was then mounted with `:U` under `--userns=auto`; afterwards the target's owner was unchanged (0:0) and only the link itself was re-owned. **Part 2a (2026-11-12, done; plain Podman 4.9.3 in the WSL2 node distro, WSL2 kernel 6.18, `--userns=auto`, in `spikes/`):** a volume directory held a symlink to a root-owned directory outside it (holding a root-owned file), a symlink to a root-owned regular file outside it, and, in a subdirectory, a symlink to that outside directory. It was mounted with `:U`, then with `:U` again in a new container (a new user namespace). After both mounts every outside target (the directory, the file in it, the regular file) was still 0:0; only the volume and the links were re-owned. Inside the container the links did not resolve (the absolute host paths do not exist in its mount namespace). `:U` on 2,000 files (2 GiB) took 0.58 s, and 0.37 s again when already owned, under a new user namespace. `:idmap` mounted, but the container got "Permission denied" writing to the volume, so `:idmap` is not usable on this kernel and Podman and `:U` stays (§11.1). **Moved to T2-50 as its recorded checks (§17):** image sizes and digests, the egress hosts of model downloads, that the template images write no links and load only GGUF, VRAM and tokens/s of candidate models, whisper.cpp speed, and the default model (O-5). **Part 2b (after T2-22, part of T2-60's acceptance; a precondition of nothing):** the template service launched by the agent with `--network=none`, the ingress bridge and a volume. | Part 2a: no target outside the volume changes owner. Part 2b: healthy ≤ 60 s with cached model **(H)**; downloads work through the egress proxy; no port reachable except through the bridge. | Change the template's image, model or command; a pre-pull step by the agent. If `:U` follows a link or re-owns an outside target (in any later run, on any kernel or Podman), §11.1, ADR-015 and the `:U` wording of hard rule 3 are amended before T2-22 ships, and volumes stay off. |
 | **E12** · relay map (proposed by this spec) | `iroh-relay` in plain-HTTP mode on Railway with native and browser clients; home-relay selection with a mixed map (our HTTP relay plus n0's relays); QUIC address discovery through n0 while relaying through ours; the egress gate opening on a WSL2 node with the production map; whether the hub's endpoint can drop and re-add `p2pc/pair/1` from its accepted ALPNs at run time (§10.5); relay throughput and cost per GB on the PaaS. | AC-H2-13 passes. | A relay on a host with UDP (and TLS) for production, or n0's paid relays. |
 
 ### 18.2 Open items
@@ -2176,7 +2181,7 @@ consistent with a beta in 4-6 weeks only if E9, E10 and E11 pass without a desig
 | O-2 | Official domain and origin of the web app and relay. | Owner | `<web app origin>`, `relay.<domain>` placeholders. |
 | O-3 | Relay hosting plan, budget and abuse limits. | Owner (money) | n0 relays for the beta; Railway for the official deployment. |
 | O-4 | Should a join token created by a phone (`nodes:join`) need approval on the hub PC before the node gets work? | Architect | **Closed (spec v1): yes.** The default phone profile has no `nodes:join` (it opens join requests with `nodes:invite`, approved on the hub PC); `nodes:join` stays in the opt-in developer device profile, and every node enrolled with a token minted by a non-`admin` principal starts `pending_approval` (§5.4, §5.5, SI-H2-19). |
-| O-5 | Default chat model and license review of template images and models. | Architect; owner for legal | An Apache-2.0 or MIT model of ≤ ~4 B parameters, chosen in E11. |
+| O-5 | Default chat model and license review of template images and models. | Architect; owner for legal | An Apache-2.0 or MIT model of ≤ ~4 B parameters, chosen in T2-50's checks (§17); E11 ran `gemma3:1b` only as a test vehicle. |
 | O-6 | Direct device → node connections for service traffic. | Architect | H3. |
 | O-7 | Opening a service's own web UI in the phone (service-worker proxy over iroh). | Architect | H3. |
 | O-8 | Restarting a crashed service in place. | Architect | Not in H2. |
@@ -2187,7 +2192,7 @@ consistent with a beta in 4-6 weeks only if E9, E10 and E11 pass without a desig
 | O-13 | UI languages of the beta. | Owner | English; strings externalized. |
 | O-14 | Privacy notice: what the relay and static host see; the GDPR role of the project. | Owner (legal) | Required before public release. |
 | O-15 | Windows 10 support in the app. | Owner | Not in the beta. |
-| O-16 | Putting the two proposed hard-rule exceptions of §4.3 in force: persistent volumes (ADR-015) and inbound iroh connections on the hub PC (ADR-016, §10.5). | Architect | **Closed (2026-11-11).** The architect accepted this spec after E11 part 1 (2026-11-10, §18 E11: an Ollama GPU service ran in the WSL2 node distro under Podman 4.9.3 with `--userns=auto`, `--cap-drop=all`, `no-new-privileges` and a CDI GPU, and `:U` did not follow a planted symlink to a root-owned file outside the volume). One separate change ("docs: put the H2 hard-rule exceptions in force (O-16)") amended CONTRIBUTING hard rule 3 and H1 §9's "Never" line, and hard rule 4 and H1 §10, together, and marked ADR-015 and ADR-016 Accepted; T2-22, T2-11, T2-41, T2-43 and T2-44 are no longer blocked by it (§17). E10 is pending: the invite-listener clause of the listening exception is in force subject to it, and if E10 shows that a relay-only listener is impossible, that clause and ADR-016 are amended before T2-44, which depends on E10. E11 part 2 (pending) is an acceptance test, not a precondition of O-16; T2-22 and T2-50 depend on it. |
+| O-16 | Putting the two proposed hard-rule exceptions of §4.3 in force: persistent volumes (ADR-015) and inbound iroh connections on the hub PC (ADR-016, §10.5). | Architect | **Closed (2026-11-11).** The architect accepted this spec after E11 part 1 (2026-11-10, §18 E11: an Ollama GPU service ran in the WSL2 node distro under Podman 4.9.3 with `--userns=auto`, `--cap-drop=all`, `no-new-privileges` and a CDI GPU, and `:U` did not follow a planted symlink to a root-owned file outside the volume). One separate change ("docs: put the H2 hard-rule exceptions in force (O-16)") amended CONTRIBUTING hard rule 3 and H1 §9's "Never" line, and hard rule 4 and H1 §10, together, and marked ADR-015 and ADR-016 Accepted; T2-22, T2-11, T2-41, T2-43 and T2-44 are no longer blocked by it (§17). The invite-listener clause of the listening exception is subject to E10, which is pending: no code builds the invite listener until E10 passes (T2-44 depends on E10). If E10 fails, that clause lapses until one reviewed change amends hard rule 4, H1 §10 and ADR-016 together. A joining-PC listener with an IP transport is never covered. E11 part 2a (2026-11-12, done) showed that `:U` re-owns no target outside the volume, through links to a file and to a directory and across a remount, and that `:idmap` is not usable there, so `:U` stays; T2-22 and T2-50 wait on nothing more from E11. E11 part 2b runs after T2-22 as part of T2-60 and is a precondition of nothing. |
 
 ## 19. Sources
 

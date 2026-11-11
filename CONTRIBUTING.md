@@ -76,20 +76,22 @@ expected: do not work around it.
    - no container-runtime socket and no host paths mounted, except the per-job scratch directories the agent creates
      and one exception, **persistent volumes** (ADR-015, H2 spec §4.3 "Sandbox and hard rules", SI-H2-9): a volume
      directory is created by the agent itself, per account, named by a hash of the volume name, never a path taken
-     from the JobSpec; it is mounted read-write with `:U` (or `:idmap` if E11 replaces it, H2 §11.1) only into
-     service jobs and template jobs of that account; it is size-limited (`max_mb`); before every mount the agent
-     walks it without following links and refuses any symlink, any entry that is not a directory or a regular file,
-     and any regular file with more than one link; it is deleted without following links. No other host path;
+     from the JobSpec; it is mounted read-write with `:U` (or `:idmap` only if a later E11 run shows it works, H2
+     §11.1) only into service jobs and template jobs of that account; it is size-limited (`max_mb`); before every
+     mount the agent walks it without following links and refuses any symlink, any entry that is not a directory or
+     a regular file, and any regular file with more than one link; it is deleted without following links. No other
+     host path;
    - limits on CPU, memory, PIDs, disk and wall-clock time.
-4. **Nodes never listen on the network** by default. Agents only connect outbound. One bounded exception (ADR-016,
-   H2 spec §4.3 "Listening" and §10.5): on the hub PC, only while the hub is enabled, the hub's own iroh endpoint
+4. **Nodes never listen on the network** by default. Agents only connect outbound. One bounded exception (ADR-016, H2
+   spec §4.3 "Listening" and §10.5): on the hub PC, only while the hub is enabled, the hub's own iroh endpoint
    accepts incoming QUIC on the UDP sockets `p2pc-net` binds for that endpoint under H1's address hygiene, with every
    ALPN behind a ticket, a token, a key or a paired NodeId and under pre-auth limits; on a PC that is joining, the
    app's relay-only invite listener (no IP transport) accepts the two `p2pc/invite/1` exchanges of one join (open,
    then hand-over, both from one phone) while the invite is valid. Nothing else listens beyond the loopback REST
-   listener, and every agent still only dials out. The invite-listener clause is in force subject to E10 (H2 spec
-   §18), which is pending: if E10 shows that a relay-only listener is impossible, that clause is amended before the
-   listener is built.
+   listener, and every agent still only dials out. The invite-listener clause is subject to E10 (H2 spec §18), which
+   is pending: no code builds the invite listener until E10 passes. If E10 fails, that clause lapses until one
+   reviewed change amends hard rule 4, H1 §10 and ADR-016 together. A joining-PC listener with an IP transport is
+   never covered.
 5. **Secrets:**
    - API keys and enrollment codes are stored only as hashes and shown once.
    - Never put secrets in logs, errors, panics, test fixtures or the repo. Use `secrecy` or redaction.
