@@ -239,8 +239,10 @@ mod tests {
 
     #[test]
     fn without_opt_in_a_reminder_after_thirty_days_and_nothing_sent() {
-        let mut s = UpdateState::default();
-        s.first_seen = Some(NOW);
+        let mut s = UpdateState {
+            first_seen: Some(NOW),
+            ..UpdateState::default()
+        };
         assert_eq!(notice(Some(false), &s, NOW + 30 * DAY_SECS - 1), None);
         assert_eq!(
             notice(Some(false), &s, NOW + 30 * DAY_SECS).unwrap().message(),

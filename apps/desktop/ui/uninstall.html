@@ -1,0 +1,43 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- The uninstaller's cleanup (H2 §8.7, T2-45): `P2PC.exe --uninstall-cleanup` opens this page only. -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Uninstall P2PC</title>
+    <link rel="stylesheet" href="style.css" />
+    <script type="module" src="uninstall.js"></script>
+  </head>
+  <body>
+    <main>
+      <h1>Uninstall P2PC</h1>
+      <section id="confirm" hidden>
+        <p>
+          This removes P2PC from this PC: its scheduled task, the p2pc-node WSL distro (its container images and model
+          files) and its files in your profile.
+        </p>
+        <div id="hub" hidden>
+          <p id="hub-text" class="warning"></p>
+          <label><input type="checkbox" id="hub-ok" /> I understand: delete my cloud</label>
+        </div>
+        <div id="backups" hidden>
+          <p id="backups-reason"></p>
+          <ul id="backups-list"></ul>
+          <label><input type="checkbox" id="delete-backups" /> <span id="delete-backups-label"></span></label>
+        </div>
+        <p>
+          <button type="button" id="go">Uninstall</button>
+          <button type="button" id="cancel">Cancel</button>
+        </p>
+      </section>
+      <p id="working" aria-live="polite" hidden>Removing P2PC… This can take a minute.</p>
+      <section id="done" aria-live="polite" hidden>
+        <ul id="done-lines"></ul>
+        <p id="done-log"></p>
+        <button type="button" id="finish">Close</button>
+      </section>
+      <p id="error" role="alert" hidden></p>
+    </main>
+  </body>
+</html>

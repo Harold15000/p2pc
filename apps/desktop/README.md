@@ -11,11 +11,14 @@ controls, the install of the `p2pc-node` WSL2 distro (through `crates/p2pc-wsl`)
     them), `tray` (menu, tooltip, icons as data), `settings`, `autostart` (`HKCU\…\Run` and `RunOnce`), `launch`
     (single instance, start in the tray at sign-in), `keystore` (the DPAPI-protected device key, §8.9), `navigation`
     (bundled pages only, links to the system browser), `commands` and `capabilities` (the checks that pin the
-    capability, the CSP and the plugin list), and `setup/` (first run, §8.2: the flow, `setup.json`, the disk
-    arithmetic, the §8.8 errors, the WSL host over `crates/p2pc-wsl`, the hub API trait).
+    capability, the CSP and the plugin list), `setup/` (first run, §8.2: the flow, `setup.json`, the disk
+    arithmetic, the §8.8 errors, the WSL host over `crates/p2pc-wsl`, the hub API trait), `update/` (§14, §9.6: the
+    update policy, the artifact gate, the web app verification, the template bundle's delivery, the distro's upgrade
+    plan) and `uninstall/` (§8.7: the cleanup the uninstaller runs).
   - The Tauri glue, `src/app.rs` and `src/main.rs`, behind the cargo feature **`app`** (off by default).
   - `tauri.conf.json`, `capabilities/main.json` (the main window gets the app's own commands only), `icons/`
-    (placeholders written by `icons/generate.py`).
+    (placeholders written by `icons/generate.py`), `nsis/hooks.nsh` (the uninstaller runs the cleanup, never during
+    an update).
 - `ui/`: a placeholder window until the web app build (`apps/web`, T2-31) replaces it (`build.frontendDist`): plain
   HTML and JS modules with no build step. `ui/setup.js` shows first run over the `setup_*` commands; the web app's
   `apps/web/src/desktop/` pages replace it and call the same commands with the same JSON (`SetupView` in
@@ -31,6 +34,10 @@ controls, the install of the `p2pc-node` WSL2 distro (through `crates/p2pc-wsl`)
 apps/desktop/check.sh          # fmt, clippy, tests, cargo-deny; no webview toolkit needed
 apps/desktop/check.sh --app    # plus clippy, tests and a build with the `app` feature
 ```
+
+Without the webview toolkit, the `app` glue can still be type-checked and linted (nothing is linked): put a
+`pkg-config` that answers every query on `PATH` and run
+`cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets --features app -- -D warnings`.
 
 ## Building the app
 
@@ -68,6 +75,15 @@ What to expect in this version (T2-42, T2-43):
   `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\P2PC` = `"<path>\P2PC.exe" --autostart`; turning it off
   deletes that value. On Linux the switch reports that it is not available.
 - The window cannot navigate away from the bundled page; web links open in the system browser.
+- Updates (T2-45): Settings has "Check for updates and verify the web app automatically", "Check for updates",
+  "Verify web app" and, once an update passed its checks, "Install". A build without the release values
+  (`P2PC_UPDATER_PUBKEY`, `P2PC_UPDATE_ENDPOINT`, `P2PC_RELEASE_PUBKEY`, `P2PC_TEMPLATES_ENDPOINT`,
+  `P2PC_WEB_ORIGIN`, `P2PC_WEB_VERSION`, `P2PC_NODE_IMAGE_VERSION`, `P2PC_NODE_IMAGE_MIN_SERVER_VERSION`; see
+  `src/update/release.rs`) checks nothing. Without the user's yes the app never contacts the update endpoint by
+  itself.
+- Uninstall (T2-45): Windows' "Uninstall" runs `P2PC.exe --uninstall-cleanup`, which asks first (on the hub PC with
+  an explicit checkbox), then removes the node and logs each step to `%TEMP%\p2pc-uninstall-<time>.log`. Cancelling
+  stops the uninstall. An app update never runs it.
 
 Filled by:
 

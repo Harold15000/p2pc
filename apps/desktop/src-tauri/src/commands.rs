@@ -39,4 +39,21 @@ pub const COMMANDS: &[&str] = &[
     "setup_phone_status",
     // Step 5: "Continue" or "Skip for now"; first run ends.
     "setup_finish_phone",
+    // Updates (§14.1, T2-45): what the window shows.
+    "update_status",
+    // "Check for updates".
+    "update_check",
+    // "Install now" of a downloaded update.
+    "update_install",
+    // "Verify web app" (§9.6).
+    "web_verify",
+    // Settings' automatic checks on or off (§8.2 step 1).
+    "set_update_checks",
+    // "Update now", "Tonight at 03:00" or "Later" for the distro (§14.2).
+    "distro_upgrade",
+    // The uninstaller's cleanup (§8.7, T2-45). Registered only in the `--uninstall-cleanup` app, never in the normal
+    // one, so the normal window cannot start an uninstall.
+    "uninstall_view",
+    "uninstall_run",
+    "uninstall_finish",
 ];

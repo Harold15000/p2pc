@@ -10,12 +10,17 @@
 //! - [`templates`]: the template bundle's delivery into the distro on the hub PC (§14.1);
 //! - [`web`]: the web app verification against its signed manifest, with its high-water mark (§9.6, SI-H2-22);
 //! - [`distro`]: when and whether to upgrade the distro after the app updated (§14.2);
+//! - [`pending`]: a downloaded update kept until it is installed;
 //! - [`signature`]: minisign verification with the compiled-in keys; [`fetch`]: bounded HTTPS GETs; [`release`]: what a
-//!   release build compiles in.
+//!   release build compiles in;
+//! - `glue` (feature `app`): the updater plugin, the checks, the background thread and the distro's upgrade.
 
 pub mod artifact;
 pub mod distro;
 pub mod fetch;
+#[cfg(feature = "app")]
+pub mod glue;
+pub mod pending;
 pub mod policy;
 pub mod release;
 pub mod signature;

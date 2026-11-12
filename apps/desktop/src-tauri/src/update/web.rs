@@ -397,8 +397,10 @@ mod tests {
                 .messages(ORIGIN)
                 .contains(&"The web app is newer than this app.".to_owned())
         );
-        let mut state = UpdateState::default();
-        state.web_mark = r.new_mark;
+        let state = UpdateState {
+            web_mark: r.new_mark,
+            ..UpdateState::default()
+        };
         store.save(&state).unwrap();
 
         // Then the previous build, validly signed: the rollback warning, also after a restart (the mark is read back).

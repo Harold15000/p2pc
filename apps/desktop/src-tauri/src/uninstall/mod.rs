@@ -19,6 +19,8 @@
 //!
 //! The steps are plain Rust behind [`CleanupHost`] and [`HubNodes`], tested with fakes; [`host`] holds the real ones.
 
+#[cfg(feature = "app")]
+pub mod glue;
 pub mod host;
 pub mod log;
 
@@ -248,8 +250,7 @@ pub fn run_cleanup(
             kept.join("; ")
         ));
     }
-    let mut left: Vec<String> = removed.left.iter().map(|p: &PathBuf| p.display().to_string()).collect();
-    left.extend(host.remove_app_traces());
+    let left: Vec<String> = removed.left.iter().map(|p: &PathBuf| p.display().to_string()).collect();
     for l in &left {
         log.line(&format!("could not delete: {l}"));
     }
@@ -258,6 +259,11 @@ pub fn run_cleanup(
             "These could not be deleted; delete them yourself: {}.",
             left.join("; ")
         ));
+    }
+    // The app's own folders can still be in use by this window's webview: the uninstaller removes them again after
+    // the app has exited (the NSIS hook), so what is left here is logged, not shown.
+    for l in host.remove_app_traces() {
+        log.line(&format!("step 6: left for the uninstaller's last step: {l}"));
     }
     log.line("step 6: the app's data folders and its Run and RunOnce values removed");
     lines.push(WSL_STAYS.to_owned());

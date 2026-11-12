@@ -13,6 +13,7 @@
 //! | `P2PC_TEMPLATES_ENDPOINT` | the channel's `templates-latest.json` URL (https) |
 //! | `P2PC_WEB_ORIGIN` | the official web app origin |
 //! | `P2PC_WEB_VERSION` | the version of this release's web build (the start of the high-water mark) |
+//! | `P2PC_NODE_IMAGE_VERSION` | the pinned node image's version (§8.3; the URL and SHA-256 are first run's pin) |
 //! | `P2PC_NODE_IMAGE_MIN_SERVER_VERSION` | the pinned node image's `min_server_version` (§14.2) |
 
 use semver::Version;
@@ -26,6 +27,7 @@ pub struct Release {
     pub templates_endpoint: Option<String>,
     pub web_origin: Option<String>,
     pub web_version: Option<Version>,
+    pub image_version: Option<Version>,
     pub image_min_server_version: Option<Version>,
 }
 
@@ -49,6 +51,7 @@ impl Release {
             option_env!("P2PC_TEMPLATES_ENDPOINT"),
             option_env!("P2PC_WEB_ORIGIN"),
             option_env!("P2PC_WEB_VERSION"),
+            option_env!("P2PC_NODE_IMAGE_VERSION"),
             option_env!("P2PC_NODE_IMAGE_MIN_SERVER_VERSION"),
         )
     }
@@ -62,6 +65,7 @@ impl Release {
         templates_endpoint: Option<&str>,
         web_origin: Option<&str>,
         web_version: Option<&str>,
+        image_version: Option<&str>,
         image_min_server_version: Option<&str>,
     ) -> Self {
         let version = |v: Option<&str>| non_empty(v).and_then(|s| Version::parse(&s).ok());
@@ -72,6 +76,7 @@ impl Release {
             templates_endpoint: https_url(templates_endpoint),
             web_origin: non_empty(web_origin).and_then(|o| super::web::normalize_origin(&o)),
             web_version: version(web_version),
+            image_version: version(image_version),
             image_min_server_version: version(image_min_server_version),
         }
     }
@@ -101,6 +106,7 @@ mod tests {
             Some("https://releases.example.invalid/templates-latest.json"),
             Some("https://app.example.invalid/"),
             Some("0.3.0"),
+            Some("0.3.1"),
             Some("not a version"),
         );
         assert_eq!(r.updater_pubkey.as_deref(), Some("key"));
@@ -109,6 +115,7 @@ mod tests {
         assert!(r.templates_endpoint.is_some());
         assert_eq!(r.web_origin.as_deref(), Some("https://app.example.invalid"));
         assert_eq!(r.own_web_version(), Version::new(0, 3, 0));
+        assert_eq!(r.image_version, Some(Version::new(0, 3, 1)));
         assert_eq!(r.image_min_server_version, None);
         assert_eq!(Release::default().own_web_version(), Release::app_version());
     }
