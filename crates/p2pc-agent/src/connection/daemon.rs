@@ -88,6 +88,12 @@ struct StateTracker<'a> {
     current: Option<ConnectionState>,
     since: OffsetDateTime,
     last_welcome_at: Option<OffsetDateTime>,
+    /// The hub's version at the last `Welcome` (H2 §14.2).
+    server_version: Option<String>,
+    /// The node's approval as last known (H2 §5.5): this run's [`super::session::Approval`] once a `Welcome` set it,
+    /// the state file's before that.
+    pending_approval: Option<bool>,
+    approval: Option<super::session::Approval>,
 }
 
 impl StateTracker<'_> {
@@ -100,11 +106,21 @@ impl StateTracker<'_> {
         self.since = OffsetDateTime::now_utc();
         let mut file = AgentState::new(state, self.since, self.server.to_string(), Some(self.node.to_string()));
         file.last_welcome_at = self.last_welcome_at;
+        file.server_version.clone_from(&self.server_version);
+        file.pending_approval = self
+            .approval
+            .as_ref()
+            .and_then(super::session::Approval::pending)
+            .or(self.pending_approval);
         writer.set(file);
     }
 
-    fn welcomed(&mut self) {
+    fn welcomed(&mut self, w: &session::Welcomed) {
         self.last_welcome_at = Some(OffsetDateTime::now_utc());
+        self.server_version = Some(w.server_version.clone());
+        if self.approval.is_some() {
+            self.pending_approval = Some(w.pending_approval);
+        }
         self.current = None;
         self.set(ConnectionState::Connected);
     }
@@ -123,23 +139,41 @@ impl Daemon {
         };
         let watchdog_task = self.shared.watchdog.spawn(self.shared.supervisor.clone());
         let mut backoff = Backoff::new(self.backoff_seed);
-        // The last Welcome of this enrollment survives a restart of `run` (T05b review P3): read once, off the runtime.
-        let last_welcome_at = match self.state_file.clone() {
+        // The last Welcome of this enrollment survives a restart of `run` (T05b review P3), with what it said (the hub's
+        // version, the approval): read once, off the runtime.
+        let earlier = match self.state_file.clone() {
             Some(file) => tokio::task::spawn_blocking(move || file.read())
                 .await
                 .ok()
                 .flatten()
-                .filter(|s| s.is_of(&self.server_node_id, &self.agent_node_id))
-                .and_then(|s| s.last_welcome_at),
+                .filter(|s| s.is_of(&self.server_node_id, &self.agent_node_id)),
             None => None,
         };
+        let approval = self.shared.node.as_ref().map(|n| n.approval.clone());
         let mut state = StateTracker {
             writer: self.state_file.clone().map(StateFile::spawn_writer),
             server: &self.server_node_id,
             node: &self.agent_node_id,
             current: None,
             since: OffsetDateTime::now_utc(),
-            last_welcome_at,
+            last_welcome_at: earlier.as_ref().and_then(|s| s.last_welcome_at),
+            server_version: earlier.as_ref().and_then(|s| s.server_version.clone()),
+            pending_approval: earlier.as_ref().and_then(|s| s.pending_approval),
+            approval: approval.clone(),
+        };
+        // `NodeApproved` comes in the middle of a session: it reaches the state file at once (H2 §8.8 `join_pending`
+        // ends on it), not at the next change of the connection state.
+        let approval_task = match (approval, state.writer.as_ref().map(StateWriter::patcher)) {
+            (Some(approval), Some(patcher)) => Some(tokio::spawn(async move {
+                let mut rx = approval.subscribe();
+                while rx.changed().await.is_ok() {
+                    let pending = *rx.borrow_and_update();
+                    if let Some(pending) = pending {
+                        patcher.set_pending_approval(pending);
+                    }
+                }
+            })),
+            _ => None,
         };
         // An inventory detected for an attempt whose dial failed, and when (see INVENTORY_REUSE).
         let mut unsent: Option<(tokio::time::Instant, p2pc_proto::api::Inventory)> = None;
@@ -179,9 +213,9 @@ impl Daemon {
                         Ok(Ok(link)) => {
                             // This inventory goes out in `Hello`: the next connection detects afresh.
                             unsent = None;
-                            let on_welcome = |_: &session::Welcomed| {
+                            let on_welcome = |w: &session::Welcomed| {
                                 backoff.reset();
-                                state.welcomed();
+                                state.welcomed(w);
                             };
                             session::run(&self.shared, link, inventory, &mut shutdown, &mut network, on_welcome).await
                         }
@@ -253,6 +287,9 @@ impl Daemon {
             state.set(ConnectionState::Stopped);
         }
         watchdog_task.abort();
+        if let Some(task) = approval_task {
+            task.abort();
+        }
         if let Some(writer) = state.writer.take() {
             writer.finish().await;
         }

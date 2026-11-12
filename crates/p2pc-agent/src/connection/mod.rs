@@ -71,12 +71,22 @@ pub struct DetectInventory {
     pub config: Config,
     /// Where each successful detection publishes its offer, if anywhere. A failed detection keeps the last one.
     pub offers: Option<OfferFeed>,
+    /// The owner's share in force, when it can change while the agent runs (`p2pc-agent share set`, H2 §8.4): each
+    /// detection uses it instead of `config.share`.
+    pub live_share: Option<tokio::sync::watch::Receiver<crate::config::Share>>,
 }
 
 impl InventorySource for DetectInventory {
     fn detect(&self) -> BoxFuture<'_, Result<Inventory, String>> {
         Box::pin(async move {
-            let mut report = crate::inventory::detect_periodic(&self.host, &SystemRunner::default(), &self.config)
+            let config = match &self.live_share {
+                Some(share) => Config {
+                    share: share.borrow().clone(),
+                    ..self.config.clone()
+                },
+                None => self.config.clone(),
+            };
+            let mut report = crate::inventory::detect_periodic(&self.host, &SystemRunner::default(), &config)
                 .await
                 .map_err(|e| e.to_string())?;
             if let Some(feed) = &self.offers {

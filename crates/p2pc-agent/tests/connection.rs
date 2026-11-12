@@ -13,10 +13,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use p2pc_agent::config::Share;
 use p2pc_agent::connection::daemon::{Daemon, DaemonExit};
 use p2pc_agent::connection::lease::{LeaseDecision, LeaseHandler, LeaseOffer, LeaseSupervisor, NotReady};
 use p2pc_agent::connection::load::LoadSource;
-use p2pc_agent::connection::session::{INVENTORY_INTERVAL, InventorySource, MAX_PENDING_DECISIONS, Shared};
+use p2pc_agent::connection::session::{
+    Approval, INVENTORY_INTERVAL, InventorySource, LeaveEnd, MAX_PENDING_DECISIONS, NodeControls, Shared,
+};
 use p2pc_agent::connection::state::{AgentState, ConnectionState, StateFile};
 use p2pc_agent::connection::streams::{HubRecv, HubSend, HubStream, PortIo, PortOpener, StreamAcceptor};
 use p2pc_agent::connection::transport::{ConnectError, Connector, Link};
@@ -280,6 +283,8 @@ struct Options {
     earlier_state: Option<AgentState>,
     /// The node's port opener (its ingress bridge); `None` is an H1 agent.
     ports: Option<Arc<dyn PortOpener>>,
+    /// The H2 node controls (the owner's share, the approval); `None` is an H1 agent.
+    node: Option<NodeControls>,
     /// Where the streams the fake server opens arrive.
     incoming: Option<Arc<dyn StreamAcceptor>>,
 }
@@ -292,6 +297,7 @@ impl Default for Options {
             agent_lease_ttl: Duration::from_secs(45),
             earlier_state: None,
             ports: None,
+            node: None,
             incoming: None,
         }
     }
@@ -341,6 +347,7 @@ fn start(opts: Options) -> World {
         decisions: Arc::new(Semaphore::new(MAX_PENDING_DECISIONS)),
         uplink: Uplink::new(),
         ports: opts.ports,
+        node: opts.node,
     };
     let daemon = Daemon {
         shared,
@@ -378,6 +385,17 @@ impl World {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         panic!("the state file never said {expected:?}: {:?}", self.state.read());
+    }
+
+    /// Like [`World::state_becomes`], for any condition on the state file.
+    async fn state_matches(&self, what: &str, check: impl Fn(&AgentState) -> bool) {
+        for _ in 0..200 {
+            if self.state.read().is_some_and(|s| check(&s)) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("the state file never had {what}: {:?}", self.state.read());
     }
 
     async fn next_connection(&mut self) -> ServerEnd {
@@ -1462,4 +1480,279 @@ async fn the_servers_streams_are_served_only_after_the_welcome_and_end_with_the_
     assert_eq!(ack, json!({"ok": true}));
     let (_task, _rx) = s.serve(true);
     assert_eq!(w.shutdown().await, DaemonExit::Shutdown);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// H2 node controls (T2-23): the owner's pause and share changes, the node's approval, and `leave`.
+
+fn node_controls() -> (NodeControls, watch::Sender<Share>) {
+    let (tx, rx) = watch::channel(Share::default());
+    (
+        NodeControls {
+            share: rx,
+            approval: Approval::new(),
+        },
+        tx,
+    )
+}
+
+/// H2 §5.5, §6.1: an H2 node declares `leave` and `approval`; `Welcome.pending_approval` and `NodeApproved` reach the
+/// state file that `p2pc-agent status --json` reads, with the hub's version (H2 §14.2).
+#[tokio::test(start_paused = true)]
+async fn an_h2_node_declares_leave_and_approval_and_the_state_file_follows_the_approval() {
+    let (node, _share) = node_controls();
+    let approval = node.approval.clone();
+    let mut w = start(Options {
+        node: Some(node),
+        ..Options::default()
+    });
+    let mut s = w.next_connection().await;
+    let hello = s.recv().await.unwrap();
+    assert_eq!(hello["features"], json!(["leave", "approval"]));
+    assert_eq!(approval.pending(), None, "unknown before the first Welcome");
+    s.send(json!({
+        "type": "welcome",
+        "server_version": "0.2.0",
+        "node_id": NodeId::generate(),
+        "account_id": w.owner,
+        "heartbeat_interval_s": 5,
+        "lease_ttl_s": 60,
+        "pending_approval": true,
+    }))
+    .await;
+    let _ = s.recv().await; // a heartbeat: welcomed
+    assert_eq!(approval.pending(), Some(true));
+    w.state_matches("pending_approval and the hub version", |st| {
+        st.connection == ConnectionState::Connected
+            && st.pending_approval == Some(true)
+            && st.server_version.as_deref() == Some("0.2.0")
+    })
+    .await;
+    // An admin approves the node: the state file says so at once, in the middle of the session.
+    s.send(json!({"type": "node_approved"})).await;
+    s.send(json!({"type": "drain"})).await;
+    assert_eq!(w.next_event().await.1, Event::Drain);
+    assert_eq!(approval.pending(), Some(false));
+    w.state_matches("the approval", |st| st.pending_approval == Some(false))
+        .await;
+    // A later Welcome without the field (absent means false) keeps it approved.
+    drop(s);
+    let mut s = w.next_connection().await;
+    let _ = s.handshake(w.owner).await;
+    let _ = s.recv().await;
+    assert_eq!(approval.pending(), Some(false));
+    let (_task, _rx) = s.serve(true);
+    w.shutdown().await;
+}
+
+/// H2 §6.1, §8.4: while the owner paused sharing, a new lease of the owner gets `draining` and never reaches the
+/// handler; the owner check comes first (SI-1); a resume takes leases again, without a reconnect.
+#[tokio::test(start_paused = true)]
+async fn a_paused_node_refuses_new_leases_with_draining_until_resumed() {
+    let recorder = Arc::new(Recorder::default());
+    let (node, share) = node_controls();
+    share.send_replace(Share {
+        paused: true,
+        ..Share::default()
+    });
+    let mut w = start(Options {
+        handler: recorder.clone(),
+        node: Some(node),
+        ..Options::default()
+    });
+    let mut s = w.next_connection().await;
+    let _ = s.handshake(w.owner).await;
+    let (other, lease) = lease_msg(AccountId::generate(), good_job());
+    s.send(lease).await;
+    let answer = s.recv_not_heartbeat().await.unwrap();
+    assert_eq!(answer["lease_id"], json!(other));
+    assert_eq!(answer["reason"], "not_owner", "SI-1 before the pause");
+    let (id, lease) = lease_msg(w.owner, good_job());
+    s.send(lease).await;
+    let answer = s.recv_not_heartbeat().await.unwrap();
+    assert_eq!(
+        answer,
+        json!({"type": "lease_rejected", "lease_id": id, "epoch": 1, "reason": "draining"})
+    );
+    assert!(recorder.offers.lock().unwrap().is_empty());
+    // Resume.
+    share.send_replace(Share::default());
+    let (id, lease) = lease_msg(w.owner, good_job());
+    s.send(lease).await;
+    let answer = s.recv_not_heartbeat().await.unwrap();
+    assert_eq!(answer, json!({"type": "lease_accepted", "lease_id": id, "epoch": 1}));
+    assert_eq!(*recorder.offers.lock().unwrap(), [id]);
+    assert_eq!(w.connector.attempts.lock().unwrap().len(), 1, "never reconnected");
+    let (_task, _rx) = s.serve(true);
+    w.shutdown().await;
+}
+
+/// H2 §8.4: a share change re-detects the inventory at once, and a changed offer goes out as `InventoryUpdate` within
+/// seconds, not at the 10-minute tick. A change that leaves the inventory as it was sends nothing.
+#[tokio::test(start_paused = true)]
+async fn a_share_change_sends_inventory_update_within_seconds() {
+    let (node, share) = node_controls();
+    let mut w = start(Options {
+        node: Some(node),
+        ..Options::default()
+    });
+    let mut s = w.next_connection().await;
+    let _ = s.handshake(w.owner).await;
+    let (_task, mut rx) = s.serve(true);
+    let detections = w.inventory.2.load(Ordering::SeqCst);
+    // The pause alone does not change the wire inventory: a detection, but no update.
+    share.send_replace(Share {
+        paused: true,
+        ..Share::default()
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(w.inventory.2.load(Ordering::SeqCst), detections + 1);
+    while let Ok(m) = rx.try_recv() {
+        assert_ne!(m["type"], "inventory_update", "{m}");
+    }
+    // Fewer cores offered: the new offer is sent at once.
+    w.inventory.0.lock().unwrap().offered =
+        serde_json::from_value(json!({"cpu": 2.0, "memory_mb": 4096, "gpu": 0})).unwrap();
+    share.send_replace(Share {
+        cpu_cores: Some(2.0),
+        memory_mb: Some(4096),
+        ..Share::default()
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let mut sent = Vec::new();
+    while let Ok(m) = rx.try_recv() {
+        if m["type"] == "inventory_update" {
+            sent.push(m);
+        }
+    }
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["inventory"]["offered"]["cpu"], json!(2.0));
+    assert_eq!(sent[0]["inventory"]["offered"]["memory_mb"], 4096);
+    w.shutdown().await;
+}
+
+/// A link over pipes, for `leave`.
+fn pipe_link() -> (Link, ServerEnd) {
+    let (agent, server) = tokio::io::duplex(1024 * 1024);
+    let (ar, aw) = tokio::io::split(agent);
+    let (sr, sw) = tokio::io::split(server);
+    (
+        Link::new(Box::new(aw), Box::new(ar), Box::new(|| {})),
+        ServerEnd { r: sr, w: sw },
+    )
+}
+
+fn leave_reason() -> p2pc_proto::protocol::Leave {
+    serde_json::from_value(json!({"reason": "uninstall"})).unwrap()
+}
+
+/// Runs `leave` against a fake hub scripted by `hub`.
+async fn leave_with<F, Fut>(owner: AccountId, running: Vec<RunningLease>, hub: F) -> LeaveEnd
+where
+    F: FnOnce(ServerEnd) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let (link, server) = pipe_link();
+    let script = tokio::spawn(hub(server));
+    let end = p2pc_agent::connection::session::leave(
+        link,
+        owner,
+        inventory("node-1"),
+        running,
+        leave_reason(),
+        Duration::from_secs(10),
+    )
+    .await;
+    script.await.unwrap();
+    end
+}
+
+/// H2 §6.1: `Hello` with `leave` and the leases still held, the owner's `Welcome`, `Leave{reason}`, and the hub's close
+/// is the node removed.
+#[tokio::test(start_paused = true)]
+async fn leave_sends_leave_after_the_owners_welcome_and_ends_when_the_hub_closes() {
+    let owner = AccountId::generate();
+    let lease = RunningLease::new(LeaseId::generate(), 2);
+    let end = leave_with(owner, vec![lease], move |mut s| async move {
+        let hello = s.recv().await.unwrap();
+        assert_eq!(hello["type"], "hello");
+        assert_eq!(hello["features"], json!(["leave"]));
+        assert_eq!(hello["running"], json!([{"lease_id": lease.lease_id, "epoch": 2}]));
+        s.welcome(owner, 60).await;
+        // A lease offered in between is refused: this connection takes no work.
+        let (id, offer) = lease_msg(owner, good_job());
+        s.send(offer).await;
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            got.push(s.recv().await.unwrap());
+        }
+        assert!(
+            got.contains(&json!({"type": "leave", "reason": "uninstall"})),
+            "{got:?}"
+        );
+        assert!(
+            got.contains(&json!({"type": "lease_rejected", "lease_id": id, "epoch": 1, "reason": "draining"})),
+            "{got:?}"
+        );
+        // The hub deletes the node and closes, answering nothing.
+        drop(s);
+    })
+    .await;
+    assert_eq!(end, LeaveEnd::Left);
+}
+
+#[tokio::test(start_paused = true)]
+async fn leave_reports_why_the_node_was_not_removed() {
+    let owner = AccountId::generate();
+    // A hub without `Leave`.
+    let end = leave_with(owner, vec![], move |mut s| async move {
+        let _ = s.recv().await.unwrap();
+        s.welcome(owner, 60).await;
+        assert_eq!(s.recv().await.unwrap()["type"], "leave");
+        s.send(json!({"type": "error", "code": "unsupported_message", "message": "leave"}))
+            .await;
+        let _ = s.recv().await;
+    })
+    .await;
+    assert_eq!(end, LeaveEnd::Unsupported);
+    // SI-1: a Welcome for another account gets no `Leave`.
+    let end = leave_with(owner, vec![], |mut s| async move {
+        let _ = s.recv().await.unwrap();
+        s.welcome(AccountId::generate(), 60).await;
+        assert_eq!(s.recv().await, None, "nothing after Hello");
+    })
+    .await;
+    assert_eq!(end, LeaveEnd::WrongOwner);
+    // Already removed.
+    let end = leave_with(owner, vec![], |mut s| async move {
+        let _ = s.recv().await.unwrap();
+        s.send(json!({"type": "error", "code": "not_enrolled", "message": "x"}))
+            .await;
+        assert_eq!(s.recv().await, None);
+    })
+    .await;
+    assert_eq!(end, LeaveEnd::NotEnrolled);
+    // The hub closes before anything was sent: not removed.
+    let end = leave_with(owner, vec![], |mut s| async move {
+        let _ = s.recv().await.unwrap();
+        drop(s);
+    })
+    .await;
+    assert_eq!(end, LeaveEnd::Lost);
+    // A silent hub: bounded by the deadline.
+    let started = Instant::now();
+    let end = leave_with(owner, vec![], move |mut s| async move {
+        let _ = s.recv().await.unwrap();
+        s.welcome(owner, 60).await;
+        assert_eq!(s.recv().await.unwrap()["type"], "leave");
+        // Holds the connection open past the deadline, then lets the agent close it.
+        let _ = s.recv().await;
+    })
+    .await;
+    assert_eq!(end, LeaveEnd::TimedOut);
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_secs(10) && took < Duration::from_secs(13),
+        "{took:?}"
+    );
 }

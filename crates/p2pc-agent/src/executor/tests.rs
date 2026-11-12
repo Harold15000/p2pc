@@ -1474,6 +1474,7 @@ mod through_the_session {
                 decisions: Arc::new(Semaphore::new(MAX_PENDING_DECISIONS)),
                 uplink: w.uplink.clone(),
                 ports: None,
+                node: None,
             },
             connector: Arc::new(Pipes {
                 accepted: tx,

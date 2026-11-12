@@ -4,6 +4,8 @@
 //!
 //! - T07: the local core: `config show`, `identity`, `inventory` and `doctor`.
 //! - T05b: `join` (enrollment with a join token), `run` (the connection to the control plane) and `status`.
+//! - T2-23 (H2): `status --json` (with the iroh NodeId before enrollment, the node phrase and the approval),
+//!   `share set` (share changes and the owner's pause, H2 §8.4) and `leave` (H2 §6.1, §8.7).
 
 use std::io::IsTerminal as _;
 use std::path::PathBuf;
@@ -12,18 +14,20 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
-use p2pc_agent::config::{Config, ConfigSource, Env, Hardware};
+use p2pc_agent::config::{Config, ConfigSource, Env, GpuShare, Hardware, ShareUpdate, ShareWatcher};
 use p2pc_agent::connection::daemon::Daemon;
 use p2pc_agent::connection::endpoint::{IrohConnector, relay_mode, server_addr};
 use p2pc_agent::connection::exit;
 use p2pc_agent::connection::gate::{GateFile, render_gate};
 use p2pc_agent::connection::join::{JoinError, enroll};
 use p2pc_agent::connection::load::LoadMeter;
-use p2pc_agent::connection::session::{INVENTORY_INTERVAL, MAX_PENDING_DECISIONS, Shared};
-use p2pc_agent::connection::state::{StateFile, render_status};
+use p2pc_agent::connection::session::{
+    Approval, INVENTORY_INTERVAL, LeaveEnd, MAX_PENDING_DECISIONS, NodeControls, Shared,
+};
+use p2pc_agent::connection::state::{StateFile, render_node, render_status, status_json};
 use p2pc_agent::connection::token::{self, TokenText};
 use p2pc_agent::connection::watchdog::Watchdog;
-use p2pc_agent::connection::{DetectInventory, Uplink};
+use p2pc_agent::connection::{Connector as _, DetectInventory, Uplink};
 use p2pc_agent::doctor::{self, Findings, IdentityState};
 use p2pc_agent::executor::SystemClock;
 use p2pc_agent::executor::status::{LeasesFile, render_leases};
@@ -61,7 +65,24 @@ enum Command {
         force: bool,
     },
     /// Show whether this machine is enrolled and the last connection state. Needs no network.
-    Status,
+    Status {
+        /// Print JSON for the desktop app: this node's iroh NodeId (created on first use, also before `join`) and node
+        /// phrase, the enrollment, the last connection state, the approval and the owner's pause.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change what this machine offers.
+    Share {
+        #[command(subcommand)]
+        action: ShareAction,
+    },
+    /// Ask the hub to remove this node, then stop (exit code 7 once the hub removed it). Run by the desktop app on
+    /// uninstall.
+    Leave {
+        /// Why, for the hub's audit log.
+        #[arg(long, default_value = "leave", value_name = "TEXT")]
+        reason: String,
+    },
     /// Inspect the configuration.
     Config {
         #[command(subcommand)]
@@ -84,6 +105,35 @@ enum ConfigAction {
     /// Print the effective configuration, with defaults filled in.
     Show,
 }
+
+#[derive(Debug, Subcommand)]
+enum ShareAction {
+    /// Change the share limits or pause sharing. Checked against this machine (never above its hardware), written to
+    /// agent.toml atomically, and applied by a running agent within seconds. Options left out keep their value.
+    Set {
+        /// vCPUs to offer; fractions allowed.
+        #[arg(long, value_name = "CORES")]
+        cpu: Option<f64>,
+        /// Memory to offer, in MiB.
+        #[arg(long, value_name = "MIB")]
+        memory_mb: Option<u64>,
+        /// GPUs to offer: `all`, `none`, or GPU UUIDs separated by commas.
+        #[arg(long, value_name = "all|none|UUIDS")]
+        gpu: Option<GpuShare>,
+        /// Disk for job directories, in MiB.
+        #[arg(long, value_name = "MIB")]
+        disk_mb: Option<u64>,
+        /// Disk for persistent volumes, in MiB.
+        #[arg(long, value_name = "MIB")]
+        volumes_mb: Option<u64>,
+        /// Pause sharing (`true`: new work is refused, running work continues) or resume it (`false`).
+        #[arg(long, value_name = "true|false")]
+        paused: Option<bool>,
+    },
+}
+
+/// How long `leave` may take in all: the desktop app gives it 10 s (H2 §8.7), detection and dial included.
+const LEAVE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn describe(source: &ConfigSource) -> String {
     let path = source.path().display();
@@ -136,6 +186,7 @@ fn config_show(cli: &Cli, env: &Env) -> anyhow::Result<ExitCode> {
     config.share.cpu_cores = Some(resolved.cpu_cores);
     config.share.memory_mb = Some(resolved.memory_mb);
     config.share.disk_mb = Some(resolved.disk_mb);
+    config.share.volumes_mb = Some(config.share.volumes_mb());
     println!("# Effective p2pc-agent configuration");
     println!("# source: {}", describe(&source));
     println!("# GPU UUIDs and the disk size are checked against the hardware by `p2pc-agent inventory`.");
@@ -283,7 +334,8 @@ fn join_cmd(cli: &Cli, env: &Env, token: Option<&str>, force: bool) -> anyhow::R
 
 /// `p2pc-agent run`.
 fn run_cmd(cli: &Cli, env: &Env) -> anyhow::Result<ExitCode> {
-    let (_, config) = load(cli, env)?;
+    let (source, config) = load(cli, env)?;
+    let env = env.clone();
     let Some(server) = config.server.clone() else {
         eprintln!("error: this machine is not enrolled yet; run `p2pc-agent join` with a join token first");
         return Ok(ExitCode::from(exit::NOT_JOINED));
@@ -334,6 +386,8 @@ fn run_cmd(cli: &Cli, env: &Env) -> anyhow::Result<ExitCode> {
         executor.startup().await;
         let _leases = executor.spawn_status_writer(LeasesFile::in_dir(&config.data_dir));
         let executor = Arc::new(executor);
+        // `p2pc-agent share set` runs as another process: the share in force follows agent.toml (H2 §8.4).
+        let (share, _share_watcher) = ShareWatcher::new(source, env, config.share.clone()).spawn();
         let shared = Shared {
             owner: server.account_id,
             agent_lease_ttl: ttl,
@@ -344,6 +398,7 @@ fn run_cmd(cli: &Cli, env: &Env) -> anyhow::Result<ExitCode> {
                 host: host.clone(),
                 config: config.clone(),
                 offers: Some(offers),
+                live_share: Some(share.clone()),
             }),
             load: Arc::new(LoadMeter::new(host)),
             inventory_interval: INVENTORY_INTERVAL,
@@ -351,6 +406,11 @@ fn run_cmd(cli: &Cli, env: &Env) -> anyhow::Result<ExitCode> {
             uplink,
             // The hub's port streams go through the driver's ingress bridge (H2 §6.1, §11.2).
             ports: Some(Arc::new(ingress)),
+            // The owner's pause and share changes, and the node's approval (H2 §5.5, §8.4).
+            node: Some(NodeControls {
+                share,
+                approval: Approval::new(),
+            }),
         };
         let daemon = Daemon {
             shared,
@@ -416,11 +476,32 @@ fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
         .context("cannot start the async runtime")
 }
 
-/// `p2pc-agent status`: local files only.
-fn status_cmd(cli: &Cli, env: &Env) -> anyhow::Result<ExitCode> {
+/// `p2pc-agent status`: local files only. With `--json`, the identity is created when missing, so the desktop app gets
+/// this node's iroh NodeId before `join` (H2 §5.4 step 2); the plain text only reads it.
+fn status_cmd(cli: &Cli, env: &Env, json: bool) -> anyhow::Result<ExitCode> {
     let (_, config) = load(cli, env)?;
     let state = StateFile::in_dir(&config.data_dir).read();
+    if json {
+        let identity = Identity::load_or_create(&config.data_dir)?;
+        let running = p2pc_agent::node::agent_running(&config.data_dir);
+        let status = status_json(&config, state.as_ref(), Some(&identity.node_id()), running);
+        println!("{}", serde_json::to_string_pretty(&status)?);
+        return Ok(ExitCode::SUCCESS);
+    }
+    let identity = if config.data_dir.join(IDENTITY_FILE).exists() {
+        Identity::load(&config.data_dir).ok()
+    } else {
+        None
+    };
     print!("{}", render_status(&config, state.as_ref()));
+    print!(
+        "{}",
+        render_node(
+            &config,
+            state.as_ref(),
+            identity.as_ref().map(Identity::node_id).as_ref()
+        )
+    );
     if config.server.is_some() {
         let running = p2pc_agent::node::agent_running(&config.data_dir);
         print!(
@@ -433,13 +514,164 @@ fn status_cmd(cli: &Cli, env: &Env) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `p2pc-agent share set` (H2 §8.4): the new share is checked against this machine with a full detection (as `run` does
+/// at start: never above the hardware, listed GPUs must exist), then only the keys given are written into agent.toml,
+/// atomically. A running agent applies it within seconds ([`ShareWatcher`]).
+fn share_set_cmd(cli: &Cli, env: &Env, update: &ShareUpdate) -> anyhow::Result<ExitCode> {
+    if update.is_empty() {
+        eprintln!(
+            "error: nothing to change: give at least one of --cpu, --memory-mb, --gpu, --disk-mb, --volumes-mb, --paused"
+        );
+        return Ok(ExitCode::from(exit::FAILURE));
+    }
+    let (source, mut config) = load(cli, env)?;
+    config.share = update.apply(&config.share);
+    let report = match block_on(inventory::detect(&Host::system(), &SystemRunner::default(), &config))? {
+        Ok(report) => report,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return Ok(ExitCode::from(exit::FAILURE));
+        }
+    };
+    p2pc_agent::config::write_share_update(source.path(), update, env)?;
+    let share = &report.local.share;
+    println!(
+        "Share: {} vCPU, {} MiB RAM, {} GPU(s), {} MiB disk for jobs, {} MiB for volumes{}.",
+        share.cpu_cores,
+        share.memory_mb,
+        share.gpus.len(),
+        share.disk_mb,
+        config.share.volumes_mb(),
+        if config.share.paused { "; paused" } else { "" }
+    );
+    for warning in &share.warnings {
+        println!("warning: {warning}");
+    }
+    println!("Saved in {}.", source.path().display());
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `p2pc-agent leave` (H2 §6.1, §8.7): its own connection to the hub, `Leave`, and exit 7 once the hub removed the node.
+/// A running agent's connection is replaced by this one; when it reconnects it is told `not_enrolled` and exits 7 too.
+fn leave_cmd(cli: &Cli, env: &Env, reason: &str) -> anyhow::Result<ExitCode> {
+    let (_, config) = load(cli, env)?;
+    let Some(server) = config.server.clone() else {
+        eprintln!("error: this machine is not enrolled");
+        return Ok(ExitCode::from(exit::NOT_JOINED));
+    };
+    let leave = p2pc_proto::protocol::Leave {
+        reason: reason.to_string(),
+    };
+    if let Err(e) = leave.validate() {
+        eprintln!("error: --reason: {e}");
+        return Ok(ExitCode::from(exit::FAILURE));
+    }
+    let rt = runtime()?;
+    let result = rt.block_on(async move {
+        let started = tokio::time::Instant::now();
+        let id = Identity::load(&config.data_dir)?;
+        let relays = config.relays();
+        let connector = IrohConnector::new(
+            id.secret_key().clone(),
+            relay_mode(&relays)?,
+            server_addr(&server.node_id, &relays)?,
+            current_selection(&config.iroh.direct_addresses).await,
+        );
+        let inventory = inventory::detect_periodic(&Host::system(), &SystemRunner::default(), &config).await?;
+        // The leases a running agent holds go into Hello, so the hub's reconciliation does not take them for lost if
+        // the Leave never lands. Without a running agent, nothing runs: the leases file is an earlier run's.
+        let running = if p2pc_agent::node::agent_running(&config.data_dir) {
+            LeasesFile::in_dir(&config.data_dir)
+                .read()
+                .map(|s| {
+                    s.leases
+                        .iter()
+                        .map(|l| p2pc_proto::protocol::RunningLease::new(l.lease_id, l.epoch))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let left = LEAVE_DEADLINE.saturating_sub(started.elapsed());
+        let end = match tokio::time::timeout(left, connector.connect()).await {
+            Ok(Ok(link)) => {
+                let left = LEAVE_DEADLINE.saturating_sub(started.elapsed());
+                p2pc_agent::connection::session::leave(
+                    link,
+                    server.account_id,
+                    inventory.inventory,
+                    running,
+                    leave,
+                    left,
+                )
+                .await
+            }
+            Ok(Err(e)) => {
+                eprintln!("error: cannot connect to the hub: {e}");
+                return anyhow::Ok(ExitCode::from(exit::FAILURE));
+            }
+            Err(_) => LeaveEnd::TimedOut,
+        };
+        connector.shutdown().await;
+        anyhow::Ok(match end {
+            LeaveEnd::Left | LeaveEnd::NotEnrolled => {
+                println!("This node was removed from its cloud.");
+                ExitCode::from(exit::NOT_ENROLLED)
+            }
+            other => {
+                eprintln!("error: {}", leave_failure(&other));
+                ExitCode::from(exit::FAILURE)
+            }
+        })
+    });
+    rt.shutdown_timeout(std::time::Duration::from_secs(2));
+    result
+}
+
+/// What `leave` says when the node was not removed.
+fn leave_failure(end: &LeaveEnd) -> String {
+    match end {
+        LeaveEnd::Left | LeaveEnd::NotEnrolled => "the node was removed".into(),
+        LeaveEnd::Unsupported => "the hub does not support leaving; remove this node from the hub instead".into(),
+        LeaveEnd::WrongOwner => "the hub's Welcome named another account than this node's owner (SI-1)".into(),
+        LeaveEnd::AgentTooOld => "the hub refuses this agent version".into(),
+        LeaveEnd::Refused(code) => format!("the hub refused: {code}"),
+        LeaveEnd::Lost => "the connection to the hub ended before the request was sent".into(),
+        LeaveEnd::TimedOut => format!("no answer from the hub within {} s", LEAVE_DEADLINE.as_secs()),
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let env = Env::system();
     let result = match &cli.command {
         Command::Join { token, force } => join_cmd(&cli, &env, token.as_deref(), *force),
         Command::Run => run_cmd(&cli, &env),
-        Command::Status => status_cmd(&cli, &env),
+        Command::Status { json } => status_cmd(&cli, &env, *json),
+        Command::Share {
+            action:
+                ShareAction::Set {
+                    cpu,
+                    memory_mb,
+                    gpu,
+                    disk_mb,
+                    volumes_mb,
+                    paused,
+                },
+        } => share_set_cmd(
+            &cli,
+            &env,
+            &ShareUpdate {
+                cpu_cores: *cpu,
+                memory_mb: *memory_mb,
+                gpus: gpu.clone(),
+                disk_mb: *disk_mb,
+                volumes_mb: *volumes_mb,
+                paused: *paused,
+            },
+        ),
+        Command::Leave { reason } => leave_cmd(&cli, &env, reason),
         Command::Config {
             action: ConfigAction::Show,
         } => config_show(&cli, &env),
@@ -515,5 +747,81 @@ mod tests {
             ))
         ));
         assert!(parse(&["p2pc-agent", "config"]).is_err());
+        assert!(matches!(
+            parse(&["p2pc-agent", "status", "--json"]),
+            Ok((None, Command::Status { json: true }))
+        ));
+        assert!(matches!(
+            parse(&["p2pc-agent", "status"]),
+            Ok((None, Command::Status { json: false }))
+        ));
+        assert!(matches!(
+            parse(&["p2pc-agent", "leave"]),
+            Ok((None, Command::Leave { reason })) if reason == "leave"
+        ));
+        assert!(matches!(
+            parse(&["p2pc-agent", "leave", "--reason", "uninstall"]),
+            Ok((None, Command::Leave { reason })) if reason == "uninstall"
+        ));
+    }
+
+    /// H2 §8.4: the desktop app's command lines.
+    #[test]
+    fn share_set_parses_the_apps_options() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args).map(|c| c.command);
+        let Ok(Command::Share {
+            action:
+                ShareAction::Set {
+                    cpu,
+                    memory_mb,
+                    gpu,
+                    disk_mb,
+                    volumes_mb,
+                    paused,
+                },
+        }) = parse(&[
+            "p2pc-agent",
+            "share",
+            "set",
+            "--cpu",
+            "2.5",
+            "--memory-mb",
+            "4096",
+            "--gpu",
+            "none",
+            "--disk-mb",
+            "10240",
+            "--volumes-mb",
+            "20480",
+            "--paused",
+            "true",
+        ])
+        else {
+            panic!("share set does not parse");
+        };
+        assert_eq!(cpu, Some(2.5));
+        assert_eq!(memory_mb, Some(4096));
+        assert_eq!(gpu, Some(GpuShare::None));
+        assert_eq!(disk_mb, Some(10_240));
+        assert_eq!(volumes_mb, Some(20_480));
+        assert_eq!(paused, Some(true));
+        assert!(matches!(
+            parse(&["p2pc-agent", "share", "set", "--paused", "false"]),
+            Ok(Command::Share {
+                action: ShareAction::Set {
+                    paused: Some(false),
+                    cpu: None,
+                    ..
+                }
+            })
+        ));
+        for bad in [
+            &["p2pc-agent", "share", "set", "--paused", "maybe"][..],
+            &["p2pc-agent", "share", "set", "--gpu", "GPU 1"],
+            &["p2pc-agent", "share", "set", "--memory-mb", "-1"],
+            &["p2pc-agent", "share"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
     }
 }
