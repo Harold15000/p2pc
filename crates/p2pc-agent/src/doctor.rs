@@ -3,11 +3,22 @@
 //! `p2pc-agent doctor` and the human form of `p2pc-agent inventory`: readiness in plain text, with a fix hint for
 //! each problem. Nothing here changes the machine, except the egress socket check, which makes a test job directory
 //! and socket under the data dir and removes them again.
+//!
+//! The relay check (H2 §10.2-§10.3) is doctor's only network traffic: one `GET /ping` to each relay this node uses,
+//! within [`RELAY_PROBE_TIMEOUT`], for its reachability and latency, next to the map's rules from `p2pc-net` (which
+//! relays offer QUIC address discovery, without which no egress job starts).
 
 use std::fmt::Write as _;
 use std::os::unix::fs::MetadataExt;
 
 use std::path::Path;
+use std::sync::Arc;
+
+use iroh::RelayUrl;
+use p2pc_net::relays::{
+    AddressDiscovery, RELAY_PROBE_TIMEOUT, Reachability, RelayMapReport, RelayProber, Role, Severity, check_relay_map,
+    probe_relays,
+};
 
 use p2pc_proto::api::{GpuStatusKind, Inventory, Platform};
 use p2pc_proto::ids::LeaseId;
@@ -42,6 +53,138 @@ pub struct Findings<'a> {
     pub report: &'a Result<Report, DetectError>,
     /// Whether a job's egress socket can be created under the data dir ([`check_egress_socket`]).
     pub egress_socket: EgressSocketState,
+    /// The relays: the map's rules and each relay's probe ([`check_relays`]).
+    pub relays: RelayState,
+}
+
+/// What [`check_relays`] found (H2 §10.2-§10.3).
+#[derive(Debug)]
+pub enum RelayState {
+    /// No relay to check: the node has not joined, and `[iroh] relays` is empty.
+    NotEnrolled,
+    /// The map's rules were checked, but no relay was probed: why.
+    NotProbed {
+        /// The map's rules.
+        map: RelayMapReport,
+        /// Why nothing was probed.
+        why: String,
+    },
+    /// The map's rules, and each usable relay's probe in the map's order.
+    Checked {
+        /// The map's rules.
+        map: RelayMapReport,
+        /// Each relay's reachability.
+        probes: Vec<(RelayUrl, Reachability)>,
+    },
+}
+
+/// Checks the relays the agent uses (`relays`, from [`crate::config::Config::relays`]) under the node rules of H2 §10.3,
+/// and probes each one with `prober` (or says why it cannot). `enrolled`: whether the node has joined.
+pub async fn check_relays<P: RelayProber>(
+    prober: Result<Arc<P>, String>,
+    relays: &[String],
+    enrolled: bool,
+) -> RelayState {
+    if relays.is_empty() && !enrolled {
+        return RelayState::NotEnrolled;
+    }
+    let map = check_relay_map(relays, Role::Node);
+    match prober {
+        Err(why) => RelayState::NotProbed { map, why },
+        Ok(prober) => {
+            let urls: Vec<RelayUrl> = map.relays.iter().map(|r| r.url.clone()).collect();
+            let probes = probe_relays(prober, &urls, RELAY_PROBE_TIMEOUT).await;
+            RelayState::Checked { map, probes }
+        }
+    }
+}
+
+/// What to do about a relay problem, by its code.
+fn relay_fix(code: &str) -> &'static str {
+    match code {
+        "relay_invalid_url" => {
+            "write each relay as `https://<host>/` in `[iroh] relays` of the config, or join again with a token whose \
+             relays are valid"
+        }
+        "relay_not_https" => "use the relay's https URL; plain http is for a development relay on this machine",
+        "relay_host_not_allowed" => "use the relay's public DNS name",
+        "relay_no_address_discovery" => {
+            "add n0's public relays to `[iroh] relays` in the config, next to the hub's (H2 §10.3); until then every \
+             job with an egress list fails with `egress_unavailable`"
+        }
+        "relays_unreachable" => {
+            "check this machine's internet access, and that no firewall blocks https to the relays; without a relay \
+             the node reaches the hub only directly"
+        }
+        _ => "fix the relay list in the config",
+    }
+}
+
+/// The relay section of doctor's report. Returns how many blocking problems it shows.
+fn relay_lines(out: &mut String, state: &RelayState) -> usize {
+    let (map, probes, not_probed) = match state {
+        RelayState::NotEnrolled => {
+            let _ = writeln!(out, "Relays: none yet (`p2pc-agent join` stores the hub's)");
+            return 0;
+        }
+        RelayState::NotProbed { map, why } => (map, None, Some(why)),
+        RelayState::Checked { map, probes } => (map, Some(probes), None),
+    };
+    let discovery = if map.has_address_discovery() {
+        "address discovery through n0's public relays"
+    } else {
+        "address discovery: NONE"
+    };
+    let count = map.relays.len();
+    let _ = match (count, not_probed, probes) {
+        (0, _, _) => writeln!(out, "Relays: none; {discovery}"),
+        (_, Some(why), _) => writeln!(out, "Relays: {count}, not probed ({}); {discovery}", clean(why)),
+        (_, None, probes) => {
+            let reachable = probes
+                .into_iter()
+                .flatten()
+                .filter(|(_, r)| matches!(r, Reachability::Reachable(_)))
+                .count();
+            writeln!(out, "Relays: {count}, {reachable} reachable; {discovery}")
+        }
+    };
+    for (i, relay) in map.relays.iter().enumerate() {
+        let reach = match probes.and_then(|p| p.get(i)) {
+            Some((_, Reachability::Reachable(latency))) => format!("reachable, {} ms; ", latency.as_millis()),
+            Some((_, Reachability::Unreachable(why))) => format!("unreachable: {}; ", clean(why)),
+            Some((_, Reachability::TimedOut(after))) => format!("no answer within {} s; ", after.as_secs()),
+            None => String::new(),
+        };
+        let discovery = match relay.address_discovery {
+            AddressDiscovery::Offered => "yes (n0's public relay)",
+            AddressDiscovery::Unknown => "unknown (only with TLS and UDP on the relay)",
+            AddressDiscovery::NotOffered => "no (plain http)",
+        };
+        // A relay URL displays parsed: the parser percent-encodes control characters (relays.rs).
+        let _ = writeln!(out, "  - {}: {reach}address discovery: {discovery}", relay.url);
+    }
+    let mut blocking = 0;
+    for f in &map.findings {
+        let mark = match f.severity {
+            Severity::Error => {
+                blocking += 1;
+                "[x]"
+            }
+            Severity::Warning => "[!]",
+        };
+        let code = f.problem.code();
+        let _ = writeln!(out, "  {mark} {code}: {}", f.problem);
+        let _ = writeln!(out, "      fix: {}", relay_fix(code));
+    }
+    if let Some(probes) = probes
+        && !probes.is_empty()
+        && !probes.iter().any(|(_, r)| matches!(r, Reachability::Reachable(_)))
+    {
+        blocking += 1;
+        let _ = writeln!(out, "  [x] relays_unreachable: no relay answered its probe");
+        let _ = writeln!(out, "      fix: {}", relay_fix("relays_unreachable"));
+    }
+    blocking
 }
 
 /// What [`check_egress_socket`] found.
@@ -223,6 +366,7 @@ pub fn render(f: &Findings<'_>) -> (String, bool) {
             let _ = writeln!(out, "      fix: {EGRESS_SOCKET_FIX}");
         }
     }
+    blocking += relay_lines(&mut out, &f.relays);
     let gpu = probe.gpu_status();
     let _ = write!(out, "GPU: {}", gpu_status_name(gpu.status));
     if let Some(reason) = &gpu.reason {
@@ -414,6 +558,9 @@ pub fn inventory_text(report: &Report) -> String {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::time::Duration;
+
+    use p2pc_net::relays::RelayProber;
 
     use super::*;
     use crate::config::{Config, Env};
@@ -476,6 +623,7 @@ mod tests {
             probe: &probe,
             report: &report,
             egress_socket: EgressSocketState::Ok,
+            relays: RelayState::NotEnrolled,
         };
         let (text, ready) = render(&findings);
         assert!(!ready);
@@ -511,6 +659,7 @@ mod tests {
             probe: &probe,
             report: &report,
             egress_socket,
+            relays: RelayState::NotEnrolled,
         };
         let (text, ready) = render(&findings(EgressSocketState::Failed(
             "bind (through /proc/self/fd) /proc/self/fd/9/egress.sock: Operation not permitted".into(),
@@ -621,6 +770,7 @@ mod tests {
             probe: &probe,
             report: &report,
             egress_socket: EgressSocketState::Ok,
+            relays: RelayState::NotEnrolled,
         };
         let (text, ready) = render(&ok);
         assert!(ready, "{text}");
@@ -660,6 +810,7 @@ mod tests {
             probe: &probe,
             report: &report,
             egress_socket: EgressSocketState::NotChecked("test".into()),
+            relays: RelayState::NotEnrolled,
         };
         let (text, _) = render(&findings);
         assert!(text.contains("RTX"), "the name is still shown:\n{text}");
@@ -680,8 +831,170 @@ mod tests {
             probe,
             report: &report,
             egress_socket: EgressSocketState::NotChecked("test".into()),
+            relays: RelayState::NotEnrolled,
         })
         .0
+    }
+
+    const N0: &str = "https://use1-1.relay.n0.iroh.link./";
+    const OURS: &str = "https://relay.example.com/";
+
+    /// Answers by host: n0's in 81 ms, ours in 40 ms, `hang` never, anything else refused (with a control character in
+    /// the error, as an OS message could carry).
+    struct FakeProber;
+
+    impl RelayProber for FakeProber {
+        async fn probe(&self, url: &RelayUrl) -> Result<Duration, String> {
+            match url.host_str() {
+                Some("use1-1.relay.n0.iroh.link.") => Ok(Duration::from_millis(81)),
+                Some("relay.example.com") => Ok(Duration::from_millis(40)),
+                Some("hang.example.com") => std::future::pending().await,
+                _ => Err("connection refused\u{1b}[2J".into()),
+            }
+        }
+    }
+
+    /// Runs `f` on its own runtime with a paused clock: `fake_probe` builds a runtime of its own, so the relay tests
+    /// cannot be `#[tokio::test]`s, and a probe that never answers times out without waiting.
+    fn paused<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    fn relays_of(map: &[&str]) -> RelayState {
+        let map: Vec<String> = map.iter().map(|s| (*s).to_string()).collect();
+        paused(check_relays(Ok(Arc::new(FakeProber)), &map, true))
+    }
+
+    fn render_relays(relays: RelayState) -> (String, bool) {
+        let (_dir, mut probe) = fake_probe("Linux version 6.8.0-48-generic\n");
+        probe.problems.clear();
+        let report = probe.clone().report(&config());
+        render(&Findings {
+            config_source: "x".into(),
+            config_error: None,
+            identity: IdentityState::Missing,
+            probe: &probe,
+            report: &report,
+            egress_socket: EgressSocketState::Ok,
+            relays,
+        })
+    }
+
+    /// H2 §10.2-§10.3: each relay with its reachability, latency and whether it offers address discovery; the official
+    /// mixed map (n0's relays plus our HTTP relay) is fine.
+    #[test]
+    fn doctor_reports_each_relay_with_its_latency_and_address_discovery() {
+        let (text, ready) = render_relays(relays_of(&[N0, OURS]));
+        assert!(ready, "{text}");
+        assert!(
+            text.contains("Relays: 2, 2 reachable; address discovery through n0's public relays"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "  - {N0}: reachable, 81 ms; address discovery: yes (n0's public relay)"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "  - {OURS}: reachable, 40 ms; address discovery: unknown (only with TLS and UDP on the relay)"
+            )),
+            "{text}"
+        );
+        assert!(!text.contains("relay_no_address_discovery"), "{text}");
+    }
+
+    /// §10.3: with no address-discovery relay, doctor says so in the spec's words. A warning: the node still runs jobs
+    /// without internet access, and the egress gate stays closed on its own.
+    #[test]
+    fn doctor_says_jobs_with_internet_access_will_not_start_without_address_discovery() {
+        let (text, ready) = render_relays(relays_of(&[OURS]));
+        assert!(ready, "{text}");
+        assert!(text.contains("address discovery: NONE"), "{text}");
+        assert!(
+            text.contains(
+                "  [!] relay_no_address_discovery: jobs with internet access will not start: no relay offers address \
+                 discovery"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("fix: add n0's public relays"), "{text}");
+    }
+
+    /// A relay that does not answer, or not in time, is shown as such; when none answers, the node is not ready.
+    #[test]
+    fn doctor_fails_when_no_relay_answers() {
+        let (text, ready) = render_relays(relays_of(&[N0, "https://down.example.com/"]));
+        assert!(ready, "one relay still answers:\n{text}");
+        assert!(
+            text.contains("  - https://down.example.com/: unreachable: connection refused"),
+            "{text}"
+        );
+        let (text, ready) = render_relays(relays_of(&["https://down.example.com/", "https://hang.example.com/"]));
+        assert!(!ready, "{text}");
+        assert!(
+            text.contains("  - https://hang.example.com/: no answer within 5 s"),
+            "{text}"
+        );
+        assert!(text.contains("  [x] relays_unreachable: "), "{text}");
+        assert!(text.contains("(1 problem)"), "{text}");
+        let stray: Vec<char> = text.chars().filter(|c| c.is_control() && *c != '\n').collect();
+        assert!(stray.is_empty(), "control characters in the doctor output: {stray:?}");
+    }
+
+    /// An entry iroh cannot use as written blocks; the others are still probed.
+    #[test]
+    fn doctor_fails_on_a_relay_entry_iroh_cannot_use() {
+        let (text, ready) = render_relays(relays_of(&[N0, "https://relay.example.com/sub/"]));
+        assert!(!ready, "{text}");
+        assert!(
+            text.contains("  [x] relay_invalid_url: relay #2: a path is not allowed"),
+            "{text}"
+        );
+        assert!(text.contains(&format!("  - {N0}: reachable")), "{text}");
+        // Plain http to a remote relay is a warning for a node.
+        let (text, ready) = render_relays(relays_of(&[N0, "http://relay.example.com/"]));
+        assert!(ready, "{text}");
+        assert!(text.contains("  [!] relay_not_https: "), "{text}");
+        assert!(
+            text.contains("http://relay.example.com/: reachable, 40 ms; address discovery: no (plain http)"),
+            "{text}"
+        );
+    }
+
+    /// Before `join` there are no relays to check; when the prober cannot be built, the map's rules are still checked.
+    #[test]
+    fn doctor_without_relays_or_prober() {
+        let state = paused(check_relays(Ok(Arc::new(FakeProber)), &[], false));
+        let (text, ready) = render_relays(state);
+        assert!(ready, "{text}");
+        assert!(
+            text.contains("Relays: none yet (`p2pc-agent join` stores the hub's)"),
+            "{text}"
+        );
+        // Enrolled with no relay at all: no address discovery, said so.
+        let (text, _) = render_relays(paused(check_relays(Ok(Arc::new(FakeProber)), &[], true)));
+        assert!(text.contains("Relays: none"), "{text}");
+        assert!(text.contains("[!] relay_no_address_discovery"), "{text}");
+        let state = paused(check_relays::<FakeProber>(
+            Err("no TLS roots".into()),
+            &[OURS.to_string()],
+            true,
+        ));
+        let (text, ready) = render_relays(state);
+        assert!(ready, "{text}");
+        assert!(text.contains("Relays: 1, not probed (no TLS roots)"), "{text}");
+        assert!(
+            text.contains(&format!("  - {OURS}: address discovery: unknown")),
+            "{text}"
+        );
+        assert!(text.contains("[!] relay_no_address_discovery"), "{text}");
     }
 
     /// T07b review, carry-over 5: the detection deadline notes have their own block, outside the GPU section.
