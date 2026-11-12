@@ -1,0 +1,41 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- Placeholder window of the desktop app (H2 T2-42, T2-43) until the web app build (T2-31) replaces it. -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>P2PC</title>
+    <link rel="stylesheet" href="style.css" />
+    <script type="module" src="main.js"></script>
+  </head>
+  <body>
+    <main>
+      <h1>P2PC</h1>
+
+      <!-- First run (H2 §8.2): filled by setup.js while the app is in the state `setup`. -->
+      <section id="setup" aria-live="polite" hidden></section>
+
+      <section id="status-section" aria-labelledby="status-heading" hidden>
+        <p id="ready" class="ready" hidden>Your cloud is ready.</p>
+        <h2 id="status-heading">Status</h2>
+        <p class="status"><span id="dot" class="dot grey" aria-hidden="true"></span><span id="state">…</span></p>
+        <p id="hub-notice" hidden></p>
+        <p id="attention" hidden></p>
+        <div id="controls"></div>
+        <div id="confirm" hidden>
+          <p id="confirm-text"></p>
+          <button type="button" id="confirm-yes"></button>
+          <button type="button" id="confirm-no">Cancel</button>
+        </div>
+      </section>
+
+      <p id="error" role="alert" hidden></p>
+
+      <section aria-labelledby="settings-heading">
+        <h2 id="settings-heading">Settings</h2>
+        <label><input type="checkbox" id="autostart" /> Start P2PC when I sign in</label>
+      </section>
+    </main>
+  </body>
+</html>

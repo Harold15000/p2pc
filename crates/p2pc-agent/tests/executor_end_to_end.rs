@@ -230,6 +230,7 @@ where
             uplink,
             ports: None,
             node: None,
+            volumes: None,
         },
         connector: Arc::new(IrohConnector::new(
             SecretKey::generate(),

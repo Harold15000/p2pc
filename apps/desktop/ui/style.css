@@ -1,0 +1,102 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Placeholder UI of the desktop app (H2 T2-42). */
+
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, "Segoe UI", sans-serif;
+}
+
+main {
+  max-width: 40rem;
+  margin: 2rem auto;
+  padding: 0 1rem;
+}
+
+.note {
+  opacity: 0.75;
+}
+
+.status {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 1.25rem;
+}
+
+.dot {
+  display: inline-block;
+  width: 0.9rem;
+  height: 0.9rem;
+  border-radius: 50%;
+}
+
+/* The tray colours of src/state.rs (`TrayColor::rgb`). */
+.dot.grey {
+  background: #8a8f98;
+}
+.dot.green {
+  background: #2ea043;
+}
+.dot.yellow {
+  background: #e3b341;
+}
+.dot.blue {
+  background: #2f81f7;
+}
+.dot.red {
+  background: #d1242f;
+}
+
+button {
+  margin: 0.25rem 0.5rem 0.25rem 0;
+  padding: 0.4rem 0.9rem;
+}
+
+#error {
+  color: #d1242f;
+}
+
+/* First run (H2 §8.2, T2-43). */
+.warning {
+  color: #9a6700;
+}
+
+.error-box {
+  border-left: 3px solid #d1242f;
+  padding-left: 0.75rem;
+}
+
+.error,
+.check-failed {
+  color: #d1242f;
+}
+
+.detail,
+.progress {
+  opacity: 0.8;
+}
+
+.paired,
+.ready {
+  font-weight: 600;
+}
+
+fieldset {
+  border: none;
+  padding: 0;
+  margin: 1rem 0;
+}
+
+fieldset label {
+  margin-right: 1.5rem;
+}
+
+.share input[type="range"] {
+  width: 100%;
+}
+
+canvas {
+  display: block;
+  margin: 1rem 0;
+  image-rendering: pixelated;
+}

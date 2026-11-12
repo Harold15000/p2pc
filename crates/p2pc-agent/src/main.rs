@@ -374,6 +374,7 @@ fn run_cmd(cli: &Cli, env: &Env) -> anyhow::Result<ExitCode> {
             executor,
             offers,
             ingress,
+            volumes,
         } = node::build(
             &config,
             facts,
@@ -388,6 +389,9 @@ fn run_cmd(cli: &Cli, env: &Env) -> anyhow::Result<ExitCode> {
         let executor = Arc::new(executor);
         // `p2pc-agent share set` runs as another process: the share in force follows agent.toml (H2 §8.4).
         let (share, _share_watcher) = ShareWatcher::new(source, env, config.share.clone()).spawn();
+        // Volume upkeep (H2 §11.3): retries the removal of containers that still hold a volume, and expires unused
+        // volumes.
+        tokio::spawn(node::keep_volumes(executor.clone()));
         let shared = Shared {
             owner: server.account_id,
             agent_lease_ttl: ttl,
@@ -411,6 +415,8 @@ fn run_cmd(cli: &Cli, env: &Env) -> anyhow::Result<ExitCode> {
                 share,
                 approval: Approval::new(),
             }),
+            // `VolumeReport` and `VolumeDelete` (H2 §6.1), when the node offers volume space.
+            volumes,
         };
         let daemon = Daemon {
             shared,

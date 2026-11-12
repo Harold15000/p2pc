@@ -5,7 +5,9 @@
 //! Connections get the limits of spec §10 "Slow clients" (`[http]` in `server.toml`):
 //! - at most `max_connections` open at once: the accept loop takes a semaphore permit **before** `accept`, so an
 //!   extra client waits in the listen backlog until another connection closes;
-//! - the header and keep-alive idle limits, per connection ([`crate::conn::ConnIo`]);
+//! - the header and keep-alive idle limits, per connection ([`crate::conn::ConnIo`]). A connection upgraded to a
+//!   service port (H2 §7.4) leaves them, closes after `port_idle_s` without a byte, and keeps its slot of
+//!   `max_connections` until it closes;
 //! - the body and whole-request limits, as tower layers on the router ([`crate::app::router`]).
 //!
 //! Connections are served by hyper's own HTTP/1 builder (the API speaks nothing else, and the limits above are
@@ -18,10 +20,9 @@ use std::time::Duration;
 
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
-use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, watch};
 
 use crate::app::{AppState, router};
 use crate::clock::SystemClock;
@@ -91,9 +92,10 @@ pub async fn serve_on(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
     let http = state.config.http.clone();
+    let port_idle = Duration::from_secs(u64::from(state.config.services.port_idle_s));
     let app = router(state);
     let permits = Arc::new(Semaphore::new(http.max_connections as usize));
-    let graceful = GracefulShutdown::new();
+    let graceful = Graceful::new();
     let mut builder = http1::Builder::new();
     builder
         .timer(TokioTimer::new())
@@ -127,19 +129,36 @@ pub async fn serve_on(
         };
         let _ = stream.set_nodelay(true);
         let conn_state = Arc::new(ConnState::default());
+        // The socket carries its slot of the cap: an upgraded port connection (H2 §7.4) keeps it for its whole
+        // life, also after hyper is done with the connection.
         let io = TokioIo::new(ConnIo::new(
             stream,
             conn_state.clone(),
             http.header_read_timeout(),
             http.keepalive_idle(),
+            port_idle,
+            permit,
         ));
         let service = Tracked::new(TowerToHyperService::new(app.clone()), conn_state);
-        let conn = graceful.watch(builder.serve_connection(io, service));
+        // `with_upgrades`: a service port connection (H2 §7.4) takes the socket over after its `101`.
+        let conn = builder.serve_connection(io, service).with_upgrades();
+        let mut closing = graceful.subscribe();
         tokio::spawn(async move {
-            if let Err(e) = conn.await {
+            let mut conn = std::pin::pin!(conn);
+            let mut told = false;
+            let ended = loop {
+                tokio::select! {
+                    ended = conn.as_mut() => break ended,
+                    // The server is shutting down: finish the request in flight, take no other.
+                    _ = closing.changed(), if !told => {
+                        told = true;
+                        conn.as_mut().graceful_shutdown();
+                    }
+                }
+            };
+            if let Err(e) = ended {
                 tracing::debug!(error = %e, "connection closed with an error");
             }
-            drop(permit);
         });
     }
     drop(listener);
@@ -148,6 +167,36 @@ pub async fn serve_on(
         tracing::warn!("connections still open after the shutdown grace period");
     }
     Ok(())
+}
+
+/// Tells every connection to shut down gracefully, and waits for them (what hyper-util's `GracefulShutdown` does,
+/// for connections served `with_upgrades`, which it does not take).
+///
+/// Each connection task holds a receiver until hyper is done with the connection. An upgraded connection is not
+/// hyper's any more: it does not hold one, so a shutdown does not wait for open service port connections.
+#[derive(Debug)]
+struct Graceful {
+    closing: watch::Sender<()>,
+}
+
+impl Graceful {
+    fn new() -> Self {
+        Self {
+            closing: watch::channel(()).0,
+        }
+    }
+
+    /// A receiver for one connection: it changes when the server shuts down.
+    fn subscribe(&self) -> watch::Receiver<()> {
+        self.closing.subscribe()
+    }
+
+    /// Tells every connection, then completes when the last one has ended.
+    async fn shutdown(self) {
+        // An error means there is no connection to tell.
+        let _ = self.closing.send(());
+        self.closing.closed().await;
+    }
 }
 
 /// Where `p2pc/http/1` streams connect: the REST listener, through loopback when it listens on every address.

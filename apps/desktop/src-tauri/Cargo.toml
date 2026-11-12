@@ -1,0 +1,90 @@
+[package]
+name = "p2pc-desktop"
+description = "P2PC desktop app (H2 §8): the Tauri 2 shell, its states, tray, single instance, autostart and device key."
+license = "Apache-2.0"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+
+# This crate is its own workspace (and is excluded from the root one): the Tauri glue needs WebKitGTK on Linux and
+# WebView2 on Windows, so it cannot be part of `cargo clippy --workspace --all-features` on a machine without them.
+# `apps/desktop/check.sh` runs its gates. Its lock file is `apps/desktop/src-tauri/Cargo.lock`.
+[workspace]
+
+[lib]
+name = "p2pc_desktop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "p2pc-desktop"
+path = "src/main.rs"
+required-features = ["app"]
+
+[features]
+default = []
+# The Tauri glue: builder, tray, window, commands. Off by default, so that everything else builds and is tested on a
+# machine without a webview toolkit.
+app = ["dep:tauri", "dep:tauri-build", "dep:tauri-plugin-single-instance", "dep:tauri-plugin-opener"]
+
+# The same versions as the root workspace (and its lock file) where the crate is shared.
+[dependencies]
+# The device key: 32 bytes from the OS generator (already in the tree through `rand`).
+getrandom = "0.4.3"
+# The device key's public half, the app's device NodeId (`p2pc-server init --owner-device`, H2 §5.3, §8.2 step 4). The
+# root workspace's version and features (key types only, no networking).
+iroh-base = { version = "~1.4.1", default-features = false, features = ["key"] }
+# The WSL side of first run (H2 §8.3, T2-40): checks, image download, import, the scheduled task, `wsl.exe` runs.
+p2pc-wsl = { version = "0.1.0", path = "../../../crates/p2pc-wsl" }
+# The pairing QR code of first-run step 5 (H2 §8.2), as a module matrix the window draws: the ticket never reaches the
+# webview as text. The CLI's version, without its image renderers.
+qrcode = { version = "0.14.1", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+# The hub's `server.toml`: "Create my cloud" sets `[blobs] blobs_quota_mb` (H2 §7.5, §8.2) in the file `p2pc-server init`
+# wrote. Already in the tree through Tauri; the root workspace's version.
+toml = { version = "1.2.0", default-features = false, features = ["std", "serde", "parse", "display"] }
+# The navigation guard reads the URLs the webview asks for (Tauri hands them over as `url::Url`).
+url = "2.5.8"
+# The device key is wiped from memory when dropped.
+zeroize = "1.9.1"
+
+# --- Tauri glue (feature `app`) ---
+# `tray-icon` for the tray. No shell, filesystem or HTTP plugin (H2 §8.9; `capabilities::tests` checks this file).
+tauri = { version = "2.12.5", features = ["tray-icon"], optional = true }
+# Opens links in the system browser (H2 §8.9). Used from Rust only: the webview gets none of its permissions.
+tauri-plugin-opener = { version = "2.7.3", optional = true }
+# One app process per signed-in user (H2 §8.1). Rust only; it adds no webview permission.
+tauri-plugin-single-instance = { version = "2.5.5", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# DPAPI (`CryptProtectData`, current user) for `%LOCALAPPDATA%\P2PC\device.key` (H2 §8.9). Already in the tree
+# through Tauri.
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+# `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (H2 §8.1). Safe wrapper from the same project as `windows`.
+windows-registry = "0.6.1"
+
+[build-dependencies]
+tauri-build = { version = "2.7.4", optional = true }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints.rust]
+# The workspace forbids `unsafe`; this crate denies it and allows it only in `keystore::dpapi` (Windows FFI to
+# `CryptProtectData`, which has no safe wrapper in the `windows` crate), each block with a `// SAFETY:` comment.
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+dbg_macro = "deny"
+todo = "warn"
+print_stdout = "allow"
+
+[profile.release]
+lto = "thin"
+strip = true

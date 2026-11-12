@@ -20,7 +20,9 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use p2pc_proto::api::{Estimate, Job, JobKind, JobSpec, JobStatus, Page, Problem, REASON_STOPPED, Scope, ServiceView};
+use p2pc_proto::api::{
+    AllowedRoute, Estimate, Job, JobKind, JobSpec, JobStatus, Page, Problem, REASON_STOPPED, Scope, ServiceView,
+};
 use p2pc_proto::ids::{JobId, NodeId};
 use p2pc_proto::units::{Units, estimate_units};
 use p2pc_proto::validate::{ErrorCode, H2Features, ImageRef, Limits, image_allowed};
@@ -47,6 +49,14 @@ pub const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 pub trait TemplateCatalog: Send + Sync + fmt::Debug + 'static {
     /// The ids of the `singleton` templates of the bundle the hub serves now.
     fn singleton_ids(&self) -> Vec<String>;
+
+    /// The `allowed_routes` of the template `template_id` in the bundle the hub serves now (H2 §7.4, §7.6): the
+    /// requests a principal that is not `admin` may send to a service of that template. Empty when no bundle is
+    /// served or the bundle has no such template, so nothing matches and the service is closed to them.
+    fn allowed_routes(&self, template_id: &str) -> Vec<AllowedRoute> {
+        let _ = template_id;
+        Vec::new()
+    }
 }
 
 /// No template bundle is loaded: no template is `singleton`.
@@ -424,7 +434,9 @@ pub async fn list_jobs(
 ///
 /// `last_activity_at` is what the idle timeout counts from: the attempt's first `healthy`, then the traffic the port
 /// relay records. `cap_deadline` is when the day's cap reservation runs out (H2 §12), `null` for an uncapped principal
-/// or while no attempt runs. `setup` and `traffic` belong to the template and port tasks and stay `null` here.
+/// or while no attempt runs. `traffic` is what the port relay recorded for today, UTC (H2 §12), `null` when the day has
+/// none; a connection's bytes are added at most 10 s after they were relayed. `setup` belongs to the template task and
+/// stays `null` here.
 async fn service_view(
     conn: &mut Conn,
     state: &AppState,
@@ -466,6 +478,7 @@ async fn service_view(
         deadline,
         restarts_24h: u32::try_from(restarts).unwrap_or(u32::MAX),
         cap_deadline: crate::units::cap_deadline(conn, row.job_id, gpu_hour_units(&state.config)).await?,
+        traffic: store::ports::traffic_today(conn, row.job_id, now).await?,
         ..ServiceView::default()
     }))
 }
@@ -476,7 +489,8 @@ async fn service_view(
 /// template view (H2 §5.5).
 ///
 /// A service adds `service` (H2 §7.2): `health` and `health_since` while it runs, `ports`, `open_connections`,
-/// `last_activity_at`, `idle_deadline`, `deadline` and `restarts_24h`.
+/// `last_activity_at`, `idle_deadline`, `deadline`, `restarts_24h` and `traffic`, today's totals of its port
+/// connections (H2 §12).
 #[utoipa::path(
     get,
     path = "/v1/jobs/{id}",

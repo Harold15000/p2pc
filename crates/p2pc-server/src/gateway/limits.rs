@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The gateway's limits (spec §6 "Before `Join`", §10) and a fixed-window rate limiter.
+//! The gateway's limits (spec §6 "Before `Join`", §10; H2 §5.3, §6.3), a fixed-window rate limiter and the device
+//! stream budget.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration as StdDuration;
 
+use p2pc_proto::device::{self, DeviceStreamBudget};
+use p2pc_proto::ids::DeviceId;
+use p2pc_proto::pair;
 use time::{Duration, OffsetDateTime};
 
 /// Every limit of the gateway. [`GatewayLimits::default`] is the spec; tests shorten the timeouts.
@@ -51,6 +56,30 @@ pub struct GatewayLimits {
     /// Output upload streams (§6 "Uploads", T10b): 2 per node and 8 in total at once, 30 s idle, 64 KiB/s after
     /// the first 10 s.
     pub uploads: crate::outputs::UploadLimits,
+    /// `p2pc/pair/1` connections at once, counted apart from the other ALPNs (H2 §5.3: 32).
+    pub pair_max_connections: usize,
+    /// `Pair`s being checked at once (H2 §5.3: 8).
+    pub pair_max_pending: usize,
+    /// Time for the one `Pair` of a connection to arrive, counted from the handshake (H2 §5.3: 10 s).
+    pub pair_deadline: StdDuration,
+    /// Failed pairings per NodeId per minute; a NodeId over it is refused when it connects (H2 §5.3: 10).
+    pub pair_failures_per_node_per_minute: u32,
+    /// Failed pairings per ticket-hash prefix per minute; beyond it a failing attempt in that prefix is closed with
+    /// no detail, and a valid ticket still pairs (H2 §5.3: 10).
+    pub pair_failures_per_prefix_per_minute: u32,
+    /// The aggregate failure cap of `p2pc/pair/1` and of the device check of `p2pc/device/1`, each counted on its own
+    /// (H2 §5.3: 60 a minute). Beyond it a failure gets no detailed answer and is not logged one by one; the
+    /// credential is still looked up, so a valid one succeeds. `p2pc/agent/1` has `join_failures_per_minute`.
+    pub aggregate_failures_per_minute: u32,
+    /// `p2pc/device/1` connections at once that have not passed the device check (H2 §6.3: 32).
+    pub device_max_unchecked_connections: usize,
+    /// Time for the device check of a connection, counted from the handshake (H2 §6.3: 5 s).
+    pub device_check_deadline: StdDuration,
+    /// `not_paired` closes per NodeId per minute; a NodeId over it is closed at connect without the lookup (H2 §6.3:
+    /// 10).
+    pub device_not_paired_per_node_per_minute: u32,
+    /// `p2pc/device/1` connections at once per device (H2 §6.3: 2).
+    pub device_connections_per_device: usize,
 }
 
 impl Default for GatewayLimits {
@@ -74,6 +103,108 @@ impl Default for GatewayLimits {
             final_message_grace: StdDuration::from_secs(2),
             sweep_interval: StdDuration::from_secs(1),
             uploads: crate::outputs::UploadLimits::default(),
+            pair_max_connections: pair::PAIR_MAX_CONNECTIONS,
+            pair_max_pending: pair::PAIR_MAX_PENDING,
+            pair_deadline: pair::PAIR_DEADLINE,
+            pair_failures_per_node_per_minute: pair::PAIR_FAILURES_PER_NODE_PER_MINUTE,
+            pair_failures_per_prefix_per_minute: pair::PAIR_FAILURES_PER_PREFIX_PER_MINUTE,
+            aggregate_failures_per_minute: pair::AGGREGATE_FAILURE_CAP_PER_MINUTE,
+            device_max_unchecked_connections: device::MAX_UNCHECKED_CONNECTIONS,
+            device_check_deadline: device::DEVICE_CHECK_DEADLINE,
+            device_not_paired_per_node_per_minute: device::NOT_PAIRED_PER_NODE_PER_MINUTE,
+            device_connections_per_device: device::MAX_CONNECTIONS_PER_DEVICE,
+        }
+    }
+}
+
+/// The device stream budget (H2 §6.3), counted apart from the REST connection cap and the tunnel budget: device
+/// streams never take a TCP slot and TCP connections never take a device slot.
+///
+/// A stream is one HTTP/1.1 connection of a `p2pc/device/1` connection; it holds its [`StreamSlot`] for its whole
+/// life, an upgraded port connection or a log follow included. Three caps apply to a new stream:
+/// - **per device:** `streams_per_device` across the device's connections;
+/// - **in total:** `budget`;
+/// - **the `admin` reserve:** devices without the `admin` scope hold together at most `budget - admin_reserve`, so
+///   the hub PC's app, which is how a device gets revoked, always finds a slot whatever paired phones do.
+#[derive(Debug)]
+pub struct DeviceBudget {
+    limits: DeviceStreamBudget,
+    used: Arc<Mutex<BudgetUse>>,
+}
+
+#[derive(Debug, Default)]
+struct BudgetUse {
+    total: usize,
+    non_admin: usize,
+    per_device: HashMap<DeviceId, usize>,
+}
+
+/// One device stream of the budget. Dropping it gives the slot back.
+#[derive(Debug)]
+pub struct StreamSlot {
+    used: Arc<Mutex<BudgetUse>>,
+    device_id: DeviceId,
+    admin: bool,
+}
+
+impl DeviceBudget {
+    /// An unused budget with `limits`.
+    #[must_use]
+    pub fn new(limits: DeviceStreamBudget) -> Self {
+        Self {
+            limits,
+            used: Arc::default(),
+        }
+    }
+
+    /// The limits this budget enforces.
+    #[must_use]
+    pub fn limits(&self) -> DeviceStreamBudget {
+        self.limits
+    }
+
+    /// A slot for one more stream of `device_id`, or `None` when the device, the non-`admin` share or the whole
+    /// budget is full. `admin` says whether the device has the `admin` scope.
+    #[must_use]
+    pub fn try_acquire(&self, device_id: DeviceId, admin: bool) -> Option<StreamSlot> {
+        let mut used = self.used.lock().unwrap_or_else(PoisonError::into_inner);
+        if used.total >= self.limits.budget
+            || used.per_device.get(&device_id).copied().unwrap_or(0) >= self.limits.streams_per_device
+            || (!admin && used.non_admin >= self.limits.non_admin_streams())
+        {
+            return None;
+        }
+        used.total += 1;
+        if !admin {
+            used.non_admin += 1;
+        }
+        *used.per_device.entry(device_id).or_insert(0) += 1;
+        Some(StreamSlot {
+            used: self.used.clone(),
+            device_id,
+            admin,
+        })
+    }
+
+    /// Streams open now, in total.
+    #[must_use]
+    pub fn in_use(&self) -> usize {
+        self.used.lock().unwrap_or_else(PoisonError::into_inner).total
+    }
+}
+
+impl Drop for StreamSlot {
+    fn drop(&mut self) {
+        let mut used = self.used.lock().unwrap_or_else(PoisonError::into_inner);
+        used.total = used.total.saturating_sub(1);
+        if !self.admin {
+            used.non_admin = used.non_admin.saturating_sub(1);
+        }
+        if let Some(count) = used.per_device.get_mut(&self.device_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                used.per_device.remove(&self.device_id);
+            }
         }
     }
 }
@@ -239,6 +370,102 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(gate.available(), 8, "the slot is released after the decode");
+    }
+
+    fn budget(streams_per_device: usize, budget: usize, admin_reserve: usize) -> DeviceBudget {
+        let limits = DeviceStreamBudget {
+            streams_per_device,
+            budget,
+            admin_reserve,
+        };
+        assert_eq!(limits.validate(), Ok(()));
+        DeviceBudget::new(limits)
+    }
+
+    /// H2 §6.3: the pre-auth limits of `p2pc/pair/1` and of the device check are the spec's.
+    #[test]
+    fn the_h2_defaults_are_the_specs() {
+        let l = GatewayLimits::default();
+        assert_eq!((l.pair_max_connections, l.pair_max_pending), (32, 8));
+        assert_eq!(l.pair_deadline, StdDuration::from_secs(10));
+        assert_eq!(
+            (
+                l.pair_failures_per_node_per_minute,
+                l.pair_failures_per_prefix_per_minute,
+                l.aggregate_failures_per_minute
+            ),
+            (10, 10, 60)
+        );
+        assert_eq!(l.device_max_unchecked_connections, 32);
+        assert_eq!(l.device_check_deadline, StdDuration::from_secs(5));
+        assert_eq!(l.device_not_paired_per_node_per_minute, 10);
+        assert_eq!(l.device_connections_per_device, 2);
+    }
+
+    /// H2 §6.3 "Per device": a device holds at most `streams_per_device` streams, and a slot it gives back is usable
+    /// again.
+    #[test]
+    fn a_device_is_capped_at_its_own_streams() {
+        let b = budget(2, 8, 2);
+        let phone = DeviceId::generate();
+        let first = b.try_acquire(phone, false).unwrap();
+        let _second = b.try_acquire(phone, false).unwrap();
+        assert!(b.try_acquire(phone, false).is_none(), "a third stream of one device");
+        // Another device is not affected.
+        let _other = b.try_acquire(DeviceId::generate(), false).unwrap();
+        assert_eq!(b.in_use(), 3);
+        drop(first);
+        assert_eq!(b.in_use(), 2);
+        assert!(b.try_acquire(phone, false).is_some());
+    }
+
+    /// H2 §6.3 "Reserved for `admin`", SI-H2-4: phones hold together at most the budget minus the reserve, whatever
+    /// their number, and an `admin` device still opens its own share from the reserve.
+    #[test]
+    fn non_admin_devices_never_take_the_admin_reserve() {
+        let b = budget(2, 6, 2);
+        let mut held = Vec::new();
+        // Four phone streams: the whole non-admin share (6 - 2).
+        for _ in 0..2 {
+            let phone = DeviceId::generate();
+            held.push(b.try_acquire(phone, false).unwrap());
+            held.push(b.try_acquire(phone, false).unwrap());
+        }
+        let late_phone = DeviceId::generate();
+        assert!(
+            b.try_acquire(late_phone, false).is_none(),
+            "the non-admin share is full"
+        );
+        // The owner's app still gets its whole per-device share.
+        let app = DeviceId::generate();
+        held.push(b.try_acquire(app, true).unwrap());
+        held.push(b.try_acquire(app, true).unwrap());
+        assert_eq!(b.in_use(), 6);
+        // The whole budget is in use: nobody gets a stream, `admin` or not.
+        assert!(b.try_acquire(DeviceId::generate(), true).is_none());
+        assert!(b.try_acquire(late_phone, false).is_none());
+        // A phone slot given back goes to a phone again.
+        held.remove(0);
+        assert!(b.try_acquire(late_phone, false).is_some());
+    }
+
+    /// `admin` devices may use the whole budget; the phones then wait, and the total is never exceeded.
+    #[test]
+    fn the_total_budget_bounds_admin_devices_too() {
+        let b = budget(2, 5, 2);
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let app = DeviceId::generate();
+            held.push(b.try_acquire(app, true).unwrap());
+            held.push(b.try_acquire(app, true).unwrap());
+        }
+        let phone = DeviceId::generate();
+        held.push(b.try_acquire(phone, false).unwrap());
+        assert_eq!(b.in_use(), 5);
+        assert!(b.try_acquire(phone, false).is_none());
+        assert!(b.try_acquire(DeviceId::generate(), true).is_none());
+        held.clear();
+        assert_eq!(b.in_use(), 0);
     }
 
     #[test]

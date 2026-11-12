@@ -31,6 +31,12 @@
 //! serves the streams the server opens on the connection ([`super::streams`]) until it ends. Without one it is an H1
 //! session: no capability, service leases are `invalid_job`, and no stream of the server is ever accepted.
 //!
+//! **Volumes** (H2 §6.1, §11.3). A session with a [`VolumeStore`] ([`Shared::volumes`]) declares the `volumes`
+//! capability and accepts leases whose job has `volumes`. Once welcomed it sends a `VolumeReport`, then one every 10
+//! minutes and one each time a lease that held a volume ends; `VolumeDelete` deletes a volume no lease uses and is
+//! answered with a fresh report ([`crate::volumes::serve_session`], on its own task, so a slow deletion never stalls
+//! the connection's reads). Without a store, a lease with volumes is `invalid_job` and `VolumeDelete` is ignored.
+//!
 //! **The owner's share and the node's approval** (H2 §5.5, §6.1, §8.4). A session with [`NodeControls`]
 //! ([`Shared::node`]) declares `leave` and `approval`:
 //! - `Welcome.pending_approval` and `NodeApproved` are recorded in [`Approval`], which `p2pc-agent status` shows.
@@ -56,14 +62,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use p2pc_proto::api::Inventory;
+use p2pc_proto::api::{Inventory, JobSpec};
 use p2pc_proto::ids::AccountId;
 use p2pc_proto::net::{AddressChange, SelectedAddr};
+use p2pc_proto::protocol::LeaseJob;
 use p2pc_proto::protocol::{
-    AGENT_LEASE_TTL_MARGIN_S, AgentMsg, FrameError, LeaseRejectReason, MAX_FRAME_LEN, ServerMsg, capability,
-    error_code, read_frame, write_frame,
+    AGENT_LEASE_TTL_MARGIN_S, AgentMsg, FrameError, LeaseRejectReason, MAX_FRAME_LEN, ServerMsg,
+    VOLUME_REPORT_INTERVAL, capability, error_code, read_frame, write_frame,
 };
-use p2pc_proto::validate::{H2Features, Limits};
+use p2pc_proto::validate::{H2Features, Limits, SpecContext};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::{Notify, Semaphore, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -78,6 +85,7 @@ use super::uplink::{Acks, JOB_QUEUE, JobFrame, Port, Uplink};
 use super::watchdog::Watchdog;
 use crate::config::Share;
 use crate::inventory::AGENT_VERSION;
+use crate::volumes::{self, VolumeStore};
 
 /// How long the server has to answer `Hello`.
 pub const WELCOME_TIMEOUT: Duration = Duration::from_secs(15);
@@ -140,6 +148,9 @@ pub struct Shared {
     /// The owner's share and the node's approval (H2 §5.5, §6.1, §8.4). `None` is an H1 agent: it declares neither
     /// `leave` nor `approval`, and ignores `NodeApproved`.
     pub node: Option<NodeControls>,
+    /// The node's persistent volumes (H2 §11.3), when the owner gave them a share of the disk. `None`: the agent
+    /// declares no `volumes`, takes no lease with volumes, and sends no `VolumeReport`.
+    pub volumes: Option<VolumeStore>,
 }
 
 /// What an H2 node adds to a session (H2 §5.5, §6.1, §8.4).
@@ -195,8 +206,9 @@ impl Approval {
 }
 
 impl Shared {
-    /// `Hello.features`: `service_jobs` exactly when this node can serve the ports of a service; `leave` and `approval`
-    /// for an H2 node ([`Shared::node`]), in the order of the spec's table (H2 §6.1).
+    /// `Hello.features`, in the order of the spec's table (H2 §6.1): `service_jobs` exactly when this node can serve
+    /// the ports of a service, `volumes` exactly when it mounts persistent volumes, and `leave` and `approval` for an H2
+    /// node ([`Shared::node`]).
     ///
     /// `share_update` is not declared: it promises `Inventory.volumes_mb` and `owner_paused`, which the wire inventory
     /// does not carry yet. The share is still applied live, and a paused node refuses every lease with `draining`.
@@ -205,6 +217,9 @@ impl Shared {
         let mut features = Vec::new();
         if self.ports.is_some() {
             features.push(capability::SERVICE_JOBS.to_string());
+        }
+        if self.volumes.is_some() {
+            features.push(capability::VOLUMES.to_string());
         }
         if self.node.is_some() {
             features.push(capability::LEAVE.to_string());
@@ -218,17 +233,30 @@ impl Shared {
         self.node.as_ref().is_some_and(|n| n.share.borrow().paused)
     }
 
-    /// The limits a lease's job is parsed with: the agent's, with service jobs understood exactly when the
-    /// capability is declared (H2 §6.1: a job this agent does not understand is `invalid_job`).
+    /// The limits a lease's job is parsed with: the agent's, with service jobs and volumes understood exactly when
+    /// their capability is declared (H2 §6.1: a job this agent does not understand is `invalid_job`).
     fn lease_limits(&self) -> Limits {
         Limits {
             h2: H2Features {
                 services: self.ports.is_some(),
+                volumes: self.volumes.is_some(),
                 ..H2Features::default()
             },
             ..Limits::agent()
         }
     }
+}
+
+/// The "must understand" check of a lease's job (§6): a strict parse (unknown fields refused), then the validation of
+/// a spec the hub **stored** (H2 §7.1), which is what a lease carries. Only there may a job have `template` and that
+/// template's own `tpl:` volumes: a template launch sets them, and a client never can. Every other rule is the one a
+/// new job is checked with. On failure, the fields that broke a rule (never their values).
+fn parse_lease_job(job: &LeaseJob, limits: &Limits) -> Result<JobSpec, Vec<String>> {
+    let spec: JobSpec = serde_json::from_value(serde_json::Value::Object(job.as_object().clone()))
+        .map_err(|_| vec!["job".to_string()])?;
+    spec.validate_in(limits, SpecContext::Stored)
+        .map_err(|errors| errors.iter().map(|e| e.field.clone()).collect::<Vec<String>>())?;
+    Ok(spec)
 }
 
 /// What the `Welcome` said, once checked.
@@ -428,6 +456,9 @@ struct Io {
     incoming: Option<Arc<dyn StreamAcceptor>>,
     /// Serves the streams the server opens (H2 §6.1), once welcomed.
     dispatcher: Option<JoinHandle<()>>,
+    /// Reports the volumes and carries out `VolumeDelete` (H2 §6.1), once welcomed: where the names to delete go,
+    /// and the task.
+    volumes: Option<(mpsc::Sender<String>, JoinHandle<()>)>,
     /// The number of this session's port on the [`Uplink`], once welcomed.
     port: Option<u64>,
 }
@@ -456,7 +487,17 @@ impl Io {
             streams,
             incoming,
             dispatcher: None,
+            volumes: None,
             port: None,
+        }
+    }
+
+    /// Stops the volume reports of this session and waits until their task is gone: it holds the control queue
+    /// open.
+    async fn stop_volumes(&mut self) {
+        if let Some((_, task)) = self.volumes.take() {
+            task.abort();
+            let _ = task.await;
         }
     }
 
@@ -489,6 +530,9 @@ impl Drop for Io {
         self.writer.abort();
         if let Some(dispatcher) = &self.dispatcher {
             dispatcher.abort();
+        }
+        if let Some((_, task)) = &self.volumes {
+            task.abort();
         }
         if let Some(close) = self.close.take() {
             close();
@@ -524,8 +568,9 @@ pub async fn run(
     if let Some(port) = io.port.take() {
         shared.uplink.disconnect(port);
     }
-    // The port streams of this connection end with it.
+    // The port streams of this connection end with it, and so do its volume reports.
     io.stop_dispatcher().await;
+    io.stop_volumes().await;
     decisions.shutdown().await;
     io.finish().await;
     end
@@ -630,6 +675,18 @@ async fn drive(
                     // Only now, and only with a bridge: before the Welcome no stream of the server is accepted.
                     if let (Some(ports), Some(incoming)) = (&shared.ports, io.incoming.take()) {
                         io.dispatcher = Some(tokio::spawn(streams::serve(incoming, Arc::clone(ports))));
+                    }
+                    // H2 §6.1: a `VolumeReport` after `Hello` (the session is welcomed), then every 10 minutes and
+                    // when a lease that held a volume ends.
+                    if let Some(store) = &shared.volumes {
+                        let (deletes, names) = mpsc::channel(volumes::MAX_PENDING_DELETES);
+                        let task = tokio::spawn(volumes::serve_session(
+                            store.clone(),
+                            io.outbox.clone(),
+                            names,
+                            VOLUME_REPORT_INTERVAL,
+                        ));
+                        io.volumes = Some((deletes, task));
                     }
                     w
                 }
@@ -809,10 +866,9 @@ async fn route(shared: &Shared, io: &Io, decisions: &mut JoinSet<()>, msg: Serve
                 return queue(io, reject(LeaseRejectReason::Draining));
             }
             // §6 "must understand": strict parse; a failure is a rejected offer, never a closed connection.
-            let job = match job.parse_strict_with(&shared.lease_limits()) {
+            let job = match parse_lease_job(&job, &shared.lease_limits()) {
                 Ok(job) => job,
-                Err(errors) => {
-                    let fields: Vec<&str> = errors.iter().map(|e| e.field.as_str()).collect();
+                Err(fields) => {
                     tracing::warn!(%lease_id, ?fields, "lease with a job this agent does not accept (invalid_job)");
                     return queue(io, reject(LeaseRejectReason::InvalidJob));
                 }
@@ -869,10 +925,16 @@ async fn route(shared: &Shared, io: &Io, decisions: &mut JoinSet<()>, msg: Serve
             }
             None => tracing::debug!("NodeApproved for an agent that did not declare `approval`; ignored"),
         },
-        // H2 §6.1: sent only to agents that declared `volumes`, which this one does not yet.
-        msg @ ServerMsg::VolumeDelete(_) => {
-            tracing::debug!(kind = msg.kind(), "a message this agent does not use yet; ignored");
-        }
+        // H2 §6.1: delete a node-local volume that no lease uses, and answer with a fresh `VolumeReport`. The
+        // deletion runs on the session's volume task: never on this one, which must go back to reading.
+        ServerMsg::VolumeDelete(delete) => match &io.volumes {
+            Some((deletes, _)) => {
+                if deletes.try_send(delete.name).is_err() {
+                    tracing::warn!("too many VolumeDelete in progress; this one is dropped");
+                }
+            }
+            None => tracing::debug!("VolumeDelete for an agent that declared no volumes; ignored"),
+        },
     }
     None
 }

@@ -162,6 +162,7 @@ async fn si12_runtime_the_running_agent_opens_only_its_iroh_udp_sockets() {
             uplink: p2pc_agent::connection::Uplink::new(),
             ports: None,
             node: None,
+            volumes: None,
         },
         connector: connector.clone(),
         backoff_seed: 1,

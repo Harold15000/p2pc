@@ -4,9 +4,12 @@
 //!
 //! The §10 plumbing (no port mapping, no address lookup, one socket per selected address, the interface snapshot
 //! and the debounced network watcher) is `p2pc-net`'s, shared with the agent (T05b review, P2-3). This module adds
-//! what is the server's own: its identity and relays, the two ALPNs it accepts (`p2pc/agent/1`, `p2pc/http/1`), and
-//! the options read from `server.toml`.
+//! what is the server's own: its identity and relays, the ALPNs it accepts ([`accepted_alpns`]), and the options read
+//! from `server.toml`.
 //!
+//! - **What it accepts** (hard rule 4, H2 §10.5): `p2pc/agent/1`, `p2pc/http/1` and `p2pc/device/1` always, each
+//!   behind a join token, an API key or a paired NodeId, and `p2pc/pair/1` only while a pairing ticket is open. The
+//!   list is the TLS ALPN list, so a connection that offers anything else fails its handshake before any message.
 //! - The public address that the relay observes (QUIC address discovery) is still advertised: it is the
 //!   default route's own address as seen from the internet.
 //! - **Network changes** (T05 review, carry-over 6): when [`p2pc_net::watch_network`] reports a new selection (the
@@ -21,7 +24,7 @@ use p2pc_net::BindSpec;
 use p2pc_proto::api::ServerInfo;
 use p2pc_proto::auth::ServerAddress;
 use p2pc_proto::net::{DirectAddresses, IfAddr, SelectedAddr, select_addresses};
-use p2pc_proto::{PROTOCOL_ALPN_AGENT, PROTOCOL_ALPN_HTTP};
+use p2pc_proto::{PROTOCOL_ALPN_AGENT, PROTOCOL_ALPN_DEVICE, PROTOCOL_ALPN_HTTP, PROTOCOL_ALPN_PAIR};
 use url::Url;
 
 pub use p2pc_net::BindError as EndpointError;
@@ -162,14 +165,31 @@ impl EndpointOptions {
     }
 }
 
-/// Binds the server's endpoint: `p2pc_net::bind_endpoint` with the two ALPNs the server accepts and exactly the IP
-/// sockets of `options`.
+/// The ALPNs the hub's endpoint accepts (H2 §10.5), and nothing else: `p2pc/agent/1`, `p2pc/http/1` and
+/// `p2pc/device/1`, plus `p2pc/pair/1` only when `pair_open` (a pairing ticket is open). Without it a `p2pc/pair/1`
+/// connection fails its TLS handshake before any message.
+#[must_use]
+pub fn accepted_alpns(pair_open: bool) -> Vec<Vec<u8>> {
+    let mut alpns = vec![
+        PROTOCOL_ALPN_AGENT.to_vec(),
+        PROTOCOL_ALPN_HTTP.to_vec(),
+        PROTOCOL_ALPN_DEVICE.to_vec(),
+    ];
+    if pair_open {
+        alpns.push(PROTOCOL_ALPN_PAIR.to_vec());
+    }
+    alpns
+}
+
+/// Binds the server's endpoint: `p2pc_net::bind_endpoint` with the ALPNs the server always accepts
+/// ([`accepted_alpns`] with no pairing ticket open) and exactly the IP sockets of `options`. The gateway adds
+/// `p2pc/pair/1` while a ticket is open (`Endpoint::set_alpns`).
 pub async fn bind(secret_key: SecretKey, options: &EndpointOptions) -> Result<Endpoint, EndpointError> {
     let spec = BindSpec {
         relay_mode: options.relay_mode.clone(),
         addrs: options.bind.clone(),
         port: options.port,
-        alpns: vec![PROTOCOL_ALPN_AGENT.to_vec(), PROTOCOL_ALPN_HTTP.to_vec()],
+        alpns: accepted_alpns(false),
     };
     p2pc_net::bind_endpoint(secret_key, &spec).await
 }
@@ -202,6 +222,21 @@ mod tests {
         // Debug never shows the secret key.
         let hex = data_encoding::HEXLOWER.encode(&id.secret_key().to_bytes());
         assert!(!format!("{id:?}").contains(&hex));
+    }
+
+    /// Hard rule 4, H2 §10.5: the accepted ALPNs are exactly the listed ones, and `p2pc/pair/1` only with a ticket
+    /// open. `p2pc/invite/1` is never the hub's.
+    #[test]
+    fn the_accepted_alpns_are_exactly_the_ones_of_10_5() {
+        let closed = accepted_alpns(false);
+        assert_eq!(
+            closed,
+            [&b"p2pc/agent/1"[..], b"p2pc/http/1", b"p2pc/device/1"].map(<[u8]>::to_vec)
+        );
+        let open = accepted_alpns(true);
+        assert_eq!(open[..3], closed[..]);
+        assert_eq!(open[3..], [b"p2pc/pair/1".to_vec()]);
+        assert!(!open.contains(&p2pc_proto::PROTOCOL_ALPN_INVITE.to_vec()));
     }
 
     #[tokio::test]

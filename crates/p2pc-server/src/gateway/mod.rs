@@ -1,12 +1,22 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The node gateway (spec §6, §10): the server's iroh endpoint and its two protocols.
+//! The node gateway (spec §6, §10; H2 §5.3, §6.3, §10.5): the server's iroh endpoint and its protocols.
 //!
 //! - `p2pc/agent/1` ([`agent`]): `Join`, `Hello`, heartbeats and the routing of lease and job messages to
 //!   [`NodeEvents`]; live connections in the [`NodeHub`].
 //! - uploads ([`upload`]): every bidirectional stream after an agent's control stream carries one output file;
+//! - port streams ([`ports`], H2 §6.1, §7.4): the bidirectional streams the **hub** opens on the agent connection of a
+//!   service's node, one `PortOpen` per client connection to a service port, and the relay between the two;
 //! - `p2pc/http/1` ([`tunnel`]): each bidirectional stream relayed to the local REST listener, where the API key is
 //!   checked as for any other request.
+//! - `p2pc/pair/1` ([`pair`]): one `Pair` with a one-time ticket, under its own pre-auth limits. It is in the
+//!   endpoint's accepted ALPNs **only while a pairing ticket is open** ([`Gateway::refresh_pair_serving`]).
+//! - `p2pc/device/1` ([`device`]): the REST API for paired devices, served in-process with the device principal,
+//!   after the device check, under the device stream budget.
+//!
+//! **What the endpoint accepts (hard rule 4, H2 §10.5).** Exactly these ALPNs, each behind a join token, an API key,
+//! a pairing ticket or a paired NodeId and under pre-auth limits; a connection with any other ALPN fails its TLS
+//! handshake, and [`accept_on`] closes one that got through anyway.
 //! - Liveness: a node with no contact for `lease_ttl_s` becomes `offline` ([`Gateway::sweep_liveness`], run every
 //!   second); at boot, every node that was online gets `lease_ttl_s` from the boot (§6 "Server restart"), a grace
 //!   that is never recorded as a contact.
@@ -14,9 +24,12 @@
 //! Later tasks plug in through [`LeaseReconciler`] (T06) and [`NodeEvents`] (T06, T10).
 
 mod agent;
+pub mod device;
 pub mod endpoint;
 pub mod hub;
 pub mod limits;
+pub mod pair;
+pub mod ports;
 mod tunnel;
 mod upload;
 
@@ -24,22 +37,22 @@ use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use iroh::Endpoint;
 use iroh::endpoint::VarInt;
-use p2pc_proto::ids::NodeId;
+use p2pc_proto::ids::{DeviceId, NodeId};
 use p2pc_proto::protocol::{AgentMsg, RunningLease, ServerMsg};
-use p2pc_proto::{PROTOCOL_ALPN_AGENT, PROTOCOL_ALPN_HTTP};
+use p2pc_proto::{PROTOCOL_ALPN_AGENT, PROTOCOL_ALPN_DEVICE, PROTOCOL_ALPN_HTTP, PROTOCOL_ALPN_PAIR};
 use time::Duration;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 pub use self::endpoint::{EndpointOptions, ServerIdentity};
-pub use self::hub::{Expired, HubEvent, NodeHub, OfflineReason, SendError};
+pub use self::hub::{Expired, HubEvent, NodeHub, OfflineReason, PortStreamError, SendError};
 pub use self::limits::GatewayLimits;
-use self::limits::MinuteLimiter;
+use self::limits::{DeviceBudget, MinuteLimiter};
 use crate::app::AppState;
 use crate::store::{self, StoreError};
 
@@ -137,6 +150,10 @@ pub struct GatewayConfig {
     /// Lease and job messages and node loss (T06, T10). Installed in the hub at start, so `DELETE /v1/nodes/{id}`
     /// reaches it too.
     pub events: Arc<dyn NodeEvents>,
+    /// The router that serves `p2pc/device/1` streams; `None` is [`crate::app::device_router`]. Only tests set it,
+    /// to add a route the API does not have yet (an upgrade, which the port connections of T2-13 will use).
+    #[doc(hidden)]
+    pub device_router: Option<axum::Router>,
 }
 
 impl GatewayConfig {
@@ -150,6 +167,7 @@ impl GatewayConfig {
             limits: GatewayLimits::default(),
             reconciler: Arc::new(CancelAllLeases),
             events: Arc::new(DropNodeEvents),
+            device_router: None,
         }
     }
 }
@@ -185,6 +203,32 @@ pub(crate) struct Inner {
     pub(crate) agent_connections: Mutex<std::collections::HashMap<NodeId, usize>>,
     /// Per node: the upload streams whose header is being read (at most `uploads.headers_per_node`).
     pub(crate) upload_headers: Mutex<std::collections::HashMap<NodeId, Arc<Semaphore>>>,
+    /// `p2pc/pair/1` connections open (H2 §5.3: 32), counted apart from every other ALPN.
+    pub(crate) pair_connections: Arc<Semaphore>,
+    /// `Pair`s being checked (H2 §5.3: 8).
+    pub(crate) pending_pairs: Arc<Semaphore>,
+    /// Failed pairings per NodeId, and in total for the aggregate failure cap (H2 §5.3).
+    pub(crate) pair_failures: Mutex<MinuteLimiter>,
+    /// Failed pairings per ticket-hash prefix (H2 §5.3).
+    pub(crate) pair_prefix_failures: Mutex<MinuteLimiter>,
+    /// Unix seconds until which a pairing ticket is open, as last read ([`pair::refresh`]); [`pair::CLOSED`] when
+    /// none is. `p2pc/pair/1` is served only before it (H2 §10.5).
+    pub(crate) pair_open_until: AtomicI64,
+    /// Whether the endpoint in use accepts `p2pc/pair/1` now. Changed only under `pair_refresh`.
+    pub(crate) pair_alpn_accepted: AtomicBool,
+    /// Serialises [`pair::refresh`] and the replacement of the endpoint, so the accepted ALPNs of the endpoint in
+    /// use always follow the last read.
+    pub(crate) pair_refresh: tokio::sync::Mutex<()>,
+    /// `p2pc/device/1` connections that have not passed the device check (H2 §6.3: 32).
+    pub(crate) device_unchecked: Arc<Semaphore>,
+    /// `not_paired` closes per NodeId, and in total for the aggregate failure cap (H2 §6.3).
+    pub(crate) device_failures: Mutex<MinuteLimiter>,
+    /// `p2pc/device/1` connections open per device (H2 §6.3: 2).
+    pub(crate) device_connections: Mutex<std::collections::HashMap<DeviceId, usize>>,
+    /// The device stream budget (H2 §6.3), apart from the REST connection cap and the tunnel budget.
+    pub(crate) device_budget: DeviceBudget,
+    /// The router device streams are served with, in-process.
+    pub(crate) device_router: axum::Router,
 }
 
 impl Inner {
@@ -203,6 +247,22 @@ impl Inner {
 
     pub(crate) fn join_failures(&self) -> std::sync::MutexGuard<'_, MinuteLimiter> {
         self.join_failures.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn pair_failures(&self) -> std::sync::MutexGuard<'_, MinuteLimiter> {
+        self.pair_failures.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn pair_prefix_failures(&self) -> std::sync::MutexGuard<'_, MinuteLimiter> {
+        self.pair_prefix_failures.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn device_failures(&self) -> std::sync::MutexGuard<'_, MinuteLimiter> {
+        self.device_failures.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn device_connections(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<DeviceId, usize>> {
+        self.device_connections.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub(crate) fn http_connections(&self) -> std::sync::MutexGuard<'_, MinuteLimiter> {
@@ -238,6 +298,10 @@ pub enum GatewayError {
     /// The database failed.
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// The device stream budget breaks a relation of H2 §6.3 (`server.toml` is checked at load; this is the same
+    /// check for a config built in code).
+    #[error("devices: {0}")]
+    DeviceBudget(#[from] p2pc_proto::device::BudgetError),
 }
 
 /// The running gateway. Dropping it does not stop it; call [`Gateway::shutdown`].
@@ -252,6 +316,9 @@ pub struct Gateway {
 impl Gateway {
     /// Binds the endpoint, applies the restart grace and starts accepting connections.
     pub async fn start(state: AppState, config: GatewayConfig) -> Result<Self, GatewayError> {
+        // H2 §6.3: the hub refuses to start with a device budget that breaks one of its relations.
+        let device_budget = state.config.devices.stream_budget();
+        device_budget.validate()?;
         let endpoint = endpoint::bind(state.server.secret_key().clone(), &config.endpoint).await?;
         // §6 "Server restart": nodes that were online get lease_ttl_s from now, so none expires before it. A grace,
         // not a contact: their `last_seen_at` stays the real one. They are listed `offline` until their agent's
@@ -263,7 +330,28 @@ impl Gateway {
         state.hub.seen_at_boot(&online, boot);
         state.hub.set_node_events(config.events.clone());
         let limits = config.limits;
+        let device_router = config
+            .device_router
+            .unwrap_or_else(|| crate::app::device_router(state.clone()));
         let inner = Arc::new(Inner {
+            pair_connections: Arc::new(Semaphore::new(limits.pair_max_connections)),
+            pending_pairs: Arc::new(Semaphore::new(limits.pair_max_pending)),
+            pair_failures: Mutex::new(MinuteLimiter::new(
+                limits.pair_failures_per_node_per_minute,
+                limits.aggregate_failures_per_minute,
+            )),
+            pair_prefix_failures: Mutex::new(MinuteLimiter::new(limits.pair_failures_per_prefix_per_minute, u32::MAX)),
+            pair_open_until: AtomicI64::new(pair::CLOSED),
+            pair_alpn_accepted: AtomicBool::new(false),
+            pair_refresh: tokio::sync::Mutex::new(()),
+            device_unchecked: Arc::new(Semaphore::new(limits.device_max_unchecked_connections)),
+            device_failures: Mutex::new(MinuteLimiter::new(
+                limits.device_not_paired_per_node_per_minute,
+                limits.aggregate_failures_per_minute,
+            )),
+            device_connections: Mutex::new(std::collections::HashMap::new()),
+            device_budget: DeviceBudget::new(device_budget),
+            device_router,
             min_agent_version: state.config.nodes.min_agent_version(),
             agent_connections: Mutex::new(std::collections::HashMap::new()),
             upload_headers: Mutex::new(std::collections::HashMap::new()),
@@ -292,6 +380,8 @@ impl Gateway {
             events: config.events,
             rest_addr: config.rest_addr,
         });
+        // H2 §10.5: `p2pc/pair/1` joins the accepted ALPNs only if a pairing ticket is open now; the sweep keeps it so.
+        pair::refresh(&inner).await;
         tracing::info!(
             node_id = %inner.endpoint().id(),
             sockets = ?inner.endpoint().bound_sockets(),
@@ -328,6 +418,20 @@ impl Gateway {
     #[must_use]
     pub fn hub(&self) -> &NodeHub {
         self.inner.hub()
+    }
+
+    /// Re-reads whether a pairing ticket is open (unexpired and unrevoked) and makes the endpoint accept
+    /// `p2pc/pair/1` exactly then (H2 §10.5). Returns whether one is open. The gateway runs it at start and at every
+    /// sweep (each second), so a new ticket is served within a second; a caller that has just created or revoked a
+    /// ticket may call it to apply the change at once, and tests do.
+    pub async fn refresh_pair_serving(&self) -> bool {
+        pair::refresh(&self.inner).await
+    }
+
+    /// Device streams open now, of the device stream budget (H2 §6.3).
+    #[must_use]
+    pub fn device_streams_in_use(&self) -> usize {
+        self.inner.device_budget.in_use()
     }
 
     /// Turns every node with no contact for `lease_ttl_s` `offline`: closes its connection, writes its
@@ -399,6 +503,13 @@ async fn rebind(inner: &Inner, bind: Vec<p2pc_proto::net::SelectedAddr>) {
     options.bind = bind;
     match endpoint::bind(inner.state.server.secret_key().clone(), &options).await {
         Ok(new) => {
+            // The new endpoint accepts `p2pc/pair/1` only if a ticket is open, like the one it replaces (H2 §10.5).
+            // Under the refresh lock, so no refresh applies its result to the endpoint that is being replaced.
+            let serial = inner.pair_refresh.lock().await;
+            let pair_open = pair::is_open(inner, inner.state.clock.now());
+            if pair_open {
+                new.set_alpns(endpoint::accepted_alpns(true));
+            }
             // Checked again under the endpoint lock: `shutdown` sets `closing` before it takes the endpoint, so
             // either it sees this swap, or this sees `closing` and closes the new endpoint instead (T05b review P3).
             let swapped = {
@@ -407,9 +518,11 @@ async fn rebind(inner: &Inner, bind: Vec<p2pc_proto::net::SelectedAddr>) {
                     Err(new)
                 } else {
                     inner.generation.fetch_add(1, Ordering::SeqCst);
+                    inner.pair_alpn_accepted.store(pair_open, Ordering::SeqCst);
                     Ok(std::mem::replace(&mut *slot, new))
                 }
             };
+            drop(serial);
             match swapped {
                 Ok(old) => {
                     tracing::info!(
@@ -453,6 +566,10 @@ async fn accept_on(inner: &Arc<Inner>, ep: &Endpoint) {
             match conn.alpn() {
                 a if a == PROTOCOL_ALPN_AGENT => agent::handle(inner, conn).await,
                 a if a == PROTOCOL_ALPN_HTTP => tunnel::handle(inner, conn).await,
+                a if a == PROTOCOL_ALPN_PAIR => pair::handle(inner, conn).await,
+                a if a == PROTOCOL_ALPN_DEVICE => device::handle(inner, conn).await,
+                // Nothing else is served (hard rule 4, H2 §10.5). The endpoint accepts no other ALPN, so this is
+                // never reached; it stays as the last line of defence.
                 _ => conn.close(VarInt::from_u32(hub::CLOSE_BY_SERVER), b""),
             }
         });
@@ -471,6 +588,8 @@ async fn sweep_loop(inner: Arc<Inner>) {
 async fn sweep(inner: &Inner) {
     let expired = inner.hub().take_expired(inner.state.clock.now(), inner.ttl());
     finish_sweep(inner, expired).await;
+    // H2 §10.5: stop accepting `p2pc/pair/1` once no ticket is open, and accept it again when one is created.
+    pair::refresh(inner).await;
 }
 
 async fn finish_sweep(inner: &Inner, expired: Vec<Expired>) {

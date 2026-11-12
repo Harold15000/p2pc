@@ -73,6 +73,8 @@ struct FakeState {
     default: Mutex<Script>,
     journal: Journal,
     root: tempfile::TempDir,
+    /// What the sandbox answers at admission ([`Sandbox::admit`]): `Some` refuses every lease so.
+    refuse_admission: Mutex<Option<LeaseRejectReason>>,
 }
 
 #[derive(Debug, Clone)]
@@ -85,7 +87,12 @@ impl FakeSandbox {
             default: Mutex::new(Script::default()),
             journal,
             root: tempfile::tempdir().unwrap(),
+            refuse_admission: Mutex::new(None),
         }))
+    }
+
+    fn refuse_admission(&self, reason: Option<LeaseRejectReason>) {
+        *self.0.refuse_admission.lock().unwrap() = reason;
     }
 
     fn script(&self, key: LeaseKey, script: Script) {
@@ -127,6 +134,16 @@ fn finished(outcome: Outcome, exit_code: Option<i32>) -> Finished {
 
 impl Sandbox for FakeSandbox {
     type Job = FakeJob;
+
+    fn admit(&self, lease: &LeaseContext) -> Result<(), LeaseRejectReason> {
+        match *self.0.refuse_admission.lock().unwrap() {
+            Some(reason) => {
+                self.note(format!("admit {} refused", lease.epoch));
+                Err(reason)
+            }
+            None => Ok(()),
+        }
+    }
 
     async fn prepare(
         &self,
@@ -542,6 +559,54 @@ fn outcome_of(msg: &AgentMsg) -> (Outcome, Option<i32>, Option<String>) {
 
 // ---------------------------------------------------------------------------------------------------------------
 // Admission.
+
+/// H2 §11.3: what the sandbox refuses at admission (a volume another lease holds, a volume that does not fit the
+/// budget, a job that may not mount one) is a `LeaseRejected` with the sandbox's reason. It is asked last, nothing
+/// stays reserved, and nothing runs.
+#[tokio::test(start_paused = true)]
+async fn a_lease_the_sandbox_refuses_at_admission_is_rejected_and_holds_nothing() {
+    let w = world();
+    w.sandbox
+        .refuse_admission(Some(LeaseRejectReason::InsufficientCapacity));
+    let id = LeaseId::generate();
+    assert_eq!(
+        w.lease(w.offer(id, 1, job(1.0, 512))).await,
+        LeaseDecision::Reject(LeaseRejectReason::InsufficientCapacity)
+    );
+    w.settle().await;
+    assert_eq!(w.held(), 0, "the capacity the ledger reserved went back");
+    assert_eq!(w.journal(), ["admit 1 refused"], "no prepare: nothing ran");
+    assert!(w.exec.running().is_empty() && w.exec.holding().is_empty());
+    // The sandbox is asked last: a lease another check refuses never reaches it.
+    w.sandbox.refuse_admission(Some(LeaseRejectReason::InvalidJob));
+    assert_eq!(
+        w.lease(w.offer(LeaseId::generate(), 1, job(64.0, 512))).await,
+        LeaseDecision::Reject(LeaseRejectReason::InsufficientCapacity),
+        "64 vCPUs do not fit"
+    );
+    let mut foreign = w.offer(LeaseId::generate(), 1, job(1.0, 512));
+    foreign.account_id = AccountId::generate();
+    assert_eq!(
+        w.lease(foreign).await,
+        LeaseDecision::Reject(LeaseRejectReason::NotOwner)
+    );
+    assert_eq!(w.journal(), ["admit 1 refused"]);
+    // Its own reason is the answer.
+    assert_eq!(
+        w.lease(w.offer(LeaseId::generate(), 1, job(1.0, 512))).await,
+        LeaseDecision::Reject(LeaseRejectReason::InvalidJob)
+    );
+    // The first answer is remembered, as every decision is; another lease is taken once the sandbox takes it.
+    w.sandbox.refuse_admission(None);
+    assert_eq!(
+        w.lease(w.offer(id, 1, job(1.0, 512))).await,
+        LeaseDecision::Reject(LeaseRejectReason::InsufficientCapacity)
+    );
+    let _session = connect(&w.uplink, &w.journal, accept_all());
+    w.run(1).await;
+    w.idle().await;
+    assert_eq!(w.held(), 0);
+}
 
 #[tokio::test(start_paused = true)]
 async fn admission_checks_readiness_capacity_draining_deadline_and_duplicates() {
@@ -1475,6 +1540,7 @@ mod through_the_session {
                 uplink: w.uplink.clone(),
                 ports: None,
                 node: None,
+                volumes: None,
             },
             connector: Arc::new(Pipes {
                 accepted: tx,

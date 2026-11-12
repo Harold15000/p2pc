@@ -1,0 +1,23 @@
+{
+  "identifier": "main",
+  "description": "The main window may call the app's own commands and nothing else: no core plugin, no shell, filesystem, HTTP or opener permission (H2 §8.9). src/capabilities.rs tests this file.",
+  "local": true,
+  "windows": ["main"],
+  "permissions": [
+    "allow-status",
+    "allow-control",
+    "allow-settings",
+    "allow-set-autostart",
+    "allow-setup-status",
+    "allow-setup-welcome",
+    "allow-setup-checks",
+    "allow-setup-install-wsl",
+    "allow-setup-download",
+    "allow-setup-prepare-node",
+    "allow-setup-share",
+    "allow-setup-create-cloud",
+    "allow-setup-pair-phone",
+    "allow-setup-phone-status",
+    "allow-setup-finish-phone"
+  ]
+}

@@ -19,7 +19,7 @@ use p2pc_proto::validate::{ErrorCode, FieldError};
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
-use crate::{app, artifacts_api, devices_api, jobs_api, join_requests_api, nodes_api, usage_api};
+use crate::{app, artifacts_api, devices_api, jobs_api, join_requests_api, nodes_api, ports_api, usage_api};
 
 /// Name of the security scheme.
 pub const BEARER: &str = "bearer";
@@ -69,6 +69,7 @@ pub const BEARER: &str = "bearer";
         jobs_api::get_job,
         jobs_api::cancel_job,
         jobs_api::estimate,
+        ports_api::connect,
         artifacts_api::get_logs,
         artifacts_api::list_outputs,
         artifacts_api::download_output,

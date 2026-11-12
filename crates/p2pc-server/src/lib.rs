@@ -13,6 +13,7 @@
 //! - [`error`] and [`extract`]: RFC 9457 problem responses (§7);
 //! - [`app`]: the axum router and handlers; [`nodes_api`]: join tokens, nodes and `GET /v1/server`;
 //! - [`jobs_api`]: the jobs endpoints (§7), with [`units`] (§11) and [`node_directory`];
+//! - [`ports_api`]: service ports (H2 §7.4), the upgrade endpoint and the `allowed_routes` filter;
 //! - [`scheduler`]: placement, leases and fencing, liveness and the watchdog (§6, §8), and [`usage_api`] (§11);
 //! - [`logs`] (with [`fsutil`]): stored job logs (§7, §12);
 //! - [`openapi`]: the generated OpenAPI 3.1 document;
@@ -42,6 +43,7 @@ pub mod node_directory;
 pub mod nodes_api;
 pub mod openapi;
 pub mod outputs;
+pub mod ports_api;
 pub mod recover;
 pub mod scheduler;
 pub mod serve;
