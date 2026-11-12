@@ -116,6 +116,345 @@
         }
       }
     },
+    "/v1/blobs": {
+      "get": {
+        "tags": [
+          "blobs"
+        ],
+        "summary": "The caller's account's blobs, oldest first, with how many jobs reference each and when it expires, plus the\naccount's stored bytes and quota.",
+        "operationId": "list_blobs",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1-100 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "`next_cursor` of the previous page.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of blobs. `expires_at` is `null` while a non-terminal job references the blob.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BlobList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid key.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller lacks `jobs:read`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid `limit` or `cursor`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "blobs"
+        ],
+        "summary": "Uploads one blob into the caller's account (H2 §7.5): `201` when it is new, `200` with the same body when the\naccount already has it (the caller then holds a claim on it too).",
+        "description": "The body is the raw bytes, with `Content-Length` and `X-P2PC-SHA256`. The size and the quotas are checked before\nthe body is read. There is no whole-request limit: an upload may take as long as it keeps an average of 16 KiB/s\nover every 60 s and never idles for 60 s.",
+        "operationId": "upload_blob",
+        "parameters": [
+          {
+            "name": "X-P2PC-SHA256",
+            "in": "header",
+            "description": "SHA-256 of the body, 64 lowercase hex characters.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Content-Length",
+            "in": "header",
+            "description": "Required; at most `max_blob_mb` MiB.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "The blob's bytes.",
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The account already had it; the caller now holds a claim on it too.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BlobUploaded"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Stored.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BlobUploaded"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`body_length_mismatch`: the body was shorter or longer than `Content-Length`, or broke. `invalid_content_length`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid key.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller lacks `blobs:write`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "The body idled for 60 s, or averaged under 16 KiB/s over 60 s.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "411": {
+            "description": "`length_required`: no `Content-Length` (chunked uploads are refused).",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: over `max_blob_mb`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`digest_mismatch`: the body does not hash to `X-P2PC-SHA256`. `validation_failed`: the header is missing or malformed.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "`too_many_uploads`: the caller already has 2 uploads in progress.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "507": {
+            "description": "`quota_exceeded`: the account's blob quota, or the device's, would be exceeded.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/blobs/{sha256}": {
+      "delete": {
+        "tags": [
+          "blobs"
+        ],
+        "summary": "Withdraws the caller's claim on a blob of its account (an `admin`: every claim); when no claim remains, the blob\nis deleted at once (tombstone, file, row; H2 §7.5).",
+        "description": "A caller without a claim gets `403` unless it is `admin`. While a non-terminal job references the blob, `409\nblob_in_use` and nothing changes.",
+        "operationId": "delete_blob",
+        "parameters": [
+          {
+            "name": "sha256",
+            "in": "path",
+            "description": "The blob's SHA-256, 64 lowercase hex characters.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The claim (or, for an admin, every claim) is gone; with the last one, the blob too."
+          },
+          "401": {
+            "description": "Missing or invalid key.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: the caller lacks `blobs:write`, or holds no claim on the blob and is not `admin`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The account has no such blob.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`blob_in_use`: a non-terminal job references it.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "head": {
+        "tags": [
+          "blobs"
+        ],
+        "summary": "Whether the caller's account holds the blob: `200` with its size as `Content-Length`, else `404`. Another\naccount's blobs are never seen (SI-H2-8).",
+        "operationId": "head_blob",
+        "parameters": [
+          {
+            "name": "sha256",
+            "in": "path",
+            "description": "The blob's SHA-256, 64 lowercase hex characters.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The account has it; `Content-Length` is its size. No body.",
+            "headers": {
+              "Content-Length": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "The blob's size in bytes."
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid key."
+          },
+          "403": {
+            "description": "The caller has neither `blobs:write` nor `jobs:read`."
+          },
+          "404": {
+            "description": "The account has no such blob."
+          }
+        }
+      }
+    },
     "/v1/devices": {
       "get": {
         "tags": [
@@ -790,7 +1129,7 @@
             }
           },
           "422": {
-            "description": "Invalid job: `errors` lists each field. Codes: `validation_failed`, `unsupported_pool`, `too_large` (the job does not fit its `Lease` frame), `invalid_body`.",
+            "description": "Invalid job: `errors` lists each field. Codes: `validation_failed`, `unsupported_pool`, `too_large` (the job does not fit its `Lease` frame), `invalid_body`, `unknown_blob` (an `inputs` blob the caller's account does not hold), `inputs_exceed_disk` (blob inputs and inline files over `resources.disk_mb` minus 64 MiB).",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -3029,6 +3368,46 @@
           "template_bundle_loaded"
         ]
       },
+      "BlobInfo": {
+        "type": "object",
+        "description": "One blob of `GET /v1/blobs` (H2 §7.3). There is no endpoint that returns blob contents.",
+        "required": [
+          "sha256",
+          "size",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the account first stored it."
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When it expires if nothing references it; `null` while a non-terminal job keeps it alive."
+          },
+          "referenced_by": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many jobs reference it (a count, so the response stays bounded).",
+            "minimum": 0
+          },
+          "sha256": {
+            "$ref": "#/components/schemas/Sha256Digest",
+            "description": "The blob's digest."
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Size in bytes.",
+            "minimum": 0
+          }
+        }
+      },
       "BlobInput": {
         "type": "object",
         "description": "A blob input (H2 §7.1): the blob, delivered read-only at `path`.\n\n**Strict** (request type): the `POST /v1/jobs` body, and what the agent parses a lease's job into (`LeaseJob::parse_strict`). Unknown fields are rejected, which catches typos and refuses a lease the agent would not fully understand (§6). Responses use the lenient twin, [`JobSpecView`].",
@@ -3066,9 +3445,78 @@
           }
         }
       },
+      "BlobList": {
+        "type": "object",
+        "description": "Response of `GET /v1/blobs` (H2 §7.3, §12): one page of the account's blobs, plus its stored total and quota.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BlobInfo"
+            },
+            "description": "The blobs of this page."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pass as `cursor` to get the next page. `None` on the last page."
+          },
+          "quota_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The account's blob quota, in MiB.",
+            "minimum": 0
+          },
+          "total_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bytes the account stores in blobs (every page).",
+            "minimum": 0
+          }
+        }
+      },
       "BlobRef": {
         "type": "string",
         "description": "A blob input's content address (H2 §7.1, §7.5): `sha256:<64 lowercase hex>`."
+      },
+      "BlobUploaded": {
+        "type": "object",
+        "description": "Response of `POST /v1/blobs` (`201`, or `200` when the account already had it; H2 §7.5).",
+        "required": [
+          "sha256",
+          "size",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the account first stored it."
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When it expires if nothing references it; `null` while a non-terminal job keeps it alive."
+          },
+          "sha256": {
+            "$ref": "#/components/schemas/Sha256Digest",
+            "description": "The blob's digest."
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Size in bytes.",
+            "minimum": 0
+          }
+        }
       },
       "Capacity": {
         "type": "object",
@@ -6993,6 +7441,10 @@
     {
       "name": "usage",
       "description": "The usage ledger: finished attempts and the units they cost."
+    },
+    {
+      "name": "blobs",
+      "description": "Content-addressed job inputs, per account (H2 §7.5). No route returns blob contents."
     }
   ]
 }
