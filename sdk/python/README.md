@@ -386,9 +386,10 @@ H2 additions (T2-54, spec §7.8): `client.blobs.put(path)`, `jobs.run(..., input
 `estimate`), `client.services.run(...)` and `client.services.connect(job, port)`, and
 `client.templates.list()` / `launch(...)`, each on `Client` and `AsyncClient`. New request
 models: `ServiceSpec`, `ServicePort`, `HealthCheck`, `VolumeSpec`, `BlobInput`; `JobSpec` gains
-`kind`, `service`, `volumes` and `inputs`. `Blob`, `TemplateInfo`, `TemplateList` and
-`TemplateParam` live in `p2pc.h2` until the OpenAPI document describes the blob and template
-routes.
+`kind`, `service`, `volumes` and `inputs`. `TemplateInfo`, `TemplateList`, `TemplateParam` and
+`TemplateRequirements` are wire models of `p2pc.models`, held against the OpenAPI document like
+the others (T2-15: `TemplateInfo.requirements` is now a model, not a `dict`); `Blob` stays in
+`p2pc.h2`.
 
 Aligned with the server's scheduler and ledger (T06) and the T13b review:
 

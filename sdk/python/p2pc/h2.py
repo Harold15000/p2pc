@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""H2 additions: blobs and templates (spec §7.5, §7.6, §7.8).
+"""H2 additions: blobs (spec §7.5, §7.8).
 
-These models are **not** in :mod:`p2pc.models` on purpose. ``tests/test_openapi_contract.py``
-holds every model of that module against ``docs/api/openapi.json``, and the document does not
-have the blob and template routes yet (they wait for their server task). The contract test has a
-guard that fails the day the document gains them, as a reminder to move these models into
-:mod:`p2pc.models` and its registry.
+:class:`Blob` is what ``client.blobs.put`` returns: the server's ``BlobUploaded`` plus the
+client-side ``uploaded`` flag, so it is not a wire model of :mod:`p2pc.models`;
+``tests/test_openapi_contract.py`` checks it field by field against the document instead.
+
+The template models (``TemplateInfo``, ``TemplateList``, ``TemplateParam``) live in
+:mod:`p2pc.models` with every other wire model, held against ``docs/api/openapi.json``.
 """
 
 from __future__ import annotations
@@ -18,13 +19,13 @@ import stat
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from datetime import datetime
-from typing import IO, Any, Literal
+from typing import IO
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from p2pc.errors import P2PCError
 
-__all__ = ["Blob", "TemplateInfo", "TemplateList", "TemplateParam", "blob_ref"]
+__all__ = ["Blob", "blob_ref"]
 
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}")
 _REF_RE = re.compile(r"sha256:[0-9a-f]{64}")
@@ -69,49 +70,6 @@ def blob_ref(blob: Blob | str) -> str:
         "an input blob is a Blob (from client.blobs.put) or a digest string 'sha256:<64 hex>'; "
         "a local path is never accepted"
     )
-
-
-class TemplateParam(_Response):
-    """A parameter of a template: ``type`` is ``enum``, ``int``, ``bool`` or ``blob``."""
-
-    name: str
-    label: str | None = None
-    type: Literal["enum", "int", "bool", "blob"]
-    values: list[str] | None = None
-    min: int | None = None
-    max: int | None = None
-    default: bool | int | str | None = None
-    target: str
-
-
-class TemplateInfo(_Response):
-    """A template as ``GET /v1/templates`` lists it."""
-
-    id: str
-    version: int
-    title: str
-    description: str = ""
-    kind: Literal["batch", "service"]
-    ui: str
-    singleton: bool = False
-    requirements: dict[str, Any] = Field(default_factory=dict)
-    params: list[TemplateParam] = Field(default_factory=list)
-    licenses: list[str] = Field(default_factory=list)
-    download_mb: int = 0
-
-
-class TemplateList(_Response):
-    """The served template bundle: empty with ``bundle_error`` when no bundle can be loaded."""
-
-    bundle_version: int | None = None
-    templates: list[TemplateInfo] = Field(default_factory=list)
-    bundle_error: str | None = None
-
-    def __iter__(self) -> Iterator[TemplateInfo]:  # type: ignore[override]
-        return iter(self.templates)
-
-    def __len__(self) -> int:
-        return len(self.templates)
 
 
 class BlobFileError(P2PCError):
