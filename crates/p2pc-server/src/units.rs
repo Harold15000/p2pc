@@ -23,10 +23,15 @@
 //!   is left of `timeout_s` and by the cap minus `spent(P, D)` ([`day_reservation`]). It is set at creation
 //!   ([`reserve_new_service`], `402 cap_exceeded` under 15 minutes of runtime) and again at each midnight, in the
 //!   transaction that writes the slice of the day that ended, so no instant counts the slice and the reservation
-//!   both, or neither.
+//!   both, or neither. A new attempt (after a node loss) takes it again too, from its own start and with its whole
+//!   `timeout_s` ([`attempt_began`]): the reservation of the lost attempt may be bounded by that attempt's timeout.
 //! - **`cap_reached`.** While it runs, its `cap_deadline` is when its rows for the day plus its current slice at the
-//!   reserved rate reach the reservation ([`cap_deadline_at`]). The hub stops it then, and at a midnight whose
-//!   reservation is under 15 minutes: `cancelled`, `reason: "cap_reached"`.
+//!   reserved rate reach the reservation ([`cap_deadline_at`]). When the cap is what bounds the reservation, the hub
+//!   asks it to stop one stop grace before that ([`STOP_GRACE_S`]), and at a midnight or a new attempt whose
+//!   reservation is under 15 minutes: `cancelled`, `reason: "cap_reached"`. A reservation bounded by the day or by
+//!   `timeout_s` never stops it: the midnight renews it, or the attempt ends `timed_out`.
+//! - **Reports.** A heartbeat's `used_cpu_ms` above what the lease can have used is refused
+//!   ([`plausible_cpu_ms`]), and what a slice records saturates, so no agent can keep a slice from being written.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -48,6 +53,11 @@ pub const DAY_S: i64 = 86_400;
 /// A service's day reservation must buy at least this much runtime (H2 §12), unless the day or its `timeout_s`
 /// leaves less.
 pub const MIN_CAP_RUNTIME_S: i64 = 15 * 60;
+
+/// How long an agent may take to stop a job it is told to cancel (spec §9: SIGTERM, 10 s of grace, SIGKILL). The hub
+/// asks a service to stop for its cap this long before its cap deadline, so that an agent that takes the whole grace
+/// still ends within the day's reservation.
+pub const STOP_GRACE_S: i64 = 10;
 
 /// Milliseconds in an hour: units are per hour, amounts per millisecond.
 const HOUR_MS: u128 = 3_600_000;
@@ -270,14 +280,23 @@ pub async fn cap_deadline(
     Ok(deadline_of(&s, gpu_hour).and_then(|t| OffsetDateTime::from_unix_timestamp(t).ok()))
 }
 
-/// Whether the cap stops `s` at `now` (H2 §12): its deadline is reached before the end of its attempt's `timeout_s`.
-/// A reservation bounded by what is left of `timeout_s` runs out when the attempt does: that attempt ends
-/// `timed_out`, as H1 ends it, not `cap_reached`.
+/// Whether the cap stops `s` at `now` (H2 §12): its reservation is bounded by the cap, and its cap deadline is one
+/// stop grace away or closer ([`STOP_GRACE_S`]).
+///
+/// The reservation is bounded by the cap when what is left of it is less than the attempt could use until the end of
+/// the day or of its `timeout_s`. Otherwise it runs out when the day or the attempt does: the midnight renews it, or
+/// the attempt ends `timed_out`, as H1 ends it, never `cap_reached`.
 fn cap_reached(s: &MeteredService, now: i64, gpu_hour: Units) -> bool {
-    let (Some(a), Some(d)) = (s.attempt.as_ref(), deadline_of(s, gpu_hour)) else {
+    let (Some(a), Some(day), Some(reserved)) = (s.attempt.as_ref(), s.cap_day, s.cap_reserved) else {
         return false;
     };
-    !s.cancel_requested && d <= now && d < a.started_at.saturating_add(i64::from(s.timeout_s))
+    let rate = Rate::of_reserved(&a.reserved, gpu_hour);
+    let left = reserved.saturating_sub(s.rows_on_cap_day);
+    let uncapped = (day + DAY_S - a.cut_at).min(a.timeout_left(s.timeout_s)).max(0);
+    if s.cap.is_none() || s.cancel_requested || left >= rate.units_for(uncapped) {
+        return false;
+    }
+    cap_deadline_at(rate, a.cut_at, reserved, s.rows_on_cap_day).is_some_and(|d| d.saturating_sub(STOP_GRACE_S) <= now)
 }
 
 /// The cap deadline of a metered service, if it has one (see [`cap_deadline`]).
@@ -308,16 +327,36 @@ pub struct UsageReport {
     pub at: i64,
 }
 
+/// The slack of [`plausible_cpu_ms`], in seconds of wall time: reports come at most once a minute, and the hub
+/// learns of an attempt's start a little after the agent.
+pub const CPU_REPORT_MARGIN_S: i64 = 60;
+
+/// The most CPU time (milliseconds) an attempt that reserved `cpu` vCPUs can have used `elapsed_s` seconds after its
+/// start: the reserved vCPUs for the whole time, plus [`CPU_REPORT_MARGIN_S`] of slack. The sandbox limits the
+/// attempt to its reserved CPU (hard rule 3), so a report above this is wrong or hostile.
+#[must_use]
+pub fn plausible_cpu_ms(elapsed_s: i64, cpu: f64) -> u64 {
+    let wall = u64::try_from(elapsed_s.max(0).saturating_add(CPU_REPORT_MARGIN_S)).unwrap_or(0);
+    // `cpu_milli` milliseconds of CPU per second of wall time.
+    wall.saturating_mul(cpu_milli(cpu))
+}
+
 /// The latest usage report of each running service lease, kept in memory: a midnight slice reads it (H2 §12). A hub
 /// restart forgets them, and a slice with no report is `estimated`, as the spec says. Only the current lease of a
 /// running service is ever recorded ([`record_heartbeat`]), and ended leases are dropped at every [`meter`], so its
 /// size is bounded by the running services, never by what agents send. Cheap to clone; clones share the map.
 #[derive(Debug, Clone, Default)]
-pub struct ServiceReports(Arc<Mutex<HashMap<LeaseId, UsageReport>>>);
+pub struct ServiceReports(Arc<Mutex<HashMap<LeaseId, UsageReport>>>, Arc<Mutex<HashSet<LeaseId>>>);
 
 impl ServiceReports {
     fn map(&self) -> std::sync::MutexGuard<'_, HashMap<LeaseId, UsageReport>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether this is the first implausible report of `lease_id`: the caller logs it once per lease, so an agent
+    /// cannot fill the log by repeating it. The set holds only current leases of running services, like the reports.
+    fn first_refusal(&self, lease_id: LeaseId) -> bool {
+        self.1.lock().unwrap_or_else(PoisonError::into_inner).insert(lease_id)
     }
 
     /// The latest report of `(lease_id, epoch)`.
@@ -340,19 +379,27 @@ impl ServiceReports {
         }
     }
 
-    /// Keeps only the reports of `active` leases.
+    /// Keeps only the reports (and the refusals) of `active` leases.
     fn retain(&self, active: &HashSet<LeaseId>) {
         self.map().retain(|id, _| active.contains(id));
+        self.1
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|id| active.contains(id));
     }
 
     fn is_empty(&self) -> bool {
-        self.map().is_empty()
+        self.map().is_empty() && self.1.lock().unwrap_or_else(PoisonError::into_inner).is_empty()
     }
 }
 
 /// Records the `used_cpu_ms` and `max_rss_mb` a `Heartbeat` of `node_id` carries for its running service leases. An
 /// entry is kept only for the job's current lease, held by `node_id`, of a service that runs: a report for any other
 /// lease changes nothing (the H1 paths fence it).
+///
+/// A report whose `used_cpu_ms` is above [`plausible_cpu_ms`] for the attempt's age and reserved vCPUs is refused
+/// whole (and logged once per lease): the ledger never records CPU time a lease cannot have used, and the slice it
+/// would have fed is the server's estimate instead.
 pub async fn record_heartbeat(
     db: &Db,
     reports: &ServiceReports,
@@ -380,6 +427,15 @@ pub async fn record_heartbeat(
         {
             continue;
         }
+        let elapsed = lease.started_at.map_or(0, |at| (now - at).whole_seconds());
+        let limit = plausible_cpu_ms(elapsed, lease.reserved.cpu);
+        if r.used_cpu_ms.is_some_and(|used| used > limit) {
+            if reports.first_refusal(r.lease_id) {
+                tracing::warn!(lease_id = %r.lease_id, %node_id, limit,
+                    "usage report refused: more CPU time than the lease can have used");
+            }
+            continue;
+        }
         let previous = reports.get(r.lease_id, r.epoch);
         reports.record(
             r.lease_id,
@@ -392,6 +448,32 @@ pub async fn record_heartbeat(
         );
     }
     Ok(())
+}
+
+// --- Retries --------------------------------------------------------------------------------------------------------
+
+/// Runs `step` until it succeeds, at most `tries` times, waiting `backoff` before the second try and twice as long
+/// before each one after. The last failure is returned; the earlier ones are logged with `what`.
+pub async fn retry<T, E: std::fmt::Display>(
+    tries: u32,
+    backoff: std::time::Duration,
+    what: &str,
+    mut step: impl AsyncFnMut() -> Result<T, E>,
+) -> Result<T, E> {
+    let mut pause = backoff;
+    let mut tried = 1;
+    loop {
+        match step().await {
+            Ok(v) => return Ok(v),
+            Err(e) if tried >= tries => return Err(e),
+            Err(e) => tracing::warn!(error = %e, tried, tries, "{what} failed; trying again"),
+        }
+        if !pause.is_zero() {
+            tokio::time::sleep(pause).await;
+        }
+        pause = pause.saturating_mul(2);
+        tried += 1;
+    }
 }
 
 // --- The midnight step and the cap ---------------------------------------------------------------------------------
@@ -517,23 +599,7 @@ async fn meter_one(
     match s.cap {
         None if s.cap_day.is_some() => usage::set_reservation(&mut tx, job_id, None, now).await?,
         Some(cap) if s.cap_day != Some(today) => {
-            // The service's own reservation is for another day, so `spent(P, today)` does not count it.
-            let spent = Units::from_milli(leases::spent(&mut tx, s.account_id, s.principal, today).await?);
-            let timeout = i64::from(s.timeout_s);
-            let (rate, from, timeout_left) = match &s.attempt {
-                Some(a) => (
-                    Rate::of_reserved(&a.reserved, gpu_hour),
-                    a.cut_at,
-                    timeout - (a.cut_at - a.started_at),
-                ),
-                None => (Rate::new(s.cpu, s.gpu, gpu_hour), now_s, timeout),
-            };
-            let r = day_reservation(rate, from, today + DAY_S, timeout_left, cap, spent);
-            usage::set_reservation(&mut tx, job_id, Some((today, r.units)), now).await?;
-            s.cap_day = Some(today);
-            s.cap_reserved = Some(r.units);
-            s.rows_on_cap_day = usage::job_units_on_day(&mut tx, job_id, today).await?;
-            stop = !r.enough;
+            stop = !take_reservation(&mut tx, &mut s, cap, now, gpu_hour).await?;
             if stop {
                 tracing::info!(job_id = %job_id, "the day's cap reservation is under 15 minutes: the service stops");
             }
@@ -548,6 +614,76 @@ async fn meter_one(
     let stopped = stop && stop_for_cap(&mut tx, &s, now).await?;
     tx.commit().await?;
     Ok((slices, stopped))
+}
+
+/// Takes the reservation of `s` for the UTC day of `now` (H2 §12), at a midnight and again when an attempt starts:
+/// what the service's rows already charged to the day, plus its rate × the runtime left in the day, counted from the
+/// start of its current slice (now, for a queued service) and bounded by what is left of the attempt's `timeout_s`
+/// and by `cap − spent(P, D)` without this reservation. Returns whether it is enough ([`DayReservation::enough`]).
+///
+/// The rows are part of the reservation because a slice written against a day's reservation uses it up (`spent`'s
+/// term 3): what is still reserved is always `cap_reserved_units − rows`.
+async fn take_reservation(
+    tx: &mut Conn,
+    s: &mut MeteredService,
+    cap: Units,
+    now: OffsetDateTime,
+    gpu_hour: Units,
+) -> Result<bool, StoreError> {
+    let now_s = now.unix_timestamp();
+    let today = day_of(now_s);
+    // `spent(P, D)` without this reservation: what it still holds for the day, if it is for this day, is taken off.
+    let own = match (s.cap_day, s.cap_reserved) {
+        (Some(day), Some(reserved)) if day == today => reserved.saturating_sub(s.rows_on_cap_day),
+        _ => Units::ZERO,
+    };
+    let spent = Units::from_milli(leases::spent(tx, s.account_id, s.principal, today).await?).saturating_sub(own);
+    let rows = usage::job_units_on_day(tx, s.job_id, today).await?;
+    let (rate, from, timeout_left) = match &s.attempt {
+        Some(a) => (
+            Rate::of_reserved(&a.reserved, gpu_hour),
+            a.cut_at,
+            a.timeout_left(s.timeout_s),
+        ),
+        None => (Rate::new(s.cpu, s.gpu, gpu_hour), now_s, i64::from(s.timeout_s)),
+    };
+    let r = day_reservation(rate, from, today + DAY_S, timeout_left, cap, spent);
+    let reserved = rows.saturating_add(r.units);
+    usage::set_reservation(tx, s.job_id, Some((today, reserved)), now).await?;
+    s.cap_day = Some(today);
+    s.cap_reserved = Some(reserved);
+    s.rows_on_cap_day = rows;
+    Ok(r.enough)
+}
+
+/// An attempt of a service was accepted or started (H2 §12): it has its whole `timeout_s` again and its own start,
+/// so a capped principal's service takes the day's reservation again, as at a midnight. Without this, an attempt
+/// requeued after a node loss would keep the reservation its lost attempt took, which may be bounded by that
+/// attempt's `timeout_s`, and would be stopped for a cap it has not reached. A reservation under 15 minutes stops the
+/// service with `cap_reached`, as at a midnight. Call it in the transaction that accepts or starts the lease.
+///
+/// Nothing for a batch job, an uncapped principal, or an attempt with a midnight still to cut: the next
+/// [`meter`] pass cuts it and takes the new day's reservation.
+pub async fn attempt_began(
+    tx: &mut Conn,
+    job_id: JobId,
+    now: OffsetDateTime,
+    gpu_hour: Units,
+) -> Result<(), StoreError> {
+    let Some(mut s) = usage::metered_service(tx, job_id).await? else {
+        return Ok(());
+    };
+    let (Some(cap), Some(cut_at)) = (s.cap, s.attempt.as_ref().map(|a| a.cut_at)) else {
+        return Ok(());
+    };
+    if midnights(cut_at, now.unix_timestamp()).next().is_some() {
+        return Ok(());
+    }
+    if !take_reservation(tx, &mut s, cap, now, gpu_hour).await? {
+        tracing::info!(job_id = %job_id, "the cap leaves a new attempt under 15 minutes: the service stops");
+        stop_for_cap(tx, &s, now).await?;
+    }
+    Ok(())
 }
 
 /// Stops a service for its principal's daily cap: a queued one is `cancelled` at once, an assigned or running one
@@ -768,6 +904,39 @@ mod tests {
         assert!(got.enough);
         let got = day_reservation(r, day, end, 300, cap, Units::ZERO);
         assert_eq!((got.units, got.enough), (r.units_for(300), true));
+    }
+
+    #[tokio::test]
+    async fn a_retry_tries_again_and_gives_up_after_its_tries() {
+        let none = std::time::Duration::ZERO;
+        // Two failures, then a success: three calls.
+        let mut calls = 0;
+        let got: Result<u32, String> = retry(4, none, "a step", async || {
+            calls += 1;
+            if calls < 3 {
+                Err(format!("failure {calls}"))
+            } else {
+                Ok(calls)
+            }
+        })
+        .await;
+        assert_eq!(got, Ok(3));
+        // Never a success: every try is made, no more, and the last failure comes back.
+        let mut calls = 0;
+        let got: Result<(), String> = retry(4, none, "a step", async || {
+            calls += 1;
+            Err(format!("failure {calls}"))
+        })
+        .await;
+        assert_eq!((got, calls), (Err("failure 4".to_string()), 4));
+        // One try means no retry.
+        let mut calls = 0;
+        let got: Result<(), &str> = retry(1, none, "a step", async || {
+            calls += 1;
+            Err("no")
+        })
+        .await;
+        assert_eq!((got, calls), (Err("no"), 1));
     }
 
     #[test]

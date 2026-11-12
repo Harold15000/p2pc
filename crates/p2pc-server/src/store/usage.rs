@@ -50,6 +50,11 @@ pub struct NewSlice {
     pub estimated: bool,
 }
 
+/// The most `used_cpu_ms` one slice records: 2^43 ms, about 279 years of CPU time, far above anything a slice of at
+/// most a day can use, and low enough that the sums of `GET /v1/usage` cannot overflow (it would take 2^20 such
+/// rows). A larger figure saturates here instead of failing the insert.
+pub const MAX_SLICE_CPU_MS: i64 = 1 << 43;
+
 fn int(v: u64, column: &'static str) -> Result<i64, StoreError> {
     i64::try_from(v).map_err(|_| StoreError::Corrupt(column))
 }
@@ -85,8 +90,10 @@ pub async fn insert_slice(conn: &mut Conn, s: &NewSlice) -> Result<(), StoreErro
     .bind(s.charge_day)
     .bind(int(s.amounts.reserved_cpu_ms, "usage_records.reserved_cpu_ms")?)
     .bind(int(s.amounts.reserved_gpu_ms, "usage_records.reserved_gpu_ms")?)
-    .bind(int(s.used_cpu_ms, "usage_records.used_cpu_ms")?)
-    .bind(int(s.max_rss_mb, "usage_records.max_rss_mb")?)
+    // What an agent measured saturates: a figure too large must not keep the slice from being written (the
+    // metering step, the cap stop and the attempt's end are in the same transaction).
+    .bind(i64::try_from(s.used_cpu_ms).map_or(MAX_SLICE_CPU_MS, |v| v.min(MAX_SLICE_CPU_MS)))
+    .bind(i64::try_from(s.max_rss_mb).unwrap_or(i64::MAX))
     .bind(int(s.amounts.units.milli(), "usage_records.units")?)
     .bind(s.estimated)
     .execute(&mut *conn)
@@ -179,6 +186,14 @@ pub struct ActiveAttempt {
     pub cut_at: i64,
     /// The CPU time its slices recorded.
     pub used_cpu_ms: u64,
+}
+
+impl ActiveAttempt {
+    /// What is left of `timeout_s` at the start of the attempt's current slice.
+    #[must_use]
+    pub fn timeout_left(&self, timeout_s: u32) -> i64 {
+        i64::from(timeout_s) - (self.cut_at - self.started_at)
+    }
 }
 
 /// A service that is not terminal, with what the metering reads (H2 §12).
@@ -700,7 +715,7 @@ pub(crate) mod tests {
         // remembers no report.
         to(&fx, D0 + 3 * DAY_S + 6 * 3_600);
         let restarted = fx.another_scheduler();
-        restarted.catch_up().await;
+        restarted.catch_up().await.unwrap();
         let mut conn = fx.db.acquire().await.unwrap();
         let got = rows(&mut conn, job).await;
         let cuts: Vec<(i64, i64, i64, bool)> = got
@@ -717,7 +732,7 @@ pub(crate) mod tests {
         );
         assert!(got.iter().all(|r| !r.last_slice && r.started_at == start));
         // Catching up again writes nothing more.
-        restarted.catch_up().await;
+        restarted.catch_up().await.unwrap();
         assert_eq!(rows(&mut conn, job).await.len(), 3);
         // The agent was never told anything else: the service still runs.
         assert_eq!(fx.status(job).await, JobStatus::Running);
@@ -780,12 +795,12 @@ pub(crate) mod tests {
         let mut conn = fx.db.acquire().await.unwrap();
         let deadline = units::cap_deadline(&mut conn, job, GPU_HOUR).await.unwrap();
         assert_eq!(deadline, Some(at(start + 10 * 3_600)));
-        // One second before the deadline it keeps running.
-        to(&fx, start + 10 * 3_600 - 1);
+        // The stop is asked for one stop grace (SIGTERM, 10 s, SIGKILL) before the deadline, not earlier.
+        to(&fx, start + 10 * 3_600 - units::STOP_GRACE_S - 1);
         fx.sched.tick().await.clean();
         assert_eq!(fx.row(job).await.cancel_requested_at, None);
-        // At the deadline, the hub asks it to stop with `cap_reached`, and the agent is told why.
-        to(&fx, start + 10 * 3_600);
+        // Then the hub asks it to stop with `cap_reached`, and the agent is told why.
+        to(&fx, start + 10 * 3_600 - units::STOP_GRACE_S);
         fx.link.take();
         fx.sched.tick().await.clean();
         let cancels: Vec<String> = fx
@@ -798,6 +813,8 @@ pub(crate) mod tests {
             })
             .collect();
         assert_eq!(cancels, vec![REASON_CAP_REACHED.to_string()]);
+        // An agent that takes the whole grace to stop still ends within the reservation.
+        to(&fx, start + 10 * 3_600);
         fx.msg(node, finished(lease, epoch, Outcome::Cancelled, 10, 10)).await;
         let row = fx.row(job).await;
         assert_eq!(
@@ -809,6 +826,164 @@ pub(crate) mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].units, 10_000);
         assert_eq!(spent(&fx, p, D0).await, 10_000);
+    }
+
+    #[tokio::test]
+    async fn a_requeued_attempt_takes_its_reservation_again_and_is_not_stopped_for_the_cap() {
+        let fx = Fx::new().await;
+        let a = service_node(&fx, 4.0).await;
+        let b = service_node(&fx, 4.0).await;
+        // A cap far above what the service can use: 2 hours of 1 vCPU, its `timeout_s`.
+        set_key_cap(&fx, Some(100_000)).await;
+        let p = Principal::Key(fx.key);
+        let job = create_service(&fx, p, service_spec(1.0, 7_200)).await.unwrap();
+        assert_eq!(reservation(&fx, job).await, (Some(D0), Some(2_000)));
+        let (first, ..) = fx.running(job).await;
+        let start = fx.now().unix_timestamp();
+        // An hour in, its node's agent restarts: the attempt is lost and the service requeued.
+        to(&fx, start + 3_600);
+        fx.hello(first, &[]).await;
+        assert_eq!(fx.status(job).await, JobStatus::Queued);
+        // The new attempt has its whole `timeout_s` again, so it takes the day's reservation again: the hour the lost
+        // attempt was charged, plus two hours.
+        let (second, lease, epoch) = fx.running(job).await;
+        assert!(second == a || second == b);
+        assert_eq!(reservation(&fx, job).await, (Some(D0), Some(3_000)));
+        assert_eq!(spent(&fx, p, D0).await, 3_000);
+        // Where the first reservation would have run out, and to the end of its timeout, nothing stops it for the cap.
+        for t in [
+            start + 2 * 3_600 - 10,
+            start + 2 * 3_600,
+            start + 3 * 3_600 - 10,
+            start + 3 * 3_600,
+        ] {
+            to(&fx, t);
+            fx.sched.tick().await.clean();
+            assert_eq!(fx.row(job).await.cancel_requested_at, None, "at {t}");
+        }
+        // Its own timeout ends it, as in H1.
+        fx.msg(second, finished(lease, epoch, Outcome::TimedOut, 10, 10)).await;
+        let row = fx.row(job).await;
+        assert_eq!((row.status, row.reason), (JobStatus::TimedOut, None));
+        assert_eq!(spent(&fx, p, D0).await, 3_000);
+    }
+
+    #[tokio::test]
+    async fn a_requeued_attempt_is_still_stopped_when_the_cap_is_what_bounds_it() {
+        let fx = Fx::new().await;
+        let _a = service_node(&fx, 4.0).await;
+        let _b = service_node(&fx, 4.0).await;
+        // 3 units: the cap, not the day or the timeout, bounds a 1 vCPU service.
+        set_key_cap(&fx, Some(3_000)).await;
+        let p = Principal::Key(fx.key);
+        let job = create_service(&fx, p, service_spec(1.0, 30 * 86_400)).await.unwrap();
+        let (first, ..) = fx.running(job).await;
+        let start = fx.now().unix_timestamp();
+        to(&fx, start + 3_600);
+        fx.hello(first, &[]).await;
+        fx.running(job).await;
+        // One unit is used; two are left for the new attempt, and the reservation still is the cap.
+        assert_eq!(reservation(&fx, job).await, (Some(D0), Some(3_000)));
+        let mut conn = fx.db.acquire().await.unwrap();
+        let deadline = units::cap_deadline(&mut conn, job, GPU_HOUR).await.unwrap();
+        assert_eq!(deadline, Some(at(start + 3 * 3_600)));
+        to(&fx, start + 3 * 3_600 - units::STOP_GRACE_S);
+        fx.sched.tick().await.clean();
+        let row = fx.row(job).await;
+        assert!(row.cancel_requested_at.is_some());
+        assert_eq!(row.reason.as_deref(), Some(REASON_CAP_REACHED));
+    }
+
+    #[tokio::test]
+    async fn an_implausible_usage_report_stops_neither_the_midnight_slice_nor_the_cap_stop() {
+        let fx = Fx::new().await;
+        let _node = service_node(&fx, 4.0).await;
+        set_key_cap(&fx, Some(10_000)).await;
+        // One capped service that reaches its cap, and one of an uncapped device that crosses the midnight.
+        let capped = create_service(&fx, Principal::Key(fx.key), service_spec(1.0, 30 * 86_400))
+            .await
+            .unwrap();
+        let (cn, cl, ce) = fx.running(capped).await;
+        let dev = device(&fx, None).await;
+        let free = create_service(&fx, Principal::Device(dev), service_spec(1.0, 30 * 86_400))
+            .await
+            .unwrap();
+        let (un, ul, ue) = fx.running(free).await;
+        let start = fx.now().unix_timestamp();
+        // Both agents claim more CPU time than any lease can use, up to the largest number the wire can carry.
+        fx.advance(60);
+        report(&fx, cn, cl, ce, u64::MAX, 10).await;
+        report(&fx, un, ul, ue, u64::MAX - 1, 10).await;
+        report(&fx, un, ul, ue, 1_000_000_000_000, 10).await;
+        // The cap still stops the first one.
+        to(&fx, start + 10 * 3_600 - units::STOP_GRACE_S);
+        fx.sched.tick().await.clean();
+        assert_eq!(fx.row(capped).await.reason.as_deref(), Some(REASON_CAP_REACHED));
+        // The midnight slice of the second one is still written: the reports were refused, so it is an estimate.
+        to(&fx, D0 + DAY_S);
+        fx.sched.tick().await.clean();
+        let mut conn = fx.db.acquire().await.unwrap();
+        let got = rows(&mut conn, free).await;
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].used_cpu_ms, got[0].estimated), (0, true));
+        // A plausible report after that counts again.
+        report(&fx, un, ul, ue, 5_000, 20).await;
+        to(&fx, D0 + 2 * DAY_S);
+        fx.sched.tick().await.clean();
+        let got = rows(&mut conn, free).await;
+        assert_eq!(
+            (got[1].used_cpu_ms, got[1].max_rss_mb, got[1].estimated),
+            (5_000, 20, false)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slice_saturates_its_used_cpu_instead_of_failing() {
+        let fx = Fx::new().await;
+        let _node = service_node(&fx, 4.0).await;
+        let job = create_service(&fx, Principal::Key(fx.key), service_spec(1.0, 30 * 86_400))
+            .await
+            .unwrap();
+        let (_, lease, epoch) = fx.running(job).await;
+        // Whatever reached the reports (here, past the check of `record_heartbeat`), the slice is written.
+        let reports = units::ServiceReports::default();
+        reports.record(
+            lease,
+            units::UsageReport {
+                epoch,
+                used_cpu_ms: u64::MAX,
+                max_rss_mb: u64::MAX,
+                at: fx.now().unix_timestamp(),
+            },
+        );
+        to(&fx, D0 + DAY_S);
+        let pass = units::meter(&fx.db, fx.now(), GPU_HOUR, &reports).await.unwrap();
+        assert_eq!((pass.slices, pass.errors), (1, 0));
+        let mut conn = fx.db.acquire().await.unwrap();
+        let got = rows(&mut conn, job).await;
+        assert_eq!((got[0].used_cpu_ms, got[0].max_rss_mb), (MAX_SLICE_CPU_MS, i64::MAX));
+        // The sums of `GET /v1/usage` still add up over such a row.
+        let q = UsageQuery {
+            from: at(D0),
+            to: at(D0 + 2 * DAY_S),
+            group_by: UsageGroupBy::Job,
+            after: None,
+            limit: 10,
+        };
+        let (_, total) = leases::usage_report(&mut conn, fx.account, fx.project, &q)
+            .await
+            .unwrap();
+        assert_eq!(total.used_cpu_ms, u64::try_from(MAX_SLICE_CPU_MS).unwrap());
+    }
+
+    #[tokio::test]
+    async fn the_catch_up_fails_after_its_retries_when_the_metering_cannot_run() {
+        let fx = Fx::new().await;
+        fx.sched.catch_up_with(3, std::time::Duration::ZERO).await.unwrap();
+        // The database is gone: every try fails, and the catch-up says so instead of letting the server start.
+        fx.db.close().await;
+        let err = fx.sched.catch_up_with(3, std::time::Duration::ZERO).await.unwrap_err();
+        assert!(err.to_string().contains("3 tries"), "{err}");
     }
 
     #[tokio::test]

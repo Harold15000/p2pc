@@ -91,6 +91,10 @@ pub const WATCHDOG_MARGIN: Duration = Duration::seconds(60);
 pub const CANCEL_RESEND: Duration = Duration::seconds(5);
 /// Most queued jobs one tick looks at (review P3): a longer queue is served in rounds, see `Scheduler::queue_window`.
 pub const MAX_JOBS_PER_TICK: usize = 256;
+/// How many times the metering catch-up at start is tried before the server refuses to start (H2 §12).
+pub const CATCH_UP_TRIES: u32 = 4;
+/// The pause before the catch-up's second try; it doubles before each later one (0.7 s in all).
+pub const CATCH_UP_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 /// The fallback period of the loop (§8 "When it runs").
 pub const TICK: std::time::Duration = std::time::Duration::from_secs(1);
 /// Time the agent has to accept a lease (§6 "Two-phase assignment").
@@ -296,6 +300,15 @@ pub enum SchedulerError {
     /// A job transition was refused (a bug, or a race the re-read should have prevented).
     #[error("job transition refused: {0}")]
     Transition(String),
+    /// The metering catch-up at start did not complete (H2 §12): the services could not be listed (`services` is 0),
+    /// or the step of `services` of them failed. The causes are in the log.
+    #[error("the metering catch-up failed after {tries} tries ({services} services could not be metered)")]
+    CatchUp {
+        /// Services whose step failed at the last try.
+        services: usize,
+        /// Tries made.
+        tries: u32,
+    },
 }
 
 impl From<sqlx::Error> for SchedulerError {
@@ -607,13 +620,36 @@ impl Scheduler {
     }
 
     /// The catch-up at start (H2 §12): the slices of the midnights the hub missed while it was down, one per UTC day,
-    /// and the day reservations of today, written before the server serves requests. A failure is logged; the
-    /// scheduler's passes retry it every second.
-    pub async fn catch_up(&self) {
-        let mut r = TickReport::default();
-        if let Err(e) = self.meter(&mut r).await {
-            failed(&mut r, "catch up the metering", &e);
-        }
+    /// and the day reservations of today, written before the server serves requests. It is tried [`CATCH_UP_TRIES`]
+    /// times, with a backoff that starts at [`CATCH_UP_BACKOFF`]; if it still fails (the listing, or the step of any
+    /// service), the error comes back and the server must not start: it would admit jobs against caps that do not
+    /// count the running services yet.
+    pub async fn catch_up(&self) -> Result<()> {
+        self.catch_up_with(CATCH_UP_TRIES, CATCH_UP_BACKOFF).await
+    }
+
+    /// [`Scheduler::catch_up`] with explicit tries and first backoff.
+    pub async fn catch_up_with(&self, tries: u32, backoff: std::time::Duration) -> Result<()> {
+        crate::units::retry(tries, backoff, "the metering catch-up", async || {
+            let mut r = TickReport::default();
+            self.meter(&mut r).await?;
+            if r.errors == 0 {
+                Ok(())
+            } else {
+                Err(SchedulerError::CatchUp {
+                    services: r.errors,
+                    tries,
+                })
+            }
+        })
+        .await
+        .map_err(|e| match e {
+            SchedulerError::Store(e) => {
+                tracing::error!(error = %e, tries, "the metering catch-up failed");
+                SchedulerError::CatchUp { services: 0, tries }
+            }
+            other => other,
+        })
     }
 
     /// Sends the effects of a committed transaction.
@@ -729,6 +765,10 @@ impl Scheduler {
             .await?;
         leases::set_node(tx, lease.job_id, lease.node_id).await?;
         leases::open_attempt(tx, lease, now).await?;
+        // H2 §12: a new attempt of a capped principal's service takes the day's reservation again.
+        if lease.job_kind == JobKind::Service {
+            crate::units::attempt_began(tx, lease.job_id, now, self.inner.timing.gpu_hour_units).await?;
+        }
         Ok(true)
     }
 
@@ -743,6 +783,8 @@ impl Scheduler {
             // H2 §7.2: a running service is `starting` until its first passing check.
             if lease.job_kind == JobKind::Service {
                 leases::service_started(tx, lease.job_id, now).await?;
+                // H2 §12: the reservation again, from the attempt's start.
+                crate::units::attempt_began(tx, lease.job_id, now, self.inner.timing.gpu_hour_units).await?;
             }
         }
         Ok(())
