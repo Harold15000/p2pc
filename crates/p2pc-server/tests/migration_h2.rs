@@ -10,7 +10,7 @@
 use p2pc_proto::api::{Principal, UsageGroupBy};
 use p2pc_proto::auth::ApiKey;
 use p2pc_proto::ids::{AccountId, JobId, JoinTokenId, KeyId, LeaseId, NodeId, ProjectId};
-use p2pc_server::store::leases::{UsageQuery, UsageTotalsRow, spent_between, usage_report};
+use p2pc_server::store::leases::{UsageQuery, UsageTotalsRow, spent, usage_report};
 use p2pc_server::store::{self, MIGRATOR};
 use sqlx::{Connection, SqliteConnection};
 use time::OffsetDateTime;
@@ -412,9 +412,9 @@ async fn the_rebuild_keeps_every_h1_row_value_trigger_and_number() {
     let mut spent_after = Vec::new();
     for key in [fx.k1, fx.k2] {
         for (from, to) in days {
-            let milli = spent_between(&mut conn, fx.account, Principal::Key(key), from, to)
-                .await
-                .unwrap();
+            // `spent(P, D)` replaces `spent_between` (H2 §12): the same numbers for every H1 day.
+            assert_eq!(to, from + 86_400);
+            let milli = spent(&mut conn, fx.account, Principal::Key(key), from).await.unwrap();
             spent_after.push(i64::try_from(milli).unwrap());
         }
     }

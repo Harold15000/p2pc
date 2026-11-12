@@ -2489,6 +2489,7 @@ dependencies = [
  "qrcode",
  "rmcp",
  "rpassword",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.11.1",

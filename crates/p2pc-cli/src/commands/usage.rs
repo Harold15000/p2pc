@@ -80,6 +80,10 @@ fn render(report: &UsageReport) -> String {
         UsageGroupBy::Job => "JOB",
         UsageGroupBy::Node => "NODE",
         UsageGroupBy::Key => "KEY",
+        UsageGroupBy::Device => "DEVICE",
+        UsageGroupBy::Principal => "PRINCIPAL",
+        UsageGroupBy::Kind => "KIND",
+        UsageGroupBy::Template => "TEMPLATE",
     };
     let mut table = Table::new([
         by,

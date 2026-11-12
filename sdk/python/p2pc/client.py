@@ -6,6 +6,7 @@ from __future__ import annotations
 import builtins
 import inspect
 import logging
+import os
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -18,10 +19,14 @@ import httpx
 from pydantic import BaseModel
 
 from p2pc import _common as c
+from p2pc import h2
+from p2pc._ports import PortForwarder
 from p2pc.errors import InvalidResponseError, NotFoundError, P2PCConnectionError, P2PCError
+from p2pc.h2 import Blob, TemplateList
 from p2pc.models import (
     ApiKey,
     AuditEvent,
+    BlobInput,
     Egress,
     Estimate,
     InputFile,
@@ -36,7 +41,9 @@ from p2pc.models import (
     Page,
     Placement,
     ServerInfo,
+    ServicePort,
     UsageReport,
+    VolumeSpec,
     WhoAmI,
 )
 
@@ -76,6 +83,9 @@ class Client:
         self.nodes = NodesResource(self)
         self.join_tokens = JoinTokensResource(self)
         self.keys = KeysResource(self)
+        self.blobs = BlobsResource(self)
+        self.services = ServicesResource(self)
+        self.templates = TemplatesResource(self)
 
     def __repr__(self) -> str:
         return self._config.client_repr("Client")
@@ -119,8 +129,10 @@ class Client:
         *,
         params: Mapping[str, str] | None = None,
         json: Any = None,
+        content: Any = None,
+        extra_headers: Mapping[str, str] | None = None,
     ) -> Any:
-        headers = self._config.headers()
+        headers = {**self._config.headers(), **(extra_headers or {})}
         LOG.debug("request %s %s", method, path)
         body = c.ResponseBody()
         try:
@@ -129,6 +141,7 @@ class Client:
                 self._config.url(path),
                 params=params,
                 json=json,
+                content=content,
                 headers=headers,
                 timeout=self._config.timeout,
             ) as response:
@@ -181,6 +194,29 @@ class Client:
         params = {"limit": str(c.MAX_PAGE_LIMIT), **(extra or {})}
         return [item for page in self._pages(path, model, params) for item in page.items]
 
+    def _blob_exists(self, digest: str) -> bool:
+        """``HEAD /v1/blobs/{sha256}``: whether the hub has the blob.
+
+        A ``HEAD`` answer has no body, so a refusal there (``401``, ``403``) carries no reason:
+        it counts as "not known" and the upload that follows gets the hub's own answer.
+        """
+        headers = self._config.headers()
+        try:
+            with self._http.stream(
+                "HEAD",
+                self._config.url(f"/v1/blobs/{digest}"),
+                headers=headers,
+                timeout=self._config.timeout,
+            ) as response:
+                if 400 <= response.status_code < 500:
+                    return False
+                self._raise_for_status(response)
+                if "content-length" not in response.headers:
+                    raise InvalidResponseError("the answer to HEAD /v1/blobs has no Content-Length")
+                return True
+        except httpx.TransportError as exc:
+            raise self._connection_error(exc) from None
+
     # --- top-level calls -----------------------------------------------------------------
     def whoami(self) -> WhoAmI:
         """``GET /v1/whoami``: the presented key and its limits (never its secret)."""
@@ -212,6 +248,7 @@ class Client:
         placement: Placement | Mapping[str, Any] | None = None,
         max_attempts: int | None = None,
         name: str | None = None,
+        inputs: Mapping[str, Blob | str] | Sequence[BlobInput] | None = None,
     ) -> Estimate:
         """``POST /v1/estimate``: would this job fit, and what would it cost in units?"""
         spec = c.build_spec(
@@ -229,6 +266,7 @@ class Client:
             placement=placement,
             max_attempts=max_attempts,
             name=name,
+            inputs=inputs,
         )
         return c.parse_model(Estimate, self._request("POST", "/v1/estimate", json=spec.to_wire()))
 
@@ -276,8 +314,13 @@ class JobsResource:
         max_attempts: int | None = None,
         idempotency_key: str | None = None,
         name: str | None = None,
+        inputs: Mapping[str, Blob | str] | Sequence[BlobInput] | None = None,
     ) -> Job:
-        """``POST /v1/jobs``. The arguments are validated against the §7 table first."""
+        """``POST /v1/jobs``. The arguments are validated against the §7 table first.
+
+        ``inputs`` maps a path under ``/inputs`` to a blob, read-only in the job: a
+        :class:`~p2pc.Blob` from ``client.blobs.put`` or a ``"sha256:<hex>"`` string.
+        """
         spec = c.build_spec(
             image,
             command,
@@ -294,6 +337,7 @@ class JobsResource:
             max_attempts=max_attempts,
             idempotency_key=idempotency_key,
             name=name,
+            inputs=inputs,
         )
         return self._job(self._c._request("POST", "/v1/jobs", json=spec.to_wire()))
 
@@ -671,3 +715,157 @@ class KeysResource:
         self._c._request("DELETE", f"/v1/keys/{c.segment(id)}")
 
     delete = revoke
+
+
+class BlobsResource:
+    def __init__(self, client: Client) -> None:
+        self._c = client
+
+    def put(self, path: str | os.PathLike[str]) -> Blob:
+        """Upload the file at ``path`` as a blob (spec §7.5) and return it.
+
+        The file must be a regular file. It is opened once: the SHA-256 and the upload read the
+        same descriptor, so a file that changes meanwhile fails instead of uploading other bytes.
+        The hub is asked first (``HEAD``): a blob it already has is not sent again
+        (``uploaded=False``). Use ``jobs.run(..., inputs={"/inputs/x": blob})`` to give it to a job.
+        The hub keeps a blob for 24 hours after its last use.
+        """
+        measured = h2.measure_file(path)
+        try:
+            if self._c._blob_exists(measured.digest):
+                return Blob(sha256=measured.digest, size=measured.size, uploaded=False)
+            data = self._c._request(
+                "POST",
+                "/v1/blobs",
+                content=h2.upload_chunks(measured.handle, measured.size),
+                extra_headers={
+                    "Content-Length": str(measured.size),
+                    "Content-Type": "application/octet-stream",
+                    "X-P2PC-SHA256": measured.digest,
+                },
+            )
+        finally:
+            measured.close()
+        blob = c.parse_model(Blob, data)
+        if blob.sha256 != measured.digest:
+            raise InvalidResponseError("the hub stored a blob with another digest than the file's")
+        return blob.model_copy(update={"uploaded": True})
+
+
+class ServicesResource:
+    def __init__(self, client: Client) -> None:
+        self._c = client
+
+    def run(
+        self,
+        image: str,
+        command: Sequence[str],
+        *,
+        ports: Sequence[int | tuple[int, str] | ServicePort],
+        health_http: str | None = None,
+        health_tcp: bool = False,
+        idle_timeout_s: int | c._Unset | None = c.UNSET,
+        restart: str | None = None,
+        volumes: Sequence[VolumeSpec | Mapping[str, Any]] | None = None,
+        env: Mapping[str, str] | None = None,
+        files: Sequence[InputFile] | Mapping[str, bytes | str] | None = None,
+        inputs: Mapping[str, Blob | str] | Sequence[BlobInput] | None = None,
+        cpu: float = 1,
+        memory_mb: int = 1024,
+        gpu: int = 0,
+        disk_mb: int | None = None,
+        timeout_s: int | None = None,
+        egress: Egress | Sequence[str] | None = None,
+        placement: Placement | Mapping[str, Any] | None = None,
+        max_attempts: int | None = None,
+        idempotency_key: str | None = None,
+        name: str | None = None,
+    ) -> Job:
+        """``POST /v1/jobs`` with ``kind="service"`` (spec §7.1, §7.2): start a long-lived service.
+
+        ``ports`` lists the ports it listens on (a number, a ``(number, name)`` pair or a
+        :class:`~p2pc.ServicePort`). ``health_http`` (a path) or ``health_tcp`` checks the first
+        port. ``idle_timeout_s`` is 300-604800 seconds, ``None`` for never (leave it out for the
+        server's default, 3600). ``restart`` is ``"never"`` or ``"on_node_loss"`` (the default).
+        ``timeout_s`` is 60-2592000 and defaults to the 30-day maximum. Reach it with
+        :meth:`connect`; stop it with ``jobs.cancel(job.id)``.
+        """
+        spec = c.build_spec(
+            image,
+            command,
+            env=env,
+            files=files,
+            cpu=cpu,
+            memory_mb=memory_mb,
+            gpu=gpu,
+            disk_mb=disk_mb,
+            timeout_s=timeout_s,
+            egress=egress,
+            placement=placement,
+            max_attempts=max_attempts,
+            idempotency_key=idempotency_key,
+            name=name,
+            inputs=inputs,
+            kind="service",
+            service=c.build_service(
+                ports,
+                health_http=health_http,
+                health_tcp=health_tcp,
+                idle_timeout_s=idle_timeout_s,
+                restart=restart,
+            ),
+            volumes=[VolumeSpec.model_validate(v) if isinstance(v, Mapping) else v for v in volumes]
+            if volumes is not None
+            else None,
+        )
+        return self._c.jobs._job(self._c._request("POST", "/v1/jobs", json=spec.to_wire()))
+
+    def connect(self, job: Job | str, port: int, *, wait_ready: bool = True) -> PortForwarder:
+        """A local port that forwards to ``port`` of the service ``job`` (spec §7.4).
+
+        Use it as a context manager: ``with client.services.connect(job, 11434) as local_port:``.
+        It listens on ``127.0.0.1:<local_port>`` (loopback only) and opens one upgraded
+        connection to the hub per local connection; at most 16 are open at once. With
+        ``wait_ready`` (the default) the hub waits up to 30 s for a service that is still
+        ``starting``. When an upgrade is refused (``service_not_running``, ``port_not_exposed``
+        …) that local connection is closed and the error is kept in ``.last_error`` of the
+        returned object. The block ends the listener and every open connection.
+        """
+        job_id = job if isinstance(job, str) else job.id
+        c.segment(job_id, "job id")
+        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65_535:
+            raise ValueError("port must be an integer between 1 and 65535")
+        return PortForwarder(self._c._config, job_id, port, wait_ready=wait_ready)
+
+
+class TemplatesResource:
+    def __init__(self, client: Client) -> None:
+        self._c = client
+
+    def list(self) -> TemplateList:
+        """``GET /v1/templates`` (spec §7.6): the served template bundle.
+
+        Iterate it for the templates; ``bundle_error`` says why it is empty when no bundle can be
+        loaded.
+        """
+        return c.parse_model(TemplateList, self._c._request("GET", "/v1/templates"))
+
+    def launch(
+        self,
+        id: str,
+        params: Mapping[str, bool | int | str] | None = None,
+        *,
+        idempotency_key: str | None = None,
+    ) -> Job:
+        """``POST /v1/templates/{id}/launch`` (spec §7.6): start a template with ``params``.
+
+        Returns the job. For a ``singleton`` template that is already running, it is the running
+        instance. ``params`` are checked by the hub (``422 invalid_params``); a ``blob``
+        parameter takes a :class:`~p2pc.Blob` or its ``"sha256:<hex>"`` string.
+        """
+        body = c.launch_body(params, idempotency_key)
+        return self._c.jobs._job(
+            self._c._request(
+                "POST", f"/v1/templates/{c.segment(id, 'template id')}/launch", json=body
+            )
+        )

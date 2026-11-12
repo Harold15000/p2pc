@@ -81,6 +81,21 @@ fn job_schema() -> Value {
                     }
                 }
             },
+            "inputs": {
+                "type": "array", "maxItems": 32,
+                "description": "Blobs delivered read-only under /inputs, by digest. Upload a file first with \
+                                p2pc_blob_put and use the `blob` it returns. A local path is never accepted here.",
+                "items": {
+                    "type": "object", "additionalProperties": false, "required": ["path", "blob"],
+                    "properties": {
+                        "path": {"type": "string", "description": "Absolute path under /inputs/, for example /inputs/data.bin."},
+                        "blob": {
+                            "type": "string", "pattern": "^sha256:[0-9a-f]{64}$",
+                            "description": "The blob's digest, `sha256:` and 64 lowercase hex digits, as p2pc_blob_put returned it."
+                        }
+                    }
+                }
+            },
             "egress": {
                 "type": "object", "additionalProperties": false,
                 "description": "Network access. Without it the job has no network at all.",
@@ -125,7 +140,7 @@ fn description(text: &str) -> String {
     format!("{text} {SPEND_NOTE}")
 }
 
-/// The seven tools of `p2pc mcp`.
+/// The eight tools of `p2pc mcp`: the seven of H1, and `p2pc_blob_put` (H2 §7.8).
 #[must_use]
 pub fn tool_definitions() -> Vec<Tool> {
     let read_only = ToolAnnotations::new().read_only(true).open_world(false);
@@ -232,5 +247,31 @@ pub fn tool_definitions() -> Vec<Tool> {
             object(json!({"type": "object", "additionalProperties": false, "properties": {}})),
         )
         .annotate(read_only),
+        Tool::new(
+            "p2pc_blob_put",
+            description(
+                "Upload a file as a blob, to use it as a job input (`inputs` of p2pc_run). The file must be in the \
+                 upload directory the owner set aside (`p2pc mcp --upload-dir`, `~/p2pc-uploads` by default): give a \
+                 path relative to it. Hidden files, symbolic links and anything outside the directory are refused \
+                 with `path_not_allowed`. Returns {blob, size, uploaded}; the file's contents are never returned. The \
+                 hub keeps the blob for 24 hours after its last use.",
+            ),
+            object(json!({
+                "type": "object", "additionalProperties": false, "required": ["path"],
+                "properties": {
+                    "path": {
+                        "type": "string", "minLength": 1, "maxLength": 4096,
+                        "description": "A regular file, relative to the upload directory, for example `data/train.csv`."
+                    }
+                }
+            })),
+        )
+        .annotate(
+            ToolAnnotations::new()
+                .read_only(false)
+                .destructive(false)
+                .idempotent(true)
+                .open_world(false),
+        ),
     ]
 }

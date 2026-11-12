@@ -10,7 +10,8 @@ use crate::mcp::{Allow, McpConfig, McpServer, check_key, init_stderr_logging, se
 ///
 /// The key is checked with `GET /v1/whoami` before anything is served: a key with the `admin` scope or without a
 /// daily cap is refused (exit 125, message on stderr), unless `--allow-admin` or `--allow-uncapped` says otherwise,
-/// and then a warning goes to stderr. After that, stdout carries only the MCP protocol.
+/// and then a warning goes to stderr. The upload directory of `p2pc_blob_put` is then created (mode 0700) or checked,
+/// and an unsafe one is refused the same way (SI-H2-21). After that, stdout carries only the MCP protocol.
 pub async fn run(ctx: &mut Ctx<'_, '_>, args: McpArgs) -> Result<u8, CliError> {
     let (client, key) = ctx.client_with_key()?;
     let limits = client.key_limits().await?;
@@ -22,11 +23,45 @@ pub async fn run(ctx: &mut Ctx<'_, '_>, args: McpArgs) -> Result<u8, CliError> {
     for warning in &warnings {
         writeln!(ctx.host.err, "warning: {warning}")?;
     }
+    #[cfg(unix)]
+    let config = McpConfig::new(args.results_dir).with_upload_dir(unix_upload_dir(ctx, args.upload_dir)?);
+    // Elsewhere there is no upload directory: `p2pc_blob_put` refuses every call (see `mcp::upload`).
+    #[cfg(not(unix))]
+    let config = McpConfig::new(args.results_dir);
+    #[cfg(not(unix))]
+    if args.upload_dir.is_some() {
+        writeln!(
+            ctx.host.err,
+            "warning: --upload-dir is ignored: uploads from MCP are not supported on this platform yet"
+        )?;
+    }
     init_stderr_logging((ctx.host.env)("P2PC_LOG").as_deref());
     tracing::info!(key_id = %limits.key_id, "serving MCP over stdio");
     // A long-running session through a tunnel follows network changes (§10).
     let _network_watch = ctx.watch_networks().await;
-    let server = McpServer::new(client, &key, McpConfig::new(args.results_dir));
+    let server = McpServer::new(client, &key, config);
     serve_stdio(server).await.map_err(CliError::Usage)?;
     Ok(0)
+}
+
+/// The upload directory: `--upload-dir`, or `~/p2pc-uploads`, checked against the home and configuration directories.
+#[cfg(unix)]
+fn unix_upload_dir(
+    ctx: &Ctx<'_, '_>,
+    requested: Option<std::path::PathBuf>,
+) -> Result<crate::mcp::UploadDir, CliError> {
+    use std::path::PathBuf;
+
+    let home = (ctx.host.env)("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
+    let dir = match (requested, &home) {
+        (Some(dir), _) => dir,
+        (None, Some(home)) => home.join(crate::mcp::DEFAULT_UPLOAD_DIR_NAME),
+        (None, None) => {
+            return Err(CliError::usage(
+                "cannot tell where the upload directory is: the home directory is unknown; give --upload-dir",
+            ));
+        }
+    };
+    let config_dir = ctx.store()?.dir().to_path_buf();
+    crate::mcp::UploadDir::prepare(&dir, home.as_deref(), &config_dir).map_err(CliError::Usage)
 }

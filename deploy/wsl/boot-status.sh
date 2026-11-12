@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # boot-status.sh: the one definition of "is /var/lib/p2pc/boot-status.json from THIS start of the distro?", shared by
-# p2pc-boot (which writes the identity), p2pc-test-distro and p2pc-node-run (which compare it). The image installs it
+# p2pc-boot (which writes the identity), p2pc-test-distro and p2pc-run (which compare it). The image installs it
 # as /usr/local/lib/p2pc/boot-status.sh; the scripts source it from there, from the directory they sit in (a
 # checkout, deploy/wsl/), or from $P2PC_BOOT_STATUS_LIB. Sourcing only defines functions.
 #

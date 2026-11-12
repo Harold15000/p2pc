@@ -18,7 +18,7 @@ fail() {
 }
 
 # scripts/ too: the release script (scripts/release.sh) is tested from deploy/tests/.
-mapfile -t shell_files < <(find deploy scripts -type f \( -name '*.sh' -o -name 'p2pc-boot' -o -name 'p2pc-node-run' \) | LC_ALL=C sort)
+mapfile -t shell_files < <(find deploy scripts -type f \( -name '*.sh' -o -name 'p2pc-boot' -o -name 'p2pc-run' \) | LC_ALL=C sort)
 mapfile -t ps_files < <(find deploy -type f -name '*.ps1' | LC_ALL=C sort)
 all_files=("${shell_files[@]}" "${ps_files[@]}")
 

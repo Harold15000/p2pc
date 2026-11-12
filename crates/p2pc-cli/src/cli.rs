@@ -439,6 +439,12 @@ pub struct McpArgs {
     /// Where `p2pc_results` saves files that are too big or not text: `<DIR>/<job_id>/<path>`.
     #[arg(long, value_name = "DIR", default_value = crate::mcp::DEFAULT_RESULTS_DIR)]
     pub results_dir: PathBuf,
+    /// The one directory `p2pc_blob_put` reads files from (default `~/p2pc-uploads`). It is created with mode 0700 if
+    /// it is missing. `p2pc mcp` refuses a symbolic link, a directory that is not the user's or that grants group or
+    /// other access, the home directory itself, and the p2pc configuration directory or one that holds or lies inside
+    /// it.
+    #[arg(long, value_name = "DIR")]
+    pub upload_dir: Option<PathBuf>,
 }
 
 /// `p2pc login`.
@@ -826,6 +832,8 @@ mod tests {
         };
         assert!(!a.allow_admin && !a.allow_uncapped);
         assert_eq!(a.results_dir, PathBuf::from("p2pc-results"));
+        // The default upload directory is resolved from the home directory when the command runs.
+        assert_eq!(a.upload_dir, None);
         let Command::Mcp(a) = Cli::try_parse_from([
             "p2pc",
             "--profile",
@@ -835,6 +843,8 @@ mod tests {
             "--allow-uncapped",
             "--results-dir",
             "/tmp/out",
+            "--upload-dir",
+            "/tmp/up",
         ])
         .unwrap()
         .command
@@ -843,6 +853,7 @@ mod tests {
         };
         assert!(a.allow_admin && a.allow_uncapped);
         assert_eq!(a.results_dir, PathBuf::from("/tmp/out"));
+        assert_eq!(a.upload_dir, Some(PathBuf::from("/tmp/up")));
     }
 
     #[test]
