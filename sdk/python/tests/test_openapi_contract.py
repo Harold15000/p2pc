@@ -243,6 +243,12 @@ REQUESTS = [
     ("Retry", "Retry"),
     ("Outputs", "Outputs"),
     ("InputFile", "InputFile"),
+    # H2 (spec §7.1): the service, volume and blob-input members of a job.
+    ("ServicePort", "ServicePort"),
+    ("HealthCheck", "HealthCheck"),
+    ("ServiceSpec", "ServiceSpec"),
+    ("VolumeSpec", "VolumeSpec"),
+    ("BlobInput", "BlobInput"),
     ("CreateApiKey", "CreateApiKey"),
     ("CreateJoinToken", "CreateJoinToken"),
 ]
@@ -362,6 +368,17 @@ def test_every_sdk_model_is_covered_by_the_contract() -> None:
     }
     assert defined - covered == set(), "add these models to the contract registry"
     assert {p[0] for p in PAGES} <= covered
+
+
+def test_the_blob_and_template_models_move_here_when_the_document_gains_their_routes(
+    openapi: dict[str, Any],
+) -> None:
+    """``p2pc.h2`` holds the blob and template models because ``docs/api/openapi.json`` has no
+    schema to compare them with yet. The day it gains these routes, this test fails: move the
+    models of ``p2pc/h2.py`` into ``p2pc.models`` and register them above, then delete this test.
+    """
+    waiting = [p for p in openapi["paths"] if p.startswith(("/v1/blobs", "/v1/templates"))]
+    assert waiting == [], f"the document now has {waiting}: register the models of p2pc/h2.py"
 
 
 # --- the checker itself: it must notice drift ----------------------------------------------
