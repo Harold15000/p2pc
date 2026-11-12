@@ -2562,7 +2562,7 @@
         "tags": [
           "usage"
         ],
-        "summary": "The usage of the caller's project: finished attempts that ended in `[from, to)`, grouped by `group_by`, with\ncursor pagination over the groups and the total of the whole range. Only the caller's own account and project\nare ever counted.",
+        "summary": "The usage of the caller's project: the ledger rows (slices, H2 §12) that ended in `[from, to)`, grouped by\n`group_by`, with cursor pagination over the groups and the total of the whole range, which covers every selected\nrow (so with devices in use the `key` groups may add up to less). `attempts` counts finished attempts. Only the\ncaller's own account and project are ever counted.",
         "operationId": "get_usage",
         "parameters": [
           {
@@ -2586,7 +2586,7 @@
           {
             "name": "group_by",
             "in": "query",
-            "description": "`job` (default), `node` or `key`.",
+            "description": "`job` (default), `node`, `key`, `device`, `principal`, `kind` or `template`. `key` leaves device rows out,\n`device` leaves key rows out, `template` leaves out rows with no template; the others cover every row.",
             "required": false,
             "schema": {
               "type": "string"
@@ -6500,7 +6500,11 @@
         "enum": [
           "job",
           "node",
-          "key"
+          "key",
+          "device",
+          "principal",
+          "kind",
+          "template"
         ]
       },
       "UsageReport": {

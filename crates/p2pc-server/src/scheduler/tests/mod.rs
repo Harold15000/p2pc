@@ -1273,7 +1273,7 @@ mt_test!(lost_attempts_are_billed_with_an_estimate, async {
         let (account, key, day) = (fx.account, fx.key, crate::units::utc_day(fx.now()));
         async move {
             let mut c = db.acquire().await.unwrap();
-            leases::spent_between(&mut c, account, p2pc_proto::api::Principal::Key(key), day.0, day.1)
+            leases::spent(&mut c, account, p2pc_proto::api::Principal::Key(key), day.0)
                 .await
                 .unwrap()
         }
@@ -1751,15 +1751,9 @@ mt_test!(server_ended_attempts_get_an_estimated_usage_row, async {
     // The cap counts the estimate, not the whole reservation (1 vCPU × 100 s = 28 milli-units).
     let day = crate::units::utc_day(fx.now());
     let mut conn = fx.db.acquire().await.unwrap();
-    let spent = leases::spent_between(
-        &mut conn,
-        fx.account,
-        p2pc_proto::api::Principal::Key(fx.key),
-        day.0,
-        day.1,
-    )
-    .await
-    .unwrap();
+    let spent = leases::spent(&mut conn, fx.account, p2pc_proto::api::Principal::Key(fx.key), day.0)
+        .await
+        .unwrap();
     assert_eq!(spent, 89 + 10);
 });
 

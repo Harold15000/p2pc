@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! `GET /v1/usage` (spec §7, §11): the usage ledger, grouped by job, node or key.
+//! `GET /v1/usage` (spec §7, §11, H2 §12): the usage ledger, grouped by job, node, key, device, principal, kind or
+//! template.
 //!
-//! The ledger has one row per finished attempt (`usage_records`): written by the scheduler on `JobFinished`, or
-//! estimated by the server when it ended the attempt itself (watchdog, cancel on an unreachable node;
-//! `estimated_attempts` counts those). The report covers the attempts that **ended** in `[from, to)`, of the caller's
-//! account and project only (SI-7).
+//! The ledger has one row per finished **slice** (`usage_records`, H2 §12): a batch attempt is one slice, a service
+//! attempt is cut at every 00:00 UTC it runs through. Rows are written by the scheduler on `JobFinished` and at each
+//! midnight, or estimated by the server when no report covers them (watchdog, cancel on an unreachable node, node
+//! loss, a midnight with no usage report). The report covers the rows that **ended** in `[from, to)`, of the caller's
+//! account and project only (SI-7). `attempts` counts finished attempts (last slices), so a week-long service is one
+//! attempt; `estimated_attempts` counts those that are estimates, and `estimated_slices` every estimated row.
 
 use axum::Json;
 use axum::extract::State;
@@ -34,7 +37,8 @@ pub struct UsageParams {
     pub from: Option<String>,
     /// End of the range (RFC 3339, exclusive). Default: one day after `from`.
     pub to: Option<String>,
-    /// `job` (default), `node` or `key`.
+    /// `job` (default), `node`, `key`, `device`, `principal`, `kind` or `template`. `key` leaves device rows out,
+    /// `device` leaves key rows out, `template` leaves out rows with no template; the others cover every row.
     #[param(value_type = Option<String>)]
     pub group_by: Option<UsageGroupBy>,
     /// Groups per page, 1-100 (default 50).
@@ -60,11 +64,17 @@ fn writable(t: Option<OffsetDateTime>, field: &str) -> Result<OffsetDateTime, Ap
     })
 }
 
-/// The opaque cursor: unpadded base64url of the last group key. A group key is an ID, so anything else is refused.
+/// The opaque cursor: unpadded base64url of the last group key. A group key is an ID, `key:<id>` or `device:<id>`, a
+/// kind or a template ID (`[a-z][a-z0-9-]*`), so anything else is refused.
 fn decode_cursor(text: &str) -> Option<String> {
     let bytes = data_encoding::BASE64URL_NOPAD.decode(text.as_bytes()).ok()?;
     let key = String::from_utf8(bytes).ok()?;
-    (!key.is_empty() && key.len() <= 64 && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')).then_some(key)
+    (!key.is_empty()
+        && key.len() <= 72
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b':')))
+    .then_some(key)
 }
 
 fn encode_cursor(key: &str) -> String {
@@ -84,13 +94,15 @@ fn totals(row: UsageTotalsRow, key: Option<String>) -> UsageTotals {
         max_rss_mb: row.max_rss_mb,
         units: row.units,
         estimated_attempts: row.estimated_attempts,
+        estimated_slices: row.estimated_slices,
         ..UsageTotals::default()
     }
 }
 
-/// The usage of the caller's project: finished attempts that ended in `[from, to)`, grouped by `group_by`, with
-/// cursor pagination over the groups and the total of the whole range. Only the caller's own account and project
-/// are ever counted.
+/// The usage of the caller's project: the ledger rows (slices, H2 §12) that ended in `[from, to)`, grouped by
+/// `group_by`, with cursor pagination over the groups and the total of the whole range, which covers every selected
+/// row (so with devices in use the `key` groups may add up to less). `attempts` counts finished attempts. Only the
+/// caller's own account and project are ever counted.
 #[utoipa::path(
     get,
     path = "/v1/usage",
@@ -163,9 +175,23 @@ mod tests {
 
     #[test]
     fn cursors_round_trip_and_refuse_anything_but_an_id() {
-        let key = "job_01ARZ3NDEKTSV4RRFFQ69G5FAV";
-        assert_eq!(decode_cursor(&encode_cursor(key)).as_deref(), Some(key));
-        for bad in ["", "%%", &encode_cursor("a'b"), &encode_cursor("")] {
+        for key in [
+            "job_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "device:dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "key:key_01ARZ3NDEKTSV4RRFFQ69G5FAV", // gitleaks:allow (a key ID, not a secret)
+            "service",
+            "chat-llm",
+        ] {
+            assert_eq!(decode_cursor(&encode_cursor(key)).as_deref(), Some(key));
+        }
+        for bad in [
+            "",
+            "%%",
+            &encode_cursor("a'b"),
+            &encode_cursor(""),
+            &encode_cursor("a b"),
+            &encode_cursor(&"a".repeat(73)),
+        ] {
             assert_eq!(decode_cursor(bad), None, "{bad}");
         }
     }
