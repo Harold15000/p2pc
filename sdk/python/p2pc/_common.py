@@ -39,12 +39,16 @@ from p2pc.errors import (
     UnprocessableError,
     UnsafePathError,
 )
+from p2pc.h2 import Blob, blob_ref
 from p2pc.models import (
     DEFAULT_OUTPUT_FILE_BYTES,
+    MAX_IDEMPOTENCY_KEY_LEN,
     MAX_OUTPUT_FILE_BYTES,
+    BlobInput,
     CreateApiKey,
     CreateJoinToken,
     Egress,
+    HealthCheck,
     InputFile,
     JobSpec,
     JobStatus,
@@ -55,7 +59,10 @@ from p2pc.models import (
     Placement,
     Resources,
     Retry,
+    ServicePort,
+    ServiceSpec,
     UsageReport,
+    VolumeSpec,
     _JobFields,
 )
 
@@ -409,6 +416,10 @@ def build_spec(
     max_attempts: int | None = None,
     idempotency_key: str | None = None,
     name: str | None = None,
+    inputs: Mapping[str, Blob | str] | Sequence[BlobInput] | None = None,
+    kind: str | None = None,
+    service: ServiceSpec | None = None,
+    volumes: Sequence[VolumeSpec] | None = None,
 ) -> JobSpec:
     """Validate the arguments against the §7 table and return the job spec."""
     if isinstance(command, str):
@@ -427,11 +438,15 @@ def build_spec(
         Placement.model_validate(placement) if isinstance(placement, Mapping) else placement
     )
     return JobSpec(
+        kind=kind,  # type: ignore[arg-type]  # validated by the model
         name=name,
         image=image,
         command=list(command),
         env=dict(env) if env is not None else None,
         files=input_files,
+        inputs=build_inputs(inputs),
+        service=service,
+        volumes=list(volumes) if volumes is not None else None,
         resources=Resources.model_validate(
             {"cpu": cpu, "memory_mb": memory_mb, "gpu": gpu, "disk_mb": disk_mb}
         ),
@@ -442,6 +457,92 @@ def build_spec(
         retry=Retry(max_attempts=max_attempts) if max_attempts is not None else None,
         idempotency_key=idempotency_key,
     )
+
+
+def build_inputs(
+    inputs: Mapping[str, Blob | str] | Sequence[BlobInput] | None,
+) -> list[BlobInput] | None:
+    """Blob inputs as the API wants them. A blob is a ``Blob`` (from ``client.blobs.put``) or a
+    ``sha256:<hex>`` digest string: never a local path, which the SDK never reads for a job."""
+    if inputs is None:
+        return None
+    if isinstance(inputs, Mapping):
+        return [BlobInput(path=path, blob=blob_ref(blob)) for path, blob in inputs.items()]
+    return list(inputs)
+
+
+def launch_body(
+    params: Mapping[str, bool | int | str | Blob] | None, idempotency_key: str | None
+) -> dict[str, Any]:
+    """The body of ``POST /v1/templates/{id}/launch``. A ``Blob`` parameter goes as its digest."""
+    values: dict[str, bool | int | str] = {}
+    for name, value in (params or {}).items():
+        if isinstance(value, Blob):
+            value = value.ref
+        if not isinstance(name, str) or not isinstance(value, (bool, int, str)):
+            raise TypeError("template params map names to a bool, an int, a string or a Blob")
+        values[name] = value
+    body: dict[str, Any] = {"params": values}
+    if idempotency_key is not None:
+        if not 1 <= len(idempotency_key) <= MAX_IDEMPOTENCY_KEY_LEN or not all(
+            "!" <= ch <= "~" for ch in idempotency_key
+        ):
+            raise ValueError(
+                f"idempotency_key must be 1-{MAX_IDEMPOTENCY_KEY_LEN} printable ASCII "
+                "characters without spaces"
+            )
+        body["idempotency_key"] = idempotency_key
+    return body
+
+
+class _Unset:
+    """The type of :data:`UNSET`: "not given", which is not the same as ``None`` (never)."""
+
+    def __repr__(self) -> str:
+        return "UNSET"
+
+
+UNSET = _Unset()
+
+
+def build_service(
+    ports: Sequence[int | tuple[int, str] | ServicePort],
+    *,
+    health_http: str | None = None,
+    health_tcp: bool = False,
+    idle_timeout_s: int | _Unset | None = UNSET,
+    restart: str | None = None,
+) -> ServiceSpec:
+    """The ``service`` block from the arguments of ``client.services.run``.
+
+    A port is a number (named ``port-<n>``, as the CLI does), a ``(number, name)`` pair or a
+    :class:`~p2pc.ServicePort`. The health check, if any, goes to the first port.
+    """
+    if isinstance(ports, (str, bytes)) or not ports:
+        raise TypeError("ports must be a non-empty list of ports")
+    built: list[ServicePort] = []
+    for item in ports:
+        if isinstance(item, ServicePort):
+            built.append(item)
+        elif isinstance(item, tuple):
+            built.append(ServicePort(port=item[0], name=item[1]))
+        elif isinstance(item, int) and not isinstance(item, bool):
+            built.append(ServicePort(port=item, name=f"port-{item}"))
+        else:
+            raise TypeError("a port is an int, a (port, name) pair or a ServicePort")
+    if health_http is not None and health_tcp:
+        raise ValueError("give health_http or health_tcp, not both")
+    health: HealthCheck | None = None
+    if health_http is not None:
+        health = HealthCheck(port=built[0].port, http_get=health_http)
+    elif health_tcp:
+        health = HealthCheck(port=built[0].port, tcp=True)
+    kwargs: dict[str, Any] = {"ports": built, "health": health}
+    if not isinstance(idle_timeout_s, _Unset):
+        kwargs["idle_timeout_s"] = idle_timeout_s  # None = never, set explicitly
+    if restart is not None:
+        kwargs["restart"] = restart
+    return ServiceSpec(**kwargs)
 
 
 def check_limit(limit: int) -> int:

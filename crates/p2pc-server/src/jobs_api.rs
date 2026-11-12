@@ -22,7 +22,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use p2pc_proto::api::{Estimate, Job, JobKind, JobSpec, JobStatus, Page, Problem, REASON_STOPPED, Scope, ServiceView};
 use p2pc_proto::ids::{JobId, NodeId};
-use p2pc_proto::units::estimate_units;
+use p2pc_proto::units::{Units, estimate_units};
 use p2pc_proto::validate::{ErrorCode, H2Features, ImageRef, Limits, image_allowed};
 use serde::Deserialize;
 use time::{Duration, OffsetDateTime};
@@ -37,7 +37,7 @@ use crate::spec_hash::spec_hash;
 use crate::store::job_state::transition;
 use crate::store::jobs::{self, JobCursor, JobRow, ListFilter, NewJob, Visibility};
 use crate::store::{self, Conn, leases};
-use crate::units::{check_cap, gpu_hour_units, spent_today};
+use crate::units::{check_cap, gpu_hour_units, reserve_new_service, spent_today};
 
 /// The header that carries an idempotency key (§7), as an alternative to the `idempotency_key` field.
 pub const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
@@ -249,11 +249,18 @@ pub async fn create_job(
     //   file contents again;
     // - the estimate is what the cap is checked against and what is reserved.
     let files_meta = p2pc_proto::api::FileMeta::compute_all(&prepared.spec).map_err(|_| ApiError::internal())?;
-    let units = estimate_units(
-        &prepared.spec.resources,
-        prepared.spec.timeout_s,
-        gpu_hour_units(&state.config),
-    );
+    // H2 §12: a service reserves nothing at creation in `units_reserved` (0); a capped principal's service holds a
+    // reservation for one UTC day at a time instead (below).
+    let service = prepared.spec.kind == JobKind::Service;
+    let units = if service {
+        Units::ZERO
+    } else {
+        estimate_units(
+            &prepared.spec.resources,
+            prepared.spec.timeout_s,
+            gpu_hour_units(&state.config),
+        )
+    };
     let job_id = JobId::generate();
     // Reads (the caller, an earlier job with the key, the day's reservations), then writes: IMMEDIATE (see
     // `store::begin_immediate`). It also serializes concurrent submissions, so "look up the key, then insert" cannot
@@ -280,9 +287,19 @@ pub async fn create_job(
             Err(ApiError::idempotency_conflict())
         };
     }
+    let mut day_hold = None;
     if let Some(cap) = caller.daily_unit_cap {
-        let reserved = spent_today(&mut tx, p.account_id, p.id, now).await?;
-        check_cap(cap, reserved, units).map_err(|c| ApiError::cap_exceeded(c.cap, c.reserved, c.estimate))?;
+        if service {
+            // H2 §12 "Caps for services": the day's reservation, refused under 15 minutes of runtime.
+            let gpu_hour = gpu_hour_units(&state.config);
+            let held = reserve_new_service(&mut tx, p.account_id, p.id, cap, &prepared.spec, gpu_hour, now)
+                .await?
+                .map_err(|c| ApiError::cap_exceeded(c.cap, c.reserved, c.estimate))?;
+            day_hold = Some(held);
+        } else {
+            let reserved = spent_today(&mut tx, p.account_id, p.id, now).await?;
+            check_cap(cap, reserved, units).map_err(|c| ApiError::cap_exceeded(c.cap, c.reserved, c.estimate))?;
+        }
     }
     let new = NewJob {
         job_id,
@@ -295,6 +312,9 @@ pub async fn create_job(
         units_reserved: units,
     };
     let row = jobs::insert(&mut tx, &new, now).await?;
+    if let Some(held) = day_hold {
+        crate::units::hold(&mut tx, row.job_id, held, now).await?;
+    }
     tx.commit().await?;
     // The ID and the key only: never the spec.
     tracing::info!(job_id = %row.job_id, principal = %p.id, "job created");
@@ -403,8 +423,8 @@ pub async fn list_jobs(
 /// job.
 ///
 /// `last_activity_at` is what the idle timeout counts from: the attempt's first `healthy`, then the traffic the port
-/// relay records. `cap_deadline`, `setup` and `traffic` belong to the metering, template and port tasks and stay
-/// `null` here.
+/// relay records. `cap_deadline` is when the day's cap reservation runs out (H2 §12), `null` for an uncapped principal
+/// or while no attempt runs. `setup` and `traffic` belong to the template and port tasks and stay `null` here.
 async fn service_view(
     conn: &mut Conn,
     state: &AppState,
@@ -445,6 +465,7 @@ async fn service_view(
         idle_deadline,
         deadline,
         restarts_24h: u32::try_from(restarts).unwrap_or(u32::MAX),
+        cap_deadline: crate::units::cap_deadline(conn, row.job_id, gpu_hour_units(&state.config)).await?,
         ..ServiceView::default()
     }))
 }

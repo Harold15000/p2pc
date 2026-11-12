@@ -63,6 +63,7 @@ __all__ = [
     "ApiKey",
     "AsyncJob",
     "AuditEvent",
+    "BlobInput",
     "BlobInputView",
     "Capacity",
     "CpuInfo",
@@ -75,6 +76,7 @@ __all__ = [
     "FieldError",
     "GpuInfo",
     "GpuStatus",
+    "HealthCheck",
     "HealthCheckView",
     "InputFile",
     "InputFileView",
@@ -104,8 +106,10 @@ __all__ = [
     "RetryView",
     "SandboxCapability",
     "ServerInfo",
+    "ServicePort",
     "ServicePortView",
     "ServiceSetup",
+    "ServiceSpec",
     "ServiceSpecView",
     "ServiceTraffic",
     "ServiceView",
@@ -113,6 +117,7 @@ __all__ = [
     "TemplateRefView",
     "UsageReport",
     "UsageTotals",
+    "VolumeSpec",
     "VolumeSpecView",
     "WhoAmI",
     "Wsl2Health",
@@ -183,6 +188,7 @@ SERVICE_HEALTHS = frozenset({"starting", "healthy", "unhealthy"})
 SETUP_STATES = frozenset({"pulling", "done", "failed"})
 SETUP_FAILURES = frozenset({"error_line", "bad_line", "eof", "stream_broken", "deadline"})
 NODE_APPROVALS = frozenset({"approved", "pending_approval"})
+MAX_SERVICE_TIMEOUT_S = 2_592_000  # a service's wall-clock limit: 30 days, the maximum (spec §7.1)
 MILLI = 1000  # milli-units per unit, and milli-vCPUs per vCPU (spec §11)
 MIB = 1024 * 1024
 MAX_OUTPUTS_MB = 10_240  # the server's largest outputs.max_mb
@@ -337,16 +343,159 @@ class InputFile(_Request):
         return len(base64.b64decode(self.content_b64, validate=True))
 
 
+# --- H2 request models (spec §7.1) --------------------------------------------------------
+_BLOB_REF_RE = re.compile(r"sha256:[0-9a-f]{64}")
+_PORT_NAME_RE = re.compile(r"[a-z][a-z0-9-]{0,31}")
+_VOLUME_NAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,62}")
+
+
+class ServicePort(_Request):
+    """A port a service listens on inside its container. The shim forwards no other port."""
+
+    port: int = Field(ge=1, le=65_535)
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str) -> str:
+        if not _PORT_NAME_RE.fullmatch(value):
+            raise ValueError("port name must match [a-z][a-z0-9-]{0,31}")
+        return value
+
+
+class HealthCheck(_Request):
+    """How the agent decides a service is healthy: exactly one of ``http_get`` or ``tcp``."""
+
+    port: int = Field(ge=1, le=65_535)
+    http_get: str | None = None
+    tcp: bool | None = None
+    interval_s: int | None = Field(default=None, ge=2, le=300)
+    timeout_s: int | None = Field(default=None, ge=1, le=60)
+    start_period_s: int | None = Field(default=None, ge=0, le=3_600)
+    failure_threshold: int | None = Field(default=None, ge=1, le=20)
+
+    @model_validator(mode="after")
+    def _check_one_probe(self) -> Self:
+        if (self.http_get is None) == (not self.tcp):
+            raise ValueError("health: give exactly one of http_get or tcp=True")
+        if self.http_get is not None:
+            path = self.http_get
+            if (
+                not path.startswith("/")
+                or len(path.encode()) > 256
+                or any(ch in path for ch in ("\r", "\n", "\x00"))
+                or ".." in path.split("/")
+            ):
+                raise ValueError(
+                    "health.http_get must be an absolute path of at most 256 bytes "
+                    "without '..' or control characters"
+                )
+        return self
+
+
+class ServiceSpec(_Request):
+    """The ``service`` block of a ``kind="service"`` job.
+
+    ``idle_timeout_s=None`` means *never* when it is set explicitly (``ServiceSpec(ports=[...],
+    idle_timeout_s=None)``); leaving it out takes the server's default (3,600).
+    """
+
+    ports: list[ServicePort] = Field(min_length=1, max_length=8)
+    health: HealthCheck | None = None
+    idle_timeout_s: int | None = None
+    restart: Literal["never", "on_node_loss"] | None = None
+
+    @field_validator("idle_timeout_s")
+    @classmethod
+    def _check_idle(cls, value: int | None) -> int | None:
+        if value is not None and not 300 <= value <= 604_800:
+            raise ValueError("idle_timeout_s must be None (never) or 300-604800")
+        return value
+
+    @model_validator(mode="after")
+    def _check_ports(self) -> Self:
+        numbers = [p.port for p in self.ports]
+        names = [p.name for p in self.ports]
+        if len(set(numbers)) != len(numbers) or len(set(names)) != len(names):
+            raise ValueError("service ports and their names must be unique")
+        if self.health is not None and self.health.port not in numbers:
+            raise ValueError("health.port must be one of the service ports")
+        return self
+
+
+class VolumeSpec(_Request):
+    """A persistent volume (services only, spec §7.1, §11.3). ``name`` is a label, never a path."""
+
+    name: str
+    mount: str
+    max_mb: int = Field(ge=64, le=262_144)
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str) -> str:
+        # `tpl:<id>/<name>` is for template launches only: the hub refuses it from a client.
+        if not _VOLUME_NAME_RE.fullmatch(value):
+            raise ValueError("volume name must match [a-z0-9][a-z0-9._-]{0,62}")
+        return value
+
+    @field_validator("mount")
+    @classmethod
+    def _check_mount(cls, value: str) -> str:
+        parts = value.split("/")
+        if (
+            not value.startswith("/volumes/")
+            or len(value) > 4096
+            or "\x00" in value
+            or any(p in ("", ".", "..") for p in parts[1:])
+        ):
+            raise ValueError("volume mount must be an absolute path under /volumes/, without '..'")
+        return value
+
+
+class BlobInput(_Request):
+    """A blob delivered read-only at ``path`` (under ``/inputs``): ``blob`` is ``sha256:<hex>``."""
+
+    path: str
+    blob: str
+
+    @field_validator("path")
+    @classmethod
+    def _check_path(cls, value: str) -> str:
+        parts = value.split("/")
+        if (
+            not value.startswith("/inputs/")
+            or len(value) > 4096
+            or "\x00" in value
+            or any(p in ("", ".", "..") for p in parts[1:])
+        ):
+            raise ValueError("input path must be an absolute path under /inputs, without '..'")
+        return value
+
+    @field_validator("blob")
+    @classmethod
+    def _check_blob(cls, value: str) -> str:
+        if not _BLOB_REF_RE.fullmatch(value):
+            raise ValueError(
+                "blob must be a digest 'sha256:' and 64 lowercase hex digits, as "
+                "client.blobs.put returns it"
+            )
+        return value
+
+
 class JobSpec(_Request):
     """The body of ``POST /v1/jobs``."""
 
+    kind: Literal["batch", "service"] | None = None
     name: str | None = None
     image: str
     command: list[str]
     env: dict[str, str] | None = Field(default=None, repr=False)
     files: list[InputFile] | None = None
+    inputs: list[BlobInput] | None = Field(default=None, max_length=32)
+    volumes: list[VolumeSpec] | None = Field(default=None, max_length=4)
+    service: ServiceSpec | None = None
     resources: Resources = Field(default_factory=Resources)
-    timeout_s: int | None = Field(default=None, ge=1, le=86_400)
+    timeout_s: int | None = Field(default=None, ge=1, le=MAX_SERVICE_TIMEOUT_S)
     egress: Egress | None = None
     outputs: Outputs | None = None
     placement: Placement | None = None
@@ -414,9 +563,42 @@ class JobSpec(_Request):
             raise ValueError("input files are limited to 512 KiB in total (decoded)")
         return self
 
+    @model_validator(mode="after")
+    def _check_kind(self) -> Self:
+        service = self.kind == "service"
+        if service != (self.service is not None):
+            raise ValueError("service is required for kind='service' and forbidden otherwise")
+        if not service:
+            if self.timeout_s is not None and self.timeout_s > 86_400:
+                raise ValueError("timeout_s of a batch job is at most 86400")
+            if self.volumes:
+                raise ValueError("volumes are allowed only for kind='service' jobs")
+        elif self.timeout_s is not None and self.timeout_s < 60:
+            raise ValueError("timeout_s of a service is 60-2592000")
+        if self.volumes:
+            names = [v.name for v in self.volumes]
+            if len(set(names)) != len(names):
+                raise ValueError("volume names must be unique")
+        if self.inputs:
+            paths = [i.path for i in self.inputs]
+            if len(set(paths)) != len(paths):
+                raise ValueError("input paths must be unique")
+        return self
+
     def to_wire(self) -> dict[str, Any]:
-        """JSON-ready body: unset optional members are omitted so server defaults apply."""
-        return self.model_dump(mode="json", exclude_none=True)
+        """JSON-ready body: unset optional members are omitted so server defaults apply.
+
+        One ``None`` is meaningful and kept: ``service.idle_timeout_s`` set explicitly to
+        ``None`` means *never idle out*.
+        """
+        wire = self.model_dump(mode="json", exclude_none=True)
+        if (
+            self.service is not None
+            and "idle_timeout_s" in self.service.model_fields_set
+            and self.service.idle_timeout_s is None
+        ):
+            wire["service"]["idle_timeout_s"] = None
+        return wire
 
 
 # --- response models ---------------------------------------------------------------------

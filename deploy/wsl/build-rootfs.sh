@@ -7,7 +7,8 @@
 # Run as root on a Linux build host or inside a build distro (an existing Ubuntu WSL distro works). Everything
 # happens inside one temporary directory; nothing else on the host is touched, and every mount is undone on exit.
 #
-#   sudo deploy/wsl/build-rootfs.sh [--dry-run] [--out DIR] [--version V] [--agent-from DIST [--agent-version V] | --agent PATH]
+#   sudo deploy/wsl/build-rootfs.sh [--dry-run] [--out DIR] [--version V]
+#                                   [--agent-from DIST [--agent-version V] | --agent PATH [--shim PATH] [--server PATH]]
 #                                   [--base-image FILE] [--update-lock] [--archive snapshot|live]
 #
 # Reproducibility: SOURCE_DATE_EPOCH defaults to the commit time of the checkout (set it yourself to override), and the
@@ -28,7 +29,9 @@
 # 0.2.1 (T14b2 real run): p2pc-shim next to the agent, and the p2pc-node-run that waits for the lock.
 # 0.2.2 (T14b2 review): the agent's config is /var/lib/p2pc/agent.toml (P2PC_AGENT_CONFIG), so -Upgrade carries the
 # enrollment; up to 0.2.1 it was /etc/p2pc/agent.toml and an upgrade lost [server].
-readonly DEFAULT_IMAGE_VERSION="0.2.2"
+# 0.3.0 (H2 T2-41): the hub in the distro: p2pc-server (from the same dist as the agent) and p2pc-run, which runs the
+# agent and, while /var/lib/p2pc-server/hub.enabled exists, the hub; p2pc-node-run is a symlink to it for one release.
+readonly DEFAULT_IMAGE_VERSION="0.3.0"
 readonly BASE_URL="https://releases.ubuntu.com/24.04.5/ubuntu-24.04.5-wsl-amd64.wsl"
 readonly BASE_SHA256="bb415d824822c4b878125729af451a5d18fb13d1cf5cbed9a7393ad64ac6039e"
 readonly NVIDIA_KEY_URL="https://nvidia.github.io/libnvidia-container/gpgkey"
@@ -309,6 +312,13 @@ dist_shim_tarball() {
   printf 'p2pc-shim-%s\n' "${1#p2pc-agent-}"
 }
 
+# dist_server_tarball <agent tarball name>: the p2pc-server tarball of the same version and target. The image carries the
+# hub (H2 §8.5), so --agent-from installs it too.
+dist_server_tarball() {
+  [[ "$1" == p2pc-agent-*.tar.gz ]] || return 1
+  printf 'p2pc-server-%s\n' "${1#p2pc-agent-}"
+}
+
 # dist_sum <SHA256SUMS> <name>: the SHA-256 listed for exactly that name.
 dist_sum() {
   awk -v f="$2" '{ n = $2; sub(/^\*/, "", n) } n == f && $1 ~ /^[0-9a-f]+$/ && length($1) == 64 { print $1; exit }' "$1"
@@ -508,6 +518,7 @@ Inputs
   Ubuntu archive    : $(archive_record "$ARCHIVE" "$SNAPSHOT_TS"): $(archive_urls "$ARCHIVE" "$SNAPSHOT_TS")   (--archive $ARCHIVE; suites: $UBUNTU_SUITES)
   agent binary      : $(agent_plan_line)
   job shim          : $(shim_plan_line)
+  hub server        : $(server_plan_line)
   lock file         : $LOCK_FILE
 
 Steps (as root, in a private temporary directory under \${TMPDIR:-/var/tmp})
@@ -552,13 +563,23 @@ $(containers_conf_content | sed 's/^/         /')
      /usr/local/sbin/p2pc-test-distro (from deploy/wsl/test-distro.sh, mode 0755)
      /usr/local/lib/p2pc/nvidia.sh    (from deploy/wsl/nvidia.sh, mode 0644; sourced by both scripts above)
      /usr/local/lib/p2pc/boot-status.sh (from deploy/wsl/boot-status.sh, mode 0644; "is the boot status of this start?")
-     /usr/local/sbin/p2pc-node-run    (from deploy/wsl/p2pc-node-run, mode 0755; the Scheduled Task runs it)
+     /usr/local/lib/p2pc/listeners.sh (from deploy/wsl/listeners.sh, mode 0644; which TCP sockets listen, and whose:
+                                       p2pc-run stops a hub on a non-loopback address, p2pc-test-distro checks it)
+     /usr/local/sbin/p2pc-run        (from deploy/wsl/p2pc-run, mode 0755; the Scheduled Task runs it: the agent, and
+                                       the hub while /var/lib/p2pc-server/hub.enabled exists)
+     /usr/local/sbin/p2pc-node-run -> p2pc-run   (the old path, kept as a symlink for one release)
      /usr/local/bin/p2pc-agent        (only with --agent-from or --agent)
      /usr/local/bin/p2pc-shim         (with --agent-from, or --agent with --shim; the agent takes no lease without it)
+     /usr/local/bin/p2pc-server       (the hub: with --agent-from, or --agent with --server; p2pc-run starts it only while
+                                       /var/lib/p2pc-server/hub.enabled exists)
+     /usr/local/share/doc/<binary>/LICENSE and THIRD-PARTY-LICENSES   (with --agent-from, for p2pc-agent, p2pc-shim
+                                       and p2pc-server, from their own tarballs; and /usr/local/share/doc/p2pc-server/README,
+                                       which says where the AGPL-3.0-only source of p2pc-server is)
      /etc/wsl-distribution.conf       (DELETED: the base image's first-launch OOBE would create a login user)
   6. create /var/lib/p2pc with mode 0700 (the agent's identity lives here), /var/lib/p2pc/agent.toml (mode 0600, the
      agent's config, no settings: the built-in defaults; join writes [server] into it) and /var/log/p2pc with mode 0700
-     (p2pc-node-run's rotated agent.log: the distro has no journald)
+     (p2pc-run's rotated agent.log and hub.log: the distro has no journald). /var/lib/p2pc-server, the hub's data, is
+     NOT created: \`p2pc-server init\` creates it (0700) on the PC that becomes the hub
      write /etc/p2pc-distro-version  (image version $IMAGE_VERSION, build date, base sha256, apt snapshot)
   7. write manifest.txt from dpkg-query, then restore the stock apt sources, clean: apt lists and caches, /etc/machine-id (emptied), ssh host keys,
      logs, shell history, /tmp, /etc/resolv.conf
@@ -586,13 +607,16 @@ usage() {
 Usage: build-rootfs.sh [options]
   --dry-run          print the plan and exit (no root, no network, no writes)
   --out DIR          output directory (default: <script dir>/out)
-  --version V        image version, MAJOR.MINOR.PATCH (default: 0.2.2)
+  --version V        image version, MAJOR.MINOR.PATCH (default: 0.3.0)
   --agent-from DIST  install the release's agent: p2pc-agent-<v>-x86_64-unknown-linux-musl.tar.gz from DIST (the
                      dist/<version>/ of scripts/release.sh), checked against DIST/SHA256SUMS first (the documented build)
   --agent-version V  with --agent-from: which version, when SHA256SUMS lists several
-                     It also installs p2pc-shim from p2pc-shim-<v>-x86_64-unknown-linux-musl.tar.gz, checked the same way.
+                     It also installs p2pc-shim and p2pc-server (the hub) from
+                     p2pc-{shim,server}-<v>-x86_64-unknown-linux-musl.tar.gz, checked the same way, and the
+                     LICENSE and THIRD-PARTY-LICENSES of all three under /usr/local/share/doc/<binary>/.
   --agent PATH       install this p2pc-agent binary as is (a developer build; not checked against anything)
   --shim PATH        with --agent: install this p2pc-shim binary as is
+  --server PATH      with --agent: install this p2pc-server binary as is (the hub)
   --base-image FILE  use an already downloaded base image (it is still verified against the pinned SHA-256)
   --archive MODE     snapshot (default): Ubuntu packages from the pinned snapshot, reproducible.
                      live: from archive.ubuntu.com / security.ubuntu.com, NOT reproducible; for when the snapshot
@@ -840,17 +864,27 @@ write_configuration() {
   # The one definition of "is there an NVIDIA GPU?", sourced by p2pc-boot and p2pc-test-distro.
   install -D -m 0644 -o 0 -g 0 "$SCRIPT_DIR/nvidia.sh" "$ROOTFS/usr/local/lib/p2pc/nvidia.sh"
   # The one definition of "is this boot status from this start of the distro?", sourced by p2pc-boot,
-  # p2pc-test-distro and p2pc-node-run.
+  # p2pc-test-distro and p2pc-run.
   install -D -m 0644 -o 0 -g 0 "$SCRIPT_DIR/boot-status.sh" "$ROOTFS/usr/local/lib/p2pc/boot-status.sh"
-  # What the "P2PC node" Scheduled Task runs (install.ps1 -Join): it keeps the agent running.
-  install -D -m 0755 -o 0 -g 0 "$SCRIPT_DIR/p2pc-node-run" "$ROOTFS/usr/local/sbin/p2pc-node-run"
-  # The agent's identity and state live here (spec 9.0); only root may enter.
+  # The one reading of the TCP listeners in /proc, sourced by p2pc-run (it stops a hub that listens on a non-loopback
+  # address) and p2pc-test-distro.
+  install -D -m 0644 -o 0 -g 0 "$SCRIPT_DIR/listeners.sh" "$ROOTFS/usr/local/lib/p2pc/listeners.sh"
+  # What the "P2PC node" Scheduled Task runs (install.ps1 -Join): it keeps the agent running, and the hub while it is
+  # enabled (H2 §8.5).
+  install -D -m 0755 -o 0 -g 0 "$SCRIPT_DIR/p2pc-run" "$ROOTFS/usr/local/sbin/p2pc-run"
+  # The old name, kept for one release: tasks registered by an older install.ps1 (and p2pc-wsl's task XML) run it.
+  # Relative, so it points inside the image whatever the rootfs path is at build time.
+  remove_rootfs_file /usr/local/sbin/p2pc-node-run
+  ln -s p2pc-run "$ROOTFS/usr/local/sbin/p2pc-node-run"
+  # The agent's identity and state live here (spec 9.0); only root may enter. /var/lib/p2pc-server, the hub's data, is
+  # not created here: `p2pc-server init` creates it (0700) on the PC that becomes the hub, and an upgrade compares the
+  # listings of both directories before and after, so an empty one in the image would break that comparison.
   install -d -m 0700 -o 0 -g 0 "$ROOTFS/var/lib/p2pc"
   # The agent's config, next to its identity: everything mutable in /var/lib/p2pc, the one directory install.ps1
-  # -Upgrade carries over. p2pc-node-run and install.ps1 name it with P2PC_AGENT_CONFIG. No setting: the built-in
+  # -Upgrade carries over. p2pc-run and install.ps1 name it with P2PC_AGENT_CONFIG. No setting: the built-in
   # defaults (the image never had an /etc/p2pc/agent.toml either); `p2pc-agent join` writes [server] into it.
   write_rootfs_file 0600 /var/lib/p2pc/agent.toml "$(agent_config_content)"
-  # p2pc-node-run's rotated agent.log (no journald in the distro).
+  # p2pc-run's rotated agent.log and hub.log (no journald in the distro).
   install -d -m 0700 -o 0 -g 0 "$ROOTFS/var/log/p2pc"
   write_rootfs_file 0644 /etc/p2pc-distro-version \
     "$(printf 'image_version=%s\nbuild_date=%s\nbase_sha256=%s\narchive=%s%s' "$IMAGE_VERSION" "$(iso8601_utc "$SOURCE_DATE_EPOCH")" "$BASE_SHA256" "$(archive_record "$ARCHIVE" "$SNAPSHOT_TS")" "$(archive_build_time_line)")"
@@ -862,6 +896,22 @@ write_configuration() {
     # Next to the agent: that is where its executor looks for it.
     install -D -m 0755 -o 0 -g 0 "$SHIM_PATH" "$ROOTFS/usr/local/bin/p2pc-shim"
     log "installed p2pc-shim (sha256 $(sha256_of "$SHIM_PATH"))"
+  fi
+  if [[ -n "$SERVER_PATH" ]]; then
+    # The hub (H2 §8.5). p2pc-run starts it only while /var/lib/p2pc-server/hub.enabled exists.
+    install -D -m 0755 -o 0 -g 0 "$SERVER_PATH" "$ROOTFS/usr/local/bin/p2pc-server"
+    log "installed p2pc-server (sha256 $(sha256_of "$SERVER_PATH"))"
+  fi
+  # With --agent-from: each binary's LICENSE and THIRD-PARTY-LICENSES (and p2pc-server's README, which says where its
+  # AGPL-3.0-only source is) go with it, under /usr/local/share/doc/<binary>/.
+  if [[ -n "$AGENT_DOC_DIR" ]]; then
+    install_doc_files p2pc-agent "$AGENT_DOC_DIR" || die "cannot install the license files of p2pc-agent"
+  fi
+  if [[ -n "$SHIM_DOC_DIR" ]]; then
+    install_doc_files p2pc-shim "$SHIM_DOC_DIR" || die "cannot install the license files of p2pc-shim"
+  fi
+  if [[ -n "$SERVER_DOC_DIR" ]]; then
+    install_doc_files p2pc-server "$SERVER_DOC_DIR" || die "cannot install the license files of p2pc-server"
   fi
 }
 
@@ -885,6 +935,12 @@ write_manifest() {
       fi
     else
       printf '# p2pc-agent not included\n'
+    fi
+    if [[ -n "$SERVER_PATH" ]]; then
+      printf '# p2pc-server sha256 %s\n' "$(sha256_of "$SERVER_PATH")"
+      [[ -z "$AGENT_FROM" ]] || printf '# p2pc-server from %s (sha256 %s, verified against SHA256SUMS)\n' "$SERVER_TARBALL" "$SERVER_TARBALL_SHA"
+    else
+      printf '# p2pc-server not included: this image cannot be a hub\n'
     fi
     printf '# package<TAB>version\n'
     # shellcheck disable=SC2016  # dpkg-query expands ${Package}/${Version} itself
@@ -966,6 +1022,17 @@ shim_plan_line() {
   fi
 }
 
+# server_plan_line: the "hub server" line of the plan.
+server_plan_line() {
+  if [[ -n "$AGENT_FROM" ]]; then
+    printf '%s/%s (sha256 %s, verified against %s/SHA256SUMS) -> /usr/local/bin/p2pc-server' "$AGENT_FROM" "$SERVER_TARBALL" "$SERVER_TARBALL_SHA" "$AGENT_FROM"
+  elif [[ -n "$SERVER_PATH" ]]; then
+    printf '%s (--server: a developer build) -> /usr/local/bin/p2pc-server' "$SERVER_PATH"
+  else
+    printf 'none (this image cannot be a hub)'
+  fi
+}
+
 # extract_from_dist <tarball> <sha256> <binary>: copies one verified tarball into the work dir, checks it again there
 # (nothing can swap it between the check and the read), and prints the path of the binary taken out of it.
 extract_from_dist() {
@@ -981,11 +1048,46 @@ extract_from_dist() {
   printf '%s\n' "$path"
 }
 
-# extract_dist_agent: the agent (AGENT_PATH) and, when its tarball is known, p2pc-shim (SHIM_PATH) from the dist.
+# extract_doc <tarball> <file...>: the named files of <stem>/ (LICENSE, THIRD-PARTY-LICENSES, README) from the work-dir
+# copy that extract_from_dist already checked; prints the directory that holds them. Every one must be there, as a
+# regular file: scripts/release.sh puts LICENSE and THIRD-PARTY-LICENSES in every tarball.
+extract_doc() {
+  local tarball="$1" stem="${1%.tar.gz}" dir="$WORK/agent/doc" f
+  shift
+  local -a members=()
+  for f in "$@"; do members+=("$stem/$f"); done
+  mkdir -p "$dir"
+  tar -xzf "$WORK/agent/$tarball" -C "$dir" "${members[@]}" || die "$tarball lacks one of: ${members[*]}"
+  for f in "$@"; do
+    [[ -f "$dir/$stem/$f" && ! -L "$dir/$stem/$f" ]] || die "$stem/$f in $tarball is not a regular file"
+  done
+  printf '%s\n' "$dir/$stem"
+}
+
+# install_doc_files <binary> <dir>: LICENSE, THIRD-PARTY-LICENSES and (when there is one) README from <dir> into
+# /usr/local/share/doc/<binary>/ of the image, mode 0644. The binaries are distributed in the image, so their license
+# texts and the licenses of everything compiled into them go with them; p2pc-server's README says where its source is
+# (AGPL-3.0-only).
+install_doc_files() {
+  local bin="$1" dir="$2" f
+  for f in LICENSE THIRD-PARTY-LICENSES README; do
+    [[ -f "$dir/$f" ]] || continue
+    install -D -m 0644 -o 0 -g 0 "$dir/$f" "$ROOTFS/usr/local/share/doc/$bin/$f" || return 1
+  done
+}
+
+# extract_dist_agent: the agent (AGENT_PATH) and, when their tarballs are known, p2pc-shim (SHIM_PATH) and p2pc-server
+# (SERVER_PATH) from the dist, each with its license files (AGENT_DOC_DIR, SHIM_DOC_DIR, SERVER_DOC_DIR).
 extract_dist_agent() {
   AGENT_PATH="$(extract_from_dist "$AGENT_TARBALL" "$AGENT_TARBALL_SHA" p2pc-agent)" || exit 1
+  AGENT_DOC_DIR="$(extract_doc "$AGENT_TARBALL" LICENSE THIRD-PARTY-LICENSES)" || exit 1
   if [[ -n "${SHIM_TARBALL:-}" ]]; then
     SHIM_PATH="$(extract_from_dist "$SHIM_TARBALL" "$SHIM_TARBALL_SHA" p2pc-shim)" || exit 1
+    SHIM_DOC_DIR="$(extract_doc "$SHIM_TARBALL" LICENSE THIRD-PARTY-LICENSES)" || exit 1
+  fi
+  if [[ -n "${SERVER_TARBALL:-}" ]]; then
+    SERVER_PATH="$(extract_from_dist "$SERVER_TARBALL" "$SERVER_TARBALL_SHA" p2pc-server)" || exit 1
+    SERVER_DOC_DIR="$(extract_doc "$SERVER_TARBALL" LICENSE README THIRD-PARTY-LICENSES)" || exit 1
   fi
 }
 
@@ -1002,6 +1104,12 @@ main() {
   SHIM_PATH=""
   SHIM_TARBALL=""
   SHIM_TARBALL_SHA=""
+  SERVER_PATH=""
+  SERVER_TARBALL=""
+  SERVER_TARBALL_SHA=""
+  SERVER_DOC_DIR=""
+  AGENT_DOC_DIR=""
+  SHIM_DOC_DIR=""
   BASE_IMAGE_FILE=""
   local dry_run=0
   UPDATE_LOCK=0
@@ -1019,7 +1127,7 @@ main() {
         ARCHIVE="$(parse_archive_mode "$2")" || die "invalid --archive '$2' (expected snapshot or live; there is no automatic fallback)"
         shift
         ;;
-      --out | --version | --agent | --shim | --agent-from | --agent-version | --base-image)
+      --out | --version | --agent | --shim | --server | --agent-from | --agent-version | --base-image)
         (($# >= 2)) || {
           usage >&2
           die "$1 needs a value"
@@ -1029,6 +1137,7 @@ main() {
           --version) IMAGE_VERSION="$2" ;;
           --agent) AGENT_PATH="$2" ;;
           --shim) SHIM_PATH="$2" ;;
+          --server) SERVER_PATH="$2" ;;
           --agent-from) AGENT_FROM="$2" ;;
           --agent-version) AGENT_VERSION="$2" ;;
           --base-image) BASE_IMAGE_FILE="$2" ;;
@@ -1067,6 +1176,9 @@ main() {
   if [[ -n "$SHIM_PATH" && -z "$AGENT_PATH" ]]; then
     die "--shim only goes with --agent (--agent-from takes p2pc-shim from the dist)"
   fi
+  if [[ -n "$SERVER_PATH" && -z "$AGENT_PATH" ]]; then
+    die "--server only goes with --agent (--agent-from takes p2pc-server from the dist)"
+  fi
   if [[ -n "$AGENT_PATH" ]]; then
     [[ -f "$AGENT_PATH" ]] || die "--agent: no such file: $AGENT_PATH"
     is_elf "$AGENT_PATH" || die "--agent: $AGENT_PATH is not an ELF executable"
@@ -1074,6 +1186,10 @@ main() {
   if [[ -n "$SHIM_PATH" ]]; then
     [[ -f "$SHIM_PATH" ]] || die "--shim: no such file: $SHIM_PATH"
     is_elf "$SHIM_PATH" || die "--shim: $SHIM_PATH is not an ELF executable"
+  fi
+  if [[ -n "$SERVER_PATH" ]]; then
+    [[ -f "$SERVER_PATH" ]] || die "--server: no such file: $SERVER_PATH"
+    is_elf "$SERVER_PATH" || die "--server: $SERVER_PATH is not an ELF executable"
   fi
   if [[ -n "$AGENT_FROM" ]]; then
     # Checked now, before the plan or the build: reading only, so a dry run does it too.
@@ -1087,6 +1203,11 @@ main() {
       die "--agent-from: $AGENT_FROM/SHA256SUMS lists no $SHIM_TARBALL: the agent takes no lease without p2pc-shim, so the image would be useless"
     SHIM_TARBALL_SHA="$(verified_dist_sum "$AGENT_FROM" "$SHIM_TARBALL")" ||
       die "--agent-from: SHA-256 mismatch (or a missing file) for $AGENT_FROM/$SHIM_TARBALL against SHA256SUMS: refusing to use it"
+    SERVER_TARBALL="$(dist_server_tarball "$AGENT_TARBALL")" || die "internal error: no server tarball name for $AGENT_TARBALL"
+    [[ -n "$(dist_sum "$AGENT_FROM/SHA256SUMS" "$SERVER_TARBALL")" ]] ||
+      die "--agent-from: $AGENT_FROM/SHA256SUMS lists no $SERVER_TARBALL: the image carries the hub (H2 spec 8.5), so it needs p2pc-server"
+    SERVER_TARBALL_SHA="$(verified_dist_sum "$AGENT_FROM" "$SERVER_TARBALL")" ||
+      die "--agent-from: SHA-256 mismatch (or a missing file) for $AGENT_FROM/$SERVER_TARBALL against SHA256SUMS: refusing to use it"
   fi
 
   if ((dry_run)); then

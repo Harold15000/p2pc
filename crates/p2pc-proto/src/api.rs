@@ -2371,8 +2371,16 @@ pub enum UsageGroupBy {
     Job,
     /// Per node.
     Node,
-    /// Per API key.
+    /// Per API key. Rows of device principals are left out of the groups (H2 §12).
     Key,
+    /// Per device (H2 §12). Rows of API keys are left out of the groups.
+    Device,
+    /// Per principal (H2 §12): every row, in groups labelled `key:<id>` or `device:<id>`.
+    Principal,
+    /// Per job kind, `batch` or `service` (H2 §12).
+    Kind,
+    /// Per template (H2 §12). Rows of jobs that came from no template are left out of the groups.
+    Template,
 }
 
 /// Totals of a set of usage records: one group of `GET /v1/usage`, or the whole range.

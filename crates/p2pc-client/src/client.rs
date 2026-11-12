@@ -859,6 +859,10 @@ impl Client {
                     UsageGroupBy::Job => "job",
                     UsageGroupBy::Node => "node",
                     UsageGroupBy::Key => "key",
+                    UsageGroupBy::Device => "device",
+                    UsageGroupBy::Principal => "principal",
+                    UsageGroupBy::Kind => "kind",
+                    UsageGroupBy::Template => "template",
                 },
             );
         }

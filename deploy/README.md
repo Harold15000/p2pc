@@ -542,6 +542,36 @@ archive into the distro and extract it. From **cmd.exe** (PowerShell has no `<` 
 `wsl.exe -d p2pc-node -u root --exec /bin/tar --numeric-owner -C /var/lib -xpf - < "%LOCALAPPDATA%\P2PC\backups\p2pc-state-<timestamp>.tar"`.
 When the node is back, delete that file (it is never pruned: it did not come from a finished upgrade).
 
+On the PC that hosts the hub (H2: `/var/lib/p2pc-server/hub.enabled` exists) the same archive also holds
+`/var/lib/p2pc-server`: the cloud's database, the hub's keys, its blobs and `hub.enabled`. The command above restores
+both directories, because the archive's names are relative to `/var/lib` (`p2pc/...`, `p2pc-server/...`). Before you
+start the node again, check that the hub came back whole:
+`wsl.exe -d p2pc-node -u root --exec /usr/bin/stat -c "%a %U %n" /var/lib/p2pc-server /var/lib/p2pc-server/hub.enabled`
+must show `700 root` for the directory, and
+`wsl.exe -d p2pc-node -u root --exec /usr/bin/env P2PC_DATA_DIR=/var/lib/p2pc-server /usr/local/bin/p2pc-server info`
+must print the hub's NodeId as before (your phone and your other PCs know the hub by it). Then `.\install.ps1 -Start`.
+Treat this archive like the cloud itself: anyone with it holds your hub's keys and database.
+
+*Backing up and restoring the hub's data by hand.* `-Upgrade` stops with exit 23, and touches nothing, when
+`/var/lib/p2pc-server` exists without `/var/lib/p2pc`, or when the drives have no room for the archive. Before you
+repair such a distro, or before anything else that may lose it, copy the hub's data out of it yourself. From
+**cmd.exe**, with the node stopped (`.\install.ps1 -Stop`, so that the hub's database is not being written):
+
+1. Make the archive inside the distro, mode 0600, and note its hash:
+   `wsl.exe -d p2pc-node -u root --exec /bin/sh -c "umask 077; tar --numeric-owner -C /var/lib -cpf /var/tmp/p2pc-server-backup.tar p2pc-server; sha256sum /var/tmp/p2pc-server-backup.tar"`
+2. Copy it out byte for byte (cmd.exe redirection, never a PowerShell pipe, which re-encodes binary data):
+   `wsl.exe -d p2pc-node -u root --exec /bin/cat /var/tmp/p2pc-server-backup.tar > "%LOCALAPPDATA%\P2PC\backups\p2pc-server-<timestamp>.tar"`
+3. Check that `certutil -hashfile "%LOCALAPPDATA%\P2PC\backups\p2pc-server-<timestamp>.tar" SHA256` prints the hash of
+   step 1, then delete the copy in the distro:
+   `wsl.exe -d p2pc-node -u root --exec /bin/rm -f /var/tmp/p2pc-server-backup.tar`
+
+To restore it, into a distro whose node is stopped and that has no `/var/lib/p2pc-server` of its own (move an existing
+one aside first; tar would mix the two):
+`wsl.exe -d p2pc-node -u root --exec /bin/tar --numeric-owner -C /var/lib -xpf - < "%LOCALAPPDATA%\P2PC\backups\p2pc-server-<timestamp>.tar"`,
+then run the two checks above (`700 root`, the same NodeId) and `.\install.ps1 -Start`. `p2pc-run` starts the hub within
+about 5 s if `hub.enabled` came back. These `p2pc-server-*.tar` files are yours: neither `-Upgrade` nor `-Uninstall`
+prunes or deletes them.
+
 ### 5. Uninstall
 
 ```powershell
