@@ -262,6 +262,14 @@ enum Online {
 }
 
 impl Online {
+    /// Whether the owner paused sharing (H2 §6.1, §8.4): the node takes no new work, as if draining.
+    fn owner_paused(&self, node: &NodeRow) -> bool {
+        match self {
+            Online::Hello { inventory, .. } => inventory.is_owner_paused(),
+            Online::Joined => node.inventory.is_owner_paused(),
+        }
+    }
+
     /// Marks the node online. `Some(draining)` while it is live, `None` when it was deleted.
     async fn write(&self, inner: &Inner, node_id: NodeId, now: OffsetDateTime) -> Result<Option<bool>, StoreError> {
         let mut conn = inner.state.db.acquire().await?;
@@ -606,8 +614,9 @@ async fn session(
         }
     }
     // A node that joined, connected or reconnected is an eligible node changing, which re-arms the offer cap (§8);
-    // a draining one is not eligible, so it re-arms nothing until it is resumed (review P3).
-    if draining {
+    // a draining one (or one its owner paused, H2 §8.4) is not eligible, so it re-arms nothing until it is resumed
+    // (review P3).
+    if draining || online.owner_paused(&node) {
         inner.state.kick.kick();
     } else {
         crate::scheduler::node_changed(&inner.state.db, &inner.state.kick, node.account_id).await;
@@ -661,9 +670,10 @@ async fn run(inner: &Inner, control: &mut Control, node: &NodeRow) {
                     }
                 };
                 // The offered capacity may have changed (§6 `InventoryUpdate`). Only a real change on a node that is
-                // not draining is an eligible node changing, which re-arms the offer cap (§8, review P3).
+                // not draining, nor paused by its owner (H2 §8.4), is an eligible node changing, which re-arms the
+                // offer cap (§8, review P3). A resume (`owner_paused` back to false) is such a change.
                 match update {
-                    Some(u) if u.changed && !u.draining => {
+                    Some(u) if u.changed && !u.draining && !inventory.is_owner_paused() => {
                         crate::scheduler::node_changed(&inner.state.db, &inner.state.kick, node.account_id).await;
                     }
                     Some(u) if u.changed => inner.state.kick.kick(),
