@@ -43,7 +43,9 @@ download_mb = 7200
 
 [requirements]
 gpu = "preferred"
-min_vram_mb = 5120
+# The reference PC's floor (§7.6, §16): the default used 5,020 MiB of VRAM after one chat, so a card with less would
+# have almost no headroom and Ollama would move layers to the CPU.
+min_vram_mb = 6144
 
 # The model the hub downloads at launch (the `pull` target). The default is at most about 4 B parameters, Apache-2.0,
 # a 2.4 GB download that does not think out loud (checked on a test node). `qwen3:1.7b` is the smaller choice for a

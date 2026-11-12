@@ -42,6 +42,8 @@ fn sandbox(with_audio: bool) -> Sandbox {
     let bin = dir.path().join("bin");
     let log = dir.path().join("calls.log");
     fs::create_dir_all(root.join("inputs")).expect("mkdir");
+    // The job's /tmp: a tmpfs of its own that goes with the container (the sandbox's `--tmpfs /tmp`).
+    fs::create_dir_all(root.join("tmp")).expect("mkdir");
     fs::create_dir_all(&bin).expect("mkdir");
     fs::write(&log, "").expect("log");
     if with_audio {
@@ -244,6 +246,11 @@ fn every_listed_model_is_checked_against_its_own_pinned_hash() {
             1,
             "{model}: the file is hashed before use"
         );
+        let hashed = &calls(&sb, "sha256sum")[0];
+        assert!(
+            hashed.ends_with(&format!("ggml-{model}.bin.part]")),
+            "{model}: a download is hashed under its temporary name, before the rename: {hashed}"
+        );
     }
     let text = fs::read_to_string(script()).expect("script");
     for (model, hash) in PINNED_HASHES {
@@ -268,6 +275,10 @@ fn a_correct_model_already_in_the_volume_is_used_without_a_download_and_is_still
         calls(&sb, "sha256sum").len(),
         1,
         "the check runs on every run, download or not"
+    );
+    assert!(
+        calls(&sb, "sha256sum")[0].ends_with("ggml-small.bin]"),
+        "a model already in the volume is hashed under its own name"
     );
     // And again: still no download, still a check.
     assert!(run(&sb, "auto", "small").status.success());
@@ -305,6 +316,22 @@ fn a_corrupted_model_in_the_volume_is_deleted_and_the_run_fails() {
                 .map_or(true, |mut d| d.next().is_none()),
             "no transcript from a bad model"
         );
+
+        // The next run downloads it again (the fake curl serves the good file) and succeeds.
+        let again = run(&sb, "auto", "small");
+        assert!(
+            again.status.success(),
+            "{content:?}: the second run: {}",
+            String::from_utf8_lossy(&again.stderr)
+        );
+        assert_eq!(
+            calls(&sb, "curl").len(),
+            1,
+            "{content:?}: the second run downloads the model"
+        );
+        assert_eq!(calls(&sb, "whisper").len(), 1, "{content:?}: and uses it");
+        assert!(models.join("ggml-small.bin").is_file());
+        assert!(!models.join("ggml-small.bin.part").exists());
     }
 }
 
@@ -346,15 +373,77 @@ fn a_signal_still_removes_the_converted_audio() {
             out.status,
             String::from_utf8_lossy(&out.stderr)
         );
-        let left: Vec<String> = fs::read_dir(sb.root.join("volumes/models"))
-            .expect("models")
-            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
-            .collect();
-        assert!(
-            left.iter().all(|n| !n.starts_with(".work.")),
-            "{signal}: the scratch directory with the audio is gone: {left:?}"
+        assert_eq!(
+            names_in(&sb.root.join("tmp")),
+            Vec::<String>::new(),
+            "{signal}: the scratch directory with the audio is gone from /tmp"
+        );
+        assert_eq!(
+            names_in(&sb.root.join("volumes/models")),
+            ["ggml-small.bin"],
+            "{signal}: nothing but the model is in the volume"
         );
     }
+}
+
+/// The sorted names directly inside `dir`.
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .expect("read_dir")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn the_converted_audio_is_scratch_in_tmp_and_never_in_the_volume() {
+    // The converted audio is a full copy of the user's recording. It goes in the job's /tmp (a tmpfs that disappears
+    // with the container, whatever ends the job), not in the persistent models volume.
+    let sb = sandbox(true);
+    let out = run(&sb, "auto", "small");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let whisper = &calls(&sb, "whisper")[0];
+    let tmp = sb.root.join("tmp");
+    assert!(
+        whisper.contains(&format!("[-f] [{}/transcribe.", tmp.display())),
+        "whisper reads the audio from a transcribe.* directory in /tmp: {whisper}"
+    );
+    let ffmpeg = &calls(&sb, "ffmpeg")[0];
+    assert!(
+        ffmpeg.contains(&format!("[{}/transcribe.", tmp.display())) && !ffmpeg.contains("volumes"),
+        "ffmpeg writes it there: {ffmpeg}"
+    );
+    assert_eq!(names_in(&sb.root.join("volumes/models")), ["ggml-small.bin"]);
+    assert_eq!(
+        names_in(&tmp),
+        Vec::<String>::new(),
+        "the scratch directory is removed on exit"
+    );
+}
+
+#[test]
+fn a_sigkill_during_the_run_leaves_nothing_in_the_volume() {
+    // SIGKILL cannot be trapped, and the shim signals only the script's own shell, so the kill (after the 10 s grace)
+    // can land while ffmpeg or whisper-cli runs. Whatever is on disk then must be in the job's /tmp, which goes with
+    // the container, never in the volume. The fake whisper-cli SIGKILLs the script's shell and returns, which leaves
+    // exactly that state with nothing to race.
+    use std::os::unix::process::ExitStatusExt;
+
+    let sb = sandbox(true);
+    write_tool(&sb.bin, "whisper-cli", "kill -KILL $PPID");
+    let out = run(&sb, "auto", "small");
+    assert_eq!(out.status.signal(), Some(9), "{:?}", out.status);
+    assert_eq!(
+        names_in(&sb.root.join("volumes/models")),
+        ["ggml-small.bin"],
+        "only the model is in the volume after a SIGKILL"
+    );
+    // The converted audio is in /tmp (still here, since the EXIT trap did not run; gone with the real tmpfs).
+    let scratch = names_in(&sb.root.join("tmp"));
+    assert_eq!(scratch.len(), 1, "{scratch:?}");
+    assert!(scratch[0].starts_with("transcribe."), "{scratch:?}");
+    assert!(sb.root.join("tmp").join(&scratch[0]).join("audio.wav").is_file());
 }
 
 #[test]

@@ -58,9 +58,10 @@ fi
 
 mkdir -p "$out" "$models"
 
-# A run killed by its timeout or by the loss of its node cannot run the `trap` below, and the volume outlives the job.
-# So clear what an earlier run left behind: its scratch directories and its half-written downloads. A volume has one
-# job at a time (spec §11.3), so nothing here belongs to a run that is still going. Finished models stay.
+# What an earlier run may have left in the volume, which outlives the job: half-written downloads (a run killed by its
+# timeout or by the loss of its node cannot clean up), and `.work.*` directories, which older versions of this script
+# used for the converted audio (it now goes in /tmp, below). A volume has one job at a time (spec §11.3), so nothing
+# here belongs to a run that is still going. Finished models stay.
 rm -rf "$models"/.work.*
 rm -f "$models"/ggml-*.bin.part
 
@@ -82,10 +83,18 @@ if ! command -v sha256sum >/dev/null 2>&1; then
   exit 69
 fi
 
+# `check_model <file>`: whether the file has the pinned hash. `cut` takes the hash out of `sha256sum`'s
+# "<hash>  <file>"; an empty answer matches nothing, so a failing sha256sum fails closed.
+check_model() {
+  actual="$(sha256sum "$1" | cut -d ' ' -f 1)"
+  [ "$actual" = "$expected" ]
+}
+
 model_file="$models/ggml-$model.bin"
 if [ ! -s "$model_file" ]; then
-  # Downloaded under a temporary name and renamed when complete, so an interrupted download is never mistaken for
-  # the model. The shim's proxy settings carry the traffic through the egress allowlist.
+  # Downloaded under a temporary name, checked, and renamed to the final name only when the hash matches: a file under
+  # the final name is always one that has passed the check, even if the job is killed in between. The shim's proxy
+  # settings carry the traffic through the egress allowlist.
   #
   # Bounded, so that a connection that goes quiet cannot hold the job until its whole timeout_s (one hour):
   #  - --speed-limit/--speed-time: under 10 KiB/s for 60 s is a stall, and curl gives up on that try;
@@ -98,22 +107,25 @@ if [ ! -s "$model_file" ]; then
     --connect-timeout 20 --speed-limit 10240 --speed-time 60 --max-time 1800 \
     --retry 2 --retry-max-time 1800 \
     --output "$model_file.part" "$url"
+  if ! check_model "$model_file.part"; then
+    rm -f "$model_file.part"
+    echo "transcribe: the downloaded $model model failed its checksum and was deleted; run again to download it" >&2
+    exit 65
+  fi
   mv "$model_file.part" "$model_file"
-fi
-
-# Every run, whether the file was just downloaded or has been in the volume for weeks. `cut` takes the hash out of
-# `sha256sum`'s "<hash>  <file>"; an empty answer matches nothing, so a failing sha256sum fails closed.
-actual="$(sha256sum "$model_file" | cut -d ' ' -f 1)"
-if [ "$actual" != "$expected" ]; then
+elif ! check_model "$model_file"; then
+  # A model that was already in the volume is checked too, on every run, before it is used.
   rm -f "$model_file"
-  echo "transcribe: the $model model failed its checksum and was deleted; run again to download it" >&2
+  echo "transcribe: the $model model in the volume failed its checksum and was deleted; run again to download it" >&2
   exit 65
 fi
 
-# The converted audio is scratch: a full copy of the user's recording. Keep it out of the outputs and remove it on every
-# exit. `sh` does not run its EXIT trap when a signal ends it, so TERM, INT and HUP are turned into an exit (143) and
-# the EXIT trap runs; SIGKILL cannot be trapped, and what it leaves is removed by the next run (above).
-work="$(mktemp -d "$models/.work.XXXXXX")"
+# The converted audio is scratch: a full copy of the user's recording. It goes in the job's /tmp, a tmpfs that belongs
+# to the container and disappears with it whatever ends the job (a SIGKILL included), never in the persistent models
+# volume. The shim signals only this shell, and `sh` runs a trap only when its foreground command has returned, so the
+# traps below cover a signal that arrives between commands and the normal exit; for a SIGKILL during ffmpeg or whisper,
+# the tmpfs is what removes the copy. TERM, INT and HUP become an exit (143) so that the EXIT trap runs.
+work="$(mktemp -d "$root${TMPDIR:-/tmp}/transcribe.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 trap 'exit 143' TERM INT HUP
 

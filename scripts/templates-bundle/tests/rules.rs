@@ -126,6 +126,10 @@ fn the_shipped_chat_template_defaults_to_a_model_that_does_not_think() {
     };
     assert_eq!(values, &["qwen3:4b-instruct", "qwen3:1.7b"]);
     assert_eq!(model.default, Some(ParamValue::Text("qwen3:4b-instruct".to_string())));
+    // §7.6 fixes the floor at the reference PC's 6,144 MiB: the default used 5,020 MiB of VRAM after one chat, and a
+    // card with less would be offered the template with almost no headroom. The hub and the UI use this as the
+    // eligibility floor, so it is pinned here.
+    assert_eq!(chat.info.requirements.min_vram_mb, Some(6144));
     let licenses = chat.info.licenses.join("\n");
     assert!(!licenses.to_lowercase().contains("gemma"), "{licenses}");
     assert_eq!(
