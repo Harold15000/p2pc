@@ -289,6 +289,9 @@ pub struct Node {
     /// capability and reports them ([`crate::connection::session::Shared::volumes`]). `None` otherwise; the driver
     /// has the store either way.
     pub volumes: Option<VolumeStore>,
+    /// Whether the driver has the `BlobFetch` client (H2 §7.5): the session declares `blob_inputs`, and accepts
+    /// leases with blob inputs, exactly then ([`crate::connection::session::Shared::blob_inputs`]).
+    pub blob_inputs: bool,
 }
 
 /// Builds the driver and the executor from `facts`. `public_addrs` is the live source of the node's public addresses
@@ -356,6 +359,7 @@ pub fn build(
     cfg.volumes = volumes.clone();
     // Blob inputs (H2 §7.5) come over the agent's connection of the moment, as the outputs go.
     cfg.blobs = Some(BlobInputs::new(uplink.clone()));
+    let blob_inputs = cfg.blobs.is_some();
     let driver = PodmanDriver::new(
         cfg,
         PodmanEngine::system("podman", PULL_TIMEOUT),
@@ -375,6 +379,7 @@ pub fn build(
         offers: OfferFeed { tx, driver: limits },
         ingress,
         volumes,
+        blob_inputs,
     }
 }
 
@@ -435,6 +440,31 @@ mod tests {
         assert!(problems.contains("detection_failed"), "{problems}");
         assert!(problems.contains("shim_missing"), "{problems}");
         assert!(problems.contains("lease_cgroups: no delegation"), "{problems}");
+    }
+
+    /// Review P3 of T2-24: one source of truth for `blob_inputs`. What the session declares and accepts
+    /// ([`Node::blob_inputs`]) is whether the driver was given the `BlobFetch` client, so the session never accepts a
+    /// lease that the driver then refuses as `invalid_job`.
+    #[tokio::test]
+    async fn blob_inputs_is_declared_exactly_when_the_driver_has_the_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = build(
+            &config(dir.path()),
+            NodeFacts {
+                platform: Platform::Linux,
+                report: None,
+                shim: dir.path().join("no-shim"),
+                cgroups: Err("no delegation".into()),
+                volumes: None,
+            },
+            AccountId::generate(),
+            Uplink::new(),
+            watch::channel(Vec::new()).1,
+            watch::channel(p2pc_net::EgressGate::Closed).1,
+            Arc::new(SystemClock),
+        );
+        assert_eq!(node.blob_inputs, node.executor.sandbox().config().blobs.is_some());
+        assert!(node.blob_inputs, "the production driver always has it");
     }
 
     /// P3-4: one agent per data dir; the lock goes with its holder.
