@@ -36,6 +36,7 @@ use p2pc_agent::identity::{IDENTITY_FILE, Identity};
 use p2pc_agent::inventory;
 use p2pc_agent::node::{self, Node, NodeFacts, lock_data_dir};
 use p2pc_agent::runner::SystemRunner;
+use p2pc_net::relays::{HttpProber, RELAY_PROBE_TIMEOUT, Role, check_relay_map};
 use p2pc_net::{current_selection, watch_network};
 
 /// P2PC node agent.
@@ -239,6 +240,12 @@ fn doctor_cmd(cli: &Cli, env: &Env) -> anyhow::Result<ExitCode> {
     // Skipped (and said so) on a fresh machine with no data dir yet, and when doctor runs as another user than the
     // data dir's owner (`sudo p2pc-agent doctor`).
     let egress_socket = doctor::check_egress_socket(&config.data_dir);
+    // H2 §10.2-§10.3: the relays this node uses, their rules, and each one's reachability and latency.
+    let relays = block_on(doctor::check_relays(
+        HttpProber::new(RELAY_PROBE_TIMEOUT).map(Arc::new),
+        &config.relays(),
+        config.server.is_some(),
+    ))?;
     let (text, ready) = doctor::render(&Findings {
         config_source: describe(&source),
         config_error,
@@ -246,6 +253,7 @@ fn doctor_cmd(cli: &Cli, env: &Env) -> anyhow::Result<ExitCode> {
         probe: &probe,
         report: &report,
         egress_socket,
+        relays,
     });
     print!("{text}");
     Ok(if ready { ExitCode::SUCCESS } else { ExitCode::FAILURE })
@@ -355,6 +363,8 @@ fn run_cmd(cli: &Cli, env: &Env) -> anyhow::Result<ExitCode> {
     let result = rt.block_on(async move {
         let id = Identity::load(&config.data_dir)?;
         let relays = config.relays();
+        // H2 §10.3: a map with no address-discovery relay never opens the egress gate; say so at start.
+        check_relay_map(&relays, Role::Node).log();
         let bind = current_selection(&config.iroh.direct_addresses).await;
         let connector = IrohConnector::new(
             id.secret_key().clone(),

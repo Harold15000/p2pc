@@ -626,6 +626,7 @@ async fn wsl2_binfmt_entry_alone_is_only_a_note() {
             probe: &probe,
             report: &Ok(report),
             egress_socket: crate::doctor::EgressSocketState::Ok,
+            relays: crate::doctor::RelayState::NotEnrolled,
         });
         assert!(ready, "{text}");
         assert!(

@@ -13,13 +13,18 @@ publish.workspace = true
 iroh.workspace = true
 netwatch.workspace = true
 p2pc-proto = { version = "0.1.0", path = "../p2pc-proto" }
+# The relay probe of `p2pc-agent doctor` (H2 §10.3): `GET <relay>/ping`. Already in the tree through iroh, same pin,
+# with iroh's TLS (no provider of its own).
+reqwest.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tracing.workspace = true
+# The host of a relay URL (`RelayUrl` derefs to `url::Url`); the workspace pin iroh already uses.
+url.workspace = true
 
 [dev-dependencies]
 n0-watcher = "1.0.1"
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time", "test-util"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time", "test-util"] }
 
 [lints]
 workspace = true
