@@ -11,6 +11,7 @@
 //! - [`settings`]: the app's settings file (start at sign-in, opt-out);
 //! - [`autostart`]: the `HKCU\…\Run` entry behind a trait;
 //! - [`launch`]: start in the window or in the tray, and what a second start does (single instance);
+//! - [`keep_awake`]: "Keep this PC awake while sharing" (§8.6), `SetThreadExecutionState` behind a trait;
 //! - [`keystore`]: the device key, DPAPI-protected in `%LOCALAPPDATA%\P2PC\device.key`;
 //! - [`navigation`]: bundled pages only, web links to the system browser;
 //! - [`commands`] and [`capabilities`]: the window's commands and the checks that pin the capability, the CSP and the
@@ -23,6 +24,7 @@ pub mod autostart;
 pub mod capabilities;
 pub mod commands;
 pub mod core;
+pub mod keep_awake;
 pub mod keystore;
 pub mod launch;
 pub mod navigation;

@@ -6,7 +6,7 @@
 //! |---|---|---|---|
 //! | `setup` | First run not finished | grey | install |
 //! | `sharing` | Node online, taking work | green | resume, setup done |
-//! | `paused` | Node online, takes no new work | yellow | "Pause" |
+//! | `paused` | Node online, takes no new work | yellow | "Pause"; on the hub PC also its own node being removed (§8.5) |
 //! | `stopped` | Distro terminated, task disabled | grey | "Stop sharing" / "Turn off my cloud" |
 //! | `updating` | §14 | blue | update |
 //! | `attention` | An error needs the user (§8.8) | red | any error |
@@ -139,7 +139,9 @@ pub enum AttentionCode {
 
 impl AttentionCode {
     /// Whether the error is final: the node does not come back by itself, so clearing the error, or an update, must
-    /// not return to a state where it runs.
+    /// not return to a state where it runs. On the hub PC `NodeRemoved` is the exception to what final means for the
+    /// app: the hub keeps running (§8.5), so [`Machine::apply`] settles in `paused` (or leaves a stopped cloud
+    /// stopped) instead of entering `attention`.
     pub fn is_terminal(self) -> bool {
         // `hub_gone`: the app runs H1 `-Stop` and never retries on its own (§8.8). `node_removed`: agent exit 7.
         matches!(self, AttentionCode::HubGone | AttentionCode::NodeRemoved)
@@ -230,6 +232,8 @@ pub enum Event {
     Fault(AttentionCode),
     /// The error is gone; the app goes back to where it was.
     FaultCleared,
+    /// On the hub PC, its own node enrolled again after `node_removed` ("Join again", §8.8).
+    NodeRejoined,
 }
 
 /// An event the current state does not accept. Nothing changed.
@@ -250,6 +254,9 @@ pub struct Machine {
     /// The settled state to return to after `updating` or `attention`.
     resume_to: State,
     attention: Option<AttentionCode>,
+    /// Hub PC only: this PC's own node was removed from the cloud (agent exit 7) and has not joined again. The hub keeps
+    /// running (§8.5), so this is a fact about the node, not a state: it survives `FaultCleared` and "Turn off my cloud".
+    node_removed: bool,
 }
 
 impl Machine {
@@ -260,6 +267,7 @@ impl Machine {
             role: None,
             resume_to: State::Setup,
             attention: None,
+            node_removed: false,
         }
     }
 
@@ -271,6 +279,7 @@ impl Machine {
             role: Some(role),
             resume_to: state,
             attention: None,
+            node_removed: false,
         })
     }
 
@@ -289,12 +298,20 @@ impl Machine {
         self.attention
     }
 
+    /// Hub PC only: this PC's own node was removed from the cloud while the hub kept running (§8.5, §8.8
+    /// `node_removed`). Always `false` on a joined PC, where the same error is final and stops the node.
+    pub fn node_removed(&self) -> bool {
+        self.node_removed
+    }
+
     /// The controls the user may pick now, in menu order. Exactly the controls [`Machine::apply`] accepts.
     pub fn controls(&self) -> Vec<Control> {
         let Some(role) = self.role else {
             return Vec::new();
         };
         match (self.state, role) {
+            // The hub's own node is gone: there is nothing to pause, resume or stop on this PC, only the cloud itself.
+            (State::Sharing | State::Paused, Role::Hub) if self.node_removed => vec![Control::TurnOffCloud],
             (State::Sharing, Role::Joined) => vec![Control::Pause, Control::StopSharing],
             (State::Paused, Role::Joined) => vec![Control::Resume, Control::StopSharing],
             (State::Sharing, Role::Hub) => vec![Control::Pause, Control::StopSharingThisPc, Control::TurnOffCloud],
@@ -327,7 +344,12 @@ impl Machine {
                 if !self.allows(control) {
                     return Err(illegal);
                 }
-                self.enter_settled(control.target());
+                // Turning the cloud back on starts the hub; a node that was removed does not start taking work.
+                let target = match control {
+                    Control::Start if self.node_removed => State::Paused,
+                    other => other.target(),
+                };
+                self.enter_settled(target);
             }
             (State::Sharing | State::Paused | State::Stopped | State::Attention, Event::UpdateStarted) => {
                 // From `attention`, `resume_to` already holds the settled state under the error.
@@ -339,8 +361,23 @@ impl Machine {
                 State::Sharing | State::Paused | State::Stopped | State::Updating | State::Attention,
                 Event::Fault(code),
             ) => {
-                // A final error never leads back to a running state, whether it is cleared or an update follows.
-                if code.is_terminal() {
+                if code == AttentionCode::NodeRemoved && self.role == Some(Role::Hub) {
+                    // §8.5: the hub keeps running after its own node is removed. The agent stays removed until the PC
+                    // joins again, so nothing would ever clear this error: it is recorded as a fact about the node
+                    // (`node_removed`), not parked in `attention`. The PC settles in `paused` (hub up, no work taken),
+                    // never `sharing`; a cloud that was off stays off. An update or another error already in progress
+                    // is left to finish, and it too returns to that settled state.
+                    self.node_removed = true;
+                    self.resume_to = match self.resume_to {
+                        State::Stopped => State::Stopped,
+                        _ => State::Paused,
+                    };
+                    if !matches!(self.state, State::Updating | State::Attention) {
+                        self.enter_settled(self.resume_to);
+                    }
+                    return Ok(self.state);
+                } else if code.is_terminal() {
+                    // A final error never leads back to a running state, whether it is cleared or an update follows.
                     self.resume_to = State::Stopped;
                 }
                 self.attention = Some(code);
@@ -349,6 +386,9 @@ impl Machine {
             (State::Attention, Event::FaultCleared) => {
                 self.attention = None;
                 self.state = self.resume_to;
+            }
+            (_, Event::NodeRejoined) if self.role == Some(Role::Hub) && self.node_removed => {
+                self.node_removed = false;
             }
             _ => return Err(illegal),
         }
@@ -400,6 +440,7 @@ mod tests {
 
     fn all_events() -> Vec<Event> {
         let mut events = vec![Event::UpdateStarted, Event::UpdateFinished, Event::FaultCleared];
+        events.push(Event::NodeRejoined);
         events.extend(ROLES.map(Event::SetupDone));
         events.extend(Control::ALL.map(Event::Control));
         events.extend(CODES.map(Event::Fault));
@@ -540,6 +581,10 @@ mod tests {
         let expected = [(Role::Joined, Control::StopSharing), (Role::Hub, Control::TurnOffCloud)];
         for (role, stop) in expected {
             for code in CODES {
+                // The hub PC's removed node does not enter `attention` (tested on its own).
+                if role == Role::Hub && code == AttentionCode::NodeRemoved {
+                    continue;
+                }
                 for state in [State::Sharing, State::Paused, State::Stopped] {
                     let mut m = at(role, state);
                     m.apply(Event::Fault(code)).expect("fault");
@@ -568,6 +613,10 @@ mod tests {
         for code in [AttentionCode::HubGone, AttentionCode::NodeRemoved] {
             assert!(code.is_terminal(), "{code:?}");
             for role in ROLES {
+                // The hub PC's own node being removed does not stop the cloud (§8.5): tested on its own below.
+                if role == Role::Hub && code == AttentionCode::NodeRemoved {
+                    continue;
+                }
                 for state in [State::Sharing, State::Paused, State::Stopped, State::Updating] {
                     let mut m = at(role, state);
                     m.apply(Event::Fault(code)).expect("fault");
@@ -588,6 +637,109 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn on_the_hub_pc_a_removed_node_settles_in_paused_with_no_error_to_clear() {
+        // §8.5: "On the hub PC, the hub keeps running after its own node is removed." The hub PC's state is therefore
+        // not `stopped` (that means "the whole cloud is offline"), and its node, which takes no work, is not `sharing`
+        // either. Nothing will ever clear this error (the agent stays removed), so the PC does not wait in `attention`
+        // for a `FaultCleared`: it settles at once.
+        for state in [State::Sharing, State::Paused] {
+            let mut m = at(Role::Hub, state);
+            assert!(!m.node_removed());
+            assert_eq!(
+                m.apply(Event::Fault(AttentionCode::NodeRemoved)),
+                Ok(State::Paused),
+                "{state:?}"
+            );
+            assert!(m.node_removed());
+            assert_eq!(m.attention(), None, "no red icon, no `Problem` line");
+            assert_eq!(m.state().tray_color(), TrayColor::Yellow);
+            // Nothing that acts on the removed node is offered; the hub itself can still be turned off.
+            assert_eq!(m.controls(), vec![Control::TurnOffCloud]);
+            for refused in [Control::Pause, Control::Resume, Control::StopSharingThisPc] {
+                assert!(m.apply(Event::Control(refused)).is_err(), "{refused:?}");
+            }
+            // And a second report of the same exit changes nothing.
+            let before = m.clone();
+            assert_eq!(m.apply(Event::Fault(AttentionCode::NodeRemoved)), Ok(State::Paused));
+            assert_eq!(m, before);
+        }
+    }
+
+    #[test]
+    fn on_the_hub_pc_node_removed_during_an_update_settles_in_paused_when_it_ends() {
+        let mut m = at(Role::Hub, State::Sharing);
+        m.apply(Event::UpdateStarted).expect("update");
+        assert_eq!(m.apply(Event::Fault(AttentionCode::NodeRemoved)), Ok(State::Updating));
+        assert!(m.node_removed());
+        assert_eq!(m.apply(Event::UpdateFinished), Ok(State::Paused));
+        assert_eq!(m.attention(), None);
+    }
+
+    #[test]
+    fn on_the_hub_pc_node_removed_does_not_hide_another_error_in_attention() {
+        let mut m = at(Role::Hub, State::Sharing);
+        m.apply(Event::Fault(AttentionCode::DistroUnhealthy)).expect("fault");
+        assert_eq!(m.apply(Event::Fault(AttentionCode::NodeRemoved)), Ok(State::Attention));
+        assert_eq!(m.attention(), Some(AttentionCode::DistroUnhealthy));
+        assert!(m.node_removed());
+        assert_eq!(
+            m.apply(Event::FaultCleared),
+            Ok(State::Paused),
+            "never back to `sharing`"
+        );
+    }
+
+    #[test]
+    fn on_the_hub_pc_node_removed_while_the_cloud_is_off_leaves_it_off() {
+        let mut m = at(Role::Hub, State::Stopped);
+        assert_eq!(m.apply(Event::Fault(AttentionCode::NodeRemoved)), Ok(State::Stopped));
+        assert!(m.node_removed());
+        assert_eq!(m.attention(), None);
+        // Turning the cloud on starts the hub, not the removed node.
+        assert_eq!(m.controls(), vec![Control::Start]);
+        assert_eq!(m.apply(Event::Control(Control::Start)), Ok(State::Paused));
+    }
+
+    #[test]
+    fn on_the_hub_pc_turning_the_cloud_off_and_on_keeps_the_node_removed() {
+        let mut m = at(Role::Hub, State::Sharing);
+        m.apply(Event::Fault(AttentionCode::NodeRemoved)).expect("fault");
+        assert_eq!(m.apply(Event::Control(Control::TurnOffCloud)), Ok(State::Stopped));
+        assert!(m.node_removed());
+        assert_eq!(m.apply(Event::Control(Control::Start)), Ok(State::Paused));
+        assert!(m.node_removed());
+    }
+
+    #[test]
+    fn a_node_that_joined_again_clears_the_hub_pc_s_removed_mark() {
+        let mut m = at(Role::Hub, State::Sharing);
+        m.apply(Event::Fault(AttentionCode::NodeRemoved)).expect("fault");
+        assert_eq!(m.apply(Event::NodeRejoined), Ok(State::Paused));
+        assert!(!m.node_removed());
+        assert_eq!(
+            m.controls(),
+            vec![Control::Resume, Control::StopSharingThisPc, Control::TurnOffCloud]
+        );
+    }
+
+    #[test]
+    fn node_rejoined_is_refused_unless_the_hub_pc_s_node_was_removed() {
+        for role in ROLES {
+            for state in State::ALL {
+                let mut m = at(role, state);
+                let before = m.clone();
+                assert!(m.apply(Event::NodeRejoined).is_err(), "{role:?} {state:?}");
+                assert_eq!(m, before);
+            }
+        }
+        // And a joined PC never has the mark: its node_removed is final and stops it (§8.8).
+        let mut m = at(Role::Joined, State::Sharing);
+        m.apply(Event::Fault(AttentionCode::NodeRemoved)).expect("fault");
+        assert!(!m.node_removed());
+        assert!(m.apply(Event::NodeRejoined).is_err());
     }
 
     #[test]

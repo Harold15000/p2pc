@@ -16,7 +16,7 @@
 use serde::Serialize;
 
 use crate::state::{AttentionCode, Control, Event, Machine, Role, State, TrayColor};
-use crate::tray::{HUB_NOTICE, needs_confirmation, state_label};
+use crate::tray::{HUB_NOTICE, NODE_REMOVED_HUB_NOTICE, needs_confirmation, state_label};
 
 /// The node actions behind the controls.
 pub trait NodeControl: Send + Sync {
@@ -106,6 +106,10 @@ pub struct StatusView {
     pub controls: Vec<ControlView>,
     /// The §8.6 sentence, on the hub PC.
     pub hub_notice: Option<&'static str>,
+    /// Hub PC only: this PC's own node was removed from the cloud while the hub keeps running (§8.5, §8.8).
+    pub node_removed: bool,
+    /// The words for `node_removed`.
+    pub node_notice: Option<&'static str>,
     /// Whether a control is running.
     pub busy: bool,
     /// A control the user picked in the tray that the window must now ask to confirm (§8.4).
@@ -196,6 +200,8 @@ impl Core {
             attention: m.attention(),
             controls,
             hub_notice: (m.role() == Some(Role::Hub)).then_some(HUB_NOTICE),
+            node_removed: m.node_removed(),
+            node_notice: m.node_removed().then_some(NODE_REMOVED_HUB_NOTICE),
             busy: self.busy,
             // Only while the state still offers it (a stale request is dropped).
             ask_confirm: self.pending_confirm.filter(|c| !self.busy && m.allows(*c)),
@@ -388,10 +394,46 @@ mod tests {
                 "attention": null,
                 "controls": [],
                 "hub_notice": null,
+                "node_removed": false,
+                "node_notice": null,
                 "busy": false,
                 "ask_confirm": null,
             })
         );
+    }
+
+    #[test]
+    fn the_hub_pc_shows_its_node_as_removed_and_says_the_cloud_keeps_running() {
+        // §8.8 `node_removed` ("This PC was removed from your cloud") on the hub PC, where §8.5 keeps the hub running.
+        let mut core = sharing(Role::Hub);
+        assert!(!core.status().node_removed);
+        assert_eq!(core.status().node_notice, None);
+        // No `FaultCleared` is needed or sent: nothing would ever clear this error.
+        assert_eq!(core.apply(Event::Fault(AttentionCode::NodeRemoved)), Ok(State::Paused));
+        let view = core.status();
+        // The hub keeps running: `paused`, not `stopped` (the whole cloud offline), and no error is shown.
+        assert_eq!(view.state, State::Paused);
+        assert_eq!(view.attention, None);
+        assert!(view.node_removed);
+        assert_eq!(view.node_notice, Some(NODE_REMOVED_HUB_NOTICE));
+        // The hub PC keeps its §8.6 sentence, and its only control is the cloud's own.
+        assert_eq!(view.hub_notice, Some(HUB_NOTICE));
+        let ids: Vec<_> = view.controls.iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![Control::TurnOffCloud]);
+        assert!(NODE_REMOVED_HUB_NOTICE.contains("removed from your cloud"));
+        assert!(NODE_REMOVED_HUB_NOTICE.contains("keeps running"));
+    }
+
+    #[test]
+    fn a_joined_pc_has_no_removed_node_mark_its_node_removed_error_is_final() {
+        let mut core = sharing(Role::Joined);
+        core.apply(Event::Fault(AttentionCode::NodeRemoved)).expect("fault");
+        let view = core.status();
+        assert_eq!(view.attention, Some(AttentionCode::NodeRemoved));
+        assert!(!view.node_removed);
+        assert_eq!(view.node_notice, None);
+        core.apply(Event::FaultCleared).expect("cleared");
+        assert_eq!(core.status().state, State::Stopped);
     }
 
     #[test]

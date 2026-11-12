@@ -31,6 +31,7 @@ use tauri::{AppHandle, Manager, RunEvent, State, Url, WebviewWindow, WebviewWind
 use crate::autostart::{self, AutostartError};
 use crate::capabilities::MAIN_WINDOW;
 use crate::core::{CommandError, ControlError, Core, NodeControl, StatusView, Unwired};
+use crate::keep_awake::{KeepAwake, Wish};
 use crate::launch::{self, Launch, SecondInstance};
 use crate::navigation::{self, Navigation};
 use crate::settings::{Settings, SettingsFile, Startup, startup};
@@ -61,6 +62,8 @@ struct Shared {
     node: Arc<dyn NodeControl>,
     /// First run (§8.2).
     setup: Arc<Setup>,
+    /// "Keep this PC awake while sharing" (§8.6): the thread that holds `SetThreadExecutionState`.
+    keep_awake: KeepAwake,
 }
 
 impl Shared {
@@ -144,9 +147,11 @@ fn setup(app: &mut tauri::App, launch: Launch) -> Result<(), Box<dyn Error>> {
         settings_file,
         node: Arc::new(Unwired),
         setup: first_run,
+        keep_awake: KeepAwake::start_for_this_os(),
     });
     let window = build_main_window(app.handle())?;
     build_tray(app.handle())?;
+    sync_keep_awake(app.handle());
     if launch == Launch::Window {
         window.show()?;
         window.set_focus()?;
@@ -326,7 +331,22 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+/// Tells the keep-awake thread what is wanted now: the setting and the state. Called after anything that changes either
+/// (the tray is redrawn at the same times). A poisoned lock holds nothing.
+fn sync_keep_awake(app: &AppHandle) {
+    let Some(shared) = app.try_state::<Shared>() else {
+        return;
+    };
+    let enabled = shared.settings.lock().is_ok_and(|s| s.keep_awake);
+    let state = shared
+        .core
+        .lock()
+        .map_or(Machine::new().state(), |c| c.machine().state());
+    shared.keep_awake.update(Wish { enabled, state });
+}
+
 fn refresh_tray(app: &AppHandle) {
+    sync_keep_awake(app);
     let machine = current_machine(app);
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
         return;
@@ -497,6 +517,7 @@ async fn setup_share(app: AppHandle, request: ShareRequest, keep_awake: bool) ->
     if view.error.is_none() {
         let app2 = app.clone();
         let _ = blocking(move || save_setting(&app2, |s| s.keep_awake = keep_awake)).await;
+        sync_keep_awake(&app);
     }
     Ok(view)
 }
