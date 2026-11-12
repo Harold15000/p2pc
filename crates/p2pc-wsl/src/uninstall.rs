@@ -10,7 +10,9 @@
 //!    the user is told.
 //! 4. **`wsl --unregister p2pc-node`**: the distro, its images, its volumes and, on the hub PC, the cloud's database and
 //!    blobs. A failure stops here (exit 29): `%LOCALAPPDATA%\P2PC` still holds the virtual disk of a registered distro.
-//!    A distro that is not installed, or a PC without `wsl.exe`, goes on to step 5.
+//!    A distro that is not installed, or a PC without `wsl.exe`, goes on to step 5. "Not installed" is only believed on
+//!    a positive answer ([`registration`]): a listing that succeeded, or, when `wsl --list` failed, the registry's own
+//!    list of distros (read-only). A listing that failed is never read as "no distro": it stops here, nothing deleted.
 //! 5. **`%LOCALAPPDATA%\P2PC`** is deleted, with `install.ps1 -Uninstall`'s backup rule: verified upgrade backups
 //!    (`p2pc-state-<time>.ok.tar`) are deleted; the backup of an upgrade that failed (`p2pc-state-<time>.tar`) is
 //!    **kept**, because it can be the only copy of the node identity and, on the hub PC, of the cloud's database,
@@ -27,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::import::sanitize_message;
-use crate::runner::{Host, Invocation, RunError, WSL_EXE, schtasks};
+use crate::runner::{Host, Invocation, Output, RunError, WSL_EXE, powershell, schtasks};
 use crate::task::{self, TASK_PATH, TaskState};
 use crate::upgrade::{is_state_backup_name, is_verified_backup_name};
 use crate::{DISTRO_NAME, Layout};
@@ -133,6 +135,12 @@ pub enum UninstallError {
     /// The distros could not be listed (`wsl.exe` exists but failed to run): nothing was unregistered or deleted.
     #[error("could not list the WSL distros: {0}. Nothing was unregistered or deleted.")]
     Wsl(RunError),
+    /// `wsl --list` failed (a WSL service error, or its timeout after the retries) and the registry did not say that
+    /// `p2pc-node` is absent: whether the distro is registered is unknown, so nothing was unregistered or deleted.
+    #[error(
+        "could not list the WSL distros (exit {code:?}): {message}. Nothing was unregistered or deleted. Try again, or restart Windows first."
+    )]
+    ListFailed { code: Option<i32>, message: String },
     /// 29: `%LOCALAPPDATA%\P2PC` was not touched.
     #[error(
         "wsl --unregister {DISTRO_NAME} failed (exit {code:?}): {message}. Nothing in %LOCALAPPDATA%\\P2PC was deleted."
@@ -145,7 +153,7 @@ impl UninstallError {
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::TaskNotRemoved { .. } => 37,
-            Self::Wsl(_) => 1,
+            Self::Wsl(_) | Self::ListFailed { .. } => 1,
             Self::Unregister { .. } => 29,
         }
     }
@@ -202,24 +210,100 @@ pub fn remove_task(host: Host<'_>) -> Result<bool, UninstallError> {
     Ok(true)
 }
 
-/// Step 4: `wsl --unregister p2pc-node` when it is registered. Never touches another distro.
-pub fn remove_distro(host: Host<'_>) -> Result<DistroRemoval, UninstallError> {
+/// The names of the registered distros, from the registry (`HKCU\…\Lxss`, each key's `DistributionName`, as
+/// `install.ps1`'s `Get-DistroBasePath` reads them). Read-only. `lxss=read` is printed last, only when every key was
+/// read (a missing `Lxss` key means no distro was ever registered).
+pub const LXSS_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+try {
+    $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss'
+    if (Test-Path -LiteralPath $key) {
+        foreach ($k in (Get-ChildItem -Path $key -ErrorAction Stop)) {
+            $p = Get-ItemProperty -Path $k.PSPath -ErrorAction Stop
+            if ($p.DistributionName) { 'distro=' + $p.DistributionName }
+        }
+    }
+    'lxss=read'
+} catch {
+    'lxss=failed'
+    exit 1
+}
+"#;
+
+/// The distro names [`LXSS_SCRIPT`] printed; `None` unless it exited 0 and ended with its one `lxss=read` marker.
+pub fn lxss_names(out: &Output) -> Option<Vec<String>> {
+    if !out.success() {
+        return None;
+    }
+    let text = out.stdout_text();
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if lines.last() != Some(&"lxss=read") || lines.iter().filter(|l| l.starts_with("lxss=")).count() != 1 {
+        return None;
+    }
+    Some(
+        lines
+            .iter()
+            .filter_map(|l| l.strip_prefix("distro="))
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+/// Whether `p2pc-node` is registered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Registration {
+    Registered,
+    NotRegistered,
+    /// There is no `wsl.exe`.
+    WslMissing,
+}
+
+/// Whether `p2pc-node` is registered, on a positive answer only:
+///
+/// - `wsl --list --quiet` exited 0: its lines are the distros;
+/// - it failed (a WSL service error, its timeout after the retries; some WSL versions also exit non-zero when there is
+///   no distro at all): its output is an error message, never a list. The registry's list decides, and only towards
+///   "not registered"; a registry that still names `p2pc-node`, or cannot be read, is [`UninstallError::ListFailed`].
+///
+/// Nothing is ever inferred from the error text.
+pub fn registration(host: Host<'_>) -> Result<Registration, UninstallError> {
     let list = Invocation::new(WSL_EXE)
         .args(["--list", "--quiet"])
         .timeout(LIST_TIMEOUT);
-    let names: Vec<String> = match host.run_wsl(&list) {
-        Ok(out) => out
-            .text()
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(str::to_owned)
-            .collect(),
-        Err(e) if e.is_not_found() => return Ok(DistroRemoval::WslMissing),
+    let out = match host.run_wsl(&list) {
+        Ok(out) => out,
+        Err(e) if e.is_not_found() => return Ok(Registration::WslMissing),
         Err(e) => return Err(UninstallError::Wsl(e)),
     };
-    if !names.iter().any(|n| n == DISTRO_NAME) {
-        return Ok(DistroRemoval::NotInstalled);
+    if out.success() {
+        let listed = out.text().lines().any(|l| l.trim() == DISTRO_NAME);
+        return Ok(if listed {
+            Registration::Registered
+        } else {
+            Registration::NotRegistered
+        });
+    }
+    let failed = || UninstallError::ListFailed {
+        code: out.code,
+        message: sanitize_message(&out.text()),
+    };
+    let names = host
+        .run(&powershell(LXSS_SCRIPT))
+        .ok()
+        .and_then(|o| lxss_names(&o))
+        .ok_or_else(failed)?;
+    if names.iter().any(|n| n.eq_ignore_ascii_case(DISTRO_NAME)) {
+        return Err(failed());
+    }
+    Ok(Registration::NotRegistered)
+}
+
+/// Step 4: `wsl --unregister p2pc-node` when it is registered. Never touches another distro.
+pub fn remove_distro(host: Host<'_>) -> Result<DistroRemoval, UninstallError> {
+    match registration(host)? {
+        Registration::Registered => {}
+        Registration::NotRegistered => return Ok(DistroRemoval::NotInstalled),
+        Registration::WslMissing => return Ok(DistroRemoval::WslMissing),
     }
     let unregister = Invocation::new(WSL_EXE)
         .args(["--unregister", DISTRO_NAME])
@@ -531,6 +615,106 @@ mod tests {
         assert_eq!(got.distro, DistroRemoval::WslMissing);
         assert!(!got.task_removed);
         assert!(!r.layout.root().join("setup.json").exists());
+    }
+
+    #[test]
+    fn a_listing_that_fails_never_reads_as_not_installed() {
+        // A WSL service error: `wsl --list` runs to its end, exits 1 and prints an error that names no distro.
+        let r = rig();
+        r.task("none").runner.on(
+            |i| starts(i, WSL_EXE, &["--list"]),
+            Output::with(
+                1,
+                utf16("The service cannot be started.\r\nError code: Wsl/Service/0x80070422\r\n"),
+            ),
+        );
+        // The registry still names the distro, cannot be read, or answers without its marker: each one stops.
+        r.runner.on_seq(
+            |i| runs_script(i, LXSS_SCRIPT),
+            vec![
+                Ok(Output::with(0, "distro=Ubuntu\r\ndistro=p2pc-node\r\nlxss=read\r\n")),
+                Ok(Output::with(0, "distro=P2PC-Node\r\nlxss=read\r\n")),
+                Ok(Output::with(1, "lxss=failed\r\n")),
+                Ok(Output::with(0, "distro=Ubuntu\r\n")),
+                Ok(Output::with(0, "")),
+            ],
+        );
+        for case in 0..5 {
+            let err = uninstall(r.host(), &r.layout, BackupRule::DeleteAll).unwrap_err();
+            assert!(
+                matches!(err, UninstallError::ListFailed { code: Some(1), .. }),
+                "{case}: {err:?}"
+            );
+            assert_eq!(err.exit_code(), 1);
+            assert!(err.to_string().contains("Nothing was unregistered or deleted"));
+            assert!(r.layout.root().join("setup.json").exists(), "{case}");
+            assert!(
+                r.layout.distro_dir().join("ext4.vhdx").exists(),
+                "{case}: the registered distro keeps its disk"
+            );
+            assert!(r.layout.backups_dir().join(UNFINISHED).exists(), "{case}");
+        }
+        assert_eq!(
+            r.runner.count(|i| runs_script(i, LXSS_SCRIPT)),
+            5,
+            "each answer was used once"
+        );
+        assert_eq!(r.runner.count(|i| starts(i, WSL_EXE, &["--unregister"])), 0);
+    }
+
+    #[test]
+    fn the_wsl_service_timeout_on_the_listing_stops_after_its_retries() {
+        let r = rig();
+        r.task("none").runner.on(
+            |i| starts(i, WSL_EXE, &["--list"]),
+            Output::with(-1, utf16("Error code: Wsl/Service/0x8007274c\r\n")),
+        );
+        let err = uninstall(r.host(), &r.layout, BackupRule::Default).unwrap_err();
+        assert!(matches!(err, UninstallError::ListFailed { .. }), "{err:?}");
+        assert_eq!(
+            r.runner.count(|i| starts(i, WSL_EXE, &["--list"])),
+            4,
+            "one try and three retries"
+        );
+        assert!(r.layout.distro_dir().join("ext4.vhdx").exists());
+    }
+
+    #[test]
+    fn a_failed_listing_goes_on_only_when_the_registry_says_the_distro_is_absent() {
+        // WSL without any distro (first run never imported one): the listing exits non-zero with a message.
+        for lxss in [
+            "lxss=read\r\n",
+            "distro=Ubuntu\r\ndistro=p2pc-node-old\r\nlxss=read\r\n",
+        ] {
+            let r = rig();
+            r.task("none").runner.on(
+                |i| starts(i, WSL_EXE, &["--list"]),
+                Output::with(
+                    -1,
+                    utf16("Windows Subsystem for Linux has no installed distributions.\r\n"),
+                ),
+            );
+            r.runner.on(|i| runs_script(i, LXSS_SCRIPT), Output::with(0, lxss));
+            let got = uninstall(r.host(), &r.layout, BackupRule::Default).unwrap();
+            assert_eq!(got.distro, DistroRemoval::NotInstalled);
+            assert_eq!(r.runner.count(|i| starts(i, WSL_EXE, &["--unregister"])), 0);
+            assert!(!r.layout.root().join("setup.json").exists());
+        }
+    }
+
+    #[test]
+    fn the_registry_answer_needs_exit_0_and_its_final_marker() {
+        let names = |code, text: &str| lxss_names(&Output::with(code, text));
+        assert_eq!(names(0, "lxss=read\n"), Some(vec![]));
+        assert_eq!(
+            names(0, "distro=Ubuntu\r\ndistro=p2pc-node\r\nlxss=read\r\n").map(|n| n.len()),
+            Some(2)
+        );
+        assert_eq!(names(1, "lxss=read\n"), None);
+        assert_eq!(names(0, "lxss=read\ndistro=late\n"), None);
+        assert_eq!(names(0, "lxss=failed\nlxss=read\n"), None);
+        assert_eq!(names(0, "distro=Ubuntu\n"), None);
+        assert_eq!(names(0, ""), None);
     }
 
     #[test]

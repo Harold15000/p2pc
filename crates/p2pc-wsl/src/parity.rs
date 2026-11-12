@@ -16,6 +16,8 @@
 //!   `Unregister-ScheduledTask`, and an unreadable task state stops the uninstall instead of reading as "no task";
 //! - the backup's time stamp is UTC here and local time in `install.ps1` (`Get-Date -Format 'yyyyMMddHHmmss'`), so the
 //!   names of backups from both do not order by time: the upgrade never prunes the backup it just verified;
+//! - an uninstall without the distro goes on (the app must still remove its files) where the script stops (27); the
+//!   distro counts as absent only on a positive answer: a listing that succeeded, or the registry's distro names;
 //! - the uninstall deletes the whole of `%LOCALAPPDATA%\P2PC` (§8.7 step 5) where the script deletes its own files
 //!   only; both apply the same backup rule.
 //!
@@ -359,6 +361,11 @@ pub(crate) const PORTED: &[(&str, &str, &str)] = &[
         "the backup of an unfinished upgrade is named",
     ),
     // The uninstall (T2-45).
+    (
+        "Get-DistroBasePath",
+        "uninstall::LXSS_SCRIPT",
+        "the registered distros in HKCU\\…\\Lxss, by DistributionName, read-only",
+    ),
     (
         "Test-StateBackupName",
         "upgrade::is_state_backup_name",
@@ -748,6 +755,17 @@ fn the_uninstall_order_and_its_stops_match() {
     // The default rule: verified ones go; unfinished ones stay unless -DeleteFailedBackups.
     assert!(body.contains("$kind = 'Verified'"));
     assert!(body.contains("if ($mode -eq 'DeleteAll') { $kind = 'All' }"));
+    // The registry's distro names, read the same way (read-only).
+    let base = ps_function("Get-DistroBasePath");
+    assert!(base.contains("Get-ChildItem -Path $LxssKey -ErrorAction Stop"));
+    assert!(base.contains("$p.DistributionName -eq $DistroName"));
+    assert!(uninstall::LXSS_SCRIPT.contains("$key = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss'"));
+    assert!(uninstall::LXSS_SCRIPT.contains("Get-ChildItem -Path $key -ErrorAction Stop"));
+    assert!(uninstall::LXSS_SCRIPT.contains("$p.DistributionName"));
+    assert!(
+        body.contains("Fail 27"),
+        "the script stops when the distro is not listed"
+    );
     // The deliberate difference: the app deletes the task with schtasks.
     let inv = uninstall::delete_task_invocation();
     assert_eq!(inv.program(), runner::SCHTASKS_EXE);
