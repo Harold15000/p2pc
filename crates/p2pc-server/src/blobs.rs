@@ -598,7 +598,9 @@ mod tests {
     fn the_floor_rate_passes_for_hours() {
         let start = Instant::now();
         let mut pace = Pace::new(limits(), start);
-        assert!(steady(&mut pace, start, 1, 4 * 3600, 16 * KIB + 1));
+        // One-second chunks a little over the floor (exactly the floor would put a window's last chunk on its
+        // deadline instant).
+        assert!(steady(&mut pace, start, 1, 4 * 3600, 17 * KIB));
         // The kept samples stay bounded.
         assert!(pace.samples.len() <= 62, "{}", pace.samples.len());
     }
