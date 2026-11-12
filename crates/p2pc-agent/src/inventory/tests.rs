@@ -291,11 +291,11 @@ async fn detect_on(dir: &TempDir, runner: &FakeRunner, config: &Config) -> Resul
     detect(&Host::with_root(dir.path()), runner, config).await
 }
 
-/// H2 §8.2, §11.3: the volume share is resolved with the rest of the share and stays on the node (it is the budget
-/// of the volume store). The wire inventory does not carry it: `Inventory.volumes_mb` comes with `share_update` (H2
-/// §6.1), which this agent does not declare.
+/// H2 §8.2, §11.3: the volume share is resolved with the rest of the share (it is the budget of the volume store).
+/// The detection's own inventory does not carry it: `Inventory.volumes_mb` comes with `share_update` (H2 §6.1), so the
+/// run path adds it (`connection::settle`) and the session sends it only when it declares the capability.
 #[tokio::test]
-async fn the_volume_share_is_resolved_on_the_node_and_not_sent() {
+async fn the_volume_share_is_resolved_on_the_node_and_not_in_the_detection() {
     let m = machine(Platform::Linux, 1001);
     let runner = base_runner(Platform::Linux);
     let mut cfg = config(Path::new("/var/lib/p2pc"));

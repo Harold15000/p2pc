@@ -480,6 +480,9 @@ async fn hello_carries_the_version_an_empty_feature_list_the_inventory_and_the_r
     assert_eq!(hello["agent_version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(hello["features"], json!([]), "no capability in v0.1");
     assert_eq!(hello["inventory"]["hostname"], "node-1");
+    // H2 §6.1: without `share_update`, neither `volumes_mb` nor `owner_paused`.
+    assert!(hello["inventory"].get("volumes_mb").is_none(), "{hello}");
+    assert!(hello["inventory"].get("owner_paused").is_none(), "{hello}");
     assert_eq!(hello["running"], json!([{"lease_id": lease.lease_id, "epoch": 3}]));
     // Connected: the state file says so, with the Welcome time.
     let _ = s.recv().await; // the first heartbeat: the Welcome was processed
@@ -1529,8 +1532,8 @@ fn node_controls() -> (NodeControls, watch::Sender<Share>) {
     )
 }
 
-/// H2 §5.5, §6.1: an H2 node declares `leave` and `approval`; `Welcome.pending_approval` and `NodeApproved` reach the
-/// state file that `p2pc-agent status --json` reads, with the hub's version (H2 §14.2).
+/// H2 §5.5, §6.1: an H2 node declares `leave`, `share_update` and `approval`; `Welcome.pending_approval` and
+/// `NodeApproved` reach the state file that `p2pc-agent status --json` reads, with the hub's version (H2 §14.2).
 #[tokio::test(start_paused = true)]
 async fn an_h2_node_declares_leave_and_approval_and_the_state_file_follows_the_approval() {
     let (node, _share) = node_controls();
@@ -1541,7 +1544,10 @@ async fn an_h2_node_declares_leave_and_approval_and_the_state_file_follows_the_a
     });
     let mut s = w.next_connection().await;
     let hello = s.recv().await.unwrap();
-    assert_eq!(hello["features"], json!(["leave", "approval"]));
+    assert_eq!(hello["features"], json!(["leave", "share_update", "approval"]));
+    // `share_update` comes with both fields (H2 §6.1): a source that does not report the volume share offers none.
+    assert_eq!(hello["inventory"]["owner_paused"], false, "{hello}");
+    assert_eq!(hello["inventory"]["volumes_mb"], 0, "{hello}");
     assert_eq!(approval.pending(), None, "unknown before the first Welcome");
     s.send(json!({
         "type": "welcome",
@@ -1595,7 +1601,8 @@ async fn a_paused_node_refuses_new_leases_with_draining_until_resumed() {
         ..Options::default()
     });
     let mut s = w.next_connection().await;
-    let _ = s.handshake(w.owner).await;
+    let hello = s.handshake(w.owner).await;
+    assert_eq!(hello["inventory"]["owner_paused"], true, "{hello}");
     let (other, lease) = lease_msg(AccountId::generate(), good_job());
     s.send(lease).await;
     let answer = s.recv_not_heartbeat().await.unwrap();
@@ -1612,7 +1619,8 @@ async fn a_paused_node_refuses_new_leases_with_draining_until_resumed() {
     // Resume: a new connection (review P2, see `a_resume_reconnects_at_once_…`), which takes leases again.
     share.send_replace(Share::default());
     let mut s = w.next_connection().await;
-    let _ = s.handshake(w.owner).await;
+    let hello = s.handshake(w.owner).await;
+    assert_eq!(hello["inventory"]["owner_paused"], false, "{hello}");
     let (id, lease) = lease_msg(w.owner, good_job());
     s.send(lease).await;
     let answer = s.recv_not_heartbeat().await.unwrap();
@@ -1621,6 +1629,17 @@ async fn a_paused_node_refuses_new_leases_with_draining_until_resumed() {
     assert_eq!(w.connector.attempts.lock().unwrap().len(), 2);
     let (_task, _rx) = s.serve(true);
     w.shutdown().await;
+}
+
+/// Takes every `InventoryUpdate` the agent sent so far.
+fn inventory_updates(rx: &mut mpsc::Receiver<Value>) -> Vec<Value> {
+    let mut sent = Vec::new();
+    while let Ok(m) = rx.try_recv() {
+        if m["type"] == "inventory_update" {
+            sent.push(m);
+        }
+    }
+    sent
 }
 
 /// H2 §8.4: a share change re-detects the inventory at once, and a changed offer goes out as `InventoryUpdate` within
@@ -1636,16 +1655,26 @@ async fn a_share_change_sends_inventory_update_within_seconds() {
     let _ = s.handshake(w.owner).await;
     let (_task, mut rx) = s.serve(true);
     let detections = w.inventory.2.load(Ordering::SeqCst);
-    // The pause alone does not change the wire inventory: a detection, but no update.
+    // H2 §6.1, §8.4: the pause is on the wire (`owner_paused`, with `share_update`), so the scheduler treats the
+    // node as draining: one update, at once.
     share.send_replace(Share {
         paused: true,
         ..Share::default()
     });
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(w.inventory.2.load(Ordering::SeqCst), detections + 1);
-    while let Ok(m) = rx.try_recv() {
-        assert_ne!(m["type"], "inventory_update", "{m}");
-    }
+    let sent = inventory_updates(&mut rx);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["inventory"]["owner_paused"], true);
+    assert_eq!(sent[0]["inventory"]["volumes_mb"], 0);
+    // The same share again changes nothing on the wire: a detection, no update.
+    share.send_replace(Share {
+        paused: true,
+        ..Share::default()
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(w.inventory.2.load(Ordering::SeqCst), detections + 2);
+    assert!(inventory_updates(&mut rx).is_empty());
     // Fewer cores offered (still paused, so the session stays): the new offer is sent at once.
     w.inventory.0.lock().unwrap().offered =
         serde_json::from_value(json!({"cpu": 2.0, "memory_mb": 4096, "gpu": 0})).unwrap();
@@ -1656,14 +1685,10 @@ async fn a_share_change_sends_inventory_update_within_seconds() {
         ..Share::default()
     });
     tokio::time::sleep(Duration::from_secs(1)).await;
-    let mut sent = Vec::new();
-    while let Ok(m) = rx.try_recv() {
-        if m["type"] == "inventory_update" {
-            sent.push(m);
-        }
-    }
+    let sent = inventory_updates(&mut rx);
     assert_eq!(sent.len(), 1, "{sent:?}");
     assert_eq!(sent[0]["inventory"]["offered"]["cpu"], json!(2.0));
+    assert_eq!(sent[0]["inventory"]["owner_paused"], true);
     assert_eq!(sent[0]["inventory"]["offered"]["memory_mb"], 4096);
     assert_eq!(
         w.connector.attempts.lock().unwrap().len(),
@@ -1696,10 +1721,14 @@ where
 {
     let (link, server) = pipe_link();
     let script = tokio::spawn(hub(server));
+    // A detection of an H2 node, with the share fields: `leave` declares no `share_update`, so they are left out.
+    let mut inventory = inventory("node-1");
+    inventory.volumes_mb = Some(1024);
+    inventory.owner_paused = Some(false);
     let end = p2pc_agent::connection::session::leave(
         link,
         owner,
-        inventory("node-1"),
+        inventory,
         running,
         leave_reason(),
         Duration::from_secs(10),
@@ -1719,6 +1748,8 @@ async fn leave_sends_leave_after_the_owners_welcome_and_ends_when_the_hub_closes
         let hello = s.recv().await.unwrap();
         assert_eq!(hello["type"], "hello");
         assert_eq!(hello["features"], json!(["leave"]));
+        assert!(hello["inventory"].get("volumes_mb").is_none(), "{hello}");
+        assert!(hello["inventory"].get("owner_paused").is_none(), "{hello}");
         assert_eq!(hello["running"], json!([{"lease_id": lease.lease_id, "epoch": 2}]));
         s.welcome(owner, 60).await;
         // A lease offered in between is refused: this connection takes no work.

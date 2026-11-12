@@ -90,7 +90,10 @@ pub struct DetectInventory {
 /// - **What the driver cannot serve is not reported ready** (T10a review, P3-5).
 /// - **The volume budget** follows `share.volumes_mb`, so a lower disk limit is in force at once. A node that started
 ///   without volume space has no store here: it declares `volumes` only after a restart.
+/// - **`Inventory.volumes_mb`** is that share as resolved (H2 §6.1, §11.3). The session sends it only with
+///   `share_update` ([`session::Shared::share_fields`]).
 fn settle(offers: Option<&OfferFeed>, volumes: Option<&VolumeStore>, inventory: &mut Inventory, share: &ResolvedShare) {
+    inventory.volumes_mb = Some(share.volumes_mb);
     if let Some(feed) = offers {
         let offer = Offer::from_detection(inventory, share, &feed.driver);
         let served = u32::try_from(offer.gpus.len()).unwrap_or(u32::MAX);
@@ -232,6 +235,13 @@ mod tests {
             let mut inventory = detected(&now);
             settle(None, Some(&store), &mut inventory, &now);
             assert_eq!(store.budget_mb(), volumes_mb);
+            // H2 §6.1: the same resolved share is what `Inventory.volumes_mb` reports (with `share_update`).
+            assert_eq!(inventory.volumes_mb, Some(volumes_mb));
         }
+        // A node without volume space reports its share too: the hub learns it has none.
+        let none = share(&[], 0);
+        let mut inventory = detected(&none);
+        settle(None, None, &mut inventory, &none);
+        assert_eq!(inventory.volumes_mb, Some(0));
     }
 }
