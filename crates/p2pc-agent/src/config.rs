@@ -142,6 +142,91 @@ pub struct Share {
     /// Disk for job directories, in MiB. Default: 50 GiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_mb: Option<u64>,
+    /// Disk for persistent volumes (H2 §11.3 "Budget"), in MiB, apart from `disk_mb`. Default: 0, no volumes. The
+    /// desktop app sets it from its disk arithmetic (H2 §8.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volumes_mb: Option<u64>,
+    /// The owner paused sharing (`owner_paused`, H2 §6.1, §8.4): running jobs and services continue, and every new
+    /// lease is refused with `draining`. Separate from the H1 drain the server sets through the API.
+    #[serde(default)]
+    pub paused: bool,
+}
+
+impl std::str::FromStr for GpuShare {
+    type Err = String;
+
+    /// The command-line form of `share.gpus` (`p2pc-agent share set --gpu`): `all`, `none`, or GPU UUIDs separated by
+    /// commas.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "all" => return Ok(Self::All),
+            "none" => return Ok(Self::None),
+            _ => {}
+        }
+        let mut uuids: Vec<String> = Vec::new();
+        for uuid in s.split(',') {
+            if !is_gpu_uuid(uuid) {
+                return Err(format!(
+                    "`{uuid}` is not a GPU UUID: expected \"all\", \"none\" or GPU UUIDs separated by commas"
+                ));
+            }
+            if uuids.iter().any(|u| u == uuid) {
+                return Err(format!("`{uuid}` is listed twice"));
+            }
+            uuids.push(uuid.to_string());
+        }
+        Ok(Self::List(uuids))
+    }
+}
+
+/// A change of the share (`p2pc-agent share set`, H2 §8.4): each `Some` replaces that key, each `None` keeps it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ShareUpdate {
+    /// `share.cpu_cores`.
+    pub cpu_cores: Option<f64>,
+    /// `share.memory_mb`.
+    pub memory_mb: Option<u64>,
+    /// `share.gpus`.
+    pub gpus: Option<GpuShare>,
+    /// `share.disk_mb`.
+    pub disk_mb: Option<u64>,
+    /// `share.volumes_mb`.
+    pub volumes_mb: Option<u64>,
+    /// `share.paused`.
+    pub paused: Option<bool>,
+}
+
+impl ShareUpdate {
+    /// Whether it changes nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// `share` with this update applied.
+    #[must_use]
+    pub fn apply(&self, share: &Share) -> Share {
+        let mut s = share.clone();
+        if let Some(cpu) = self.cpu_cores {
+            s.cpu_cores = Some(cpu);
+        }
+        if let Some(memory) = self.memory_mb {
+            s.memory_mb = Some(memory);
+        }
+        if let Some(gpus) = &self.gpus {
+            s.gpus = gpus.clone();
+        }
+        if let Some(disk) = self.disk_mb {
+            s.disk_mb = Some(disk);
+        }
+        if let Some(volumes) = self.volumes_mb {
+            s.volumes_mb = Some(volumes);
+        }
+        if let Some(paused) = self.paused {
+            s.paused = paused;
+        }
+        s
+    }
 }
 
 /// The OCI runtime for job containers (§9 "Optional gVisor").
@@ -462,6 +547,87 @@ fn validate_server(server: &ServerSection) -> Result<(), ConfigError> {
 /// file or the new one, never half of one. A missing parent directory is created with mode 0700. The result is
 /// parsed back before it replaces anything, so a file the agent could not load again is never written.
 pub fn write_server_section(path: &Path, server: &ServerSection, env: &Env) -> Result<(), ConfigError> {
+    rewrite_config(path, env, |doc| {
+        let mut table = toml_edit::Table::new();
+        // Comments just above an existing `[server]` belong to that table: keep them when it is replaced (`--force`).
+        let old_prefix = doc
+            .get("server")
+            .and_then(toml_edit::Item::as_table)
+            .and_then(|t| t.decor().prefix())
+            .cloned();
+        match old_prefix {
+            Some(prefix) => table.decor_mut().set_prefix(prefix),
+            None => table
+                .decor_mut()
+                .set_prefix("\n# Written by `p2pc-agent join`: the control plane this node is enrolled with.\n"),
+        }
+        table["node_id"] = toml_edit::value(server.node_id.as_str());
+        let mut relays = toml_edit::Array::new();
+        for r in &server.relays {
+            relays.push(r.as_str());
+        }
+        table["relays"] = toml_edit::value(relays);
+        table["account_id"] = toml_edit::value(server.account_id.to_string());
+        table["agent_node_id"] = toml_edit::value(server.agent_node_id.to_string());
+        doc["server"] = toml_edit::Item::Table(table);
+        Ok(())
+    })
+}
+
+/// Writes the keys `update` names into `[share]` of the config file at `path` (`p2pc-agent share set`, H2 §8.4), with
+/// the guarantees of [`write_server_section`]: atomic, mode 0600, everything else kept, and never a file that would
+/// not load. Checking the result against the hardware is the caller's job.
+pub fn write_share_update(path: &Path, update: &ShareUpdate, env: &Env) -> Result<(), ConfigError> {
+    fn int(field: &str, v: u64) -> Result<toml_edit::Item, ConfigError> {
+        i64::try_from(v)
+            .map(toml_edit::value)
+            .map_err(|_| invalid(field, "is too large"))
+    }
+    rewrite_config(path, env, |doc| {
+        if doc.get("share").is_none() {
+            let mut table = toml_edit::Table::new();
+            table.decor_mut().set_prefix("\n");
+            doc["share"] = toml_edit::Item::Table(table);
+        }
+        let share = doc["share"]
+            .as_table_like_mut()
+            .ok_or_else(|| invalid("share", "is not a table"))?;
+        if let Some(cpu) = update.cpu_cores {
+            share.insert("cpu_cores", toml_edit::value(cpu));
+        }
+        if let Some(memory) = update.memory_mb {
+            share.insert("memory_mb", int("share.memory_mb", memory)?);
+        }
+        if let Some(gpus) = &update.gpus {
+            let item = match gpus {
+                GpuShare::All => toml_edit::value("all"),
+                GpuShare::None => toml_edit::value("none"),
+                GpuShare::List(uuids) => {
+                    toml_edit::value(uuids.iter().map(String::as_str).collect::<toml_edit::Array>())
+                }
+            };
+            share.insert("gpus", item);
+        }
+        if let Some(disk) = update.disk_mb {
+            share.insert("disk_mb", int("share.disk_mb", disk)?);
+        }
+        if let Some(volumes) = update.volumes_mb {
+            share.insert("volumes_mb", int("share.volumes_mb", volumes)?);
+        }
+        if let Some(paused) = update.paused {
+            share.insert("paused", toml_edit::value(paused));
+        }
+        Ok(())
+    })
+}
+
+/// Reads the config file at `path` (missing: empty), applies `edit` to it, checks that the result loads, and replaces
+/// the file atomically with mode 0600. A missing parent directory is created with mode 0700.
+fn rewrite_config(
+    path: &Path,
+    env: &Env,
+    edit: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<(), ConfigError>,
+) -> Result<(), ConfigError> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
 
@@ -478,28 +644,7 @@ pub fn write_server_section(path: &Path, server: &ServerSection, env: &Env) -> R
         path: path.to_path_buf(),
         message: e.to_string(),
     })?;
-    let mut table = toml_edit::Table::new();
-    // Comments just above an existing `[server]` belong to that table: keep them when it is replaced (`--force`).
-    let old_prefix = doc
-        .get("server")
-        .and_then(toml_edit::Item::as_table)
-        .and_then(|t| t.decor().prefix())
-        .cloned();
-    match old_prefix {
-        Some(prefix) => table.decor_mut().set_prefix(prefix),
-        None => table
-            .decor_mut()
-            .set_prefix("\n# Written by `p2pc-agent join`: the control plane this node is enrolled with.\n"),
-    }
-    table["node_id"] = toml_edit::value(server.node_id.as_str());
-    let mut relays = toml_edit::Array::new();
-    for r in &server.relays {
-        relays.push(r.as_str());
-    }
-    table["relays"] = toml_edit::value(relays);
-    table["account_id"] = toml_edit::value(server.account_id.to_string());
-    table["agent_node_id"] = toml_edit::value(server.agent_node_id.to_string());
-    doc["server"] = toml_edit::Item::Table(table);
+    edit(&mut doc)?;
     let new_text = doc.to_string();
     // Never write a file that would not load.
     Config::parse(&new_text, env).map_err(|e| match e {
@@ -642,6 +787,13 @@ pub enum MissingGpu {
 }
 
 impl Share {
+    /// The volumes share in MiB (H2 §11.3 "Budget"): 0, no volumes, unless the owner set one. [`Share::resolve`] checks
+    /// it against the disk.
+    #[must_use]
+    pub fn volumes_mb(&self) -> u64 {
+        self.volumes_mb.unwrap_or(0)
+    }
+
     /// Applies the defaults and checks the limits against the hardware. A listed UUID that is not on the machine
     /// is an error ([`MissingGpu::Error`]).
     pub fn resolve(&self, hw: &Hardware<'_>) -> Result<ResolvedShare, ConfigError> {
@@ -680,6 +832,25 @@ impl Share {
             (None, Some(total)) => DEFAULT_DISK_MB.min(total),
             (None, None) => DEFAULT_DISK_MB,
         };
+        // Volumes live on the same filesystem as the job directories (H2 §8.2 disk arithmetic): an explicit volumes
+        // share may not exceed it, alone or with the job share.
+        if let (Some(volumes_mb), Some(total)) = (self.volumes_mb, hw.disk_mb) {
+            if volumes_mb > total {
+                return Err(invalid(
+                    "share.volumes_mb",
+                    format!("is {volumes_mb} MiB, more than the {total} MiB of the data dir's filesystem"),
+                ));
+            }
+            if disk_mb.checked_add(volumes_mb).is_none_or(|sum| sum > total) {
+                return Err(invalid(
+                    "share.volumes_mb",
+                    format!(
+                        "is {volumes_mb} MiB: with share.disk_mb ({disk_mb} MiB) that is more than the {total} MiB of \
+                         the data dir's filesystem"
+                    ),
+                ));
+            }
+        }
         let mut warnings = Vec::new();
         let gpus = match &self.gpus {
             GpuShare::None => Vec::new(),
@@ -724,6 +895,85 @@ impl Share {
             disk_mb,
             warnings,
         })
+    }
+}
+
+/// How often the running agent reads `agent.toml` again for share changes (H2 §8.4: `InventoryUpdate` within 10 s of
+/// `share set`).
+pub const SHARE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Watches `agent.toml` for share changes while the agent runs (H2 §8.4: `share set` runs as another process).
+///
+/// Every [`SHARE_POLL_INTERVAL`] the file is loaded again, off the async runtime. A file that loads with another
+/// `[share]` is a change; a file that does not load (a typo while the owner edits it, a named file that is gone) is
+/// logged once and changes nothing: the last good share stays in force. Only `[share]` is applied live; every other
+/// key needs a restart.
+#[derive(Debug)]
+pub struct ShareWatcher {
+    source: ConfigSource,
+    env: Env,
+    last: Share,
+    last_error: Option<String>,
+}
+
+impl ShareWatcher {
+    /// A watcher of `source`, starting from the share in force, `initial`.
+    #[must_use]
+    pub fn new(source: ConfigSource, env: Env, initial: Share) -> Self {
+        Self {
+            source,
+            env,
+            last: initial,
+            last_error: None,
+        }
+    }
+
+    /// Loads the file once: the new share if it changed.
+    pub async fn poll(&mut self) -> Option<Share> {
+        let (source, env) = (self.source.clone(), self.env.clone());
+        let loaded = tokio::task::spawn_blocking(move || Config::load(&source, &env))
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|r| r.map_err(|e| e.to_string()));
+        match loaded {
+            Ok(config) => {
+                self.last_error = None;
+                if config.share == self.last {
+                    return None;
+                }
+                self.last = config.share.clone();
+                Some(config.share)
+            }
+            Err(e) => {
+                if self.last_error.as_deref() != Some(e.as_str()) {
+                    tracing::warn!(error = %e, "agent.toml changed but cannot be loaded; keeping the share in force");
+                    self.last_error = Some(e);
+                }
+                None
+            }
+        }
+    }
+
+    /// Runs the watcher on its own task: the receiver always holds the share in force. The task ends when every
+    /// receiver is gone.
+    #[must_use]
+    pub fn spawn(mut self) -> (tokio::sync::watch::Receiver<Share>, tokio::task::JoinHandle<()>) {
+        let (tx, rx) = tokio::sync::watch::channel(self.last.clone());
+        let task = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(SHARE_POLL_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                if tx.is_closed() {
+                    return;
+                }
+                if let Some(share) = self.poll().await {
+                    tracing::info!(paused = share.paused, "the owner changed the share");
+                    tx.send_replace(share);
+                }
+            }
+        });
+        (rx, task)
     }
 }
 
@@ -1101,6 +1351,225 @@ mod tests {
         std::fs::write(&path, "data_dir = \"relative\"\n").unwrap();
         assert!(write_server_section(&path, &server(), &env()).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "data_dir = \"relative\"\n");
+    }
+
+    #[test]
+    fn the_share_has_a_volumes_budget_and_a_pause() {
+        let c = Config::parse("[share]\nvolumes_mb = 40960\npaused = true\n", &env()).unwrap();
+        assert_eq!(c.share.volumes_mb, Some(40_960));
+        assert!(c.share.paused);
+        let d = Config::parse("", &env()).unwrap();
+        assert_eq!(d.share.volumes_mb, None);
+        assert!(!d.share.paused, "sharing by default");
+        assert!(
+            Config::parse("[share]\nvolumes_mb = 0\n", &env()).is_ok(),
+            "no volumes at all"
+        );
+        assert!(matches!(
+            Config::parse("[share]\npaused = \"yes\"\n", &env()),
+            Err(ConfigError::Parse { .. })
+        ));
+    }
+
+    /// H2 §8.4: the volumes share is disk too: it may not exceed the disk, alone or with the job share.
+    #[test]
+    fn the_volumes_share_cannot_exceed_the_disk() {
+        let hw = Hardware {
+            cores: 8,
+            memory_mb: 16_000,
+            disk_mb: Some(100_000),
+            gpus: &[],
+            gpu_detection_ok: true,
+        };
+        let resolve = |volumes_mb, disk_mb| {
+            Share {
+                volumes_mb,
+                disk_mb,
+                ..Share::default()
+            }
+            .resolve(&hw)
+        };
+        assert_eq!(
+            Share::default().volumes_mb(),
+            0,
+            "no volumes unless the owner sets a share"
+        );
+        assert!(resolve(None, None).is_ok());
+        assert!(resolve(Some(40_000), Some(60_000)).is_ok(), "exactly the disk");
+        assert_eq!(err_field(resolve(Some(100_001), Some(1))), "share.volumes_mb");
+        assert_eq!(err_field(resolve(Some(40_001), Some(60_000))), "share.volumes_mb");
+        // The job share's default (50 GiB here) counts too.
+        assert_eq!(err_field(resolve(Some(60_000), None)), "share.volumes_mb");
+        // An unknown disk size cannot be checked.
+        let blind = Hardware { disk_mb: None, ..hw };
+        assert!(
+            Share {
+                volumes_mb: Some(1 << 30),
+                ..Share::default()
+            }
+            .resolve(&blind)
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_share_update_changes_only_what_it_names() {
+        let base = Share {
+            cpu_cores: Some(2.0),
+            memory_mb: Some(4096),
+            gpus: GpuShare::None,
+            disk_mb: Some(10_240),
+            volumes_mb: Some(20_480),
+            paused: false,
+        };
+        assert!(ShareUpdate::default().is_empty());
+        let pause = ShareUpdate {
+            paused: Some(true),
+            ..ShareUpdate::default()
+        };
+        assert!(!pause.is_empty());
+        assert_eq!(
+            pause.apply(&base),
+            Share {
+                paused: true,
+                ..base.clone()
+            }
+        );
+        let all = ShareUpdate {
+            cpu_cores: Some(3.5),
+            memory_mb: Some(8192),
+            gpus: Some(GpuShare::All),
+            disk_mb: Some(1),
+            volumes_mb: Some(2),
+            paused: Some(false),
+        };
+        assert_eq!(
+            all.apply(&base),
+            Share {
+                cpu_cores: Some(3.5),
+                memory_mb: Some(8192),
+                gpus: GpuShare::All,
+                disk_mb: Some(1),
+                volumes_mb: Some(2),
+                paused: false,
+            }
+        );
+    }
+
+    #[test]
+    fn gpu_share_values_parse_from_the_command_line() {
+        assert_eq!("all".parse::<GpuShare>(), Ok(GpuShare::All));
+        assert_eq!("none".parse::<GpuShare>(), Ok(GpuShare::None));
+        assert_eq!(
+            "GPU-00000000-0000-4000-8000-000000000001,GPU-00000000-0000-4000-8000-000000000002".parse::<GpuShare>(),
+            Ok(GpuShare::List(vec![
+                "GPU-00000000-0000-4000-8000-000000000001".into(),
+                "GPU-00000000-0000-4000-8000-000000000002".into()
+            ]))
+        );
+        for bad in ["", "GPU 1", "GPU-1,,GPU-2", "GPU-1,GPU-1", "GPU-1,"] {
+            assert!(bad.parse::<GpuShare>().is_err(), "{bad}");
+        }
+        // The UUID syntax is the config file's (lenient): a word that is no GPU of this machine is refused by the
+        // hardware check of `share set`, as `share.gpus = ["…"]` is at start.
+        assert_eq!("some".parse::<GpuShare>(), Ok(GpuShare::List(vec!["some".into()])));
+    }
+
+    /// H2 §8.4: `share set` writes `agent.toml` atomically, keeps everything it does not change (comments included),
+    /// and never writes a file that would not load.
+    #[test]
+    fn a_share_update_is_written_atomically_keeping_the_rest() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+        std::fs::write(
+            &path,
+            "# my agent\nagent_lease_ttl_s = 30\n\n[share]\n# keep it small\ncpu_cores = 2.0 # two\ngpus = \"none\"\n\n\
+             [labels]\nzone = \"home\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let update = ShareUpdate {
+            memory_mb: Some(4096),
+            volumes_mb: Some(20_480),
+            paused: Some(true),
+            ..ShareUpdate::default()
+        };
+        write_share_update(&path, &update, &env()).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        for kept in ["# my agent", "# keep it small", "# two", "zone = \"home\""] {
+            assert!(text.contains(kept), "{kept}: {text}");
+        }
+        let c = Config::load(&ConfigSource::Flag(path.clone()), &env()).unwrap();
+        assert_eq!(c.share.cpu_cores, Some(2.0));
+        assert_eq!(c.share.gpus, GpuShare::None);
+        assert_eq!(c.share.memory_mb, Some(4096));
+        assert_eq!(c.share.volumes_mb, Some(20_480));
+        assert!(c.share.paused);
+        assert_eq!(c.agent_lease_ttl_s, 30);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        // GPU lists and a resume.
+        let update = ShareUpdate {
+            gpus: Some(GpuShare::List(vec!["GPU-00000000-0000-4000-8000-000000000001".into()])),
+            paused: Some(false),
+            ..ShareUpdate::default()
+        };
+        write_share_update(&path, &update, &env()).unwrap();
+        let c = Config::load(&ConfigSource::Flag(path.clone()), &env()).unwrap();
+        assert_eq!(
+            c.share.gpus,
+            GpuShare::List(vec!["GPU-00000000-0000-4000-8000-000000000001".into()])
+        );
+        assert!(!c.share.paused);
+        // A missing file is created, with only the share.
+        let fresh = dir.path().join("new/agent.toml");
+        write_share_update(&fresh, &update, &env()).unwrap();
+        assert!(!Config::load(&ConfigSource::Flag(fresh), &env()).unwrap().share.paused);
+        // An update the file cannot hold is refused, and the file is left as it was.
+        let before = std::fs::read_to_string(&path).unwrap();
+        let bad = ShareUpdate {
+            memory_mb: Some(0),
+            ..ShareUpdate::default()
+        };
+        assert_eq!(err_field(write_share_update(&path, &bad, &env())), "share.memory_mb");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.starts_with('.'))
+            .collect();
+        assert!(names.is_empty(), "no temporary file left: {names:?}");
+    }
+
+    /// H2 §8.4: the running agent sees a share change within 10 s (it polls every 2 s), and a file that does not load
+    /// keeps the last good share.
+    #[tokio::test]
+    async fn the_share_watcher_sees_changes_and_keeps_the_last_good_share() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+        std::fs::write(&path, "[share]\ncpu_cores = 2.0\n").unwrap();
+        let source = ConfigSource::Flag(path.clone());
+        let mut watcher = ShareWatcher::new(
+            source,
+            env(),
+            Share {
+                cpu_cores: Some(2.0),
+                ..Share::default()
+            },
+        );
+        assert_eq!(watcher.poll().await, None, "unchanged");
+        std::fs::write(&path, "[share]\ncpu_cores = 2.0\npaused = true\n").unwrap();
+        let changed = watcher.poll().await.unwrap();
+        assert!(changed.paused);
+        assert_eq!(watcher.poll().await, None, "reported once");
+        std::fs::write(&path, "[share]\ncpu_cores = 0\n").unwrap();
+        assert_eq!(watcher.poll().await, None, "an invalid file is not a change");
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(watcher.poll().await, None, "a named file that is gone is not a change");
+        std::fs::write(&path, "[share]\ncpu_cores = 3.0\npaused = true\n").unwrap();
+        assert_eq!(watcher.poll().await.unwrap().cpu_cores, Some(3.0));
+        assert!(SHARE_POLL_INTERVAL <= std::time::Duration::from_secs(5));
     }
 
     #[test]
