@@ -14,6 +14,8 @@
 //! - [`transport`]: what a session runs over ([`Connector`], [`Link`]); [`endpoint`]: the iroh implementation, with
 //!   the §10 address hygiene and re-binding on network changes; [`uplink`]: the welcomed session's outbox and upload
 //!   streams, as the lease executor (T10a) reaches them.
+//! - [`streams`]: the streams the hub opens on the connection (H2 §6.1): the dispatcher of `PortOpen` streams, served
+//!   by the sandbox's ingress bridge.
 //! - [`load`]: the `load` of heartbeats; [`state`]: the state file behind `p2pc-agent status`; [`gate`]: the egress gate
 //!   file behind its `Egress gate:` line (T10l); [`exit`]: the exit
 //!   codes; [`token`]: reading the join token without ever showing it (SI-6).
@@ -28,6 +30,7 @@ pub mod lease;
 pub mod load;
 pub mod session;
 pub mod state;
+pub mod streams;
 pub mod token;
 pub mod transport;
 pub mod uplink;

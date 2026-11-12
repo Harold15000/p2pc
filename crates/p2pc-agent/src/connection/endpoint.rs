@@ -7,7 +7,8 @@
 //! debounced network watcher ([`p2pc_net::watch_network`]). What is the agent's own:
 //!
 //! - **Outbound only.** The endpoint is bound with **no ALPN**, so it accepts no connection at all: it only dials
-//!   the server, on `p2pc/agent/1` (SI-12, hard rule 4).
+//!   the server, on `p2pc/agent/1` (SI-12, hard rule 4). The streams the server opens for service ports (H2 §6.1)
+//!   are streams of that dialed connection ([`super::streams`]), not connections to the agent.
 //! - The server is dialled by its NodeId and the relay URLs of the join token (or `[iroh] relays`), never by
 //!   addresses from anywhere else.
 //! - A network change makes the daemon call [`IrohConnector::set_addresses`] and reconnect at once.
@@ -34,6 +35,7 @@ use p2pc_proto::PROTOCOL_ALPN_AGENT;
 use p2pc_proto::net::SelectedAddr;
 
 use super::BoxFuture;
+use super::streams::IrohAcceptor;
 use super::transport::{BoxRead, BoxWrite, ConnectError, Connector, Link, StreamOpener};
 
 /// The QUIC close code of a clean shutdown by the agent.
@@ -319,12 +321,14 @@ impl Connector for IrohConnector {
                 .await
                 .map_err(|e| ConnectError(format!("cannot open the control stream: {e}")))?;
             let streams = Arc::new(IrohStreams(conn.clone()));
+            let incoming = Arc::new(IrohAcceptor::new(conn.clone()));
             Ok(Link::new(
                 Box::new(send),
                 Box::new(recv),
                 Box::new(move || conn.close(VarInt::from_u32(CLOSE_BY_AGENT), b"")),
             )
-            .with_streams(streams))
+            .with_streams(streams)
+            .with_incoming(incoming))
         })
     }
 

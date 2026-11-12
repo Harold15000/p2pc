@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Integration tests for `p2pc-shim` (spec §9 "Shim"): the `--` contract, exit codes, signal forwarding, zombie
-//! reaping and the egress bridge.
+//! reaping, the egress bridge and the ingress bridge (H2 §11.2).
 //!
 //! The child commands are tiny `sh` scripts. Every wait is on a pipe or a process exit, never a sleep; the only
 //! deadline is `timeout`, which turns "the shim never reaped" into a failure instead of a hang.
@@ -9,8 +9,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
-use std::os::unix::net::UnixListener;
+use std::net::{Shutdown, TcpListener, TcpStream};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::{Child, ChildStdout, Command, Stdio};
 
 use assert_cmd::cargo::cargo_bin_cmd;
@@ -290,4 +290,143 @@ fn refuses_a_non_loopback_listen_address() {
         .assert()
         .code(2)
         .stderr(contains("loopback"));
+}
+
+/// A header of the agent's side of the ingress bridge: the version, then the port, big-endian.
+fn header(version: u8, port: u16) -> [u8; 3] {
+    let [hi, lo] = port.to_be_bytes();
+    [version, hi, lo]
+}
+
+/// The next idle connection the shim dials. A read that never ends fails the test after a while instead of hanging
+/// it.
+fn next_idle(agent: &UnixListener) -> UnixStream {
+    let (conn, _) = agent.accept().unwrap();
+    conn.set_read_timeout(Some(std::time::Duration::from_secs(60))).unwrap();
+    conn
+}
+
+/// The ingress bridge end to end (H2 §11.2, SI-H2-7): a unix listener stands in for the agent's `ingress.sock`, a
+/// loopback TCP listener for the service inside the container.
+#[test]
+fn the_ingress_bridge_forwards_listed_ports_and_refuses_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("ingress.sock");
+    let agent = match UnixListener::bind(&sock) {
+        Ok(s) => s,
+        // As for the egress bridge: only a sandbox that forbids AF_UNIX skips this, loudly. The request handling
+        // is also covered by unit tests in `src/ingress.rs`, over TCP.
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!("SKIPPED: this environment forbids unix sockets ({e})");
+            return;
+        }
+        Err(e) => panic!("cannot bind the test socket: {e}"),
+    };
+    let service = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listed = service.local_addr().unwrap().port();
+    // A second service of the same "container", which `ports.json` does not list.
+    let hidden = TcpListener::bind("127.0.0.1:0").unwrap();
+    let unlisted = hidden.local_addr().unwrap().port();
+    hidden.set_nonblocking(true).unwrap();
+    let ports = dir.path().join("ports.json");
+    std::fs::write(&ports, format!("{{\"ports\":[{listed}]}}")).unwrap();
+
+    let (mut child, mut out) = spawn(&[
+        "--egress-socket",
+        dir.path().join("egress.sock").to_str().unwrap(),
+        "--ports-file",
+        ports.to_str().unwrap(),
+        "--ingress-socket",
+        sock.to_str().unwrap(),
+        "--",
+        "sh",
+        "-c",
+        "echo ready; read done",
+    ]);
+    assert_eq!(line(&mut out), "ready");
+
+    // The shim keeps 4 idle connections open.
+    let mut idle: Vec<UnixStream> = (0..4).map(|_| next_idle(&agent)).collect();
+
+    // A port that is not listed: status 2, the connection ends, and nothing reached that port.
+    let mut conn = idle.pop().unwrap();
+    conn.write_all(&header(1, unlisted)).unwrap();
+    let mut answer = Vec::new();
+    conn.read_to_end(&mut answer).unwrap();
+    assert_eq!(answer, [2], "not listed");
+    assert_eq!(
+        hidden.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "the shim connected to a port that is not listed"
+    );
+    // It dials a fresh idle connection after each request.
+    idle.push(next_idle(&agent));
+
+    // A header of another version is not answered at all.
+    let mut conn = idle.pop().unwrap();
+    conn.write_all(&header(2, listed)).unwrap();
+    let mut answer = Vec::new();
+    conn.read_to_end(&mut answer).unwrap();
+    assert!(answer.is_empty(), "{answer:?}");
+    idle.push(next_idle(&agent));
+
+    // A listed port: status 0, then bytes both ways, and a half-close travels through.
+    let mut conn = idle.pop().unwrap();
+    conn.write_all(&header(1, listed)).unwrap();
+    let mut status = [9u8; 1];
+    conn.read_exact(&mut status).unwrap();
+    assert_eq!(status, [0], "ok");
+    let (mut served, peer) = service.accept().unwrap();
+    assert!(peer.ip().is_loopback());
+    conn.write_all(b"ping").unwrap();
+    let mut got = [0u8; 4];
+    served.read_exact(&mut got).unwrap();
+    assert_eq!(&got, b"ping");
+    served.write_all(b"pong").unwrap();
+    conn.read_exact(&mut got).unwrap();
+    assert_eq!(&got, b"pong");
+    conn.shutdown(Shutdown::Write).unwrap();
+    let mut rest = Vec::new();
+    served.read_to_end(&mut rest).unwrap();
+    assert!(rest.is_empty(), "the client's end reached the service");
+    served.write_all(b"bye").unwrap();
+    drop(served);
+    conn.read_to_end(&mut rest).unwrap();
+    assert_eq!(rest, b"bye");
+    idle.push(next_idle(&agent));
+    assert_eq!(idle.len(), 4);
+
+    // The bridge listens on nothing: the service's port is reachable only through the agent's socket.
+    assert_eq!(listening_tcp(child.id()), Vec::<String>::new());
+
+    child.stdin.take().unwrap().write_all(b"x\n").unwrap();
+    assert!(child.wait().unwrap().success());
+}
+
+/// A ports file the shim cannot read exactly stops it before the job runs: it never guesses which ports to forward.
+#[test]
+fn a_malformed_ports_file_stops_the_shim_before_the_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let ports = dir.path().join("ports.json");
+    for bad in ["{\"ports\":\"all\"}", "{\"ports\":[0]}", "{\"ports\":[80],\"x\":1}", ""] {
+        std::fs::write(&ports, bad).unwrap();
+        shim()
+            .args(["--ports-file", ports.to_str().unwrap(), "--", "echo", "ran"])
+            .assert_output(1, "", "cannot read");
+    }
+}
+
+/// Runs a command and checks its exit code, its exact stdout and a part of its stderr.
+trait AssertOutput {
+    fn assert_output(&mut self, code: i32, stdout: &str, stderr_has: &str);
+}
+
+impl AssertOutput for Command {
+    fn assert_output(&mut self, code: i32, stdout: &str, stderr_has: &str) {
+        let out = self.output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(code), "{stderr}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), stdout);
+        assert!(stderr.contains(stderr_has), "{stderr}");
+    }
 }

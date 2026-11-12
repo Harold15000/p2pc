@@ -4,7 +4,8 @@
 //!
 //! ```text
 //! prepare: SI-1 owner check → validation, sandbox class, GPU → job dir, inputs, shim, env file → lease cgroup
-//!          → egress socket (if asked) → pull if missing (phase "pulling") → size cap → podman create → delete env file
+//!          → egress socket (if asked) → ingress socket and ports file (a service)
+//!          → pull if missing (phase "pulling") → size cap → podman create → delete env file
 //! start:   podman start --attach (logs and exit code) → log pump
 //! wait:    exit, or timeout / cancel (SIGTERM, grace, SIGKILL), or disk limit (SIGKILL); then cgroup counters
 //!          services also: health checks (a failure stops them with SIGTERM, grace, SIGKILL) and usage samples
@@ -20,6 +21,11 @@
 //! `error="health_check_failed"`. Its usage is sampled from the lease cgroup once a minute ([`SandboxEvent::Usage`]),
 //! and its logs are not capped in total (the executor keeps the most recent 64 MiB, H2 §11.4). A node without a probe
 //! refuses services as `invalid_job`.
+//!
+//! **The ingress bridge** (H2 §11.2, [`super::ingress`]). A service's ports are reached only through the agent's own
+//! `ingress.sock`, which `prepare` creates in the job's `p2pc/` next to `ports.json` before the container exists, and
+//! which `cleanup` removes. Both sit in the read-only `/.p2pc` mount the container already has: the `podman create`
+//! argv of a service is the batch job's, `--network=none` included, and no port is published anywhere.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -46,6 +52,7 @@ use super::cgroup::{CgroupStats, Cgroups};
 use super::disk::{self, FreeSpace, Statvfs, TreeUsage};
 use super::engine::{Attached, ContainerState, Engine, ExitFuture, StopSignal};
 use super::health::{HealthMachine, HealthPolicy, HealthProbe, ProbeTarget, Step};
+use super::ingress::{self, Attach, IngressBridge, IngressSession};
 use super::jobdir::{JOBS_DIR, JobDir};
 use super::logs::{self, LogSummary};
 use super::outputs::{self, CollectedOutputs};
@@ -102,6 +109,10 @@ pub struct DriverConfig {
     /// Runs the health checks of services (H2 §11.2: the ingress bridge, T2-21). `None`, the default: the node
     /// cannot check a service, so service leases are refused as `invalid_job`.
     pub health_probe: Option<Arc<dyn HealthProbe>>,
+    /// The ingress bridge (H2 §11.2): each service lease gets its `ingress.sock` and `ports.json` from it, from
+    /// `prepare` to `cleanup`. The agent sets it together with `health_probe`, to the same bridge. `None`, the
+    /// default: no service gets either file, so nothing can reach its ports (tests with a scripted probe).
+    pub ingress: Option<IngressBridge>,
     /// How often a service's usage is sampled from its lease cgroup for the heartbeat (H2 §11.4: at most once a
     /// minute). Shorter values are raised to [`USAGE_INTERVAL`].
     pub usage_interval: Duration,
@@ -129,6 +140,7 @@ impl DriverConfig {
             public_addrs: watch::channel(Vec::new()).1,
             egress_ready: watch::channel(p2pc_net::EgressGate::Closed).1,
             health_probe: None,
+            ingress: None,
             usage_interval: USAGE_INTERVAL,
         }
     }
@@ -444,6 +456,8 @@ pub struct PodmanJob<E: Engine, C: Cgroups, S> {
     pump: Option<JoinHandle<LogSummary>>,
     started_at: Option<Instant>,
     egress: Option<S>,
+    /// A service's place on the ingress bridge: its socket, until `cleanup`. `None` for a batch job.
+    ingress: Option<IngressSession>,
     /// A service's health policy and probe; `None` for a batch job.
     service: Option<ServiceRun>,
     guard: Guard<E, C>,
@@ -989,6 +1003,11 @@ impl<E: Engine, C: Cgroups, X: Egress> Sandbox for PodmanDriver<E, C, X> {
             // The validation already refused these.
             _ => return Err(reject(LeaseRejectReason::InvalidJob)),
         };
+        // The ports the shim may forward (H2 §11.2), for a service on a node with the ingress bridge.
+        let service_ports = match (&job.service, &self.cfg.ingress) {
+            (Some(block), Some(_)) => Some(ingress::service_ports(block).ok_or(reject(LeaseRejectReason::InvalidJob))?),
+            _ => None,
+        };
         if !self.cfg.ready {
             return Err(reject(LeaseRejectReason::UnsupportedSandbox));
         }
@@ -1020,11 +1039,16 @@ impl<E: Engine, C: Cgroups, X: Egress> Sandbox for PodmanDriver<E, C, X> {
         };
         let env_file = {
             let (dir, files, shim) = (dir.clone(), job.files.clone(), self.cfg.shim_path.clone());
+            let ports = service_ports.clone();
             setup_blocking(move || {
                 dir.write_inputs(&files)
                     .map_err(|e| SandboxError::failed(error_code::INVALID_INPUT, e))?;
                 dir.install_shim(&shim)
                     .map_err(|e| SandboxError::failed(error_code::SANDBOX_SETUP, format!("shim: {e}")))?;
+                if let Some(ports) = &ports {
+                    ingress::write_ports_file(&dir.p2pc(), ports)
+                        .map_err(|e| SandboxError::failed(error_code::SANDBOX_SETUP, format!("ports file: {e}")))?;
+                }
                 dir.write_env_file(&env)
                     .map_err(|e| SandboxError::failed(error_code::SANDBOX_SETUP, format!("env file: {e}")))
             })
@@ -1051,6 +1075,23 @@ impl<E: Engine, C: Cgroups, X: Egress> Sandbox for PodmanDriver<E, C, X> {
                     format!("egress proxy could not start: {e}"),
                 )
             })?)
+        };
+
+        // A service's ingress socket, before the container exists (the shim dials it as soon as it starts). An
+        // early return below drops the session, which removes the socket and detaches the lease.
+        let ingress = match (&service_ports, &self.cfg.ingress) {
+            (Some(ports), Some(bridge)) => Some(
+                bridge
+                    .attach(Attach {
+                        lease_id,
+                        epoch,
+                        ports,
+                        dir: &dir.p2pc(),
+                        cancel: cancel.clone(),
+                    })
+                    .map_err(|e| SandboxError::failed(error_code::SANDBOX_SETUP, e))?,
+            ),
+            _ => None,
         };
 
         let _ = events.send(SandboxEvent::Phase(Phase::Pulling)).await;
@@ -1099,6 +1140,7 @@ impl<E: Engine, C: Cgroups, X: Egress> Sandbox for PodmanDriver<E, C, X> {
             pump: None,
             started_at: None,
             egress,
+            ingress,
             service,
             guard,
         })
@@ -1360,6 +1402,8 @@ impl<E: Engine, C: Cgroups, X: Egress> Sandbox for PodmanDriver<E, C, X> {
         }
         // Stops the egress proxy and removes its socket.
         drop(job.egress.take());
+        // Detaches the lease from the ingress bridge and removes its socket: no new port stream reaches it.
+        drop(job.ingress.take());
         *job.exit.get_mut().unwrap_or_else(PoisonError::into_inner) = None;
         cleanup_steps(&self.shared, &job.lease_id, &job.name, &job.dir).await;
     }
