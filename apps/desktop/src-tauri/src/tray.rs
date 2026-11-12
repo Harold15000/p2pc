@@ -258,8 +258,8 @@ mod tests {
     #[test]
     fn the_hub_pc_menu_shows_a_removed_node_and_offers_only_the_cloud_s_own_control() {
         let mut m = sharing(Role::Hub);
+        // No `FaultCleared`: the removed node settles the hub PC in `paused` by itself.
         m.apply(Event::Fault(AttentionCode::NodeRemoved)).expect("fault");
-        m.apply(Event::FaultCleared).expect("cleared");
         let entries = menu(&m);
         assert_eq!(entries[0], MenuEntry::Text("P2PC: Paused".into()));
         assert_eq!(entries[1], MenuEntry::Text(HUB_NOTICE.into()));

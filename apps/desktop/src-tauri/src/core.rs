@@ -408,22 +408,18 @@ mod tests {
         let mut core = sharing(Role::Hub);
         assert!(!core.status().node_removed);
         assert_eq!(core.status().node_notice, None);
-        core.apply(Event::Fault(AttentionCode::NodeRemoved)).expect("fault");
-        // While the error is shown, and again after it is cleared, the node is shown as removed.
-        for cleared in [false, true] {
-            if cleared {
-                core.apply(Event::FaultCleared).expect("cleared");
-                // The hub keeps running: `paused`, not `stopped` (the whole cloud offline).
-                assert_eq!(core.status().state, State::Paused);
-            }
-            let view = core.status();
-            assert!(view.node_removed);
-            assert_eq!(view.node_notice, Some(NODE_REMOVED_HUB_NOTICE));
-            // The hub PC keeps its §8.6 sentence, and its only control is the cloud's own.
-            assert_eq!(view.hub_notice, Some(HUB_NOTICE));
-            let ids: Vec<_> = view.controls.iter().map(|c| c.id).collect();
-            assert_eq!(ids, vec![Control::TurnOffCloud]);
-        }
+        // No `FaultCleared` is needed or sent: nothing would ever clear this error.
+        assert_eq!(core.apply(Event::Fault(AttentionCode::NodeRemoved)), Ok(State::Paused));
+        let view = core.status();
+        // The hub keeps running: `paused`, not `stopped` (the whole cloud offline), and no error is shown.
+        assert_eq!(view.state, State::Paused);
+        assert_eq!(view.attention, None);
+        assert!(view.node_removed);
+        assert_eq!(view.node_notice, Some(NODE_REMOVED_HUB_NOTICE));
+        // The hub PC keeps its §8.6 sentence, and its only control is the cloud's own.
+        assert_eq!(view.hub_notice, Some(HUB_NOTICE));
+        let ids: Vec<_> = view.controls.iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![Control::TurnOffCloud]);
         assert!(NODE_REMOVED_HUB_NOTICE.contains("removed from your cloud"));
         assert!(NODE_REMOVED_HUB_NOTICE.contains("keeps running"));
     }

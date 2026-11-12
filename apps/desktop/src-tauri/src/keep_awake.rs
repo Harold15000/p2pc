@@ -398,6 +398,21 @@ mod tests {
     const LONG: Duration = Duration::from_secs(3600);
 
     #[test]
+    fn the_hub_pc_keeps_the_pc_awake_after_its_own_node_is_removed() {
+        // §8.5 "Sleep": the phone reaches the cloud only while the hub PC is awake. A removed node must not let it sleep.
+        use crate::state::{AttentionCode, Event, Machine, Role};
+        let mut machine = Machine::settled(Role::Hub, State::Sharing).expect("settled");
+        let rig = rig(Some(DESKTOP_ON_AC), LONG);
+        rig.awake.update(wish(true, machine.state()));
+        assert!(rig.next_call(), "held while sharing");
+        machine.apply(Event::Fault(AttentionCode::NodeRemoved)).expect("fault");
+        assert!(should_hold(wish(true, machine.state()), Some(DESKTOP_ON_AC)));
+        rig.awake.update(wish(true, machine.state()));
+        // Still held: the removed node made no call, and the drop releases once.
+        assert_eq!(rig.finish(), vec![true, false]);
+    }
+
+    #[test]
     fn it_holds_when_sharing_starts_and_releases_when_it_stops() {
         let rig = rig(Some(DESKTOP_ON_AC), LONG);
         rig.awake.update(wish(true, State::Sharing));
@@ -473,8 +488,8 @@ mod tests {
         rig.awake.update(wish(true, State::Sharing));
         assert!(rig.next_call(), "first attempt, refused");
         assert!(rig.next_call(), "second attempt, by the poll");
-        // It is held now, so no further attempt; the drop releases once.
-        assert_eq!(rig.finish().first(), Some(&true));
+        // It is held now, so no further attempt (it stays held through the polls); the drop releases once.
+        assert_eq!(rig.finish(), vec![true, true, false]);
     }
 
     #[test]
