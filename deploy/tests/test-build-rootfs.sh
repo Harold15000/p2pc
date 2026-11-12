@@ -467,6 +467,7 @@ make_dist() {
       esac
       printf 'license of %s\n' "$bin" >"$SCRATCH/stage/$stem/LICENSE"
       printf 'readme of %s\n' "$bin" >"$SCRATCH/stage/$stem/README"
+      printf 'third-party licenses of %s\n' "$bin" >"$SCRATCH/stage/$stem/THIRD-PARTY-LICENSES"
       tar -C "$SCRATCH/stage" -czf "$dir/$stem.tar.gz" "$stem"
     done
   done
@@ -496,7 +497,8 @@ assert_false "no server tarball name for something that is not an agent tarball"
 assert_contains "$agent_plan" "p2pc-server-0.1.0-$target.tar.gz" "the plan names the server tarball of the same version"
 assert_contains "$agent_plan" "$(sha256_of "$SCRATCH/dist1/p2pc-server-0.1.0-$target.tar.gz")" "and its SHA-256"
 assert_contains "$agent_plan" "/usr/local/bin/p2pc-server" "the plan installs p2pc-server"
-assert_contains "$agent_plan" "/usr/local/share/doc/p2pc-server/LICENSE" "and its license next to it (AGPL-3.0-only)"
+assert_contains "$agent_plan" "/usr/local/share/doc/p2pc-server/README" "and the server's README, its source offer (AGPL-3.0-only)"
+assert_contains "$agent_plan" "/usr/local/share/doc/<binary>/LICENSE and THIRD-PARTY-LICENSES" "every binary ships its license and the third-party licenses"
 cp -r "$SCRATCH/dist1" "$SCRATCH/dist-badserver"
 printf 'x' >>"$SCRATCH/dist-badserver/p2pc-server-0.1.0-$target.tar.gz"
 badserver_plan="$(bash "$script" --dry-run --agent-from "$SCRATCH/dist-badserver" 2>&1)"
@@ -570,10 +572,50 @@ server_doc="$(tail -n 1 <<<"$extracted_server")"
 assert_true "the server is extracted too, and it is the server of the tarball" cmp -s "$server_bin" "$(type -P env)"
 assert_eq "license of p2pc-server" "$(cat "$server_doc/LICENSE" 2>/dev/null)" "and its LICENSE, from the server tarball"
 assert_eq "readme of p2pc-server" "$(cat "$server_doc/README" 2>/dev/null)" "and its README (it says where the source is)"
+assert_eq "third-party licenses of p2pc-server" "$(cat "$server_doc/THIRD-PARTY-LICENSES" 2>/dev/null)" "and its THIRD-PARTY-LICENSES"
 # shellcheck disable=SC2016  # the literal text of the builder's install lines
 assert_true "the builder installs the server next to the agent" grep -qF '"$ROOTFS/usr/local/bin/p2pc-server"' "$script"
-# shellcheck disable=SC2016  # same
-assert_true "and its license" grep -qF '"$ROOTFS/usr/local/share/doc/p2pc-server/LICENSE"' "$script"
+# The license files of all three binaries (review P3): LICENSE and THIRD-PARTY-LICENSES from each verified tarball, and
+# the server's README, installed under /usr/local/share/doc/<binary>/ by install_doc_files.
+docs="$(
+  WORK="$SCRATCH/work-d" AGENT_FROM="$SCRATCH/dist1" AGENT_TARBALL="p2pc-agent-0.1.0-$target.tar.gz"
+  AGENT_TARBALL_SHA="$(sha256_of "$SCRATCH/dist1/$AGENT_TARBALL")"
+  SHIM_TARBALL="p2pc-shim-0.1.0-$target.tar.gz" SHIM_TARBALL_SHA="$(sha256_of "$SCRATCH/dist1/p2pc-shim-0.1.0-$target.tar.gz")"
+  SERVER_TARBALL="p2pc-server-0.1.0-$target.tar.gz" SERVER_TARBALL_SHA="$(sha256_of "$SCRATCH/dist1/p2pc-server-0.1.0-$target.tar.gz")"
+  extract_dist_agent 2>/dev/null || exit 1
+  # The real install sets owner 0:0, which needs root: the test drops only those two options.
+  install() {
+    local a=()
+    while (($# > 0)); do
+      if [[ "$1" == -o || "$1" == -g ]]; then shift 2; else a+=("$1") && shift; fi
+    done
+    command install "${a[@]}"
+  }
+  ROOTFS="$SCRATCH/rootfs-docs"
+  install_doc_files p2pc-agent "$AGENT_DOC_DIR" &&
+    install_doc_files p2pc-shim "$SHIM_DOC_DIR" &&
+    install_doc_files p2pc-server "$SERVER_DOC_DIR" &&
+    printf 'ok'
+)"
+assert_eq "ok" "$docs" "the license files of the three binaries are extracted and installed"
+for bin in p2pc-agent p2pc-shim p2pc-server; do
+  d="$SCRATCH/rootfs-docs/usr/local/share/doc/$bin"
+  assert_eq "license of $bin" "$(cat "$d/LICENSE" 2>/dev/null)" "$bin: LICENSE, from its own tarball"
+  assert_eq "third-party licenses of $bin" "$(cat "$d/THIRD-PARTY-LICENSES" 2>/dev/null)" "$bin: THIRD-PARTY-LICENSES next to it"
+  assert_eq "644" "$(stat -c %a "$d/THIRD-PARTY-LICENSES" 2>/dev/null)" "$bin: mode 0644"
+done
+assert_eq "readme of p2pc-server" "$(cat "$SCRATCH/rootfs-docs/usr/local/share/doc/p2pc-server/README" 2>/dev/null)" "the server's README (the source offer) is installed too"
+assert_false "the agent's README is not needed" test -e "$SCRATCH/rootfs-docs/usr/local/share/doc/p2pc-agent/README"
+# shellcheck disable=SC2016  # the literal text of the builder's lines
+assert_true "write_configuration installs them" grep -qF 'install_doc_files p2pc-server "$SERVER_DOC_DIR"' "$script"
+mkdir -p "$SCRATCH/dist-notp/stage"
+tar -xzf "$SCRATCH/dist1/p2pc-shim-0.1.0-$target.tar.gz" -C "$SCRATCH/dist-notp/stage"
+rm "$SCRATCH/dist-notp/stage/p2pc-shim-0.1.0-$target/THIRD-PARTY-LICENSES"
+tar -C "$SCRATCH/dist-notp/stage" -czf "$SCRATCH/dist-notp/p2pc-shim-0.1.0-$target.tar.gz" "p2pc-shim-0.1.0-$target"
+assert_false "a tarball without THIRD-PARTY-LICENSES is refused" bash -c "
+  source '$script'; WORK='$SCRATCH/work-n' AGENT_FROM='$SCRATCH/dist-notp'; mkdir -p '$SCRATCH/work-n/agent'
+  cp '$SCRATCH/dist-notp/p2pc-shim-0.1.0-$target.tar.gz' '$SCRATCH/work-n/agent/'
+  extract_doc 'p2pc-shim-0.1.0-$target.tar.gz' LICENSE THIRD-PARTY-LICENSES"
 assert_false "a server tarball that changed after the check is refused" bash -c "
   source '$script'; WORK='$SCRATCH/work-z' AGENT_FROM='$SCRATCH/dist1' AGENT_TARBALL='p2pc-agent-0.1.0-$target.tar.gz'
   AGENT_TARBALL_SHA=\$(sha256_of '$SCRATCH/dist1/p2pc-agent-0.1.0-$target.tar.gz')

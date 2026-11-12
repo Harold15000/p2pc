@@ -572,7 +572,9 @@ $(containers_conf_content | sed 's/^/         /')
      /usr/local/bin/p2pc-shim         (with --agent-from, or --agent with --shim; the agent takes no lease without it)
      /usr/local/bin/p2pc-server       (the hub: with --agent-from, or --agent with --server; p2pc-run starts it only while
                                        /var/lib/p2pc-server/hub.enabled exists)
-     /usr/local/share/doc/p2pc-server/LICENSE and README   (with --agent-from: p2pc-server is AGPL-3.0-only)
+     /usr/local/share/doc/<binary>/LICENSE and THIRD-PARTY-LICENSES   (with --agent-from, for p2pc-agent, p2pc-shim
+                                       and p2pc-server, from their own tarballs; and /usr/local/share/doc/p2pc-server/README,
+                                       which says where the AGPL-3.0-only source of p2pc-server is)
      /etc/wsl-distribution.conf       (DELETED: the base image's first-launch OOBE would create a login user)
   6. create /var/lib/p2pc with mode 0700 (the agent's identity lives here), /var/lib/p2pc/agent.toml (mode 0600, the
      agent's config, no settings: the built-in defaults; join writes [server] into it) and /var/log/p2pc with mode 0700
@@ -609,8 +611,9 @@ Usage: build-rootfs.sh [options]
   --agent-from DIST  install the release's agent: p2pc-agent-<v>-x86_64-unknown-linux-musl.tar.gz from DIST (the
                      dist/<version>/ of scripts/release.sh), checked against DIST/SHA256SUMS first (the documented build)
   --agent-version V  with --agent-from: which version, when SHA256SUMS lists several
-                     It also installs p2pc-shim and p2pc-server (the hub, with its LICENSE) from
-                     p2pc-{shim,server}-<v>-x86_64-unknown-linux-musl.tar.gz, checked the same way.
+                     It also installs p2pc-shim and p2pc-server (the hub) from
+                     p2pc-{shim,server}-<v>-x86_64-unknown-linux-musl.tar.gz, checked the same way, and the
+                     LICENSE and THIRD-PARTY-LICENSES of all three under /usr/local/share/doc/<binary>/.
   --agent PATH       install this p2pc-agent binary as is (a developer build; not checked against anything)
   --shim PATH        with --agent: install this p2pc-shim binary as is
   --server PATH      with --agent: install this p2pc-server binary as is (the hub)
@@ -899,10 +902,16 @@ write_configuration() {
     install -D -m 0755 -o 0 -g 0 "$SERVER_PATH" "$ROOTFS/usr/local/bin/p2pc-server"
     log "installed p2pc-server (sha256 $(sha256_of "$SERVER_PATH"))"
   fi
+  # With --agent-from: each binary's LICENSE and THIRD-PARTY-LICENSES (and p2pc-server's README, which says where its
+  # AGPL-3.0-only source is) go with it, under /usr/local/share/doc/<binary>/.
+  if [[ -n "$AGENT_DOC_DIR" ]]; then
+    install_doc_files p2pc-agent "$AGENT_DOC_DIR" || die "cannot install the license files of p2pc-agent"
+  fi
+  if [[ -n "$SHIM_DOC_DIR" ]]; then
+    install_doc_files p2pc-shim "$SHIM_DOC_DIR" || die "cannot install the license files of p2pc-shim"
+  fi
   if [[ -n "$SERVER_DOC_DIR" ]]; then
-    # p2pc-server is AGPL-3.0-only: its license, and the README that says where its source is, go with the binary.
-    install -D -m 0644 -o 0 -g 0 "$SERVER_DOC_DIR/LICENSE" "$ROOTFS/usr/local/share/doc/p2pc-server/LICENSE"
-    install -D -m 0644 -o 0 -g 0 "$SERVER_DOC_DIR/README" "$ROOTFS/usr/local/share/doc/p2pc-server/README"
+    install_doc_files p2pc-server "$SERVER_DOC_DIR" || die "cannot install the license files of p2pc-server"
   fi
 }
 
@@ -1039,28 +1048,46 @@ extract_from_dist() {
   printf '%s\n' "$path"
 }
 
-# extract_server_doc <server tarball>: LICENSE and README of p2pc-server, from the work-dir copy that extract_from_dist
-# already checked; prints the directory that holds them.
-extract_server_doc() {
-  local stem="${1%.tar.gz}" dir="$WORK/agent/doc" f
+# extract_doc <tarball> <file...>: the named files of <stem>/ (LICENSE, THIRD-PARTY-LICENSES, README) from the work-dir
+# copy that extract_from_dist already checked; prints the directory that holds them. Every one must be there, as a
+# regular file: scripts/release.sh puts LICENSE and THIRD-PARTY-LICENSES in every tarball.
+extract_doc() {
+  local tarball="$1" stem="${1%.tar.gz}" dir="$WORK/agent/doc" f
+  shift
+  local -a members=()
+  for f in "$@"; do members+=("$stem/$f"); done
   mkdir -p "$dir"
-  tar -xzf "$WORK/agent/$1" -C "$dir" "$stem/LICENSE" "$stem/README" || die "$1 has no $stem/LICENSE or $stem/README"
-  for f in LICENSE README; do
-    [[ -f "$dir/$stem/$f" && ! -L "$dir/$stem/$f" ]] || die "$stem/$f in $1 is not a regular file"
+  tar -xzf "$WORK/agent/$tarball" -C "$dir" "${members[@]}" || die "$tarball lacks one of: ${members[*]}"
+  for f in "$@"; do
+    [[ -f "$dir/$stem/$f" && ! -L "$dir/$stem/$f" ]] || die "$stem/$f in $tarball is not a regular file"
   done
   printf '%s\n' "$dir/$stem"
 }
 
+# install_doc_files <binary> <dir>: LICENSE, THIRD-PARTY-LICENSES and (when there is one) README from <dir> into
+# /usr/local/share/doc/<binary>/ of the image, mode 0644. The binaries are distributed in the image, so their license
+# texts and the licenses of everything compiled into them go with them; p2pc-server's README says where its source is
+# (AGPL-3.0-only).
+install_doc_files() {
+  local bin="$1" dir="$2" f
+  for f in LICENSE THIRD-PARTY-LICENSES README; do
+    [[ -f "$dir/$f" ]] || continue
+    install -D -m 0644 -o 0 -g 0 "$dir/$f" "$ROOTFS/usr/local/share/doc/$bin/$f" || return 1
+  done
+}
+
 # extract_dist_agent: the agent (AGENT_PATH) and, when their tarballs are known, p2pc-shim (SHIM_PATH) and p2pc-server
-# (SERVER_PATH, with its license in SERVER_DOC_DIR) from the dist.
+# (SERVER_PATH) from the dist, each with its license files (AGENT_DOC_DIR, SHIM_DOC_DIR, SERVER_DOC_DIR).
 extract_dist_agent() {
   AGENT_PATH="$(extract_from_dist "$AGENT_TARBALL" "$AGENT_TARBALL_SHA" p2pc-agent)" || exit 1
+  AGENT_DOC_DIR="$(extract_doc "$AGENT_TARBALL" LICENSE THIRD-PARTY-LICENSES)" || exit 1
   if [[ -n "${SHIM_TARBALL:-}" ]]; then
     SHIM_PATH="$(extract_from_dist "$SHIM_TARBALL" "$SHIM_TARBALL_SHA" p2pc-shim)" || exit 1
+    SHIM_DOC_DIR="$(extract_doc "$SHIM_TARBALL" LICENSE THIRD-PARTY-LICENSES)" || exit 1
   fi
   if [[ -n "${SERVER_TARBALL:-}" ]]; then
     SERVER_PATH="$(extract_from_dist "$SERVER_TARBALL" "$SERVER_TARBALL_SHA" p2pc-server)" || exit 1
-    SERVER_DOC_DIR="$(extract_server_doc "$SERVER_TARBALL")" || exit 1
+    SERVER_DOC_DIR="$(extract_doc "$SERVER_TARBALL" LICENSE README THIRD-PARTY-LICENSES)" || exit 1
   fi
 }
 
@@ -1081,6 +1108,8 @@ main() {
   SERVER_TARBALL=""
   SERVER_TARBALL_SHA=""
   SERVER_DOC_DIR=""
+  AGENT_DOC_DIR=""
+  SHIM_DOC_DIR=""
   BASE_IMAGE_FILE=""
   local dry_run=0
   UPDATE_LOCK=0
