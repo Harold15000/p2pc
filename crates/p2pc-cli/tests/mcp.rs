@@ -35,9 +35,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 fn config(results: &Path) -> McpConfig {
     McpConfig {
-        results_dir: results.to_path_buf(),
         // Polling is paced by the mock's answers, not by the clock: do not wait between polls.
         poll_interval: Duration::from_millis(1),
+        ..McpConfig::new(results.to_path_buf())
     }
 }
 
@@ -171,7 +171,7 @@ fn run_args() -> Value {
 // ---------------------------------------------------------------------------------------------------------------
 
 #[tokio::test]
-async fn the_server_lists_exactly_the_seven_tools_each_with_an_object_schema_and_the_cap_warning() {
+async fn the_server_lists_exactly_the_eight_tools_each_with_an_object_schema_and_the_cap_warning() {
     let s = session(|_| MockResponse::empty(404)).await;
     let tools = s.mcp.list_all_tools().await.unwrap();
     let mut names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
@@ -179,6 +179,7 @@ async fn the_server_lists_exactly_the_seven_tools_each_with_an_object_schema_and
     assert_eq!(
         names,
         [
+            "p2pc_blob_put",
             "p2pc_cancel",
             "p2pc_estimate",
             "p2pc_logs",
