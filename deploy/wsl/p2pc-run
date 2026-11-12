@@ -1,0 +1,545 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+#
+# p2pc-run: the one supervisor inside the p2pc-node WSL2 distro (H2 spec §8.5). It replaces p2pc-node-run, whose path
+# the image keeps as a symlink to this file for one release. Installed as /usr/local/sbin/p2pc-run; the per-user Scheduled
+# Task "P2PC node" (install.ps1 -Join, or the desktop app) starts it at logon with
+#   conhost.exe --headless wsl.exe -d p2pc-node -u root --exec /usr/local/sbin/p2pc-run
+# and that attached wsl.exe is what keeps the distro running (the installer never changes .wslconfig).
+#
+# The distro has no systemd (spec §9.0, H2 §8.5: systemd=false), so this script does what units would. It supervises up
+# to two children, each with its own lock, its own backoff (1 s doubling to 30 s, back to 1 s once a run lasted 60 s) and
+# its own size-rotated log in /var/log/p2pc/ (at most three files of 10 MiB each, because the distro has no journald):
+#
+#   the agent, always (agent.log), with H1's rules:
+#     1. one supervisor at a time (flock on its lock): a second one WAITS for the lock and takes over when the first one
+#        ends, so the wsl.exe of its task stays attached (a stopped task can leave the old runner alive);
+#     2. waits up to 60 s for a boot status of THIS start of the distro (boot-status.sh: p2pc-boot's init_starttime equals
+#        this init's), so the agent's first inventory sees the GPU state; if none comes it starts the agent anyway;
+#     3. runs `p2pc-agent run` with a clean environment (nothing from Windows reaches it: no WSL_INTEROP, no WSLENV),
+#        without the lock's descriptor and with SIGHUP ignored, and with P2PC_AGENT_CONFIG=/var/lib/p2pc/agent.toml: all
+#        mutable node state lives in /var/lib/p2pc, which the upgrade carries over. The file is created empty (0600) when
+#        it is missing: the agent refuses a named config file that does not exist, and with an empty one it stops for
+#        good with "not joined" (exit 8) instead of crash-looping;
+#     4. stops the agent for good on its terminal exit codes (crates/p2pc-agent/src/connection/exit.rs: 6 agent too old,
+#        7 not enrolled any more, 8 never joined); on exit 0 (the agent was asked to stop) it is not restarted either.
+#        Why it stopped goes to /var/lib/p2pc/node-run.status (key=value lines, mode 0600), which `install.ps1 -Status`
+#        shows. A terminal stop also records a stamp (the SHA-256 of agent.toml and of the agent binary): if the task
+#        could not be disabled, the next start finds that stamp unchanged and does not run the agent; a new enrollment
+#        or a new agent changes it;
+#
+#   the hub (hub.log), `p2pc-server serve` with P2PC_DATA_DIR=/var/lib/p2pc-server, only while
+#   /var/lib/p2pc-server/hub.enabled exists. The flag is checked every 5 s: the hub is started when it appears and
+#   stopped (TERM) when it goes away. The hub gets a clean environment too, without the lock's descriptor and with SIGHUP
+#   ignored. Before each start the runner reads the top level of /var/lib/p2pc-server/server.toml and REFUSES to start
+#   the hub (it says why in hub.log, then tries again after its backoff) unless:
+#     - `bind`, the REST listener, is a loopback address (or absent: the default is 127.0.0.1:7477). The hub's REST
+#       listener binds loopback only, as in H1 (H2 §8.5 "Hub listener"; hard rule 4: nothing listens beyond the
+#       loopback REST listener and the hub's own iroh endpoint);
+#     - `data_dir` is /var/lib/p2pc-server, the directory the upgrade carries over (H2 §8.3).
+#   The hub has no terminal exit code: while the flag exists it is restarted after every exit, with its backoff.
+#
+# Terminal stops (H2 §8.5). An agent terminal code stops only the agent. p2pc-run exits 64 (the task's wrapper,
+# install.ps1's node-task.cmd, then disables the task, so its 5-minute trigger cannot start a removed node again and
+# again) only when no child is left to supervise: the agent stopped for good AND the hub is disabled. On the hub PC the
+# hub keeps running after its own node was removed. When the agent ended with 0 and the hub is disabled it exits 0: an
+# ordinary end, which the watchdog may restart.
+# SIGTERM, SIGINT or SIGHUP (the task is stopped, the distro shuts down) are passed on as TERM to both children.
+#
+# The P2PC_RUN_* and P2PC_PROC variables exist for the tests (deploy/tests/test-run.sh); leave them unset.
+# Sourcing this file only defines functions.
+
+# The boot-status identity rule (boot_status_fresh, current_init_starttime): $P2PC_BOOT_STATUS_LIB, else next to this
+# script (a checkout), else where the image installs it.
+for _bs in "${P2PC_BOOT_STATUS_LIB:-}" "$(dirname "${BASH_SOURCE[0]}")/boot-status.sh" /usr/local/lib/p2pc/boot-status.sh; do
+  if [[ -n "$_bs" && -r "$_bs" ]]; then
+    # shellcheck source=deploy/wsl/boot-status.sh
+    source "$_bs"
+    break
+  fi
+done
+unset _bs
+
+# H2 §8.5: each child's backoff is 1 s doubling to 30 s. A run that lasted BACKOFF_RESET_S (H1's 60 s) resets it.
+readonly BACKOFF_MAX_S=30
+readonly BACKOFF_RESET_S=60
+# The exit code that tells the task wrapper to disable the task (spec 9.0).
+readonly TERMINAL_EXIT=64
+readonly BOOT_STATUS_WAIT_S=60
+readonly CLEAN_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+LOG_KEEP=3
+
+# ---------------------------------------------------------------------------------------------------------------
+# Pure helpers (unit-tested in deploy/tests/test-run.sh)
+# ---------------------------------------------------------------------------------------------------------------
+
+# next_delay <seconds>: the next backoff, doubled, at most BACKOFF_MAX_S.
+next_delay() {
+  local d=$(($1 * 2))
+  ((d > BACKOFF_MAX_S)) && d=$BACKOFF_MAX_S
+  echo "$d"
+}
+
+# is_terminal <exit code>: the agent cannot be helped by a restart; a person must act.
+is_terminal() {
+  case "$1" in
+    6 | 7 | 8) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# terminal_reason <exit code>: why the agent stopped, and what to do, for node-run.status and the log.
+terminal_reason() {
+  case "$1" in
+    6) echo "the server refuses this agent version (exit 6): upgrade the node image with .\\install.ps1 -Upgrade -Tar <new image>" ;;
+    7) echo "the server says this machine is not enrolled any more (exit 7: it was removed): join again with .\\install.ps1 -Join -Force" ;;
+    8) echo "this machine never joined a server (exit 8): run .\\install.ps1 -Join" ;;
+    0) echo "the agent stopped on request (exit 0)" ;;
+    *) echo "the agent exited with $1" ;;
+  esac
+}
+
+# toml_root_string <file> <key>: the value of a top-level string key of a TOML file (before the first [table]), a basic
+# string without escapes ("...") or a literal string ('...'), with an optional trailing comment. A bare, double-quoted
+# or single-quoted key is the same key. Returns 3 when the key is absent, 4 when it is given more than once, 5 when its
+# value is anything else (a number, a multi-line or escaped string, trailing text): the callers fail closed on those.
+# This is a line-based read of what `p2pc-server init` writes, not a TOML parser.
+toml_root_string() {
+  local file="$1" key="$2" line k rest n=0 raw=""
+  local re_key='^[[:space:]]*("([^"\\]*)"|'"'"'([^'"'"']*)'"'"'|([A-Za-z0-9_-]+))[[:space:]]*=[[:space:]]*(.*)$'
+  local re_basic='^"([^"\\]*)"[[:space:]]*(#.*)?$'
+  local re_literal="^'([^']*)'[[:space:]]*(#.*)?\$"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[[:space:]]*\[ ]] && break
+    [[ "$line" =~ $re_key ]] || continue
+    k="${BASH_REMATCH[2]}${BASH_REMATCH[3]}${BASH_REMATCH[4]}"
+    rest="${BASH_REMATCH[5]}"
+    [[ "$k" == "$key" ]] || continue
+    n=$((n + 1))
+    raw="${rest%"${rest##*[![:space:]]}"}"
+  done <"$file"
+  ((n == 0)) && return 3
+  ((n > 1)) && return 4
+  if [[ "$raw" =~ $re_basic || "$raw" =~ $re_literal ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 5
+}
+
+# is_loopback_bind <host:port>: an IPv4 loopback address (127.0.0.0/8) or [::1], with a port. Anything else, including
+# names, IPv4-mapped forms and the unspecified addresses, is not (fail closed).
+is_loopback_bind() {
+  [[ "$1" =~ ^127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}:[0-9]{1,5}$ || "$1" =~ ^\[::1\]:[0-9]{1,5}$ ]]
+}
+
+# hub_config_problem <server.toml> <hub dir>: prints why the hub must not start with this config and returns 1; prints
+# nothing and returns 0 when it may.
+hub_config_problem() {
+  local file="$1" dir="$2" bind data rc
+  if [[ ! -f "$file" ]]; then
+    printf '%s does not exist: the hub was never initialised here (p2pc-server init, with P2PC_DATA_DIR=%s)\n' "$file" "$dir"
+    return 1
+  fi
+  bind="$(toml_root_string "$file" bind)"
+  rc=$?
+  case "$rc" in
+    0)
+      if ! is_loopback_bind "$bind"; then
+        printf 'bind = "%s" in %s is not a loopback address: the hub REST listener binds loopback only (127.0.0.1:7477)\n' "$bind" "$file"
+        return 1
+      fi
+      ;;
+    3) ;; # absent: the server's default, 127.0.0.1:7477
+    4)
+      printf 'bind is given more than once in %s\n' "$file"
+      return 1
+      ;;
+    *)
+      printf 'cannot read bind in %s (want a quoted loopback address, such as "127.0.0.1:7477")\n' "$file"
+      return 1
+      ;;
+  esac
+  data="$(toml_root_string "$file" data_dir)"
+  rc=$?
+  if ((rc != 0)); then
+    printf 'cannot read data_dir in %s (want data_dir = "%s")\n' "$file" "$dir"
+    return 1
+  fi
+  if [[ "$data" != "$dir" ]]; then
+    printf 'data_dir = "%s" in %s is not %s, the directory the upgrade carries over\n' "$data" "$file" "$dir"
+    return 1
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------------------------------------------
+# Logging and status
+# ---------------------------------------------------------------------------------------------------------------
+
+# log <message>: one line of the runner's own, to stdout (which each supervisor sends to its rotated log).
+log() {
+  printf '%s p2pc-run: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
+}
+
+# rotate_logs <log>: x.log -> .1 -> .2; the oldest beyond LOG_KEEP files is dropped.
+rotate_logs() {
+  local f="$1" i
+  rm -f -- "$f.$((LOG_KEEP - 1))"
+  for ((i = LOG_KEEP - 2; i >= 1; i--)); do
+    [[ -e "$f.$i" ]] && mv -f -- "$f.$i" "$f.$((i + 1))"
+  done
+  [[ -e "$f" ]] && mv -f -- "$f" "$f.1"
+  return 0
+}
+
+# log_writer <log> <max bytes>: appends stdin to the log line by line, rotating before a line would take the file over
+# the limit (a single longer line is cut). It ignores the signals that stop the runner, so it drains to the end.
+log_writer() {
+  local f="$1" max="$2" line size len
+  trap '' TERM INT HUP
+  export LC_ALL=C # ${#line} counts bytes
+  size="$(stat -c %s -- "$f" 2>/dev/null || echo 0)"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    ((${#line} + 1 > max)) && line="${line:0:max-1}"
+    len=$((${#line} + 1))
+    if ((size > 0 && size + len > max)); then
+      rotate_logs "$f"
+      size=0
+    fi
+    printf '%s\n' "$line" >>"$f"
+    size=$((size + len))
+  done
+}
+
+# node_stamp: what a terminal stop depends on: the SHA-256 of agent.toml (the enrollment) and of the agent binary.
+node_stamp() {
+  cat -- "$AGENT_CONFIG" "$AGENT" 2>/dev/null | sha256sum | cut -d' ' -f1
+}
+
+# status_field <key>: a value of node-run.status, or nothing.
+status_field() {
+  sed -n "s/^$1=//p" "$STATE_DIR/node-run.status" 2>/dev/null | head -n 1
+}
+
+# write_status <state> [exit code] [reason] [stamp]: /var/lib/p2pc/node-run.status, atomically, mode 0600.
+write_status() {
+  local tmp
+  tmp="$(mktemp "$STATE_DIR/.node-run.status.XXXXXX" 2>/dev/null)" || return 0
+  {
+    printf 'state=%s\n' "$1"
+    printf 'time=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    [[ -n "${2:-}" ]] && printf 'exit_code=%s\n' "$2"
+    [[ -n "${3:-}" ]] && printf 'reason=%s\n' "$3"
+    [[ -n "${4:-}" ]] && printf 'stamp=%s\n' "$4"
+  } >"$tmp" 2>/dev/null
+  chmod 0600 "$tmp" 2>/dev/null
+  mv -f -- "$tmp" "$STATE_DIR/node-run.status" 2>/dev/null || rm -f -- "$tmp"
+}
+
+# ---------------------------------------------------------------------------------------------------------------
+# One child's supervisor (runs in its own subshell; globals: CHILD_PID, SLEEP_PID, WRITER_PID)
+# ---------------------------------------------------------------------------------------------------------------
+
+# finish <exit code>: close our side of the log pipe and let the writer drain, then exit.
+finish() {
+  exec 1>&- 2>&-
+  [[ -n "${WRITER_PID:-}" ]] && wait "$WRITER_PID" 2>/dev/null
+  exit "$1"
+}
+
+# take_lock <lock file> <log file>: fd 9 holds the lock. When another runner holds it (for example one whose task was
+# stopped: Stop-ScheduledTask kills conhost but not the wsl.exe under it, so that runner lives on), WAIT for it, so this
+# runner's wsl.exe stays attached and it takes over the moment the other one ends. It never exits at once: that left the
+# old runner unsupervised (T14b2 real run, W5). Exits 1 when the lock cannot be opened or taken at all.
+take_lock() {
+  local lock="$1" logf="$2"
+  if ! { exec 9>"$lock"; } 2>/dev/null; then
+    log "cannot open the lock $lock: this supervisor exits" >>"$logf"
+    exit 1
+  fi
+  if ! flock -n 9; then
+    log "another p2pc-run holds $lock: waiting to take over when it ends" >>"$logf"
+    flock 9 || {
+      log "cannot take the lock $lock: this supervisor exits" >>"$logf"
+      exit 1
+    }
+  fi
+}
+
+# start_log <log file>: from here on this supervisor's stdout and stderr go to its rotated log.
+start_log() {
+  exec > >(log_writer "$1" "$LOG_MAX_BYTES") 2>&1
+  WRITER_PID=$!
+}
+
+# stop_child: TERM to the running child and wait for it; the backoff's sleep, if any, ends too.
+stop_child() {
+  if [[ -n "${SLEEP_PID:-}" ]]; then
+    kill "$SLEEP_PID" 2>/dev/null
+    wait "$SLEEP_PID" 2>/dev/null
+  fi
+  if [[ -n "${CHILD_PID:-}" ]]; then
+    kill -TERM "$CHILD_PID" 2>/dev/null
+    wait "$CHILD_PID" 2>/dev/null
+  fi
+}
+
+# backoff <seconds>: `sleep & wait`, so that TERM is acted on at once (a foreground sleep would hold it back until the
+# delay ended). Neither the lock (fd 9) nor the log pipe is passed on: a signal between this line and SLEEP_PID=$! leaves
+# the sleep orphaned for up to 30 s, and it must not keep the next runner or the log writer waiting meanwhile.
+backoff() {
+  sleep "$1" 9>&- >/dev/null 2>&1 &
+  SLEEP_PID=$!
+  wait "$SLEEP_PID"
+  SLEEP_PID=""
+}
+
+# --- the agent ------------------------------------------------------------------------------------------------------
+
+agent_on_signal() {
+  log "stopping on a signal"
+  stop_child
+  write_status stopped "" "p2pc-run was stopped (the task was ended, or the distro shut down)"
+  finish 0
+}
+
+# wait_boot_status: up to BOOT_STATUS_WAIT_S seconds for a status of this start of the distro.
+wait_boot_status() {
+  local init i text
+  init="$(current_init_starttime 2>/dev/null)" || init=""
+  for ((i = 0; i <= BOOT_STATUS_WAIT_S; i++)); do
+    if [[ -s "$BOOT_STATUS" ]]; then
+      text="$(cat "$BOOT_STATUS" 2>/dev/null)"
+      if [[ -z "$init" ]] || boot_status_fresh "$text" "$init"; then
+        log "boot status: fresh: $text"
+        return 0
+      fi
+    fi
+    ((i < BOOT_STATUS_WAIT_S)) && sleep 1
+  done
+  log "no fresh boot status after ${BOOT_STATUS_WAIT_S} s (did p2pc-boot run?); starting the agent anyway: it reports the GPUs as not ready until there is one"
+}
+
+# supervise_agent: keeps `p2pc-agent run` running. Exits TERMINAL_EXIT after a terminal stop, 0 after a requested stop
+# (or when the image has no agent), 1 when its lock cannot be taken.
+supervise_agent() {
+  CHILD_PID=""
+  SLEEP_PID=""
+  WRITER_PID=""
+  # The lock first: a second runner must not start a second log writer (two writers would race on the rotation).
+  take_lock "$AGENT_LOCK" "$LOG_DIR/agent.log"
+  start_log "$LOG_DIR/agent.log"
+  trap agent_on_signal TERM INT HUP
+  log "starting (agent $AGENT)"
+  if [[ ! -x "$AGENT" ]]; then
+    log "$AGENT is missing: this image has no agent"
+    write_status stopped "" "$AGENT is missing: install an image with the agent (.\\install.ps1 -Upgrade -Tar <image>)"
+    finish 0
+  fi
+  if [[ ! -e "$AGENT_CONFIG" ]]; then
+    install -m 0600 /dev/null "$AGENT_CONFIG" 2>/dev/null && log "created an empty $AGENT_CONFIG (no enrollment yet)"
+  fi
+  # The fallback for a task that could not be disabled: a terminal stop with nothing changed since is not retried.
+  local last
+  last="$(status_field exit_code)"
+  if [[ "$(status_field state)" == stopped ]] && is_terminal "$last" && [[ "$(status_field stamp)" == "$(node_stamp)" ]]; then
+    log "the agent stopped for good earlier ($(terminal_reason "$last")), and nothing changed since: not starting it"
+    finish "$TERMINAL_EXIT"
+  fi
+  wait_boot_status
+
+  local delay=1 rc start ran
+  while :; do
+    write_status running
+    start="$(date +%s)"
+    # A clean environment: nothing from Windows or from the task reaches the agent (spec §9.0). Without the lock (fd 9):
+    # an agent that outlives its runner must never keep the next runner out. With SIGHUP ignored: when the wsl.exe of
+    # the task goes away, the runner (which traps HUP) stops the agent with TERM, so it stops its jobs cleanly.
+    (
+      trap '' HUP
+      exec env -i PATH="$CLEAN_PATH" HOME=/root LANG=C.UTF-8 P2PC_AGENT_CONFIG="$AGENT_CONFIG" "$AGENT" run
+    ) 9>&- &
+    CHILD_PID=$!
+    wait "$CHILD_PID"
+    rc=$?
+    CHILD_PID=""
+    ran=$(($(date +%s) - start))
+    if is_terminal "$rc"; then
+      write_status stopped "$rc" "$(terminal_reason "$rc")" "$(node_stamp)"
+      log "stopped for good: $(terminal_reason "$rc")"
+      finish "$TERMINAL_EXIT"
+    fi
+    if ((rc == 0)); then
+      write_status stopped "$rc" "$(terminal_reason "$rc")"
+      log "stopped: $(terminal_reason "$rc")"
+      finish 0
+    fi
+    ((ran >= BACKOFF_RESET_S)) && delay=1
+    write_status restarting "$rc" "$(terminal_reason "$rc"); restarting in ${delay} s"
+    log "p2pc-agent exited with $rc; restarting in ${delay} s"
+    backoff "$delay"
+    delay="$(next_delay "$delay")"
+  done
+}
+
+# --- the hub --------------------------------------------------------------------------------------------------------
+
+hub_on_signal() {
+  if [[ -e "$HUB_FLAG" ]]; then
+    log "stopping on a signal"
+  else
+    log "$HUB_FLAG was removed: stopping the hub"
+  fi
+  stop_child
+  finish 0
+}
+
+# supervise_hub: keeps `p2pc-server serve` running until TERM. It never ends by itself (only on TERM, or exit 1 when its
+# lock cannot be taken): a refused config, a missing binary and every exit of the hub are retried after the backoff.
+supervise_hub() {
+  CHILD_PID=""
+  SLEEP_PID=""
+  WRITER_PID=""
+  take_lock "$HUB_LOCK" "$LOG_DIR/hub.log"
+  start_log "$LOG_DIR/hub.log"
+  trap hub_on_signal TERM INT HUP
+  log "starting (hub $SERVER, data in $HUB_DIR, because $HUB_FLAG exists)"
+  local delay=1 rc start ran problem
+  while :; do
+    start="$(date +%s)"
+    if [[ ! -x "$SERVER" ]]; then
+      log "$SERVER is missing: this image has no hub; retrying in ${delay} s"
+    elif ! problem="$(hub_config_problem "$HUB_DIR/server.toml" "$HUB_DIR")"; then
+      log "refusing to start the hub: $problem; retrying in ${delay} s"
+    else
+      # A clean environment, without the lock (fd 9), with SIGHUP ignored: as for the agent.
+      (
+        trap '' HUP
+        exec env -i PATH="$CLEAN_PATH" HOME=/root LANG=C.UTF-8 P2PC_DATA_DIR="$HUB_DIR" "$SERVER" serve
+      ) 9>&- &
+      CHILD_PID=$!
+      wait "$CHILD_PID"
+      rc=$?
+      CHILD_PID=""
+      ran=$(($(date +%s) - start))
+      ((ran >= BACKOFF_RESET_S)) && delay=1
+      log "p2pc-server exited with $rc; restarting in ${delay} s"
+    fi
+    backoff "$delay"
+    delay="$(next_delay "$delay")"
+  done
+}
+
+# ---------------------------------------------------------------------------------------------------------------
+# The top level: starts the supervisors, follows hub.enabled, decides when the runner ends
+# ---------------------------------------------------------------------------------------------------------------
+
+# runner_log <message>: a line of the top level, appended to agent.log through the same size limit. Only written when the
+# agent's supervisor (and so its log writer) has ended, so there is never a second writer on that file.
+runner_log() {
+  log "$*" | log_writer "$LOG_DIR/agent.log" "$LOG_MAX_BYTES" 2>/dev/null
+}
+
+start_hub_supervisor() {
+  (supervise_hub) &
+  HUB_SUP=$!
+}
+
+# stop_supervisor <pid>: TERM, then wait for it (it stops its child first).
+stop_supervisor() {
+  kill -TERM "$1" 2>/dev/null
+  wait "$1" 2>/dev/null
+}
+
+stop_tick() {
+  if [[ -n "${TICK_PID:-}" ]]; then
+    kill "$TICK_PID" 2>/dev/null
+    wait "$TICK_PID" 2>/dev/null
+    TICK_PID=""
+  fi
+}
+
+runner_on_signal() {
+  [[ -n "${AGENT_SUP:-}" ]] && kill -TERM "$AGENT_SUP" 2>/dev/null
+  [[ -n "${HUB_SUP:-}" ]] && kill -TERM "$HUB_SUP" 2>/dev/null
+  [[ -n "${AGENT_SUP:-}" ]] && wait "$AGENT_SUP" 2>/dev/null
+  [[ -n "${HUB_SUP:-}" ]] && wait "$HUB_SUP" 2>/dev/null
+  stop_tick
+  exit 0
+}
+
+main() {
+  set -uo pipefail
+  umask 077
+  AGENT="${P2PC_RUN_AGENT:-/usr/local/bin/p2pc-agent}"
+  SERVER="${P2PC_RUN_SERVER:-/usr/local/bin/p2pc-server}"
+  STATE_DIR="${P2PC_RUN_STATE_DIR:-/var/lib/p2pc}"
+  HUB_DIR="${P2PC_RUN_HUB_DIR:-/var/lib/p2pc-server}"
+  LOG_DIR="${P2PC_RUN_LOG_DIR:-/var/log/p2pc}"
+  AGENT_LOCK="${P2PC_RUN_AGENT_LOCK:-/run/p2pc-run-agent.lock}"
+  HUB_LOCK="${P2PC_RUN_HUB_LOCK:-/run/p2pc-run-hub.lock}"
+  LOG_MAX_BYTES="${P2PC_RUN_LOG_MAX_BYTES:-10485760}"
+  local poll="${P2PC_RUN_HUB_POLL_S:-5}"
+  BOOT_STATUS="$STATE_DIR/boot-status.json"
+  AGENT_CONFIG="$STATE_DIR/agent.toml"
+  HUB_FLAG="$HUB_DIR/hub.enabled"
+  AGENT_SUP=""
+  HUB_SUP=""
+  TICK_PID=""
+
+  install -d -m 0700 "$LOG_DIR" "$STATE_DIR" 2>/dev/null
+  chmod 0700 "$LOG_DIR" 2>/dev/null
+  trap runner_on_signal TERM INT HUP
+
+  (supervise_agent) &
+  AGENT_SUP=$!
+  local agent_rc=0 hub_hold=0 ended rc
+  local -a pids
+  while :; do
+    # The hub follows hub.enabled. After its supervisor ended by itself (it never should), wait for one poll before
+    # starting it again, so a broken one cannot spin.
+    if [[ -e "$HUB_FLAG" ]]; then
+      [[ -z "$HUB_SUP" ]] && ((!hub_hold)) && start_hub_supervisor
+    elif [[ -n "$HUB_SUP" ]]; then
+      stop_supervisor "$HUB_SUP"
+      HUB_SUP=""
+    fi
+    # No child left to supervise: the agent has ended and the hub is disabled. 64 when the agent stopped for good.
+    if [[ -z "$AGENT_SUP" && -z "$HUB_SUP" && ! -e "$HUB_FLAG" ]]; then
+      stop_tick
+      runner_log "nothing left to supervise (the agent has ended, the hub is disabled): exit $agent_rc"
+      exit "$agent_rc"
+    fi
+    if [[ -z "$TICK_PID" ]]; then
+      sleep "$poll" 9>&- >/dev/null 2>&1 &
+      TICK_PID=$!
+    fi
+    pids=("$TICK_PID")
+    [[ -n "$AGENT_SUP" ]] && pids+=("$AGENT_SUP")
+    [[ -n "$HUB_SUP" ]] && pids+=("$HUB_SUP")
+    ended=""
+    wait -n -p ended "${pids[@]}"
+    rc=$?
+    # Nothing ended (wait was interrupted): look again. A stop signal never gets here (its trap exits).
+    [[ -n "$ended" ]] || continue
+    case "$ended" in
+      "$TICK_PID")
+        TICK_PID=""
+        hub_hold=0
+        ;;
+      "$AGENT_SUP")
+        AGENT_SUP=""
+        agent_rc=$rc
+        ;;
+      "$HUB_SUP")
+        HUB_SUP=""
+        hub_hold=1
+        ;;
+    esac
+  done
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

@@ -431,12 +431,20 @@ assert_contains "$default_plan" "/var/lib/p2pc/agent.toml" "the plan names the a
 assert_true "the builder writes it 0600" grep -qF 'write_rootfs_file 0600 /var/lib/p2pc/agent.toml' "$script"
 assert_eq "" "$(agent_config_content | grep -v '^#')" "it holds no setting (the built-in defaults), only comments"
 assert_eq "0" "$(grep -c '/etc/p2pc/agent.toml' <<<"$(sed -n '/^write_configuration()/,/^}/p' "$script" | grep -v '^[[:space:]]*#')")" "the image writes no /etc/p2pc/agent.toml"
-for needle in "/usr/local/sbin/p2pc-node-run" "/usr/local/lib/p2pc/boot-status.sh" "/var/log/p2pc"; do
+for needle in "/usr/local/sbin/p2pc-run" "/usr/local/lib/p2pc/boot-status.sh" "/var/log/p2pc"; do
   assert_contains "$plan" "$needle" "dry-run plan installs $needle"
 done
-for src in p2pc-node-run boot-status.sh; do
+for src in p2pc-run boot-status.sh; do
   assert_true "the builder installs $src into the image" grep -qF "\"\$SCRIPT_DIR/$src\"" "$script"
 done
+# H2 §8.5: p2pc-run replaces p2pc-node-run, whose path stays as a symlink for one release (an existing task, and
+# p2pc-wsl's task XML, still run /usr/local/sbin/p2pc-node-run).
+assert_false "the old runner is no longer a file of the checkout" test -e "$repo_root/deploy/wsl/p2pc-node-run"
+assert_contains "$plan" "/usr/local/sbin/p2pc-node-run -> p2pc-run" "the plan keeps the old path as a symlink to p2pc-run"
+# shellcheck disable=SC2016  # the literal text of the builder's line
+assert_true "the builder makes that symlink (relative, inside the rootfs)" grep -qF 'ln -s p2pc-run "$ROOTFS/usr/local/sbin/p2pc-node-run"' "$script"
+assert_false "the image does not create /var/lib/p2pc-server (p2pc-server init does, 0700; an upgrade compares listings)" \
+  grep -q 'var/lib/p2pc-server' <<<"$(sed -n '/^write_configuration()/,/^}/p' "$script" | grep -v '^[[:space:]]*#')"
 
 # --- --agent-from: the agent comes from the release dist, checked against SHA256SUMS --------------------------------
 target="x86_64-unknown-linux-musl"

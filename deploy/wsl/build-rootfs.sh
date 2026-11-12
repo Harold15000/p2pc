@@ -552,13 +552,16 @@ $(containers_conf_content | sed 's/^/         /')
      /usr/local/sbin/p2pc-test-distro (from deploy/wsl/test-distro.sh, mode 0755)
      /usr/local/lib/p2pc/nvidia.sh    (from deploy/wsl/nvidia.sh, mode 0644; sourced by both scripts above)
      /usr/local/lib/p2pc/boot-status.sh (from deploy/wsl/boot-status.sh, mode 0644; "is the boot status of this start?")
-     /usr/local/sbin/p2pc-node-run    (from deploy/wsl/p2pc-node-run, mode 0755; the Scheduled Task runs it)
+     /usr/local/sbin/p2pc-run         (from deploy/wsl/p2pc-run, mode 0755; the Scheduled Task runs it: the agent, and
+                                       the hub while /var/lib/p2pc-server/hub.enabled exists)
+     /usr/local/sbin/p2pc-node-run -> p2pc-run   (the old path, kept as a symlink for one release)
      /usr/local/bin/p2pc-agent        (only with --agent-from or --agent)
      /usr/local/bin/p2pc-shim         (with --agent-from, or --agent with --shim; the agent takes no lease without it)
      /etc/wsl-distribution.conf       (DELETED: the base image's first-launch OOBE would create a login user)
   6. create /var/lib/p2pc with mode 0700 (the agent's identity lives here), /var/lib/p2pc/agent.toml (mode 0600, the
      agent's config, no settings: the built-in defaults; join writes [server] into it) and /var/log/p2pc with mode 0700
-     (p2pc-node-run's rotated agent.log: the distro has no journald)
+     (p2pc-run's rotated agent.log and hub.log: the distro has no journald). /var/lib/p2pc-server, the hub's data, is
+     NOT created: \`p2pc-server init\` creates it (0700) on the PC that becomes the hub
      write /etc/p2pc-distro-version  (image version $IMAGE_VERSION, build date, base sha256, apt snapshot)
   7. write manifest.txt from dpkg-query, then restore the stock apt sources, clean: apt lists and caches, /etc/machine-id (emptied), ssh host keys,
      logs, shell history, /tmp, /etc/resolv.conf
@@ -840,17 +843,24 @@ write_configuration() {
   # The one definition of "is there an NVIDIA GPU?", sourced by p2pc-boot and p2pc-test-distro.
   install -D -m 0644 -o 0 -g 0 "$SCRIPT_DIR/nvidia.sh" "$ROOTFS/usr/local/lib/p2pc/nvidia.sh"
   # The one definition of "is this boot status from this start of the distro?", sourced by p2pc-boot,
-  # p2pc-test-distro and p2pc-node-run.
+  # p2pc-test-distro and p2pc-run.
   install -D -m 0644 -o 0 -g 0 "$SCRIPT_DIR/boot-status.sh" "$ROOTFS/usr/local/lib/p2pc/boot-status.sh"
-  # What the "P2PC node" Scheduled Task runs (install.ps1 -Join): it keeps the agent running.
-  install -D -m 0755 -o 0 -g 0 "$SCRIPT_DIR/p2pc-node-run" "$ROOTFS/usr/local/sbin/p2pc-node-run"
-  # The agent's identity and state live here (spec 9.0); only root may enter.
+  # What the "P2PC node" Scheduled Task runs (install.ps1 -Join): it keeps the agent running, and the hub while it is
+  # enabled (H2 §8.5).
+  install -D -m 0755 -o 0 -g 0 "$SCRIPT_DIR/p2pc-run" "$ROOTFS/usr/local/sbin/p2pc-run"
+  # The old name, kept for one release: tasks registered by an older install.ps1 (and p2pc-wsl's task XML) run it.
+  # Relative, so it points inside the image whatever the rootfs path is at build time.
+  remove_rootfs_file /usr/local/sbin/p2pc-node-run
+  ln -s p2pc-run "$ROOTFS/usr/local/sbin/p2pc-node-run"
+  # The agent's identity and state live here (spec 9.0); only root may enter. /var/lib/p2pc-server, the hub's data, is
+  # not created here: `p2pc-server init` creates it (0700) on the PC that becomes the hub, and an upgrade compares the
+  # listings of both directories before and after, so an empty one in the image would break that comparison.
   install -d -m 0700 -o 0 -g 0 "$ROOTFS/var/lib/p2pc"
   # The agent's config, next to its identity: everything mutable in /var/lib/p2pc, the one directory install.ps1
-  # -Upgrade carries over. p2pc-node-run and install.ps1 name it with P2PC_AGENT_CONFIG. No setting: the built-in
+  # -Upgrade carries over. p2pc-run and install.ps1 name it with P2PC_AGENT_CONFIG. No setting: the built-in
   # defaults (the image never had an /etc/p2pc/agent.toml either); `p2pc-agent join` writes [server] into it.
   write_rootfs_file 0600 /var/lib/p2pc/agent.toml "$(agent_config_content)"
-  # p2pc-node-run's rotated agent.log (no journald in the distro).
+  # p2pc-run's rotated agent.log and hub.log (no journald in the distro).
   install -d -m 0700 -o 0 -g 0 "$ROOTFS/var/log/p2pc"
   write_rootfs_file 0644 /etc/p2pc-distro-version \
     "$(printf 'image_version=%s\nbuild_date=%s\nbase_sha256=%s\narchive=%s%s' "$IMAGE_VERSION" "$(iso8601_utc "$SOURCE_DATE_EPOCH")" "$BASE_SHA256" "$(archive_record "$ARCHIVE" "$SNAPSHOT_TS")" "$(archive_build_time_line)")"
