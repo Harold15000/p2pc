@@ -1493,11 +1493,9 @@ impl<E: Engine, C: Cgroups, X: Egress> Sandbox for PodmanDriver<E, C, X> {
         };
         let mut health = job.service.as_ref().map(|s| HealthMachine::new(s.policy.limits));
         let mut health_tick = job.service.as_ref().map(|s| every(started, s.policy.interval));
-        let mut start_period_end: Option<Pin<Box<Sleep>>> = job
-            .service
-            .as_ref()
-            .and_then(|s| s.policy.limits)
-            .map(|l| Box::pin(tokio::time::sleep_until(started + l.start_period)));
+        let start_deadline = job.service.as_ref().map(|s| started + s.policy.limits.start_period);
+        let mut start_period_end: Option<Pin<Box<Sleep>>> =
+            start_deadline.map(|at| Box::pin(tokio::time::sleep_until(at)));
         let mut checking: Option<CheckFuture> = None;
         let mut usage_tick = job
             .service
@@ -1584,6 +1582,14 @@ impl<E: Engine, C: Cgroups, X: Egress> Sandbox for PodmanDriver<E, C, X> {
                 }
                 result = in_flight(&mut checking), if stop.is_none() => {
                     checking = None;
+                    // A result that comes at or after the end of the start period decides, whichever timer the
+                    // select saw first (a check tick can fall on that very instant: 300 s is a multiple of 10 s).
+                    if start_period_end.is_some() && start_deadline.is_some_and(|at| Instant::now() >= at) {
+                        start_period_end = None;
+                        if let Some(h) = health.as_mut() {
+                            h.start_period_ended();
+                        }
+                    }
                     let step = health.as_mut().map_or(Step::Stay, |h| h.record(result));
                     let (report, failed) = match step {
                         Step::Stay => (None, None),

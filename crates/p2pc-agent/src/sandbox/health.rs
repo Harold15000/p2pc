@@ -8,9 +8,12 @@
 //! - **The agent stops the service** (the H1 cancel sequence; the attempt ends `error="health_check_failed"`) when it
 //!   is still `starting` after `start_period_s`, or when `failure_threshold` consecutive checks failed after it was
 //!   `healthy`. A failed check during the start period does not count.
-//! - **Without a `health` block** the service is `healthy` as soon as a connection to its first port succeeds. It is
-//!   then checked no more, and it is never stopped for its health (H2 §7.1 gives such a service no start period and
-//!   no threshold; its `idle_timeout_s` and `timeout_s` still bound it).
+//! - **Without a `health` block** the service is `healthy` as soon as a connection to its first port succeeds (H2
+//!   §7.1). It is then checked no more, and it is never stopped for its health: it has no `failure_threshold`. Its
+//!   `starting` is still bounded (H2 §7.2: `starting` lasts at most `start_period_s`, and a service still `starting`
+//!   after it is stopped): by the default start period of §7.1, 300 s. Without that bound a service whose first port
+//!   never took a connection would stay `starting` until its `timeout_s` (up to 30 days), and the hub's idle timeout,
+//!   which counts from the first `healthy`, would never end it.
 //! - **The probe** ([`HealthProbe`]) is the ingress bridge's (§11.2, T2-21): the agent opens a bridged connection and
 //!   reads only the status line. The driver bounds each check by `timeout_s`. A node without a probe refuses service
 //!   leases (`invalid_job`): a service it could never check would only be stopped at the end of its start period.
@@ -45,13 +48,14 @@ pub enum HealthCheck {
     },
 }
 
-/// How a service with a `health` block may fail (H2 §7.1).
+/// How a service may fail its health (H2 §7.1, §7.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HealthLimits {
-    /// How long it may stay `starting`.
+    /// How long it may stay `starting`: `start_period_s`, or its default (300 s) without a `health` block.
     pub start_period: Duration,
-    /// Consecutive failed checks after `healthy` that make it `unhealthy` and stop it.
-    pub failure_threshold: u32,
+    /// Consecutive failed checks after `healthy` that make it `unhealthy` and stop it. `None` without a `health`
+    /// block: once healthy it is checked no more.
+    pub failure_threshold: Option<u32>,
 }
 
 /// What the driver runs for a service.
@@ -63,8 +67,8 @@ pub struct HealthPolicy {
     pub interval: Duration,
     /// Longest one check may take before it counts as failed.
     pub timeout: Duration,
-    /// `None` without a `health` block: healthy at the first passing check, then no more checks.
-    pub limits: Option<HealthLimits>,
+    /// How long it may stay `starting`, and how many failures after `healthy` stop it.
+    pub limits: HealthLimits,
 }
 
 /// A port of a validated JobSpec (1-65 535); anything else is refused as an invalid job.
@@ -74,10 +78,11 @@ fn port(p: u32) -> Option<u16> {
 
 impl HealthPolicy {
     /// The policy of a validated `service` block: its `health` block, or a TCP check of its first port with the
-    /// default interval and timeout. `None` if the block is not valid (no port, or a port out of range).
+    /// default interval, timeout and start period and no failure threshold. `None` if the block is not valid (no
+    /// port, or a port out of range).
     #[must_use]
     pub fn of(service: &ServiceSpec) -> Option<Self> {
-        use p2pc_proto::api::{DEFAULT_HEALTH_INTERVAL_S, DEFAULT_HEALTH_TIMEOUT_S};
+        use p2pc_proto::api::{DEFAULT_HEALTH_INTERVAL_S, DEFAULT_HEALTH_START_PERIOD_S, DEFAULT_HEALTH_TIMEOUT_S};
         let secs = |s: u32| Duration::from_secs(u64::from(s));
         match &service.health {
             Some(h) => {
@@ -93,10 +98,10 @@ impl HealthPolicy {
                     check,
                     interval: secs(h.interval_s.max(1)),
                     timeout: secs(h.timeout_s.max(1)),
-                    limits: Some(HealthLimits {
+                    limits: HealthLimits {
                         start_period: secs(h.start_period_s),
-                        failure_threshold: h.failure_threshold.max(1),
-                    }),
+                        failure_threshold: Some(h.failure_threshold.max(1)),
+                    },
                 })
             }
             None => Some(Self {
@@ -105,7 +110,10 @@ impl HealthPolicy {
                 },
                 interval: secs(DEFAULT_HEALTH_INTERVAL_S),
                 timeout: secs(DEFAULT_HEALTH_TIMEOUT_S),
-                limits: None,
+                limits: HealthLimits {
+                    start_period: secs(DEFAULT_HEALTH_START_PERIOD_S),
+                    failure_threshold: None,
+                },
             }),
         }
     }
@@ -144,7 +152,7 @@ pub enum Step {
 /// The health of one service attempt.
 #[derive(Debug, Clone)]
 pub struct HealthMachine {
-    limits: Option<HealthLimits>,
+    limits: HealthLimits,
     state: HealthState,
     /// Consecutive failed checks since the last pass.
     failures: u32,
@@ -169,7 +177,7 @@ pub fn clean_detail(detail: &str) -> String {
 impl HealthMachine {
     /// A service that just started: `starting`.
     #[must_use]
-    pub fn new(limits: Option<HealthLimits>) -> Self {
+    pub fn new(limits: HealthLimits) -> Self {
         Self {
             limits,
             state: HealthState::Starting,
@@ -189,14 +197,14 @@ impl HealthMachine {
     /// is healthy.
     #[must_use]
     pub fn wants_checks(&self) -> bool {
-        !self.stopped && (self.limits.is_some() || self.state == HealthState::Starting)
+        !self.stopped && (self.limits.failure_threshold.is_some() || self.state == HealthState::Starting)
     }
 
     /// The start period is over. A service still `starting` is checked once more at once (the driver does that when
     /// this returns true): that check decides, so even `start_period_s = 0` gets one.
     pub fn start_period_ended(&mut self) -> bool {
         self.start_period_over = true;
-        self.limits.is_some() && self.state == HealthState::Starting && !self.stopped
+        self.state == HealthState::Starting && !self.stopped
     }
 
     /// The result of one check.
@@ -216,11 +224,8 @@ impl HealthMachine {
             }
             Err(detail) => {
                 let detail = clean_detail(&detail);
-                let Some(limits) = self.limits else {
-                    // No `health` block: it stays `starting` until a connection succeeds.
-                    return Step::Stay;
-                };
                 match self.state {
+                    // Every service, with or without a `health` block (H2 §7.2).
                     HealthState::Starting if self.start_period_over => {
                         self.stopped = true;
                         Step::Stop(
@@ -231,8 +236,12 @@ impl HealthMachine {
                     // A failure in the start period does not count.
                     HealthState::Starting => Step::Stay,
                     HealthState::Healthy | HealthState::Unhealthy => {
+                        // No `health` block: once healthy it is never stopped for its health.
+                        let Some(threshold) = self.limits.failure_threshold else {
+                            return Step::Stay;
+                        };
                         self.failures = self.failures.saturating_add(1);
-                        if self.failures < limits.failure_threshold {
+                        if self.failures < threshold {
                             return Step::Stay;
                         }
                         self.stopped = true;
@@ -254,11 +263,19 @@ mod tests {
 
     use super::*;
 
-    fn limits(start_period_s: u64, failure_threshold: u32) -> Option<HealthLimits> {
-        Some(HealthLimits {
+    fn limits(start_period_s: u64, failure_threshold: u32) -> HealthLimits {
+        HealthLimits {
             start_period: Duration::from_secs(start_period_s),
-            failure_threshold,
-        })
+            failure_threshold: Some(failure_threshold),
+        }
+    }
+
+    /// A service without a `health` block: the default start period, no threshold.
+    fn no_block() -> HealthLimits {
+        HealthLimits {
+            start_period: Duration::from_secs(300),
+            failure_threshold: None,
+        }
     }
 
     fn fail(d: &str) -> Result<(), String> {
@@ -328,14 +345,47 @@ mod tests {
     }
 
     #[test]
-    fn without_a_health_block_it_is_healthy_at_the_first_connection_and_never_stopped() {
-        let mut m = HealthMachine::new(None);
-        assert!(!m.start_period_ended(), "no start period");
+    fn without_a_health_block_it_is_healthy_at_the_first_connection_and_never_stopped_after() {
+        let mut m = HealthMachine::new(no_block());
         for _ in 0..100 {
-            assert_eq!(m.record(fail("refused")), Step::Stay);
+            assert_eq!(
+                m.record(fail("refused")),
+                Step::Stay,
+                "the start period does not count failures"
+            );
         }
         assert_eq!(m.record(Ok(())), Step::Report(HealthState::Healthy, None));
         assert!(!m.wants_checks(), "checked no more once healthy");
+        assert!(
+            !m.start_period_ended(),
+            "healthy at the end of the start period: nothing to decide"
+        );
+        assert_eq!(
+            m.record(fail("refused")),
+            Step::Stay,
+            "never stopped for its health once healthy"
+        );
+        assert_eq!(m.state(), HealthState::Healthy);
+    }
+
+    /// H2 §7.2: `starting` lasts at most `start_period_s` (default 300 s, §7.1) for every service. One without a
+    /// `health` block whose first port never took a connection is stopped like any other (`health_check_failed`),
+    /// instead of staying `starting` until its `timeout_s`.
+    #[test]
+    fn without_a_health_block_still_starting_after_the_start_period_is_stopped() {
+        let mut m = HealthMachine::new(no_block());
+        assert_eq!(m.record(fail("refused")), Step::Stay);
+        assert!(m.start_period_ended(), "check once more at once");
+        let Step::Stop(None, detail) = m.record(fail("connection refused")) else {
+            panic!("not stopped")
+        };
+        assert!(detail.contains("still starting after the start period"), "{detail}");
+        assert!(!m.wants_checks());
+        assert_eq!(m.state(), HealthState::Starting);
+        // A first connection that succeeds at the deciding check still counts.
+        let mut m = HealthMachine::new(no_block());
+        assert!(m.start_period_ended());
+        assert_eq!(m.record(Ok(())), Step::Report(HealthState::Healthy, None));
     }
 
     #[test]
@@ -370,7 +420,8 @@ mod tests {
         assert_eq!(p.check, HealthCheck::Tcp { port: 11434 });
         assert_eq!(
             (p.interval, p.timeout, p.limits),
-            (Duration::from_secs(10), Duration::from_secs(3), None)
+            (Duration::from_secs(10), Duration::from_secs(3), no_block()),
+            "no block: the default start period of H2 §7.1, and no threshold"
         );
         let h = SpecHealth {
             http_get: Some("/api/version".into()),

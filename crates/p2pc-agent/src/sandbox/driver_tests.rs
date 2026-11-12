@@ -2569,7 +2569,8 @@ fn a_check_that_hangs_fails_at_its_timeout() {
 }
 
 /// Without a `health` block the service is healthy at its first successful connection to its first port, then not
-/// checked again and never stopped for its health: here it runs to its wall-clock limit (H1's enforcement).
+/// checked again and never stopped for its health: here it runs to its wall-clock limit (H1's enforcement), well past
+/// its start period.
 #[test]
 fn a_service_without_a_health_block_is_healthy_at_its_first_connection() {
     guarded(Clock::Paused, || async {
@@ -2587,6 +2588,34 @@ fn a_service_without_a_health_block_is_healthy_at_its_first_connection() {
         assert_eq!(kills(&engine), ["kill Term at 600s", "kill Kill at 610s"]);
         let (health, _) = service_events(&mut rx);
         assert_eq!(states(&health), [HealthState::Starting, HealthState::Healthy]);
+        d.cleanup(job).await;
+    });
+}
+
+/// H2 §7.2: a service without a `health` block is `starting` for at most the default start period (300 s, §7.1).
+/// One whose first port never takes a connection is stopped then with `health_check_failed`; it no longer stays
+/// `starting` until its `timeout_s`, which the hub's idle timeout (counted from the first `healthy`) never ends.
+#[test]
+fn a_service_without_a_health_block_that_never_connects_is_stopped_after_the_start_period() {
+    guarded(Clock::Paused, || async {
+        let fx = Fx::new();
+        let engine = MockEngine::default(); // ignores SIGTERM
+        let probe = FakeProbe::new([], Probe::Fail);
+        let d = fx.service_driver(Arc::clone(&probe), engine.clone());
+        mark_t0();
+        let lease = service_lease(&fx, None, 3600);
+        let (mut job, mut rx) = start_collecting(&d, &fx, lease, CancelHandle::new()).await;
+        let f = d.wait(&mut job).await.unwrap();
+        assert_eq!(
+            (f.outcome, f.exit_code, f.error.as_deref()),
+            (Outcome::Error, None, Some(error_code::HEALTH_CHECK_FAILED))
+        );
+        let times = probe.times();
+        assert_eq!(times.len(), 30, "one check every 10 s up to 300 s: {times:?}");
+        assert_eq!(times.last(), Some(&300));
+        assert_eq!(kills(&engine), ["kill Term at 300s", "kill Kill at 310s"]);
+        let (health, _) = service_events(&mut rx);
+        assert_eq!(states(&health), [HealthState::Starting], "it never became healthy");
         d.cleanup(job).await;
     });
 }
