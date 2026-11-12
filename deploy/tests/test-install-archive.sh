@@ -142,6 +142,25 @@ assert_eq "P2PC_STATE=present" "$(probe "$SCRATCH/probe/both")" "probe: agent st
 assert_eq "P2PC_STATE=present" "$(probe "$SCRATCH/probe/node")" "probe: agent state only: present"
 assert_eq "P2PC_STATE=hub-only" "$(probe "$SCRATCH/probe/hub")" "probe: hub data only: hub-only"
 assert_eq "P2PC_STATE=absent" "$(probe "$SCRATCH/probe/none")" "probe: neither: absent"
+
+# --- the size of the state to carry ($StateSizeScript, review P2), run verbatim: one du line per directory that exists.
+# shellcheck disable=SC2016  # the pattern is for grep: the $ is a literal PowerShell variable sigil
+sline="$(grep -E '^\$StateSizeScript = '"'" "$ps1")"
+sscript="${sline#\$StateSizeScript = \'}"
+sscript="${sscript%\'}"
+size_of() { # size_of <root>: the size script with /var/lib under <root>
+  sh -c "${sscript//\/var\/lib\//$1/}"
+}
+head -c 300000 /dev/zero >"$SCRATCH/probe/both/p2pc-server/blob"
+out="$(size_of "$SCRATCH/probe/both")"
+assert_eq "0" "$?" "size: exits 0 on the hub PC"
+assert_eq "2" "$(grep -c . <<<"$out")" "size: one line per directory"
+assert_true "size: the hub line ends with p2pc-server" grep -qE "^[0-9]+[[:space:]]+$SCRATCH/probe/both/p2pc-server\$" <<<"$out"
+assert_true "size: and counts its data (about 300 KB)" test "$(awk 'NR == 2 { print $1 }' <<<"$out")" -ge 290
+out="$(size_of "$SCRATCH/probe/node")"
+assert_eq "1" "$(grep -c . <<<"$out")" "size: a node without the hub: one line"
+size_of "$SCRATCH/probe/hub" >/dev/null 2>&1
+assert_false "size: no /var/lib/p2pc is a failure (never a small size)" test "$?" -eq 0
 assert_eq "secret" "$(cat "$SCRATCH/restore/p2pc-parent/p2pc/identity.key")" "the identity key content is restored"
 assert_eq "600" "$(stat -c %a "$SCRATCH/restore/p2pc-parent/p2pc/identity.key")" "the identity key mode is restored"
 

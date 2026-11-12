@@ -55,8 +55,12 @@
   from the old distro to one backup file under
   %LOCALAPPDATA%\P2PC\backups (not %TEMP%, where Windows Storage Sense deletes old files), the old distro is
   unregistered, the new image is imported, both are restored with the same modes and owners, and the result
-  is verified. After a successful upgrade the backup is renamed to p2pc-state-<time>.ok.tar and only the newest 3 of
-  those are kept. The backup of an upgrade that failed is never deleted, and its path is printed.
+  is verified. Before anything is touched it measures both directories in the old distro (du) and stops (23) unless
+  the Windows drives can hold the archive: the distro's drive about once more plus -MinFreeGB, the backup drive once
+  (twice plus -MinFreeGB when they are the same drive). After a successful upgrade the backup is renamed to
+  p2pc-state-<time>.ok.tar and only the newest 3 of those are kept, or only that one when it holds the hub's data (it
+  can be as large as the cloud's blobs); its size is printed. The backup of an upgrade that failed is never deleted,
+  and its path is printed.
 
   Exit codes
      0  success
@@ -78,7 +82,8 @@
     22  -Upgrade: p2pc-node is not installed
     23  -Upgrade: exporting /var/lib/p2pc (and /var/lib/p2pc-server) failed, or it could not be determined whether
         /var/lib/p2pc exists, or it does not exist and -Force was not given, or /var/lib/p2pc-server exists without
-        it (with or without -Force) (the old distro is never touched in these cases)
+        it (with or without -Force), or their size cannot be measured, or the Windows drives have no room for the
+        archive (the old distro is never touched in these cases)
     24  -Upgrade: unregistering the old distro failed
     25  -Upgrade: restoring /var/lib/p2pc (and /var/lib/p2pc-server) failed
     26  -Upgrade: verification after restore failed (the exported state file is kept)
@@ -174,6 +179,9 @@ $ConnectWaitSeconds = 60
 # The probe for "does the agent state exist?": prints exactly one marker. Absent is only believed on a positive answer.
 # The hub's data without the agent state is its own answer (hub-only): -Upgrade refuses it, with or without -Force.
 $StateProbeScript = 'if [ -d /var/lib/p2pc ]; then echo P2PC_STATE=present; elif [ -e /var/lib/p2pc-server ]; then echo P2PC_STATE=hub-only; else echo P2PC_STATE=absent; fi'
+# How much -Upgrade will carry, measured in the old distro before anything is touched (du -sk: KiB per directory, the
+# hub's line only when it exists). See Get-StateSize and Test-UpgradeSpace.
+$StateSizeScript = 'set -e; du -sk /var/lib/p2pc; if [ -e /var/lib/p2pc-server ]; then du -sk /var/lib/p2pc-server; fi'
 # The state archive, as a bash script run inside the distro. It WRITES the archive to a file inside the distro (@OUT@,
 # replaced by Get-StateArchiveScript with a validated path, mode 0600 through umask) and prints its SHA-256 there:
 # binary data is never streamed through PowerShell, which cannot be trusted to keep bytes (see Invoke-WslCopyOut). It
@@ -760,6 +768,69 @@ function Get-StateProbe {
     return 'unknown'
 }
 
+# Get-StateSize: the answer of $StateSizeScript as { AgentKB, HubKB ($null without the hub's data), TotalKB }, or $null
+# when the command failed or answered anything but one /var/lib/p2pc line and at most one /var/lib/p2pc-server line.
+# An unknown size is never "small enough": the caller refuses the upgrade.
+function Get-StateSize {
+    param([int]$ExitCode, [string]$Output)
+    if ($ExitCode -ne 0) { return $null }
+    $agent = @(); $hub = @()
+    foreach ($line in ($Output -split "`r?`n")) {
+        $t = $line.Trim()
+        if (-not $t) { continue }
+        $m = [regex]::Match($t, '^([0-9]+)\s+(/var/lib/p2pc|/var/lib/p2pc-server)$')
+        if (-not $m.Success) { return $null }
+        if ($m.Groups[2].Value -ceq '/var/lib/p2pc') { $agent += [long]$m.Groups[1].Value } else { $hub += [long]$m.Groups[1].Value }
+    }
+    if ($agent.Count -ne 1 -or $hub.Count -gt 1) { return $null }
+    $hubKB = $null
+    $total = $agent[0]
+    if ($hub.Count -eq 1) { $hubKB = $hub[0]; $total += $hubKB }
+    return New-Object psobject -Property @{ AgentKB = $agent[0]; HubKB = $hubKB; TotalKB = $total }
+}
+
+# Get-VolumeRoot <path>: the root of the volume that holds <path> (C:\ ...).
+function Get-VolumeRoot {
+    param([string]$Path)
+    return [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($Path))
+}
+
+# Get-FreeBytes <volume root>: the bytes this user may still write there.
+function Get-FreeBytes {
+    param([string]$Root)
+    return (New-Object System.IO.DriveInfo($Root)).AvailableFreeSpace
+}
+
+# Get-UpgradeSpaceNeeds: the bytes -Upgrade needs on each Windows volume, as root -> bytes. The archive is staged in the
+# old distro (whose virtual disk is on the distro's volume) and later restored into the new one there, and its copy goes
+# to the backup volume; the distro's volume also keeps -MinFreeGB for what runs afterwards (images, job data). On one
+# volume that is about twice the archive plus -MinFreeGB (review P2).
+function Get-UpgradeSpaceNeeds {
+    param([long]$StateBytes, [string]$DistroDir, [string]$BackupDir, [long]$MinFree)
+    $needs = [ordered]@{}
+    $d = Get-VolumeRoot $DistroDir
+    $b = Get-VolumeRoot $BackupDir
+    $needs[$d] = $StateBytes + $MinFree
+    if ($needs.Contains($b)) { $needs[$b] += $StateBytes } else { $needs[$b] = $StateBytes }
+    return $needs
+}
+
+# Test-UpgradeSpace: refuses the upgrade (23; nothing was touched yet) when a volume cannot hold what it needs.
+function Test-UpgradeSpace {
+    param($Size, [string]$DistroDir, [string]$BackupDir)
+    $stateBytes = [long]$Size.TotalKB * 1KB
+    $stateMB = [math]::Round($Size.TotalKB / 1024)
+    $needs = Get-UpgradeSpaceNeeds -StateBytes $stateBytes -DistroDir $DistroDir -BackupDir $BackupDir -MinFree ([long]$MinFreeGB * 1GB)
+    foreach ($root in @($needs.Keys)) {
+        $free = [long](Get-FreeBytes $root)
+        if ($free -lt $needs[$root]) {
+            Fail 23 ("Not enough free space on {0} for the upgrade: the state to carry is {1} MB (the agent state, and on the hub PC the hub's database and blobs). The drive of the distro holds the archive while it is made and restored, plus -MinFreeGB ({2} GB); the drive of %LOCALAPPDATA%\P2PC\backups holds its backup copy. {0}: {3} GB needed, {4} GB free. The old distro was NOT touched." -f $root, $stateMB, $MinFreeGB, [math]::Ceiling($needs[$root] / 1GB), [math]::Floor($free / 1GB)) @(
+                'Free some space on that drive, then run the upgrade again.')
+        }
+        Write-Log ("Free space on {0} for the upgrade: {1} GB, {2} GB needed: OK" -f $root, [math]::Floor($free / 1GB), [math]::Ceiling($needs[$root] / 1GB)) 'OK'
+    }
+}
+
 # Get-ConfigMigrationResult: the answer of $ConfigMigrationScript: 'present', 'moved' or 'created', or $null when the
 # script failed or answered anything else.
 function Get-ConfigMigrationResult {
@@ -939,6 +1010,8 @@ function Invoke-UpgradeSteps {
     param([string]$TarPath, [string]$Dir)
     $tarPath = $TarPath
     $dir = $Dir
+    # Whether the archive holds /var/lib/p2pc-server (decides how many verified backups are kept).
+    $script:UpgradeCarriesHub = $false
 
     # 1. Archive /var/lib/p2pc (and /var/lib/p2pc-server, the hub's data, when it exists) INSIDE the distro, hash it
     #    there, copy it out byte-exact (see the BINARY DATA RULE).
@@ -972,6 +1045,19 @@ function Invoke-UpgradeSteps {
         }
         Write-Log '/var/lib/p2pc does not exist in the old distro (confirmed by the probe) and -Force was given: continuing without restoring anything. The node will have to re-enrol after the upgrade.' 'WARN'
     } else {
+        # Before anything is written: how much will be carried, and whether the Windows drives can hold it (review P2:
+        # on the hub PC the archive holds the cloud's blobs too). An unknown size or too little room stops here (23).
+        $sizeRun = Invoke-InDistro @('/bin/sh', '-c', $StateSizeScript)
+        $size = Get-StateSize -ExitCode $sizeRun.ExitCode -Output $sizeRun.Output
+        if ($null -eq $size) {
+            Fail 23 'Could not measure /var/lib/p2pc and /var/lib/p2pc-server in the old distro (du failed or answered nothing sensible). The old distro was NOT touched.' @(
+                ("exit code {0}, output: {1}" -f $sizeRun.ExitCode, $sizeRun.Output))
+        }
+        $hubText = ''
+        if ($null -ne $size.HubKB) { $hubText = (", /var/lib/p2pc-server {0} MB" -f [math]::Round($size.HubKB / 1024)) }
+        Write-Log ("State to carry: {0} MB (/var/lib/p2pc {1} MB{2})" -f [math]::Round($size.TotalKB / 1024), [math]::Round($size.AgentKB / 1024), $hubText) 'INFO'
+        Test-UpgradeSpace -Size $size -DistroDir $dir -BackupDir $backupDir
+        $script:UpgradeCarriesHub = ($null -ne $size.HubKB)
         # The agent's config (and [server], the enrollment) into /var/lib/p2pc first, so that the archive carries it.
         $mig = Invoke-InDistro @('/bin/sh', '-c', $ConfigMigrationScript)
         $migResult = Get-ConfigMigrationResult -ExitCode $mig.ExitCode -Output $mig.Output
@@ -1071,16 +1157,24 @@ function Invoke-UpgradeSteps {
         Fail 38 ('The node was enrolled, but after the upgrade {0} holds no [server]: the agent would stop with exit 8.' -f $AgentConfigPath) @(
             ("State file kept: {0}" -f $stateFile), 'Enroll it again with a new token from p2pc join-token create:   .\install.ps1 -Join -Force')
     }
-    # Verified: mark the backup as completed (the only kind that is ever pruned) and keep the newest $BackupKeep of them.
+    # Verified: mark the backup as completed (the only kind that is ever pruned) and keep the newest $BackupKeep of them,
+    # or only this one when it holds the hub's data (it can be as large as the cloud's blobs; review P2).
     $doneFile = $stateFile -replace '\.tar$', '.ok.tar'
     Move-Item -LiteralPath $stateFile -Destination $doneFile -Force
     $script:StateBackup = $null
-    $names = @(Get-ChildItem -LiteralPath $backupDir -Filter 'p2pc-state-*.ok.tar' -File -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
-    foreach ($old in @(Get-BackupsToPrune -Names $names -Keep $BackupKeep)) {
-        Remove-Item -LiteralPath (Join-Path $backupDir $old) -Force -ErrorAction SilentlyContinue
-        Write-Log ("Removed the old state backup {0} (only the newest {1} are kept)." -f $old, $BackupKeep) 'DEBUG'
+    $keep = $BackupKeep
+    $keptText = ("the newest {0} verified backups are kept" -f $BackupKeep)
+    if ($script:UpgradeCarriesHub) {
+        $keep = 1
+        $keptText = 'it holds the hub data, so only this verified backup is kept'
     }
-    Write-Log ("Upgrade complete; /var/lib/p2pc (and /var/lib/p2pc-server, if any) restored identically ({0} entries). Backup of the state (holds the identity key, and the hub's data on the hub PC): {1}" -f $after.Count, $doneFile) 'OK'
+    $names = @(Get-ChildItem -LiteralPath $backupDir -Filter 'p2pc-state-*.ok.tar' -File -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+    foreach ($old in @(Get-BackupsToPrune -Names $names -Keep $keep)) {
+        Remove-Item -LiteralPath (Join-Path $backupDir $old) -Force -ErrorAction SilentlyContinue
+        Write-Log ("Removed the old state backup {0} (only the newest {1} are kept)." -f $old, $keep) 'DEBUG'
+    }
+    $backupMB = [math]::Round((Get-Item -LiteralPath $doneFile).Length / 1MB)
+    Write-Log ("Upgrade complete; /var/lib/p2pc (and /var/lib/p2pc-server, if any) restored identically ({0} entries). Backup of the state ({1} MB; holds the identity key, and the hub's data on the hub PC; {2}): {3}" -f $after.Count, $backupMB, $keptText, $doneFile) 'OK'
     $script:UpgradeDone = $true
     Show-BootStatus
 }
