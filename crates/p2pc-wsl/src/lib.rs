@@ -11,7 +11,12 @@
 //!   freshness rule (`init_starttime`);
 //! - [`task`]: the scheduled task "P2PC node" (its wrapper, its task XML through `schtasks /Create /XML`, its rights).
 //!
-//! T2-45 adds upgrade and uninstall.
+//! T2-45 adds the second half:
+//!
+//! - [`upgrade`]: the state-preserving upgrade (both `/var/lib/p2pc` and `/var/lib/p2pc-server`), and the byte-exact
+//!   pipes into and out of the distro that also deliver a template bundle (§14.1);
+//! - [`uninstall`]: the scheduled task, the distro and `%LOCALAPPDATA%\P2PC` with `install.ps1 -Uninstall`'s backup
+//!   rule (§8.7 steps 3 to 5).
 //!
 //! **How it reaches Windows.** Every Windows program (`wsl.exe`, `schtasks.exe`, PowerShell) runs through
 //! [`runner::CommandRunner`], so every behaviour is unit-tested on any OS with a fake runner; only
@@ -32,6 +37,8 @@ pub mod image;
 pub mod import;
 pub mod runner;
 pub mod task;
+pub mod uninstall;
+pub mod upgrade;
 
 #[cfg(test)]
 mod parity;
@@ -93,6 +100,17 @@ impl Layout {
     pub fn task_xml(&self) -> PathBuf {
         self.root.join("node-task.xml")
     }
+
+    /// `%LOCALAPPDATA%\P2PC\backups`: the upgrade's state backups (`Get-BackupDir`; not `%TEMP%`, which Windows
+    /// Storage Sense empties).
+    pub fn backups_dir(&self) -> PathBuf {
+        self.root.join("backups")
+    }
+
+    /// `%LOCALAPPDATA%\P2PC\logs`.
+    pub fn logs_dir(&self) -> PathBuf {
+        self.root.join("logs")
+    }
 }
 
 #[cfg(test)]
@@ -109,5 +127,7 @@ mod tests {
         assert_eq!(l.stop_record(), p(&["P2PC", "stopped-by-node"]));
         assert_eq!(l.task_xml(), p(&["P2PC", "node-task.xml"]));
         assert_eq!(l.images_dir(), p(&["P2PC", "images"]));
+        assert_eq!(l.backups_dir(), p(&["P2PC", "backups"]));
+        assert_eq!(l.logs_dir(), p(&["P2PC", "logs"]));
     }
 }

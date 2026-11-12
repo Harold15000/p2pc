@@ -4,11 +4,28 @@
 //!
 //! [`PORTED`] lists every `install.ps1` behaviour this crate ports, with the Rust item that does it. The tests below
 //! read the script itself (compiled in with `include_str!`) and fail when a ported function disappears or is renamed,
-//! or when a constant, a threshold, a command, the SDDL or a line of the task's wrapper differs between the two. The
-//! behaviours themselves are unit-tested in each module; the run of both implementations side by side on the Windows CI
-//! runner (checks, install, upgrade, uninstall, comparing the resulting state) is T2-45's.
+//! or when a constant, a threshold, a command, a script run in the distro, a regular expression, the SDDL or a line of
+//! the task's wrapper differs between the two. The behaviours themselves are unit-tested in each module.
+//!
+//! The deliberate differences, each pinned below so that it cannot drift silently:
+//!
+//! - the Windows build floor (22000 for the H2 app, §8.2);
+//! - the upgrade's copy out of the distro: `install.ps1` redirects with `cmd.exe` (PowerShell 5.1 re-encodes piped
+//!   bytes); Rust streams the child's stdout to the file itself. Both are byte-exact and both check the SHA-256;
+//! - the task is removed with `schtasks /Delete` (the app never loads the ScheduledTasks module) instead of
+//!   `Unregister-ScheduledTask`, and an unreadable task state stops the uninstall instead of reading as "no task";
+//! - the backup's time stamp is UTC here and local time in `install.ps1` (`Get-Date -Format 'yyyyMMddHHmmss'`), so the
+//!   names of backups from both do not order by time: the upgrade never prunes the backup it just verified;
+//! - an uninstall without the distro goes on (the app must still remove its files) where the script stops (27); the
+//!   distro counts as absent only on a positive answer: a listing that succeeded, or the registry's distro names;
+//! - the uninstall deletes the whole of `%LOCALAPPDATA%\P2PC` (§8.7 step 5) where the script deletes its own files
+//!   only; both apply the same backup rule.
+//!
+//! Running both implementations side by side on a Windows test node (install, upgrade carrying state, uninstall,
+//! comparing the distro listing, the two state listings and the task XML) needs a node image and a real WSL; it is
+//! listed as a follow-up of T2-45 (see its PR).
 
-use crate::{checks, image, import, runner, task};
+use crate::{checks, image, import, runner, task, uninstall, upgrade};
 
 /// The script, as it is in the repository.
 const INSTALL_PS1: &str = include_str!("../../../deploy/wsl/install.ps1");
@@ -219,6 +236,176 @@ pub(crate) const PORTED: &[(&str, &str, &str)] = &[
         "task::StopRecord::parse",
         "exit_code, time, reason, disabled (the file part)",
     ),
+    // The upgrade (T2-45).
+    (
+        "Test-LinuxSafePath",
+        "upgrade::is_linux_safe_path",
+        "an absolute path of [A-Za-z0-9._/-]",
+    ),
+    (
+        "Get-StateArchiveScript",
+        "upgrade::state_archive_script",
+        "the archive script writing to a validated path",
+    ),
+    (
+        "Invoke-WslCopyOut",
+        "upgrade::copy_out",
+        "cat in the distro, stdout to a Windows file, byte-exact, not retried",
+    ),
+    (
+        "Invoke-WslStream",
+        "upgrade::copy_in",
+        "a Windows file to the stdin of dd in the distro, retried on the WSL timeout",
+    ),
+    (
+        "Assert-UpgradeDirClean",
+        "upgrade::upgrade",
+        "the distro directory holds only WSL's files, before anything is touched",
+    ),
+    (
+        "Get-StateProbe",
+        "upgrade::StateProbe::parse",
+        "exit 0 and exactly one marker; anything else is unknown",
+    ),
+    (
+        "Get-StateSize",
+        "upgrade::StateSize::parse",
+        "one p2pc line, at most one p2pc-server line",
+    ),
+    (
+        "Get-VolumeRoot",
+        "upgrade::FREE_SPACE_SCRIPT",
+        "GetPathRoot(GetFullPath(path))",
+    ),
+    (
+        "Get-FreeBytes",
+        "upgrade::FREE_SPACE_SCRIPT",
+        "DriveInfo.AvailableFreeSpace",
+    ),
+    (
+        "Get-UpgradeSpaceNeeds",
+        "upgrade::space_needs",
+        "state + floor on the distro's volume, state on the backup's; both on one",
+    ),
+    (
+        "Test-UpgradeSpace",
+        "upgrade::upgrade",
+        "refused (23) when a volume cannot hold its need",
+    ),
+    (
+        "Get-ConfigMigrationResult",
+        "upgrade::ConfigMigration::parse",
+        "present, moved or created",
+    ),
+    (
+        "Test-StateListingIgnored",
+        "upgrade::is_listing_ignored",
+        "sockets, FIFOs, p2pc/tmp and the boot status",
+    ),
+    ("Get-BackupDir", "Layout::backups_dir", "%LOCALAPPDATA%\\P2PC\\backups"),
+    (
+        "Get-BackupsToPrune",
+        "upgrade::backups_to_prune",
+        "verified backups beyond the newest N, nothing else",
+    ),
+    (
+        "Get-StateListing",
+        "upgrade::STATE_LISTING",
+        "mode:uid:gid:type:path of both directories, sorted",
+    ),
+    (
+        "Get-DistroFileHash",
+        "upgrade::distro_file_hash",
+        "sha256sum in the distro",
+    ),
+    (
+        "Invoke-UpgradeAction",
+        "upgrade::upgrade",
+        "the task suspended and put back as it was",
+    ),
+    (
+        "Invoke-UpgradeSteps",
+        "upgrade::upgrade",
+        "archive, copy out, unregister, import, copy in, restore, verify, prune",
+    ),
+    ("Get-DistroNow", "upgrade::upgrade", "date -u +%s in the distro"),
+    (
+        "Test-ServerSection",
+        "upgrade::SERVER_SECTION_CHECK",
+        "grep -q ^[server] agent.toml",
+    ),
+    ("Get-StatusField", "upgrade::status_field", "the value after <label>:"),
+    (
+        "Test-ConnectedSince",
+        "upgrade::connected_since",
+        "connected (since T), T no more than 2 s before the start",
+    ),
+    (
+        "Wait-NodeConnected",
+        "upgrade::wait_came_back",
+        "a 60 s deadline on a monotonic clock, polled every 2 s",
+    ),
+    (
+        "Get-NodeRunStop",
+        "upgrade::node_run_stop",
+        "state=stopped and exit_code=N",
+    ),
+    (
+        "Clear-NodeStop",
+        "upgrade::upgrade",
+        "the stop record and node-run.status, after a fix of exit 6",
+    ),
+    (
+        "Write-KeptBackupWarning",
+        "upgrade::UpgradeFailure::kept_backup",
+        "the backup of an unfinished upgrade is named",
+    ),
+    // The uninstall (T2-45).
+    (
+        "Get-DistroBasePath",
+        "uninstall::LXSS_SCRIPT",
+        "the registered distros in HKCU\\…\\Lxss, by DistributionName, read-only",
+    ),
+    (
+        "Test-StateBackupName",
+        "upgrade::is_state_backup_name",
+        "p2pc-state-<14 digits>(.ok).tar",
+    ),
+    (
+        "Test-StateBackupVerified",
+        "upgrade::is_verified_backup_name",
+        "p2pc-state-<14 digits>.ok.tar",
+    ),
+    (
+        "Get-StateBackupFiles",
+        "uninstall::state_backup_files",
+        "regular files with a backup's name, by kind",
+    ),
+    (
+        "Get-UninstallPrompt",
+        "uninstall::UninstallPlan",
+        "what is deleted and what is kept, by full path",
+    ),
+    (
+        "Remove-StateBackups",
+        "uninstall::remove_local",
+        "the rule's backups, then the folder when empty",
+    ),
+    (
+        "Remove-NodeTaskFiles",
+        "uninstall::remove_local",
+        "the wrapper and the stop record (the whole folder in the app)",
+    ),
+    (
+        "Remove-NodeTask",
+        "uninstall::remove_task",
+        "end, then delete; a failure stops before the distro (37)",
+    ),
+    (
+        "Invoke-UninstallAction",
+        "uninstall::uninstall",
+        "the task, then wsl --unregister (29), then the backups",
+    ),
 ];
 
 /// The PowerShell array literal `@('a', 'b')` of an argument vector, as `install.ps1` writes it.
@@ -424,4 +611,163 @@ fn the_wrapper_lines_match_except_the_comments() {
         rust.iter().filter(not_rem).collect::<Vec<_>>()
     );
     assert_eq!(ps.len(), rust.len(), "the same number of lines (comments included)");
+}
+
+/// The body of `function <name> {` up to the next top-level function.
+fn ps_function(name: &str) -> &'static str {
+    INSTALL_PS1
+        .split(&format!("function {name} {{"))
+        .nth(1)
+        .and_then(|rest| rest.split("\nfunction ").next())
+        .unwrap_or_else(|| panic!("{name} not found in install.ps1"))
+}
+
+/// `a` comes before `b` in `text`.
+fn before(text: &str, a: &str, b: &str) -> bool {
+    match (text.find(a), text.find(b)) {
+        (Some(x), Some(y)) => x < y,
+        _ => panic!("{a:?} or {b:?} missing"),
+    }
+}
+
+#[test]
+fn the_scripts_run_in_the_distro_match_byte_for_byte() {
+    for (var, quote, rust) in [
+        ("StateProbeScript", '\'', upgrade::STATE_PROBE_SCRIPT),
+        ("StateSizeScript", '\'', upgrade::STATE_SIZE_SCRIPT),
+        ("StateArchiveScript", '"', upgrade::STATE_ARCHIVE_SCRIPT),
+        ("ConfigMigrationScript", '"', upgrade::CONFIG_MIGRATION_SCRIPT),
+    ] {
+        let line = format!("${var} = {quote}{rust}{quote}\n");
+        assert!(INSTALL_PS1.contains(&line), "${var} differs from upgrade.rs");
+    }
+    assert!(INSTALL_PS1.contains("$StateArchiveScript.Replace('@OUT@', $OutPath)"));
+    assert!(INSTALL_PS1.contains(&format!("$AgentConfigPath = '{}'", upgrade::AGENT_CONFIG_PATH)));
+    assert!(INSTALL_PS1.contains(&format!("$AgentPath = '{}'", upgrade::AGENT_PATH)));
+    // `p2pc-agent status` with the agent config named, without a shell (Get-AgentCommand on the 0.2.2 layout).
+    assert!(INSTALL_PS1.contains("@('/usr/bin/env', ('P2PC_AGENT_CONFIG=' + $AgentConfigPath), $AgentPath)"));
+    assert!(INSTALL_PS1.contains("(Invoke-InDistro (@(Get-AgentCommand) + @('status')))"));
+}
+
+#[test]
+fn the_upgrade_commands_and_constants_match() {
+    let mut listing: Vec<&str> = upgrade::STATE_LISTING.to_vec();
+    listing.push(upgrade::STATE_LISTING_FORMAT);
+    assert!(INSTALL_PS1.contains(&format!("Invoke-InDistro {}", ps_array(&listing))));
+    assert!(INSTALL_PS1.contains("Invoke-InDistro @('/bin/grep', '-q', '^\\[server\\]', $AgentConfigPath)"));
+    assert_eq!(upgrade::SERVER_SECTION_CHECK[..3], ["/bin/grep", "-q", "^\\[server\\]"]);
+    assert!(INSTALL_PS1.contains(&format!("$inDistroTar = '{}'", upgrade::IN_DISTRO_TAR)));
+    assert!(INSTALL_PS1.contains("('/var/tmp/p2pc-state-{0}.tar' -f $stamp)"));
+    assert!(INSTALL_PS1.contains("('p2pc-state-{0}.tar' -f $stamp)"));
+    assert!(INSTALL_PS1.contains("$stamp = Get-Date -Format 'yyyyMMddHHmmss'"));
+    assert!(INSTALL_PS1.contains("$doneFile = $stateFile -replace '\\.tar$', '.ok.tar'"));
+    assert!(INSTALL_PS1.contains(&format!("$BackupKeep = {}", upgrade::BACKUP_KEEP)));
+    assert!(
+        INSTALL_PS1.contains("$keep = 1"),
+        "one verified backup when it holds the hub's data"
+    );
+    // The pipes.
+    assert!(INSTALL_PS1.contains("Invoke-InDistro @('/bin/bash', '-c', (Get-StateArchiveScript $inDistroBackup))"));
+    assert!(INSTALL_PS1.contains("--exec /bin/cat {1} > \"{2}\""));
+    assert!(INSTALL_PS1.contains("\"-d {0} -u root --exec /bin/dd of={1} bs=1M status=none\""));
+    assert!(INSTALL_PS1.contains("Invoke-InDistro @('/usr/bin/install', '-m', '0600', '/dev/null', $inDistroTar)"));
+    assert!(INSTALL_PS1.contains("Invoke-InDistro @('/usr/bin/sha256sum', $LinuxPath)"));
+    assert!(
+        INSTALL_PS1
+            .contains("Invoke-InDistro @('/bin/tar', '--numeric-owner', '-C', '/var/lib', '-xpf', $inDistroTar)")
+    );
+    assert!(INSTALL_PS1.contains("Invoke-InDistro @('/bin/rm', '-f', $inDistroBackup)"));
+    assert!(INSTALL_PS1.contains("Invoke-InDistro @('/bin/rm', '-f', $inDistroTar)"));
+    assert!(INSTALL_PS1.contains("Invoke-InDistro @('/bin/rm', '-f', $NodeRunStatusPath)"));
+    assert!(INSTALL_PS1.contains("Invoke-InDistro @('/bin/date', '-u', '+%s')"));
+    assert!(INSTALL_PS1.contains("Invoke-Wsl @('--unregister', $DistroName)"));
+    // The space rule.
+    let needs = ps_function("Get-UpgradeSpaceNeeds");
+    for line in [
+        "$needs[$d] = $StateBytes + $MinFree",
+        "if ($needs.Contains($b)) { $needs[$b] += $StateBytes } else { $needs[$b] = $StateBytes }",
+    ] {
+        assert!(needs.contains(line), "{line}");
+    }
+    assert!(INSTALL_PS1.contains("[System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($Path))"));
+    assert!(upgrade::FREE_SPACE_SCRIPT.contains("[System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($p))"));
+    assert!(INSTALL_PS1.contains("(New-Object System.IO.DriveInfo($Root)).AvailableFreeSpace"));
+    assert!(upgrade::FREE_SPACE_SCRIPT.contains("(New-Object System.IO.DriveInfo($root)).AvailableFreeSpace"));
+    assert!(INSTALL_PS1.contains("[long]$Size.TotalKB * 1KB"));
+    assert!(INSTALL_PS1.contains("([long]$MinFreeGB * 1GB)"));
+    // The coming back.
+    assert!(INSTALL_PS1.contains(&format!("$ConnectWaitSeconds = {}", upgrade::CONNECT_WAIT.as_secs())));
+    assert!(INSTALL_PS1.contains(&format!(
+        "$ConnectedSinceSlackSeconds = {}",
+        upgrade::CONNECTED_SINCE_SLACK_SECS
+    )));
+    assert!(
+        ps_function("Wait-NodeConnected")
+            .contains(&format!("Start-Sleep -Seconds {}", upgrade::CONNECT_POLL.as_secs()))
+    );
+    assert!(INSTALL_PS1.contains("'^connected \\(since ([^)]+)\\)'"));
+    assert!(INSTALL_PS1.contains("'(?m)^state=stopped\\s*$'"));
+    assert!(INSTALL_PS1.contains("'(?m)^exit_code=([0-9]+)\\s*$'"));
+    assert!(INSTALL_PS1.contains("Get-StatusField $text 'Connection'"));
+    // Only 6 is fixed by a newer image; a stop record decides whatever the task's state.
+    assert!(INSTALL_PS1.contains("$taskWasEnabled = ($stop.Code -eq 6)"));
+    assert!(INSTALL_PS1.contains("$null = Register-NodeTask -Disabled -WarnOnFailure"));
+}
+
+#[test]
+fn the_regular_expressions_and_their_ports_agree() {
+    assert!(INSTALL_PS1.contains("$Path -match '^/[A-Za-z0-9._/-]+$'"));
+    assert!(INSTALL_PS1.contains("$Line -match '^[0-9]+:[0-9]+:[0-9]+:[sp]:'"));
+    assert!(INSTALL_PS1.contains("$Line -match ':p2pc/(tmp|tmp/.*|boot-status\\.json|\\.boot-status\\..*)$'"));
+    assert!(INSTALL_PS1.contains("$_ -match '^p2pc-state-[0-9]{14}\\.ok\\.tar$'"));
+    assert!(INSTALL_PS1.contains("$Name -match '^p2pc-state-[0-9]{14}(\\.ok)?\\.tar$'"));
+    assert!(INSTALL_PS1.contains("$Name -match '^p2pc-state-[0-9]{14}\\.ok\\.tar$'"));
+    // The probe's and the migration's markers.
+    for m in ["P2PC_STATE=present", "P2PC_STATE=absent", "P2PC_STATE=hub-only"] {
+        assert!(ps_function("Get-StateProbe").contains(&format!("'{m}'")), "{m}");
+    }
+    for m in ["P2PC_CONFIG=present", "P2PC_CONFIG=moved", "P2PC_CONFIG=created"] {
+        assert!(
+            ps_function("Get-ConfigMigrationResult").contains(&format!("'{m}'")),
+            "{m}"
+        );
+    }
+    assert!(ps_function("Get-StateSize").contains("'^([0-9]+)\\s+(/var/lib/p2pc|/var/lib/p2pc-server)$'"));
+}
+
+#[test]
+fn the_uninstall_order_and_its_stops_match() {
+    let body = ps_function("Invoke-UninstallAction");
+    assert!(before(
+        body,
+        "if (Test-NodeTaskRegistered) { Remove-NodeTask }",
+        "Invoke-Wsl @('--unregister', $DistroName)"
+    ));
+    assert!(before(
+        body,
+        "Invoke-Wsl @('--unregister', $DistroName)",
+        "Remove-StateBackups"
+    ));
+    assert!(body.contains("Fail 29 'wsl --unregister failed.'"));
+    let rm = ps_function("Remove-NodeTask");
+    assert!(before(rm, "Stop-NodeTask", "Unregister-ScheduledTask"));
+    assert!(rm.contains("Fail 37"));
+    // The default rule: verified ones go; unfinished ones stay unless -DeleteFailedBackups.
+    assert!(body.contains("$kind = 'Verified'"));
+    assert!(body.contains("if ($mode -eq 'DeleteAll') { $kind = 'All' }"));
+    // The registry's distro names, read the same way (read-only).
+    let base = ps_function("Get-DistroBasePath");
+    assert!(base.contains("Get-ChildItem -Path $LxssKey -ErrorAction Stop"));
+    assert!(base.contains("$p.DistributionName -eq $DistroName"));
+    assert!(uninstall::LXSS_SCRIPT.contains("$key = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss'"));
+    assert!(uninstall::LXSS_SCRIPT.contains("Get-ChildItem -Path $key -ErrorAction Stop"));
+    assert!(uninstall::LXSS_SCRIPT.contains("$p.DistributionName"));
+    assert!(
+        body.contains("Fail 27"),
+        "the script stops when the distro is not listed"
+    );
+    // The deliberate difference: the app deletes the task with schtasks.
+    let inv = uninstall::delete_task_invocation();
+    assert_eq!(inv.program(), runner::SCHTASKS_EXE);
+    assert_eq!(inv.arguments(), ["/Delete", "/TN", task::TASK_PATH, "/F"]);
 }

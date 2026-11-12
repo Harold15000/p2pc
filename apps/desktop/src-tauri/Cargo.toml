@@ -25,7 +25,13 @@ required-features = ["app"]
 default = []
 # The Tauri glue: builder, tray, window, commands. Off by default, so that everything else builds and is tested on a
 # machine without a webview toolkit.
-app = ["dep:tauri", "dep:tauri-build", "dep:tauri-plugin-single-instance", "dep:tauri-plugin-opener"]
+app = [
+  "dep:tauri",
+  "dep:tauri-build",
+  "dep:tauri-plugin-single-instance",
+  "dep:tauri-plugin-opener",
+  "dep:tauri-plugin-updater",
+]
 
 # The same versions as the root workspace (and its lock file) where the crate is shared.
 [dependencies]
@@ -49,6 +55,15 @@ toml = { version = "1.2.0", default-features = false, features = ["std", "serde"
 url = "2.5.8"
 # The device key is wiped from memory when dropped.
 zeroize = "1.9.1"
+# Tauri's encoding of the updater key and its signatures (base64 around minisign text, H2 §14.1). Already in the tree
+# through `p2pc-wsl`.
+data-encoding = "2.11.1"
+# Verifies minisign signatures with the keys compiled into the app: the update artifact (SI-H2-15), the web manifest
+# (SI-H2-22) and the template bundle (§14.1). Verify-only, no dependencies, MIT; the same crate and version Tauri's
+# updater plugin uses.
+minisign-verify = "0.3.0"
+# Versions of the app, the web build, the hub and the node image (§9.6, §14). Already in the tree through Tauri.
+semver = "1.0.28"
 
 # --- Tauri glue (feature `app`) ---
 # `tray-icon` for the tray. No shell, filesystem or HTTP plugin (H2 §8.9; `capabilities::tests` checks this file).
@@ -57,6 +72,10 @@ tauri = { version = "2.12.5", features = ["tray-icon"], optional = true }
 tauri-plugin-opener = { version = "2.7.3", optional = true }
 # One app process per signed-in user (H2 §8.1). Rust only; it adds no webview permission.
 tauri-plugin-single-instance = { version = "2.5.5", optional = true }
+# The app's updates (H2 §14.1): `latest.json` per channel, the signed NSIS artifact, `passive` install. Rust only (the
+# webview gets none of its permissions). rustls with `ring`, which the plugin installs itself; no `zip` (macOS and
+# Linux bundles only) and no system proxy lookup.
+tauri-plugin-updater = { version = "2.14.1", default-features = false, features = ["rustls-tls"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 # DPAPI (`CryptProtectData`, current user) for `%LOCALAPPDATA%\P2PC\device.key` (H2 §8.9), and "Keep this PC awake while
@@ -70,6 +89,9 @@ windows-registry = "0.6.1"
 tauri-build = { version = "2.7.4", optional = true }
 
 [dev-dependencies]
+# Signs test fixtures with throwaway keys made at test time (the root workspace's version, as in
+# `scripts/templates-bundle`).
+minisign = "0.10.0"
 tempfile = "3.27.0"
 
 [lints.rust]

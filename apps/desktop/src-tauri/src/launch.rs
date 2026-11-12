@@ -8,10 +8,14 @@
 //! - Started again while it runs: the running instance shows its window (the second process exits; the
 //!   single-instance plugin forwards its arguments). A second `--autostart` start changes nothing.
 //!
-//! Any other argument is refused: the app exits without starting, rather than guess (a later task adds the
-//! uninstaller's `--uninstall-cleanup`, §8.7).
+//! - Started by the uninstaller (`--uninstall-cleanup`, §8.7): the cleanup window only, outside the single-instance
+//!   rule (the uninstaller closes a running instance first), and the process's exit code tells the uninstaller whether
+//!   to go on ([`crate::uninstall::exit`]).
+//!
+//! Any other argument is refused: the app exits without starting, rather than guess.
 
 use crate::autostart::AUTOSTART_FLAG;
+use crate::uninstall::CLEANUP_FLAG;
 
 /// How this process should start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +24,8 @@ pub enum Launch {
     Window,
     /// Stay in the tray (start at sign-in).
     Tray,
+    /// Run the uninstall cleanup and exit (§8.7).
+    UninstallCleanup,
 }
 
 /// The arguments are not ones the app knows. The argument itself is not kept.
@@ -37,6 +43,7 @@ where
     let launch = match args.next() {
         None => Launch::Window,
         Some(arg) if arg.as_ref() == AUTOSTART_FLAG => Launch::Tray,
+        Some(arg) if arg.as_ref() == CLEANUP_FLAG => Launch::UninstallCleanup,
         Some(_) => return Err(UnknownArguments),
     };
     match args.next() {
@@ -59,7 +66,7 @@ pub enum SecondInstance {
 pub fn second_instance<S: AsRef<str>>(argv: &[S]) -> SecondInstance {
     match parse(argv.iter().skip(1).map(AsRef::as_ref)) {
         Ok(Launch::Window) => SecondInstance::ShowWindow,
-        Ok(Launch::Tray) | Err(UnknownArguments) => SecondInstance::Ignore,
+        Ok(Launch::Tray | Launch::UninstallCleanup) | Err(UnknownArguments) => SecondInstance::Ignore,
     }
 }
 
@@ -80,7 +87,8 @@ mod tests {
     #[test]
     fn unknown_or_extra_arguments_are_refused() {
         for args in [
-            vec!["--uninstall-cleanup"],
+            vec!["--uninstall-cleanup", "x"],
+            vec!["--UNINSTALL-CLEANUP"],
             vec!["--AUTOSTART"],
             vec!["--autostart", "--autostart"],
             vec!["--autostart", "x"],
@@ -88,6 +96,15 @@ mod tests {
         ] {
             assert_eq!(parse(&args), Err(UnknownArguments), "{args:?}");
         }
+    }
+
+    #[test]
+    fn the_uninstaller_s_start_runs_the_cleanup() {
+        assert_eq!(parse(["--uninstall-cleanup"]), Ok(Launch::UninstallCleanup));
+        assert_eq!(
+            second_instance(&["P2PC.exe", "--uninstall-cleanup"]),
+            SecondInstance::Ignore
+        );
     }
 
     #[test]

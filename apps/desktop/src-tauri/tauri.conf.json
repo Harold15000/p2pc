@@ -48,7 +48,18 @@
         "type": "downloadBootstrapper"
       },
       "nsis": {
-        "installMode": "currentUser"
+        "installMode": "currentUser",
+        "installerHooks": "nsis/hooks.nsh"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "",
+      "endpoints": [],
+      "requireSignedVersion": true,
+      "windows": {
+        "installMode": "passive"
       }
     }
   }

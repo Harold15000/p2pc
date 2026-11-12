@@ -16,6 +16,11 @@
 //! - **First run** (§8.2, T2-43): [`crate::setup`]'s flow over the real WSL host (`%LOCALAPPDATA%\P2PC`), the
 //!   DPAPI device key and, until T2-30 lands, the unwired hub API. Its commands run on a blocking thread; the app
 //!   starts in `setup` until `setup.json` says first run has finished.
+//! - **Updates** (§14, §9.6, T2-45): the updater plugin (used from Rust only), [`crate::update::glue`]'s checks and its
+//!   background thread (automatic checks only with the user's yes), the web app's verification and the distro's
+//!   upgrade, with the app in `updating` while it runs.
+//! - **Uninstall** (§8.7, T2-45): `--uninstall-cleanup` starts [`crate::uninstall::glue`]'s own minimal app instead of
+//!   this one.
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -41,8 +46,11 @@ use crate::setup::hub::{NoDevice, OwnerDevice, UnwiredHub};
 use crate::setup::record::RecordFile;
 use crate::setup::starting_machine;
 use crate::setup::wsl_host::{WslHost, WslHostParts, compiled_image_pin};
-use crate::state::{Event, Machine};
+use crate::state::{Event, Machine, State as AppState};
 use crate::tray::{self as tray_model, Effect, ICON_SIZE, MenuEntry};
+use crate::update::distro::Choice;
+use crate::update::glue::{self as updates, AppFacts, UpdateView, Updates, WebShown};
+use crate::update::policy::InstallMoment;
 
 /// The tray icon's id.
 const TRAY_ID: &str = "main";
@@ -82,6 +90,11 @@ pub fn run() -> ExitCode {
     let Ok(launch) = launch::parse(args) else {
         return ExitCode::from(2);
     };
+    let context = tauri::generate_context!();
+    // The uninstaller's start: the cleanup's own app, outside the single-instance rule (§8.7).
+    if launch == Launch::UninstallCleanup {
+        return crate::uninstall::glue::run(context);
+    }
     let builder = tauri::Builder::default()
         // First, so that a second start hands over and exits before anything else runs.
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
@@ -89,6 +102,9 @@ pub fn run() -> ExitCode {
                 show_main(app);
             }
         }))
+        // Used from Rust only (`update::glue`): the window gets none of its permissions. Its key and endpoint are
+        // compiled in (`update::release`), not taken from `tauri.conf.json`.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             status,
             control,
@@ -104,10 +120,16 @@ pub fn run() -> ExitCode {
             setup_create_cloud,
             setup_pair_phone,
             setup_phone_status,
-            setup_finish_phone
+            setup_finish_phone,
+            update_status,
+            update_check,
+            update_install,
+            web_verify,
+            set_update_checks,
+            distro_upgrade
         ])
         .setup(move |app| setup(app, launch));
-    let Ok(app) = builder.build(tauri::generate_context!()) else {
+    let Ok(app) = builder.build(context) else {
         return ExitCode::FAILURE;
     };
     app.run(|app, event| match event {
@@ -148,6 +170,13 @@ fn setup(app: &mut tauri::App, launch: Launch) -> Result<(), Box<dyn Error>> {
         node: Arc::new(Unwired),
         setup: first_run,
         keep_awake: KeepAwake::start_for_this_os(),
+    });
+    app.manage(Updates::new(app.handle()));
+    updates::spawn_background(app.handle().clone(), app_facts, |app| {
+        let app = app.clone();
+        tauri::async_runtime::block_on(async move {
+            let _ = upgrade_distro(&app).await;
+        });
     });
     let window = build_main_window(app.handle())?;
     build_tray(app.handle())?;
@@ -554,4 +583,90 @@ async fn setup_finish_phone(app: AppHandle) -> Result<SetupView, CommandError> {
         refresh_tray(&app);
     }
     Ok(view)
+}
+
+// --- Updates (§14, §9.6) ---
+
+/// What the update glue asks of the app's state.
+fn app_facts(app: &AppHandle) -> AppFacts {
+    let Some(shared) = app.try_state::<Shared>() else {
+        return AppFacts {
+            update_checks: None,
+            in_first_run: true,
+            role: None,
+            state: AppState::Setup,
+        };
+    };
+    let machine = current_machine(app);
+    AppFacts {
+        update_checks: shared.settings.lock().ok().and_then(|s| s.update_checks),
+        in_first_run: machine.state() == AppState::Setup,
+        role: machine.role(),
+        state: machine.state(),
+    }
+}
+
+/// The distro's upgrade with the app in `updating` (§8.4, §14.2), then back where it was.
+async fn upgrade_distro(app: &AppHandle) -> Result<(), CommandError> {
+    {
+        let shared = app.state::<Shared>();
+        shared
+            .core()?
+            .apply(Event::UpdateStarted)
+            .map_err(|_| CommandError::NotAllowed)?;
+    }
+    refresh_tray(app);
+    let outcome = updates::run_distro_upgrade(app).await;
+    {
+        let shared = app.state::<Shared>();
+        let _ = shared.core()?.apply(Event::UpdateFinished);
+    }
+    refresh_tray(app);
+    outcome
+}
+
+#[tauri::command]
+fn update_status(app: AppHandle) -> Result<UpdateView, CommandError> {
+    app.state::<Updates>().view(app_facts(&app).update_checks)
+}
+
+/// "Check for updates" (Settings and tray): the only way the app contacts the endpoint without the user's yes.
+#[tauri::command]
+async fn update_check(app: AppHandle) -> Result<UpdateView, CommandError> {
+    let facts = app_facts(&app);
+    updates::check_now(&app, facts, false).await?;
+    app.state::<Updates>().view(facts.update_checks)
+}
+
+/// "Install now": the user agreed (never in first run).
+#[tauri::command]
+async fn update_install(app: AppHandle) -> Result<bool, CommandError> {
+    updates::install(&app, InstallMoment::UserAgreed, app_facts(&app).in_first_run).await
+}
+
+/// "Verify web app" (Settings).
+#[tauri::command]
+async fn web_verify(app: AppHandle) -> Result<WebShown, CommandError> {
+    updates::verify_web(&app).await
+}
+
+/// Settings' "Check for updates and verify the web app automatically" (§8.2 step 1, hard rule 6).
+#[tauri::command]
+async fn set_update_checks(app: AppHandle, enabled: bool) -> Result<Settings, CommandError> {
+    blocking(move || save_setting(&app, |s| s.update_checks = Some(enabled))).await
+}
+
+/// The answer to "Update now", "Tonight at 03:00" or "Later" (§14.2).
+#[tauri::command]
+async fn distro_upgrade(app: AppHandle, choice: String) -> Result<UpdateView, CommandError> {
+    let choice = match choice.as_str() {
+        "now" => Choice::Now,
+        "tonight" => Choice::Tonight,
+        "later" => Choice::Later,
+        _ => return Err(CommandError::InvalidArgument),
+    };
+    if updates::choose_distro_upgrade(&app, choice).await? {
+        upgrade_distro(&app).await?;
+    }
+    app.state::<Updates>().view(app_facts(&app).update_checks)
 }

@@ -65,6 +65,11 @@ impl Sha256Digest {
         Self::from_hex(hex).map_err(|_| ImageError::BadChecksumFile)
     }
 
+    /// The digest of some bytes.
+    pub fn of(bytes: &[u8]) -> Self {
+        Self(Sha256::digest(bytes).into())
+    }
+
     /// Lower-case hex.
     pub fn to_hex(&self) -> String {
         self.0.iter().map(|b| format!("{b:02x}")).collect()
