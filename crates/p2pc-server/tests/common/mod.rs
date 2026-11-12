@@ -8,6 +8,7 @@
 #![allow(dead_code, clippy::unwrap_used)]
 
 pub mod fleet;
+pub mod h2;
 pub mod sql;
 
 use std::sync::Arc;
