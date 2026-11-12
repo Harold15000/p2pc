@@ -103,6 +103,18 @@ def refusal(
     return c.error_from_response(response, key, body)
 
 
+def body_length(headers: dict[str, str]) -> int:
+    """How much of an error answer's body to read: its ``content-length``, at most the error cap.
+
+    A header that is not a plain decimal number is the hub's answer being garbled, which is an
+    :class:`~p2pc.InvalidResponseError`, not a ``ValueError`` that would end a worker thread.
+    """
+    raw = headers.get("content-length", "0").strip() or "0"
+    if not (raw.isascii() and raw.isdigit()):
+        raise InvalidResponseError("the server's answer has an invalid Content-Length")
+    return min(int(raw), c.MAX_ERROR_BODY)
+
+
 def _no_upgrade(status: int) -> P2PCError:
     return InvalidResponseError(
         f"the server answered {status} instead of switching protocols; "
@@ -154,7 +166,7 @@ def open_port(
             return sock, rest
         # An error answer: its (short) body is the problem document.
         body = bytearray(rest)
-        want = min(int(headers.get("content-length", "0") or 0), c.MAX_ERROR_BODY)
+        want = body_length(headers)
         while len(body) < want:
             chunk = sock.recv(8192)
             if not chunk:
@@ -298,7 +310,14 @@ class PortForwarder:
             selector.close()
 
     def _serve(self, client: socket.socket) -> None:
+        upstream: socket.socket | None = None
         try:
+            # The local socket is known to `close()` before the (slow) upgrade starts, so closing
+            # the forwarder ends this connection even while the hub has not answered yet.
+            with self._lock:
+                if self._stopped.is_set():
+                    return
+                self._live.add(client)
             try:
                 upstream, leftover = self._opener(
                     self._config, self._job_id, self._port, self._wait_ready, context=self._context
@@ -306,16 +325,22 @@ class PortForwarder:
             except P2PCError as exc:
                 self.last_error = exc
                 LOG.warning("service connection to port %d refused: %s", self._port, exc)
-                client.close()
                 return
             with self._lock:
-                self._live.update((client, upstream))
-            try:
-                _pump(client, upstream, leftover)
-            finally:
-                with self._lock:
-                    self._live.difference_update((client, upstream))
+                # `close()` may have run during the upgrade: it could not see this socket.
+                if self._stopped.is_set():
+                    return
+                self._live.add(upstream)
+            _pump(client, upstream, leftover)
         finally:
+            with self._lock:
+                self._live.discard(client)
+                if upstream is not None:
+                    self._live.discard(upstream)
+            for sock in (client, upstream):
+                if sock is not None:
+                    with contextlib.suppress(OSError):
+                        sock.close()
             self._slots.release()
 
     def close(self) -> None:
@@ -378,7 +403,7 @@ async def aopen_port(
         status, reason, headers = parse_head(raw_head[:-4])
         if status == 101:
             return reader, writer
-        want = min(int(headers.get("content-length", "0") or 0), c.MAX_ERROR_BODY)
+        want = body_length(headers)
         body = await asyncio.wait_for(reader.read(want), timeout=config.timeout) if want else b""
         if status < 300:
             raise _no_upgrade(status)

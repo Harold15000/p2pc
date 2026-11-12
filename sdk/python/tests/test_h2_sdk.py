@@ -466,9 +466,10 @@ def test_a_template_id_is_one_path_segment_and_params_are_typed() -> None:
 class FakeHub:
     """Answers ``POST …/connect`` with a ``101`` and an upper-casing echo, or with a refusal."""
 
-    def __init__(self, status: int = 101, body: bytes = b"") -> None:
+    def __init__(self, status: int = 101, body: bytes = b"", length: str | None = None) -> None:
         self.status = status
         self.body = body
+        self.length = length if length is not None else str(len(body))
         self.heads: list[str] = []
         self._lock = threading.Lock()
         self._listener = socket.create_server(("127.0.0.1", 0))
@@ -507,7 +508,7 @@ class FakeHub:
             if self.status != 101:
                 conn.sendall(
                     f"HTTP/1.1 {self.status} Error\r\ncontent-type: application/problem+json\r\n"
-                    f"content-length: {len(self.body)}\r\nconnection: close\r\n\r\n".encode()
+                    f"content-length: {self.length}\r\nconnection: close\r\n\r\n".encode()
                     + self.body
                 )
                 return
@@ -678,3 +679,134 @@ def test_async_connect_forwards_and_reports_a_refusal(hub: FakeHub) -> None:
             refusing.close()
 
     asyncio.run(scenario())
+
+
+# --- review fixes: the handshake and the connection limit --------------------------------------
+from p2pc._ports import MAX_CONNECTIONS, PortForwarder  # noqa: E402
+
+
+@pytest.mark.parametrize("length", ["abc", "-5", "1e3", "٣", "1 2"])
+def test_a_garbled_content_length_is_an_invalid_response_and_the_local_socket_is_closed(
+    length: str,
+) -> None:
+    garbled = FakeHub(409, b"{}", length=length)
+    try:
+        forwarder = hub_client(garbled).services.connect("job_svc", 8000)
+        with forwarder as port, socket.create_connection(("127.0.0.1", port), timeout=10) as conn:
+            conn.settimeout(10)
+            assert conn.recv(10) == b""  # closed, not left open by a dead worker thread
+        assert isinstance(forwarder.last_error, p2pc.InvalidResponseError)
+    finally:
+        garbled.close()
+
+
+def test_a_garbled_content_length_is_an_invalid_response_in_the_async_forwarder() -> None:
+    async def scenario() -> None:
+        garbled = FakeHub(409, b"{}", length="abc")
+        try:
+            async with AsyncClient(
+                api_url=f"http://127.0.0.1:{garbled.port}", api_key=KEY
+            ) as client:
+                forwarder = client.services.connect("job_svc", 8000)
+                async with forwarder as port:
+                    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+                    assert await asyncio.wait_for(reader.read(10), 10) == b""
+                    writer.close()
+                assert isinstance(forwarder.last_error, p2pc.InvalidResponseError)
+        finally:
+            garbled.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_the_local_socket_is_closed_even_when_the_opener_fails_in_an_unexpected_way() -> None:
+    def broken(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("boom")
+
+    forwarder = PortForwarder(
+        Client(api_url="http://127.0.0.1:1", api_key=KEY)._config, "job_svc", 80, opener=broken
+    )
+    with forwarder as port, socket.create_connection(("127.0.0.1", port), timeout=10) as conn:
+        conn.settimeout(10)
+        assert conn.recv(10) == b""
+
+
+def test_closing_during_the_upgrade_ends_the_local_connection_and_drops_the_late_upstream() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    peers: list[socket.socket] = []
+    upstreams: list[socket.socket] = []
+
+    def slow(*_args: Any, **_kwargs: Any) -> tuple[socket.socket, bytes]:
+        entered.set()
+        assert release.wait(30)
+        mine, theirs = socket.socketpair()
+        upstreams.append(mine)
+        peers.append(theirs)
+        return mine, b""
+
+    config = Client(api_url="http://127.0.0.1:1", api_key=KEY)._config
+    forwarder = PortForwarder(config, "job_svc", 80, opener=slow)
+    port = forwarder.start()
+    conn = socket.create_connection(("127.0.0.1", port), timeout=10)
+    conn.settimeout(10)
+    assert entered.wait(10)  # the worker is inside the hub handshake
+    closer = threading.Thread(target=forwarder.close)
+    closer.start()
+    try:
+        # The local socket was known to `close()` before the handshake: it ends now, not after it.
+        assert conn.recv(10) == b""
+    finally:
+        release.set()
+        closer.join(30)
+    assert not closer.is_alive()
+    (late,) = upstreams
+    # The upstream that arrived after `close()` was dropped, not served.
+    assert late.fileno() == -1
+    assert peers[0].recv(10) == b""
+    peers[0].close()
+    conn.close()
+
+
+def test_the_seventeenth_connection_waits_for_a_free_slot() -> None:
+    entered = threading.Semaphore(0)
+    gate = threading.Semaphore(0)
+    seen_released: list[int] = []
+    released = [0]
+    lock = threading.Lock()
+
+    def blocking(*_args: Any, **_kwargs: Any) -> tuple[socket.socket, bytes]:
+        with lock:
+            seen_released.append(released[0])
+        entered.release()
+        assert gate.acquire(timeout=30)
+        # The handshake ends in a refusal, which frees the slot at once (a served connection would
+        # hold it until the local client closes).
+        raise p2pc.P2PCError("handshake over")
+
+    config = Client(api_url="http://127.0.0.1:1", api_key=KEY)._config
+    forwarder = PortForwarder(config, "job_svc", 80, opener=blocking)
+    conns: list[socket.socket] = []
+    with forwarder as port:
+        try:
+            conns.extend(
+                socket.create_connection(("127.0.0.1", port), timeout=10)
+                for _ in range(MAX_CONNECTIONS)
+            )
+            for _ in range(MAX_CONNECTIONS):
+                assert entered.acquire(timeout=10)
+            # All 16 slots are inside the handshake. The 17th connects (the listen backlog takes it)
+            # but is not served: its opener does not start.
+            conns.append(socket.create_connection(("127.0.0.1", port), timeout=10))
+            assert not entered.acquire(timeout=0.3)
+            with lock:
+                released[0] += 1
+            gate.release()  # one handshake finishes: its slot frees
+            assert entered.acquire(timeout=10)  # now the 17th is served
+            assert seen_released == [0] * MAX_CONNECTIONS + [1]
+        finally:
+            for _ in range(MAX_CONNECTIONS + 1):
+                gate.release()
+            for conn in conns:
+                conn.close()
