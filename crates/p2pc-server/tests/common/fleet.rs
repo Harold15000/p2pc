@@ -147,6 +147,12 @@ impl Fleet {
     /// [`Fleet::restart`] with the capabilities the agent declares in its `Hello` (H2 §6.1). A `Join` carries none,
     /// so an agent that runs services reconnects once after it joined.
     pub async fn restart_with(&self, agent: FakeAgent, features: &[&str]) -> FakeAgent {
+        self.reconnect(agent, features, &[]).await
+    }
+
+    /// The agent's connection breaks and comes back (§6 "Reconnects") with a `Hello` that lists `running`: the hub
+    /// keeps those leases, and every stream of the old connection is gone.
+    pub async fn reconnect(&self, agent: FakeAgent, features: &[&str], running: &[(LeaseId, u64)]) -> FakeAgent {
         let node_id = agent.node_id;
         let key = agent.key.clone();
         agent.conn.close(0u32.into(), b"restart");
@@ -155,7 +161,10 @@ impl Fleet {
             .send(&AgentMsg::Hello {
                 agent_version: "0.1.0".into(),
                 inventory: super::inventory("node"),
-                running: vec![],
+                running: running
+                    .iter()
+                    .map(|(lease_id, epoch)| RunningLease::new(*lease_id, *epoch))
+                    .collect(),
                 features: features.iter().map(ToString::to_string).collect(),
             })
             .await;

@@ -130,9 +130,16 @@ async fn a_key_revoked_after_its_headers_cannot_create_a_key() {
         .iter()
         .map(|e| e["kind"].as_str().unwrap())
         .collect();
+    // Between the two keys, the hub's own first start: it loaded its template bundle (H2 §7.6).
     assert_eq!(
         kinds,
-        ["auth_failed", "key_revoked", "key_created", "key_created"],
+        [
+            "auth_failed",
+            "key_revoked",
+            "key_created",
+            "template_bundle_loaded",
+            "key_created"
+        ],
         "{audit}"
     );
     assert_eq!(audit["items"][0]["subject_id"], key_id(&caller), "{audit}");

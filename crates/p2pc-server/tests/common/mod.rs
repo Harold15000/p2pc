@@ -7,6 +7,7 @@
 // cover them.
 #![allow(dead_code, clippy::unwrap_used)]
 
+pub mod bundles;
 pub mod fleet;
 pub mod h2;
 pub mod ports;

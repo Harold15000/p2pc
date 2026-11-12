@@ -181,13 +181,9 @@ fn prepare(state: &AppState, mut spec: JobSpec, headers: &HeaderMap) -> Result<P
     }
     let limits = Limits {
         allowed_registries: Some(state.config.allowed_registries.clone()),
-        // Service jobs are served from T2-12 on, blob inputs from T2-14 on. Volumes stay refused until their own task
-        // (T2-15) turns them on.
-        h2: H2Features {
-            services: true,
-            blob_inputs: true,
-            ..H2Features::default()
-        },
+        // Service jobs are served from T2-12 on, blob inputs from T2-14 on and volumes from T2-15 on. A client's
+        // body is validated as `SpecContext::Create`: volumes only on a service, and never a `tpl:` name.
+        h2: H2Features::ALL,
         ..Limits::default()
     };
     spec.validate(&limits).map_err(|e| ApiError::validation(&e))?;
@@ -454,8 +450,8 @@ pub async fn list_jobs(
 /// `last_activity_at` is what the idle timeout counts from: the attempt's first `healthy`, then the traffic the port
 /// relay records. `cap_deadline` is when the day's cap reservation runs out (H2 §12), `null` for an uncapped principal
 /// or while no attempt runs. `traffic` is what the port relay recorded for today, UTC (H2 §12), `null` when the day has
-/// none; a connection's bytes are added at most 10 s after they were relayed. `setup` belongs to the template task and
-/// stays `null` here.
+/// none; a connection's bytes are added at most 10 s after they were relayed. `setup` is the hub's model pull of a
+/// template service ([`crate::model_pull::setup_view`], H2 §7.6), `null` for a job without one.
 async fn service_view(
     conn: &mut Conn,
     state: &AppState,
@@ -487,7 +483,10 @@ async fn service_view(
         .iter()
         .filter(|at| now.unix_timestamp() - **at < RESTART_WINDOW.whole_seconds())
         .count();
-    Ok(Some(ServiceView {
+    // Every member is set today; the update syntax stays so that a member added to the shared type later does not
+    // break this (CONTRIBUTING "Shared types grow").
+    #[allow(clippy::needless_update)]
+    let view = ServiceView {
         health: st.health.filter(|_| running),
         health_since: st.health_since.filter(|_| running),
         ports: spec.ports.clone(),
@@ -498,8 +497,10 @@ async fn service_view(
         restarts_24h: u32::try_from(restarts).unwrap_or(u32::MAX),
         cap_deadline: crate::units::cap_deadline(conn, row.job_id, gpu_hour_units(&state.config)).await?,
         traffic: store::ports::traffic_today(conn, row.job_id, now).await?,
+        setup: crate::model_pull::setup_view(conn, row).await?,
         ..ServiceView::default()
-    }))
+    };
+    Ok(Some(view))
 }
 
 /// One job of the caller, with its `attempts` (§7): `[{attempt, node_id, outcome, reason, started_at, ended_at}]`,

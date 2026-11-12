@@ -49,6 +49,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AUDIT_KINDS",
+    "GPU_REQUIREMENTS",
     "GPU_STATUS_KINDS",
     "JOB_KINDS",
     "LOG_STREAMS",
@@ -60,6 +61,8 @@ __all__ = [
     "SERVICE_HEALTHS",
     "SETUP_FAILURES",
     "SETUP_STATES",
+    "TEMPLATE_PARAM_TYPES",
+    "TEMPLATE_UIS",
     "ApiKey",
     "AsyncJob",
     "AuditEvent",
@@ -114,7 +117,11 @@ __all__ = [
     "ServiceTraffic",
     "ServiceView",
     "SmokeResult",
+    "TemplateInfo",
+    "TemplateList",
+    "TemplateParam",
     "TemplateRefView",
+    "TemplateRequirements",
     "UsageReport",
     "UsageTotals",
     "VolumeSpec",
@@ -188,6 +195,10 @@ SERVICE_HEALTHS = frozenset({"starting", "healthy", "unhealthy"})
 SETUP_STATES = frozenset({"pulling", "done", "failed"})
 SETUP_FAILURES = frozenset({"error_line", "bad_line", "eof", "stream_broken", "deadline"})
 NODE_APPROVALS = frozenset({"approved", "pending_approval"})
+# Templates (spec §7.6): the UI a template gets, what it needs from a GPU, and its parameter types.
+TEMPLATE_UIS = frozenset({"chat", "transcribe", "none"})
+GPU_REQUIREMENTS = frozenset({"required", "preferred", "none"})
+TEMPLATE_PARAM_TYPES = frozenset({"enum", "int", "bool", "blob"})
 MAX_SERVICE_TIMEOUT_S = 2_592_000  # a service's wall-clock limit: 30 days, the maximum (spec §7.1)
 MILLI = 1000  # milli-units per unit, and milli-vCPUs per vCPU (spec §11)
 MIB = 1024 * 1024
@@ -1371,6 +1382,62 @@ class UsageReport(_Response):
     items: list[UsageTotals]
     total: UsageTotals
     next_cursor: str | None = None
+
+
+# --- templates (H2 spec §7.6) --------------------------------------------------------------
+class TemplateParam(_Response):
+    """A parameter of a template: ``type`` is one of :data:`TEMPLATE_PARAM_TYPES`.
+
+    An ``enum`` has ``values``, an ``int`` has ``min`` and ``max``; a parameter without a
+    ``default`` is required. ``target`` says where the hub writes the value (``env:<NAME>``,
+    ``argv:<index>``, ``field:<field>``, ``input:<path>`` or ``pull``).
+    """
+
+    name: str
+    label: str | None = None
+    type: Literal["enum", "int", "bool", "blob"]
+    values: list[str] | None = None
+    min: int | None = None
+    max: int | None = None
+    default: bool | int | str | None = None
+    target: str
+
+
+class TemplateRequirements(_Response):
+    """What a template needs from the hardware: ``gpu`` is one of :data:`GPU_REQUIREMENTS`."""
+
+    gpu: str = "none"
+    min_vram_mb: int | None = None
+
+
+class TemplateInfo(_Response):
+    """A template as ``GET /v1/templates`` lists it. ``ui`` is one of :data:`TEMPLATE_UIS`."""
+
+    id: str
+    version: int
+    title: str
+    description: str = ""
+    kind: Literal["batch", "service"]
+    ui: str
+    singleton: bool = False
+    requirements: TemplateRequirements = Field(default_factory=TemplateRequirements)
+    params: list[TemplateParam] = Field(default_factory=list)
+    licenses: list[str] = Field(default_factory=list)
+    download_mb: int = 0
+
+
+class TemplateList(_Response):
+    """The served template bundle: empty with ``bundle_error`` when no bundle can be loaded."""
+
+    bundle_version: int | None = None
+    templates: list[TemplateInfo] = Field(default_factory=list)
+    bundle_error: str | None = None
+
+    def __iter__(self) -> Iterator[TemplateInfo]:  # type: ignore[override]
+        return iter(self.templates)
+
+    def __len__(self) -> int:
+        return len(self.templates)
 
 
 T = TypeVar("T")

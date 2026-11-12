@@ -78,9 +78,10 @@ tauri-plugin-single-instance = { version = "2.5.5", optional = true }
 tauri-plugin-updater = { version = "2.14.1", default-features = false, features = ["rustls-tls"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
-# DPAPI (`CryptProtectData`, current user) for `%LOCALAPPDATA%\P2PC\device.key` (H2 §8.9). Already in the tree
+# DPAPI (`CryptProtectData`, current user) for `%LOCALAPPDATA%\P2PC\device.key` (H2 §8.9), and "Keep this PC awake while
+# sharing" (`SetThreadExecutionState`, `GetSystemPowerStatus`, H2 §8.6: `Win32_System_Power`). Already in the tree
 # through Tauri.
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Power"] }
 # `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (H2 §8.1). Safe wrapper from the same project as `windows`.
 windows-registry = "0.6.1"
 
@@ -95,7 +96,8 @@ tempfile = "3.27.0"
 
 [lints.rust]
 # The workspace forbids `unsafe`; this crate denies it and allows it only in `keystore::dpapi` (Windows FFI to
-# `CryptProtectData`, which has no safe wrapper in the `windows` crate), each block with a `// SAFETY:` comment.
+# `CryptProtectData`, which has no safe wrapper in the `windows` crate) and `keep_awake` (`SetThreadExecutionState`,
+# `GetSystemPowerStatus`), each block with a `// SAFETY:` comment.
 unsafe_code = "deny"
 missing_debug_implementations = "warn"
 

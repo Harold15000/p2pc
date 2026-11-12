@@ -111,6 +111,15 @@ class Schema:
         required: set[str] = set()
         for part in node["allOf"]:
             piece = self.sub(part).merged().node
+            if "oneOf" in piece:
+                # A tagged union flattened into the object (how ``TemplateParam`` carries its
+                # ``type``): the object may have every member of every alternative, and must
+                # have the ones all of them require.
+                alternatives = [self.sub(alt).merged().node for alt in piece["oneOf"]]
+                for alt in alternatives:
+                    props |= alt.get("properties", {})
+                required |= set.intersection(*(set(a.get("required", [])) for a in alternatives))
+                continue
             props |= piece.get("properties", {})
             required |= set(piece.get("required", []))
         extra = {k: v for k, v in node.items() if k not in ("allOf", "description")}
@@ -296,6 +305,11 @@ RESPONSES = [
     ("ServiceView", "ServiceView"),
     ("ServiceSetup", "ServiceSetup"),
     ("ServiceTraffic", "ServiceTraffic"),
+    # H2 (spec §7.6): the template listing.
+    ("TemplateList", "TemplateList"),
+    ("TemplateInfo", "TemplateInfo"),
+    ("TemplateParam", "TemplateParam"),
+    ("TemplateRequirements", "TemplateRequirements"),
 ]
 # Members of a `oneOf` schema: (SDK model, OpenAPI schema, the member's `kind` value). The OpenAPI
 # names the union, not its members, so each member is found by its tag.
@@ -368,17 +382,6 @@ def test_every_sdk_model_is_covered_by_the_contract() -> None:
     }
     assert defined - covered == set(), "add these models to the contract registry"
     assert {p[0] for p in PAGES} <= covered
-
-
-def test_the_template_models_move_here_when_the_document_gains_their_routes(
-    openapi: dict[str, Any],
-) -> None:
-    """``p2pc.h2`` holds the template models because ``docs/api/openapi.json`` has no schema to
-    compare them with yet. The day it gains these routes, this test fails: move the template
-    models of ``p2pc/h2.py`` into ``p2pc.models`` and register them above, then delete this test.
-    """
-    waiting = [p for p in openapi["paths"] if p.startswith("/v1/templates")]
-    assert waiting == [], f"the document now has {waiting}: register the models of p2pc/h2.py"
 
 
 def test_the_blob_model_reads_every_field_of_an_upload_answer(schemas: dict[str, Any]) -> None:
@@ -459,6 +462,47 @@ def test_checker_notices_a_change_in_the_service_view(schemas: dict[str, Any]) -
     assert any("replicas" in p for p in drift_against(schemas, "Job", "Job", request=False))
 
 
+def test_checker_notices_a_change_in_a_flattened_union(schemas: dict[str, Any]) -> None:
+    """``TemplateParam`` is an ``allOf`` of its ``type`` union and its own members: a member
+    added to one alternative, or to the object itself, is drift."""
+
+    def add_step(s: dict[str, Any]) -> None:
+        for alt in s["ParamType"]["oneOf"]:
+            if alt["properties"]["type"]["enum"] == ["int"]:
+                alt["properties"]["step"] = {"type": "integer"}
+
+    changed = mutated(schemas, add_step)
+    problems = drift_against(changed, "TemplateParam", "TemplateParam", request=False)
+    assert any("step" in p for p in problems)
+    changed = mutated(
+        schemas,
+        lambda s: s["TemplateParam"]["allOf"][1]["properties"].update(hint={"type": "string"}),
+    )
+    problems = drift_against(changed, "TemplateParam", "TemplateParam", request=False)
+    assert any("hint" in p for p in problems)
+    # And through the listing that carries it.
+    assert any(
+        "hint" in p for p in drift_against(changed, "TemplateList", "TemplateList", request=False)
+    )
+
+
+def test_the_param_types_are_the_alternatives_of_the_openapi_union(schemas: dict[str, Any]) -> None:
+    tags = {alt["properties"]["type"]["enum"][0] for alt in schemas["ParamType"]["oneOf"]}
+    assert tags == set(m.TEMPLATE_PARAM_TYPES)
+
+
+def test_the_launch_body_matches_openapi(schemas: dict[str, Any]) -> None:
+    """``client.templates.launch`` builds its body by hand: every member it sends is one the
+    hub's strict ``LaunchTemplate`` takes, and a parameter value is a bool, an int or a string."""
+    launch = schemas["LaunchTemplate"]
+    assert launch["additionalProperties"] is False
+    body = c.launch_body({"model": "small", "n": 3, "fast": True}, "launch-1")
+    assert set(body) <= set(launch["properties"])
+    assert set(body) == {"params", "idempotency_key"}
+    kinds = {alt["type"] for alt in schemas["ParamValue"]["oneOf"]}
+    assert kinds == {"boolean", "integer", "string"}
+
+
 # --- enums, paths and parameters -----------------------------------------------------------
 def api_enum(schemas: dict[str, Any], name: str) -> set[str]:
     node = schemas[name]
@@ -484,6 +528,8 @@ def test_enums_match_openapi(schemas: dict[str, Any]) -> None:
     assert set(m.SETUP_STATES) == api_enum(schemas, "SetupState")
     assert set(m.SETUP_FAILURES) == api_enum(schemas, "SetupFailure")
     assert set(m.NODE_APPROVALS) == api_enum(schemas, "NodeApproval")
+    assert set(m.TEMPLATE_UIS) == api_enum(schemas, "TemplateUi")
+    assert set(m.GPU_REQUIREMENTS) == api_enum(schemas, "GpuRequirement")
 
 
 def test_problem_members_are_all_exposed_by_errors(schemas: dict[str, Any]) -> None:
@@ -537,6 +583,8 @@ SDK_ENDPOINTS = [
     ("get", "/v1/usage"),
     ("head", "/v1/blobs/{sha256}"),
     ("post", "/v1/blobs"),
+    ("get", "/v1/templates"),
+    ("post", "/v1/templates/{id}/launch"),
 ]
 
 
