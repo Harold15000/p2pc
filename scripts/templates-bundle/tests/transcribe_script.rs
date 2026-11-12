@@ -70,8 +70,22 @@ fn sandbox(with_audio: bool) -> Sandbox {
         &bin,
         "curl",
         &format!(
-            "prev=''\nprintf 'curl' >> '{log}'; for a in \"$@\"; do printf ' [%s]' \"$a\" >> '{log}'; {{ [ \"$prev\" = '-o' ] || [ \"$prev\" = '--output' ]; }} && target=\"$a\"; prev=\"$a\"; done; echo >> '{log}'\nprintf model > \"$target\"",
+            "prev=''\nprintf 'curl' >> '{log}'; for a in \"$@\"; do printf ' [%s]' \"$a\" >> '{log}'; {{ [ \"$prev\" = '-o' ] || [ \"$prev\" = '--output' ]; }} && target=\"$a\"; prev=\"$a\"; done; echo >> '{log}'\nprintf 'good model' > \"$target\"",
             log = log.display()
+        ),
+    );
+    // sha256sum: the fake "good model" content stands for the real model of that size (the test cannot ship 466 MB),
+    // so it gets the pinned hash of the model named by the file; any other content is hashed for real.
+    for (model, hash) in PINNED_HASHES {
+        fs::write(bin.join(format!("hash-{model}")), hash).expect("hash");
+    }
+    write_tool(
+        &bin,
+        "sha256sum",
+        &format!(
+            "printf 'sha256sum [%s]\\n' \"$1\" >> '{log}'\nname=\"${{1##*/}}\"; name=\"${{name%.part}}\"; m=\"${{name#ggml-}}\"; m=\"${{m%.bin}}\"\ncontent=\"$(cat \"$1\")\"\nif [ \"$content\" = 'good model' ] && [ -f '{bin}/hash-'\"$m\" ]; then printf '%s  %s\\n' \"$(cat '{bin}/hash-'\"$m\")\" \"$1\"; else exec /usr/bin/sha256sum \"$1\"; fi",
+            log = log.display(),
+            bin = bin.display()
         ),
     );
     Sandbox {
@@ -81,6 +95,25 @@ fn sandbox(with_audio: bool) -> Sandbox {
         log,
     }
 }
+
+/// The SHA-256 of each model file at the pinned Hugging Face revision (the LFS oid), as the architect recorded them.
+const PINNED_HASHES: [(&str, &str); 3] = [
+    (
+        "base",
+        "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe",
+    ),
+    (
+        "small",
+        "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b",
+    ),
+    (
+        "medium",
+        "6c14d5adee5f86394037b4e4e8b59f1673b6cee10e3cf0b11bbdbee79c156208",
+    ),
+];
+
+/// The Hugging Face commit the script downloads from.
+const PINNED_REVISION: &str = "5359861c739e955e79d9a303bcbc70fb988958b1";
 
 fn run(sb: &Sandbox, language: &str, model: &str) -> Output {
     Command::new("sh")
@@ -162,11 +195,8 @@ fn the_model_download_is_bounded_against_a_stall_and_by_a_total_time() {
         value_of("--speed-time"),
         value_of("--max-time"),
     );
-    assert!(
-        floor >= 1,
-        "a stalled transfer is one below a floor of at least 1 byte/s"
-    );
-    assert!((10..=300).contains(&window), "the stall window is {window} s");
+    assert_eq!(floor, 10240, "a stall is under 10 KiB/s");
+    assert_eq!(window, 60, "for 60 s");
     let loaded = templates_bundle::source::load_dir(&shipped_dir()).expect("loads");
     let timeout_s = loaded
         .templates
@@ -176,9 +206,155 @@ fn the_model_download_is_bounded_against_a_stall_and_by_a_total_time() {
         .spec
         .timeout_s;
     assert!(
-        ceiling < u64::from(timeout_s) && ceiling >= 600,
-        "--max-time {ceiling} must be under timeout_s {timeout_s} and long enough for the biggest model"
+        ceiling == 1800 && ceiling < u64::from(timeout_s),
+        "--max-time {ceiling} must be 1800 and under timeout_s {timeout_s}"
     );
+}
+
+#[test]
+fn the_model_comes_from_the_pinned_revision_never_from_main() {
+    let sb = sandbox(true);
+    assert!(run(&sb, "auto", "small").status.success());
+    let curl = calls(&sb, "curl");
+    assert_eq!(curl.len(), 1);
+    let url = format!("https://huggingface.co/ggerganov/whisper.cpp/resolve/{PINNED_REVISION}/ggml-small.bin");
+    assert!(curl[0].contains(&format!("[{url}]")), "{}", curl[0]);
+    assert!(!curl[0].contains("resolve/main"), "{}", curl[0]);
+    let text = fs::read_to_string(script()).expect("script");
+    assert!(
+        !text.contains("resolve/main"),
+        "the script must not name a moving branch"
+    );
+}
+
+#[test]
+fn every_listed_model_is_checked_against_its_own_pinned_hash() {
+    // The fake "good model" content is accepted only when the script's table has the pinned hash for that model, so
+    // this fails if a hash in the script is wrong or belongs to another model.
+    for (model, _) in PINNED_HASHES {
+        let sb = sandbox(true);
+        let out = run(&sb, "auto", model);
+        assert!(
+            out.status.success(),
+            "{model}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            calls(&sb, "sha256sum").len(),
+            1,
+            "{model}: the file is hashed before use"
+        );
+    }
+    let text = fs::read_to_string(script()).expect("script");
+    for (model, hash) in PINNED_HASHES {
+        assert!(text.contains(hash), "the script has no hash for {model}");
+    }
+}
+
+#[test]
+fn a_correct_model_already_in_the_volume_is_used_without_a_download_and_is_still_hashed() {
+    let sb = sandbox(true);
+    let models = sb.root.join("volumes/models");
+    fs::create_dir_all(&models).expect("mkdir");
+    fs::write(models.join("ggml-small.bin"), b"good model").expect("model");
+    let out = run(&sb, "auto", "small");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        calls(&sb, "curl").is_empty(),
+        "no download for a model that is already there"
+    );
+    assert_eq!(calls(&sb, "whisper").len(), 1);
+    assert_eq!(
+        calls(&sb, "sha256sum").len(),
+        1,
+        "the check runs on every run, download or not"
+    );
+    // And again: still no download, still a check.
+    assert!(run(&sb, "auto", "small").status.success());
+    assert!(calls(&sb, "curl").is_empty());
+    assert_eq!(calls(&sb, "sha256sum").len(), 2);
+}
+
+#[test]
+fn a_corrupted_model_in_the_volume_is_deleted_and_the_run_fails() {
+    for content in [&b"junk"[..], b"good mode", b"good model!", b"\0\0\0"] {
+        let sb = sandbox(true);
+        let models = sb.root.join("volumes/models");
+        fs::create_dir_all(&models).expect("mkdir");
+        fs::write(models.join("ggml-small.bin"), content).expect("model");
+        let out = run(&sb, "auto", "small");
+        assert!(!out.status.success(), "{content:?} was used");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("checksum"),
+            "the error says why: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !models.join("ggml-small.bin").exists(),
+            "{content:?} stays in the volume"
+        );
+        assert!(calls(&sb, "whisper").is_empty(), "no transcription with a bad model");
+        assert!(
+            calls(&sb, "curl").is_empty(),
+            "the next run downloads it, this one stops"
+        );
+        assert!(
+            sb.root
+                .join("outputs")
+                .read_dir()
+                .map_or(true, |mut d| d.next().is_none()),
+            "no transcript from a bad model"
+        );
+    }
+}
+
+#[test]
+fn a_download_with_the_wrong_hash_is_deleted_and_the_run_fails() {
+    // The hub's egress allowlist does not authenticate the file: only the hash does.
+    let sb = sandbox(true);
+    write_tool(
+        &sb.bin,
+        "curl",
+        &format!(
+            "printf 'curl' >> '{log}'; for a in \"$@\"; do printf ' [%s]' \"$a\" >> '{log}'; done; echo >> '{log}'\nprev=''; for a in \"$@\"; do [ \"$prev\" = '--output' ] && printf 'not the model' > \"$a\"; prev=\"$a\"; done",
+            log = sb.log.display()
+        ),
+    );
+    let out = run(&sb, "auto", "small");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("checksum"));
+    let models = sb.root.join("volumes/models");
+    assert!(!models.join("ggml-small.bin").exists());
+    assert!(!models.join("ggml-small.bin.part").exists());
+    assert!(calls(&sb, "whisper").is_empty());
+}
+
+#[test]
+fn a_signal_still_removes_the_converted_audio() {
+    // The converted audio is a full copy of the user's recording. An untrapped SIGTERM ends `sh` at once and skips the
+    // EXIT trap, leaving the copy in the volume until the next run; trapping TERM, INT and HUP turns them into an
+    // exit (143), so the EXIT trap runs. The fake whisper-cli signals the script's own shell and returns: the trap
+    // runs when the foreground command is done, with no sleep and nothing to race.
+    for signal in ["TERM", "INT", "HUP"] {
+        let sb = sandbox(true);
+        write_tool(&sb.bin, "whisper-cli", &format!("kill -{signal} $PPID"));
+        let out = run(&sb, "auto", "small");
+        assert_eq!(
+            out.status.code(),
+            Some(143),
+            "{signal}: {:?} {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let left: Vec<String> = fs::read_dir(sb.root.join("volumes/models"))
+            .expect("models")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            left.iter().all(|n| !n.starts_with(".work.")),
+            "{signal}: the scratch directory with the audio is gone: {left:?}"
+        );
+    }
 }
 
 #[test]

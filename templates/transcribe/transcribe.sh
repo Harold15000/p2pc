@@ -64,12 +64,23 @@ mkdir -p "$out" "$models"
 rm -rf "$models"/.work.*
 rm -f "$models"/ggml-*.bin.part
 
-# The converted audio is scratch: keep it out of the outputs and remove it on every exit.
-work="$(mktemp -d "$models/.work.XXXXXX")"
-trap 'rm -rf "$work"' EXIT
+# The model first, so a bad or missing model stops the run before the user's audio is copied anywhere.
+#
+# The files come from one pinned commit of the Hugging Face repository, never from a moving branch, and each is
+# checked against its SHA-256 (the LFS object id at that commit) on EVERY run, before it is used: the egress allowlist
+# decides where the job may connect, not what it receives, and the model is parsed by native code. A file that fails
+# the check is deleted and the run stops with an error; the next run downloads it again.
+revision=5359861c739e955e79d9a303bcbc70fb988958b1
+case "$model" in
+  base) expected=60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe ;;
+  small) expected=1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b ;;
+  medium) expected=6c14d5adee5f86394037b4e4e8b59f1673b6cee10e3cf0b11bbdbee79c156208 ;;
+esac
 
-# Whisper reads 16 kHz mono PCM. `-nostdin` keeps ffmpeg from reading the job's stdin.
-ffmpeg -nostdin -loglevel error -y -i "$audio" -ar 16000 -ac 1 -c:a pcm_s16le -f wav "$work/audio.wav"
+if ! command -v sha256sum >/dev/null 2>&1; then
+  echo "transcribe: sha256sum is missing, so no model can be checked" >&2
+  exit 69
+fi
 
 model_file="$models/ggml-$model.bin"
 if [ ! -s "$model_file" ]; then
@@ -77,17 +88,36 @@ if [ ! -s "$model_file" ]; then
   # the model. The shim's proxy settings carry the traffic through the egress allowlist.
   #
   # Bounded, so that a connection that goes quiet cannot hold the job until its whole timeout_s (one hour):
-  #  - --speed-limit/--speed-time: below 1 KiB/s for 60 s is a stall, and curl gives up on that try;
-  #  - --max-time: no try lasts over 25 minutes, even a slow one that keeps moving;
-  #  - --retry 2 with --retry-max-time: at most two more tries, none started after 25 minutes since the first. The
-  #    worst case is therefore about 50 minutes of download, which can still use up the job's hour; the job then ends at
-  #    its timeout, never hangs, and the next run starts clean (stale .part files are removed above).
-  url="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-$model.bin"
+  #  - --speed-limit/--speed-time: under 10 KiB/s for 60 s is a stall, and curl gives up on that try;
+  #  - --max-time: no try lasts over 30 minutes, even a slow one that keeps moving;
+  #  - --retry 2 with --retry-max-time: a try that fails early may be repeated, none started after 30 minutes since the
+  #    first. The worst case can still use up the job's hour; the job then ends at its timeout and never hangs, and the
+  #    next run starts clean (stale .part files are removed above).
+  url="https://huggingface.co/ggerganov/whisper.cpp/resolve/$revision/ggml-$model.bin"
   curl --fail --location --silent --show-error \
-    --connect-timeout 20 --speed-limit 1024 --speed-time 60 --max-time 1500 \
-    --retry 2 --retry-max-time 1500 \
+    --connect-timeout 20 --speed-limit 10240 --speed-time 60 --max-time 1800 \
+    --retry 2 --retry-max-time 1800 \
     --output "$model_file.part" "$url"
   mv "$model_file.part" "$model_file"
 fi
+
+# Every run, whether the file was just downloaded or has been in the volume for weeks. `cut` takes the hash out of
+# `sha256sum`'s "<hash>  <file>"; an empty answer matches nothing, so a failing sha256sum fails closed.
+actual="$(sha256sum "$model_file" | cut -d ' ' -f 1)"
+if [ "$actual" != "$expected" ]; then
+  rm -f "$model_file"
+  echo "transcribe: the $model model failed its checksum and was deleted; run again to download it" >&2
+  exit 65
+fi
+
+# The converted audio is scratch: a full copy of the user's recording. Keep it out of the outputs and remove it on every
+# exit. `sh` does not run its EXIT trap when a signal ends it, so TERM, INT and HUP are turned into an exit (143) and
+# the EXIT trap runs; SIGKILL cannot be trapped, and what it leaves is removed by the next run (above).
+work="$(mktemp -d "$models/.work.XXXXXX")"
+trap 'rm -rf "$work"' EXIT
+trap 'exit 143' TERM INT HUP
+
+# Whisper reads 16 kHz mono PCM. `-nostdin` keeps ffmpeg from reading the job's stdin.
+ffmpeg -nostdin -loglevel error -y -i "$audio" -ar 16000 -ac 1 -c:a pcm_s16le -f wav "$work/audio.wav"
 
 "$whisper" -m "$model_file" -f "$work/audio.wav" -l "$language" -otxt -osrt -ovtt -of "$out/transcript"

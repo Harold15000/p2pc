@@ -49,4 +49,9 @@ the release build (`--release`) and the signer refuse it, so a bundle that carri
 `qwen3:1.7b` do, even with `"think": false`, and a template cannot pass request options, so the chat UI should strip a
 leading reasoning block (see the comment in `private-chat.toml`).
 
+`transcribe` downloads each whisper model from one pinned Hugging Face commit and checks its SHA-256 on every run
+before using it; a file that fails is deleted and the run stops (see the comment in `transcribe.toml`). `private-chat`
+keeps only Ollama's blobs in its volume (mounted at `/volumes/models/blobs`, below `OLLAMA_MODELS=/volumes/models`), so
+the manifest symlink that Ollama writes never reaches the volume.
+
 The compiler and signer are documented in [`scripts/templates-bundle/README.md`](../scripts/templates-bundle/README.md).

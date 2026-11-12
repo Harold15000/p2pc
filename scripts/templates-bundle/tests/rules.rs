@@ -84,6 +84,32 @@ fn the_shipped_transcribe_template_runs_on_the_cpu_image() {
 }
 
 #[test]
+fn the_shipped_transcribe_description_states_the_supported_audio_length() {
+    // Measured on 4 CPU threads: 30 minutes of audio took 286 s with `small` and 912 s with `medium`. With the job's
+    // 3600 s limit that is about 6 hours of audio with `small` and about 1 h 55 min with `medium`.
+    let loaded = load_dir(&shipped_dir()).expect("templates/ loads");
+    let t = loaded
+        .templates
+        .iter()
+        .find(|t| t.info.id == "transcribe")
+        .expect("transcribe");
+    let limit = u64::from(t.spec.timeout_s);
+    let half_hour = 30 * 60;
+    assert!(
+        limit * half_hour / 286 >= 6 * 3600,
+        "`small` handles at least 6 h in {limit} s"
+    );
+    assert!(
+        limit * half_hour / 912 >= (60 + 55) * 60,
+        "`medium` handles at least 1 h 55 min in {limit} s"
+    );
+    let d = &t.info.description;
+    assert!(d.contains("about 6 hours"), "{d}");
+    assert!(d.contains("about 1 h 55 min"), "{d}");
+    assert!(d.chars().count() <= 1000, "the description fits its limit");
+}
+
+#[test]
 fn the_shipped_chat_template_defaults_to_a_model_that_does_not_think() {
     // `qwen3:4b` answers with its reasoning even with `"think": false`; the `-instruct` variant (Apache-2.0, 2.4 GB)
     // does not. `gemma3:1b` is gone from the list: its licence is not Apache-2.0 or MIT.
@@ -106,6 +132,34 @@ fn the_shipped_chat_template_defaults_to_a_model_that_does_not_think() {
         chat.info.download_mb, 7200,
         "5.10 GB image plus the 2.4 GB model, in MiB, rounded up"
     );
+}
+
+#[test]
+fn the_shipped_chat_template_keeps_only_the_blobs_in_its_volume() {
+    // Ollama 0.40.16 writes a relative symlink into `models/manifests-v2/...`, and a volume that holds a link is refused
+    // at the next mount (§11.3). With the volume mounted at `<OLLAMA_MODELS>/blobs` only the blobs live in it (regular
+    // files and one directory), and the manifests are written to `OLLAMA_MODELS`, in the container. The hub's pull
+    // per attempt restores the manifest in about a second. The mount stays under `/volumes/` (§7.1).
+    let loaded = load_dir(&shipped_dir()).expect("templates/ loads");
+    let chat = loaded
+        .templates
+        .iter()
+        .find(|t| t.info.id == "private-chat")
+        .expect("private-chat");
+    assert_eq!(chat.spec.volumes.len(), 1);
+    let volume = &chat.spec.volumes[0];
+    assert_eq!(volume.name, "tpl:private-chat/models");
+    assert_eq!(volume.mount, "/volumes/models/blobs");
+    assert_eq!(volume.max_mb, 20480);
+    assert_eq!(
+        chat.spec.env.get("OLLAMA_MODELS").map(String::as_str),
+        Some("/volumes/models")
+    );
+    // A guard: some Ollama versions remove blobs no manifest names, and the volume holds blobs only.
+    assert_eq!(chat.spec.env.get("OLLAMA_NOPRUNE").map(String::as_str), Some("1"));
+    // The models directory is the mount's parent, and the mount is a valid volume mount.
+    assert_eq!(volume.mount.rsplit_once('/'), Some(("/volumes/models", "blobs")));
+    assert!(p2pc_proto::validate::validate_volume_mount(&volume.mount).is_ok());
 }
 
 #[test]

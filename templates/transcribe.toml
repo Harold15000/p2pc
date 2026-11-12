@@ -15,13 +15,15 @@
 # To move the digest, take the new one from the registry (`skopeo inspect` or `crane digest`), run the image on a test
 # node, raise `bundle_version` in `bundle.toml` and run `templates-bundle check --release`.
 #
-# OPEN ITEM: models are downloaded without a checksum. Record the SHA-256 of base, small and medium so the script can
-# verify them.
+# MODELS. `transcribe.sh` downloads each model from one pinned commit of the Hugging Face repository and checks its
+# SHA-256 on every run, before using it; a file that fails is deleted and the run stops with an error. To move to
+# another commit, change the revision and the three hashes in the script (the LFS object ids of that commit) and the
+# test that pins them.
 
 id = "transcribe"
 version = 1
 title = "Transcribe audio"
-description = "Turn a recording into text with Whisper, on your own computers. It runs on the processor, so it needs no graphics card: about 5 minutes for 30 minutes of audio with the small model, and about three times longer with the medium one. You get the transcript as plain text and as subtitles (SRT and VTT)."
+description = "Turn a recording into text with Whisper, on your own computers. It runs on the processor, so it needs no graphics card. The job has a one-hour limit on 4 processor threads, which includes the model download and the conversion. Measured: 30 minutes of audio took 286 s with the small model and 912 s with the medium one, so the hour holds about 6 hours of audio with small and about 1 h 55 min with medium; longer recordings are stopped at the limit. You get the transcript as plain text and as subtitles (SRT and VTT)."
 kind = "batch"
 ui = "transcribe"
 licenses = [
