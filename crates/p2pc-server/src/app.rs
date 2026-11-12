@@ -36,7 +36,7 @@ use crate::nodes_api;
 use crate::store::audit::NewEvent;
 use crate::store::keys::{KeyCursor, MAX_DAILY_UNIT_CAP_MILLI, NewKey, Revoke};
 use crate::store::{self, Db, StoreError};
-use crate::{blobs_api, devices_api, jobs_api, join_requests_api, templates_api};
+use crate::{blobs_api, devices_api, jobs_api, join_requests_api, templates_api, volumes_api};
 
 /// Default page size of list endpoints.
 pub const DEFAULT_PAGE_LIMIT: u32 = 50;
@@ -240,6 +240,10 @@ fn build(state: AppState, transport: Transport) -> Router {
         .route("/v1/estimate", post(jobs_api::estimate))
         .route("/v1/templates", get(templates_api::list_templates))
         .route("/v1/templates/{id}/launch", post(templates_api::launch_template))
+        .route("/v1/volumes", get(volumes_api::list_volumes))
+        // `{name}` is one percent-encoded segment (H2 §7.3): the path is split before a segment is decoded, so the
+        // `%2F` of `tpl%3Aprivate-chat%2Fmodels` never becomes a separator.
+        .route("/v1/volumes/{node_id}/{name}", delete(volumes_api::delete_volume))
         .route("/v1/usage", get(crate::usage_api::get_usage))
         .route("/v1/blobs", get(blobs_api::list_blobs))
         .route(

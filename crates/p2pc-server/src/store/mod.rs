@@ -28,6 +28,7 @@ pub mod outputs;
 pub mod ports;
 pub mod templates;
 pub mod usage;
+pub mod volumes;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
