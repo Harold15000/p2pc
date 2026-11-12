@@ -21,7 +21,7 @@
 //! - **A header with another version** is not answered: the connection is closed. The agent and the shim always come
 //!   from the same release (the agent injects the shim), so this is a peer that is not the agent's bridge.
 
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -265,16 +265,19 @@ fn splice<A: Duplex, B: Duplex>(agent: A, service: B) -> io::Result<()> {
     Ok(())
 }
 
+/// How the shim reaches the agent: a connection to `ingress.sock` outside tests.
+type Dial<C> = dyn Fn() -> io::Result<C> + Send + Sync;
+
 /// One idle connection after another, for the life of the shim: dial the agent, wait for a request, hand it over,
 /// dial again.
-fn dialer(socket: &Path, forwarder: &Arc<Forwarder>) {
+fn dialer<C: Duplex>(dial: &Dial<C>, forwarder: &Arc<Forwarder>) {
     let mut delay = REDIAL_MIN;
     let wait = |delay: &mut Duration| {
         thread::sleep(*delay);
         *delay = (*delay * 2).min(REDIAL_MAX);
     };
     loop {
-        let Ok(mut conn) = UnixStream::connect(socket) else {
+        let Ok(mut conn) = dial() else {
             wait(&mut delay);
             continue;
         };
@@ -303,25 +306,32 @@ fn dialer(socket: &Path, forwarder: &Arc<Forwarder>) {
     }
 }
 
+/// Starts [`IDLE_CONNECTIONS`] threads that keep one idle connection each, made with `dial`.
+fn spawn_dialers<C: Duplex>(dial: Arc<Dial<C>>, forwarder: Arc<Forwarder>) -> io::Result<()> {
+    for _ in 0..IDLE_CONNECTIONS {
+        let (dial, forwarder) = (Arc::clone(&dial), Arc::clone(&forwarder));
+        thread::Builder::new()
+            .name("ingress-idle".into())
+            .spawn(move || dialer(&*dial, &forwarder))?;
+    }
+    Ok(())
+}
+
 /// Starts the bridge: [`IDLE_CONNECTIONS`] threads that keep one idle connection each to `socket`.
 ///
 /// # Errors
 /// When a thread cannot be started.
 pub fn start(socket: &Path, ports: Vec<u16>) -> io::Result<()> {
+    let socket: PathBuf = socket.to_path_buf();
     let forwarder = Arc::new(Forwarder::new(ports, Box::new(connect_loopback)));
-    for _ in 0..IDLE_CONNECTIONS {
-        let (socket, forwarder): (PathBuf, _) = (socket.to_path_buf(), Arc::clone(&forwarder));
-        thread::Builder::new()
-            .name("ingress-idle".into())
-            .spawn(move || dialer(&socket, &forwarder))?;
-    }
-    Ok(())
+    spawn_dialers(Arc::new(move || UnixStream::connect(&socket)), forwarder)
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
 
+    use std::io::Write;
     use std::net::{Shutdown, TcpListener};
     use std::sync::Mutex;
 
@@ -527,6 +537,61 @@ mod tests {
         let mut rest = Vec::new();
         peer.read_to_end(&mut rest).unwrap();
         assert!(rest.is_empty());
+    }
+
+    /// The dial loop end to end, with a loopback TCP listener standing in for the agent's `ingress.sock`: 4 idle
+    /// connections, a fresh one after every request, an unlisted port refused with nothing connected, a header of
+    /// another version not answered, a listed port forwarded.
+    #[test]
+    fn the_dialers_keep_4_idle_connections_and_dial_again_after_each_request() {
+        let agent = TcpListener::bind("127.0.0.1:0").unwrap();
+        let agent_addr = agent.local_addr().unwrap();
+        let service = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (forwarder, tried) = recording(&[8080], Some(service.local_addr().unwrap()));
+        spawn_dialers(Arc::new(move || TcpStream::connect(agent_addr)), Arc::new(forwarder)).unwrap();
+        let next_idle = || {
+            let (conn, _) = agent.accept().unwrap();
+            conn.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+            conn
+        };
+        let mut idle: Vec<TcpStream> = (0..IDLE_CONNECTIONS).map(|_| next_idle()).collect();
+        // No fifth one is dialed while four are idle: the listener has nothing more to accept.
+        agent.set_nonblocking(true).unwrap();
+        assert_eq!(agent.accept().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        agent.set_nonblocking(false).unwrap();
+
+        // Not listed: status 2, the end, nothing connected, and a fresh idle connection.
+        let mut conn = idle.pop().unwrap();
+        conn.write_all(&[VERSION, 0, 80]).unwrap();
+        let mut answer = Vec::new();
+        conn.read_to_end(&mut answer).unwrap();
+        assert_eq!(answer, [STATUS_NOT_LISTED]);
+        assert!(tried.lock().unwrap().is_empty());
+        idle.push(next_idle());
+
+        // Another version: closed without an answer, and a fresh idle connection.
+        let mut conn = idle.pop().unwrap();
+        conn.write_all(&[VERSION + 1, 0x1f, 0x90]).unwrap();
+        let mut answer = Vec::new();
+        conn.read_to_end(&mut answer).unwrap();
+        assert!(answer.is_empty(), "{answer:?}");
+        idle.push(next_idle());
+
+        // Listed: status 0 and the service's bytes; the dialer does not wait for the connection to end.
+        let mut conn = idle.pop().unwrap();
+        conn.write_all(&[VERSION, 0x1f, 0x90]).unwrap();
+        let mut status = [9u8; 1];
+        conn.read_exact(&mut status).unwrap();
+        assert_eq!(status, [STATUS_OK]);
+        let (mut served, _) = service.accept().unwrap();
+        idle.push(next_idle());
+        served.write_all(b"hello").unwrap();
+        drop(served);
+        let mut got = Vec::new();
+        conn.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"hello");
+        assert_eq!(*tried.lock().unwrap(), [8080]);
+        assert_eq!(idle.len(), IDLE_CONNECTIONS);
     }
 
     /// The numbers of §11.2, which the agent's side of the bridge shares.
