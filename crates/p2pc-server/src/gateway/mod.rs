@@ -24,6 +24,7 @@
 //! Later tasks plug in through [`LeaseReconciler`] (T06) and [`NodeEvents`] (T06, T10).
 
 mod agent;
+mod blob_fetch;
 pub mod device;
 pub mod endpoint;
 pub mod hub;
