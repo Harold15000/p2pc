@@ -291,6 +291,47 @@ async fn detect_on(dir: &TempDir, runner: &FakeRunner, config: &Config) -> Resul
     detect(&Host::with_root(dir.path()), runner, config).await
 }
 
+/// H2 §8.2, §11.3: the volume share is resolved with the rest of the share and stays on the node (it is the budget
+/// of the volume store). The wire inventory does not carry it: `Inventory.volumes_mb` comes with `share_update` (H2
+/// §6.1), which this agent does not declare.
+#[tokio::test]
+async fn the_volume_share_is_resolved_on_the_node_and_not_sent() {
+    let m = machine(Platform::Linux, 1001);
+    let runner = base_runner(Platform::Linux);
+    let mut cfg = config(Path::new("/var/lib/p2pc"));
+    let report = detect_on(&m, &runner, &cfg).await.unwrap();
+    assert_eq!(report.local.share.volumes_mb, 0, "nothing unless the owner says so");
+
+    cfg.share.disk_mb = Some(64);
+    cfg.share.volumes_mb = Some(128);
+    let report = detect_on(&m, &runner, &cfg).await.unwrap();
+    assert_eq!(report.local.share.volumes_mb, 128);
+    assert_eq!(report.inventory.offered.disk_mb, Some(64), "apart from the job share");
+    assert!(report.local.share.warnings.iter().all(|w| !w.contains("volumes")));
+    let local = serde_json::to_value(&report.local).unwrap();
+    assert_eq!(local["share"]["volumes_mb"], 128);
+    let wire = serde_json::to_string(&report.inventory).unwrap();
+    assert!(!wire.contains("volumes_mb"), "{wire}");
+
+    // A share that could hold no volume at all says so.
+    cfg.share.volumes_mb = Some(63);
+    let report = detect_on(&m, &runner, &cfg).await.unwrap();
+    assert!(
+        report
+            .local
+            .share
+            .warnings
+            .iter()
+            .any(|w| w.contains("share.volumes_mb is 63 MiB")),
+        "{:?}",
+        report.local.share.warnings
+    );
+    // More than the disk holds next to the job share: the detection names the key.
+    cfg.share.volumes_mb = Some(u64::MAX / 2);
+    let err = detect_on(&m, &runner, &cfg).await.unwrap_err();
+    assert!(err.to_string().contains("share.volumes_mb"), "{err}");
+}
+
 #[tokio::test]
 async fn native_linux_node_with_a_gpu() {
     let m = machine(Platform::Linux, 1001);

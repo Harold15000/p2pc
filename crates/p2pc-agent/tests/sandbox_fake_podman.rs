@@ -245,6 +245,7 @@ async fn a_cpu_job_through_the_podman_cli() {
         gpu: None,
         image: &job.image,
         command: &job.command,
+        volumes: &[],
     })
     .unwrap();
     assert_eq!(calls[4], expected);

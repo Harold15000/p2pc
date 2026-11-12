@@ -15,13 +15,23 @@
 //!
 //! The env values go into the `--env-file`, never into the argv. [`env_file`] refuses values with NUL, `\n` or
 //! `\r`, which would inject another variable into Podman's line-based format.
+//!
+//! **Persistent volumes** (H2 §11.1, §11.3; CONTRIBUTING hard rule 3 as amended by O-16) add the one host path
+//! beyond the three per-job directories: `-v <volume dir>:<mount>:rw,U` per volume. `<volume dir>` is never a string
+//! from the JobSpec: it must be the agent's own `<data_dir>/volumes/<account_id>/<hash>/data`, which [`create_argv`]
+//! checks again by its shape, next to the job directory's data dir. `<mount>` is the job's, so it is checked again
+//! too: under `/volumes/`, and free of the characters of Podman's mount syntax.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 
 use p2pc_proto::api::Platform;
-use p2pc_proto::ids::LeaseId;
+use p2pc_proto::ids::{AccountId, LeaseId};
+use p2pc_proto::validate::validate_volume_mount;
+
+use super::jobdir::JOBS_DIR;
+use crate::volumes::{DATA_DIR, Mount, VOLUMES_DIR};
 
 /// `--pids-limit` (§9).
 pub const PIDS_LIMIT: u32 = 2048;
@@ -71,6 +81,9 @@ pub struct ArgvParams<'a> {
     pub image: &'a str,
     /// The job's argv (after the second `--`).
     pub command: &'a [String],
+    /// The persistent volumes to mount (H2 §11.3), locked and checked by [`crate::volumes::VolumeStore`]. Empty for
+    /// every job without volumes: the argv is then H1's.
+    pub volumes: &'a [Mount],
 }
 
 /// A value that cannot be put into the argv safely. The message never contains env values.
@@ -117,6 +130,37 @@ fn mount_path(p: &Path) -> Result<&str, ArgvError> {
     Ok(s)
 }
 
+/// The `-v` argument of one persistent volume: `<volume dir>:<mount>:rw,U`.
+///
+/// The host side must be `<data_dir>/volumes/<account_id>/<hash>/data` of the data dir that holds the job directory
+/// (`<data_dir>/jobs/<lease_id>`): an account id, 32 hex digits and `data`, nothing else. The container side must be
+/// a path under `/volumes/` without `:` or `,`, which would add an option or another path to the argument.
+fn volume_arg(job_dir: &Path, volume: &Mount) -> Result<String, ArgvError> {
+    let refused = || err("a volume directory is not the agent's own <data_dir>/volumes/<account_id>/<hash>/data");
+    let host = mount_path(&volume.host).map_err(|_| refused())?;
+    let data_dir = job_dir
+        .parent()
+        .filter(|jobs| jobs.file_name().is_some_and(|name| name == JOBS_DIR))
+        .and_then(Path::parent)
+        .ok_or_else(refused)?;
+    let below = volume
+        .host
+        .strip_prefix(data_dir.join(VOLUMES_DIR))
+        .map_err(|_| refused())?;
+    let parts: Vec<&str> = below.iter().filter_map(|part| part.to_str()).collect();
+    let [account, hash, data] = parts.as_slice() else {
+        return Err(refused());
+    };
+    let hash_ok = hash.len() == 32 && hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if account.parse::<AccountId>().is_err() || !hash_ok || *data != DATA_DIR {
+        return Err(refused());
+    }
+    if validate_volume_mount(&volume.mount).is_err() || volume.mount.contains([':', ',']) {
+        return Err(err("a volume mount must be a path under /volumes/ without ':' or ','"));
+    }
+    Ok(format!("{host}:{}:rw,U", volume.mount))
+}
+
 fn check_gpu_uuid(uuid: &str) -> Result<(), ArgvError> {
     let ok = uuid.len() <= 128
         && uuid
@@ -130,7 +174,8 @@ fn check_gpu_uuid(uuid: &str) -> Result<(), ArgvError> {
 /// # Errors
 /// [`ArgvError`] when a value cannot be passed safely: an image that is empty, starts with `-` or contains
 /// whitespace or control characters, an empty command, an unsafe job directory or cgroup path, a GPU UUID that is
-/// not `GPU-…`, or a non-positive CPU or memory amount.
+/// not `GPU-…`, a non-positive CPU or memory amount, or a volume whose host directory is not the agent's own or
+/// whose mount is not a plain path under `/volumes/`.
 pub fn create_argv(p: &ArgvParams<'_>) -> Result<Vec<String>, ArgvError> {
     // The image goes after `--`, so Podman cannot read it as a flag; refusing these is defence in depth (the §7
     // validation already requires a valid OCI reference).
@@ -160,6 +205,11 @@ pub fn create_argv(p: &ArgvParams<'_>) -> Result<Vec<String>, ArgvError> {
     }
     let job = mount_path(p.job_dir)?;
     let env_file = mount_path(p.env_file)?;
+    let volumes = p
+        .volumes
+        .iter()
+        .map(|volume| volume_arg(p.job_dir, volume))
+        .collect::<Result<Vec<String>, ArgvError>>()?;
 
     let mut a: Vec<String> = vec![
         "create".into(),
@@ -197,6 +247,13 @@ pub fn create_argv(p: &ArgvParams<'_>) -> Result<Vec<String>, ArgvError> {
         format!("{job}/outputs:/outputs:rw,U"),
         "-v".into(),
         format!("{job}/p2pc:/.p2pc:ro,U"),
+    ]);
+    // The one host path beyond the three per-job directories (hard rule 3's exception, H2 §11.1): the agent's own
+    // volume directories, read-write, chowned by `U` to the container's user like the job directories.
+    for volume in volumes {
+        a.extend(["-v".into(), volume]);
+    }
+    a.extend([
         "--entrypoint".into(),
         SHIM_IN_CONTAINER.into(),
         "--env-file".into(),
@@ -306,6 +363,7 @@ mod tests {
             gpu: None,
             image: "docker.io/library/python:3.12-slim",
             command: &f.command,
+            volumes: &[],
         }
     }
 
@@ -411,6 +469,173 @@ mod tests {
     fn flags(argv: &[String]) -> &[String] {
         let dash = argv.iter().position(|a| a == "--").unwrap();
         &argv[..dash]
+    }
+
+    const ACCOUNT: &str = "acc_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+
+    /// A volume as [`crate::volumes::VolumeStore::lock_and_check`] hands it over: the agent's own directory.
+    fn volume(name: &str, mount: &str) -> Mount {
+        Mount {
+            name: name.into(),
+            host: PathBuf::from(format!(
+                "/var/lib/p2pc/volumes/{ACCOUNT}/{}/data",
+                crate::volumes::dir_name(name)
+            )),
+            mount: mount.into(),
+            max_bytes: 64 << 20,
+        }
+    }
+
+    /// SI-H2-9: the exact `-v` arguments of persistent volumes (H2 §11.1). They come after the three per-job
+    /// directories, read-write with `U`, and nothing else in the argv changes.
+    #[test]
+    fn si_h2_9_golden_argv_of_the_volume_mounts() {
+        let f = fixture();
+        let volumes = [
+            volume("tpl:private-chat/models", "/volumes/models"),
+            volume("models", "/volumes/cache/hf"),
+        ];
+        let mut p = params(&f, Platform::Wsl2, "/p2pc/lse_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        p.volumes = &volumes;
+        let argv = create_argv(&p).unwrap();
+        let job = "/var/lib/p2pc/jobs/lse_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let expected = strings(&[
+            "create",
+            "--rm",
+            "--network=none",
+            "--http-proxy=false",
+            "--cap-drop=all",
+            "--security-opt=no-new-privileges",
+            "--pids-limit=2048",
+            "--log-driver=none",
+            "--userns=auto",
+            "--memory=4096m",
+            "--memory-swap=4096m",
+            "--cpus=2",
+            "--tmpfs",
+            "/tmp:rw,nosuid,nodev,size=4096m",
+            "-v",
+            &format!("{job}/inputs:/inputs:ro,U"),
+            "-v",
+            &format!("{job}/outputs:/outputs:rw,U"),
+            "-v",
+            &format!("{job}/p2pc:/.p2pc:ro,U"),
+            "-v",
+            &format!("/var/lib/p2pc/volumes/{ACCOUNT}/5faf9d87fa1a7df25ef30f96a1d2ffba/data:/volumes/models:rw,U"),
+            "-v",
+            &format!("/var/lib/p2pc/volumes/{ACCOUNT}/8edcc26c0f6c7256a71a8ede6b954ad9/data:/volumes/cache/hf:rw,U"),
+            "--entrypoint",
+            "/.p2pc/shim",
+            "--env-file",
+            &format!("{job}/env"),
+            "--label",
+            "p2pc.lease=lse_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "--cgroup-parent=/p2pc/lse_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "--name",
+            "p2pc-lse_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "--",
+            "docker.io/library/python:3.12-slim",
+            "--",
+            "python",
+            "-c",
+            "print(6*7)",
+        ]);
+        assert_eq!(argv, expected, "\n{}", Shown(&argv));
+        // The volume's name never reaches the argv: only its hash does.
+        assert!(argv.iter().all(|a| !a.contains("tpl:") && !a.contains("private-chat")));
+        // Without the volumes the argv is H1's, to the letter: the mounts are the only difference.
+        let mut h1 = argv.clone();
+        h1.drain(20..24);
+        p.volumes = &[];
+        assert_eq!(create_argv(&p).unwrap(), h1);
+        // Every host path that is mounted is a per-job directory or a volume's `data/`, on both profiles.
+        p.volumes = &volumes;
+        for platform in [Platform::Linux, Platform::Wsl2] {
+            p.platform = platform;
+            let argv = create_argv(&p).unwrap();
+            let mounted: Vec<&str> = argv
+                .iter()
+                .zip(argv.iter().skip(1))
+                .filter(|(flag, _)| *flag == "-v")
+                .map(|(_, spec)| spec.split(':').next().unwrap())
+                .collect();
+            assert_eq!(mounted.len(), 5, "{platform:?}");
+            assert!(
+                mounted
+                    .iter()
+                    .all(|host| host.starts_with(job) || host.starts_with("/var/lib/p2pc/volumes/")),
+                "{mounted:?}"
+            );
+        }
+    }
+
+    /// Hard rule 3's exception is exact: a volume directory is the agent's own, named by a hash, and no string from
+    /// the JobSpec can turn the `-v` argument into another path or add an option to it.
+    #[test]
+    fn a_volume_that_is_not_the_agents_own_directory_or_a_hostile_mount_is_refused() {
+        let f = fixture();
+        let good = volume("models", "/volumes/models");
+        let with = |change: &dyn Fn(&mut Mount)| {
+            let mut v = good.clone();
+            change(&mut v);
+            let volumes = [v];
+            let mut p = params(&f, Platform::Wsl2, "/p2pc/x");
+            p.volumes = &volumes;
+            create_argv(&p)
+        };
+        assert!(with(&|_| {}).is_ok());
+        let hash = crate::volumes::dir_name("models");
+        let hosts = [
+            // A path the JobSpec could name.
+            "/etc".to_string(),
+            "/".to_string(),
+            "/var/lib/p2pc".to_string(),
+            "/run/podman/podman.sock".to_string(),
+            // The volume directory itself (with `meta.json`), not its `data/`.
+            format!("/var/lib/p2pc/volumes/{ACCOUNT}/{hash}"),
+            // Not a hash: a volume's name used as a directory.
+            format!("/var/lib/p2pc/volumes/{ACCOUNT}/models/data"),
+            format!("/var/lib/p2pc/volumes/{ACCOUNT}/{}/data", hash.to_uppercase()),
+            // Not an account's directory.
+            format!("/var/lib/p2pc/volumes/shared/{hash}/data"),
+            // Another data dir, a job directory, a deeper path, a relative one.
+            format!("/srv/other/volumes/{ACCOUNT}/{hash}/data"),
+            "/var/lib/p2pc/jobs/lse_01ARZ3NDEKTSV4RRFFQ69G5FAV/outputs".to_string(),
+            format!("/var/lib/p2pc/volumes/{ACCOUNT}/{hash}/data/sub"),
+            format!("/var/lib/p2pc/volumes/{ACCOUNT}/{hash}/data/../../.."),
+            format!("volumes/{ACCOUNT}/{hash}/data"),
+        ];
+        for host in hosts {
+            let refused = with(&|v| v.host = PathBuf::from(&host));
+            assert!(refused.is_err(), "{host}");
+        }
+        let mounts = [
+            "/etc",
+            "/",
+            "/volumes",
+            "/volumes/",
+            "/volumes/../etc",
+            "/inputs/x",
+            "/.p2pc",
+            "volumes/x",
+            "/volumes/x:ro",
+            "/volumes/x:/etc",
+            "/volumes/x,ro",
+            "/volumes/x:rw,U,exec",
+            "/volumes/x\0",
+            "",
+        ];
+        for mount in mounts {
+            let refused = with(&|v| v.mount = mount.into());
+            assert!(refused.is_err(), "{mount:?}");
+        }
+        // A job directory that is not `<data_dir>/jobs/<lease_id>` gives no data dir to compare with.
+        let elsewhere = PathBuf::from("/var/lib/p2pc/work/lse_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let volumes = [good.clone()];
+        let mut p = params(&f, Platform::Wsl2, "/p2pc/x");
+        p.job_dir = &elsewhere;
+        p.volumes = &volumes;
+        assert!(create_argv(&p).is_err());
     }
 
     /// T10m: a job's output never reaches Podman's log store or the host's journal; the agent reads it by attaching.

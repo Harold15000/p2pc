@@ -34,6 +34,12 @@ pub const DEFAULT_DETECT_TIMEOUT_S: u64 = 15;
 pub const DETECT_TIMEOUT_RANGE: std::ops::RangeInclusive<u64> = 1..=300;
 /// Default `share.disk_mb`: 50 GiB.
 pub const DEFAULT_DISK_MB: u64 = 50 * 1024;
+/// Default `share.volumes_mb`: nothing. A node mounts persistent volumes only once its owner gives them a share of
+/// the disk (H2 §8.2, §11.3).
+pub const DEFAULT_VOLUMES_MB: u64 = 0;
+/// Allowed range of `volume_retention_days` (H2 §11.3; the default is
+/// [`crate::volumes::DEFAULT_RETENTION_DAYS`]).
+pub const VOLUME_RETENTION_DAYS_RANGE: std::ops::RangeInclusive<u32> = 1..=3650;
 /// `$P2PC_AGENT_SUPERVISED=1`: set by the installers (`install.ps1`, `install-node.sh`), whose Scheduled Task or systemd
 /// unit starts the agent. `join` then says so instead of telling the owner to run `p2pc-agent run`.
 pub const SUPERVISED_ENV: &str = "P2PC_AGENT_SUPERVISED";
@@ -142,6 +148,10 @@ pub struct Share {
     /// Disk for job directories, in MiB. Default: 50 GiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_mb: Option<u64>,
+    /// Disk for persistent volumes, in MiB, apart from `disk_mb` (H2 §8.2 `volumes_mb`, §11.3 "Budget"). Default:
+    /// 0, which mounts no volume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volumes_mb: Option<u64>,
 }
 
 /// The OCI runtime for job containers (§9 "Optional gVisor").
@@ -181,6 +191,7 @@ struct RawConfig {
     share: Share,
     agent_lease_ttl_s: Option<u64>,
     detect_timeout_s: Option<u64>,
+    volume_retention_days: Option<u32>,
     #[serde(default)]
     labels: BTreeMap<String, String>,
     #[serde(default)]
@@ -232,6 +243,8 @@ pub struct Config {
     /// The overall deadline of one inventory detection, in seconds. A tool that has not answered by then is
     /// reported as unknown, with a note, instead of stalling the detection (and the heartbeat behind it).
     pub detect_timeout_s: u64,
+    /// After how many days without a holder a persistent volume is deleted (H2 §11.3 "Retention").
+    pub volume_retention_days: u32,
     /// The OCI runtime.
     pub runtime: Runtime,
     /// Share limits; the defaults that depend on the hardware stay `None` until [`Share::resolve`].
@@ -402,6 +415,19 @@ impl Config {
                 ),
             ));
         }
+        let volume_retention_days = raw
+            .volume_retention_days
+            .unwrap_or(crate::volumes::DEFAULT_RETENTION_DAYS);
+        if !VOLUME_RETENTION_DAYS_RANGE.contains(&volume_retention_days) {
+            return Err(invalid(
+                "volume_retention_days",
+                format!(
+                    "must be between {} and {} days",
+                    VOLUME_RETENTION_DAYS_RANGE.start(),
+                    VOLUME_RETENTION_DAYS_RANGE.end()
+                ),
+            ));
+        }
         validate_share(&raw.share)?;
         validate_labels(&raw.labels)?;
         validate_relays("iroh.relays", &raw.iroh.relays)?;
@@ -412,6 +438,7 @@ impl Config {
             data_dir,
             agent_lease_ttl_s,
             detect_timeout_s,
+            volume_retention_days,
             runtime: raw.runtime,
             share: raw.share,
             labels: raw.labels,
@@ -615,6 +642,9 @@ pub struct ResolvedShare {
     pub gpus: Vec<String>,
     /// Disk for job directories, in MiB.
     pub disk_mb: u64,
+    /// Disk for persistent volumes, in MiB (`volumes_mb`, H2 §11.3 "Budget"): what every volume on the node may
+    /// hold together, apart from `disk_mb`. 0 mounts no volume.
+    pub volumes_mb: u64,
     /// Things the owner should know that do not stop the agent.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
@@ -680,6 +710,20 @@ impl Share {
             (None, Some(total)) => DEFAULT_DISK_MB.min(total),
             (None, None) => DEFAULT_DISK_MB,
         };
+        // The volumes share the data dir's filesystem with the job directories: both must fit on it.
+        let volumes_mb = self.volumes_mb.unwrap_or(DEFAULT_VOLUMES_MB);
+        if let Some(total) = hw.disk_mb
+            && disk_mb.saturating_add(volumes_mb) > total
+            && volumes_mb > 0
+        {
+            return Err(invalid(
+                "share.volumes_mb",
+                format!(
+                    "is {volumes_mb} MiB: with the {disk_mb} MiB for jobs, more than the {total} MiB of the data \
+                     dir's filesystem"
+                ),
+            ));
+        }
         let mut warnings = Vec::new();
         let gpus = match &self.gpus {
             GpuShare::None => Vec::new(),
@@ -722,6 +766,7 @@ impl Share {
             memory_mb,
             gpus,
             disk_mb,
+            volumes_mb,
             warnings,
         })
     }
@@ -953,6 +998,65 @@ mod tests {
             ..hw
         };
         assert_eq!(Share::default().resolve(&small).unwrap().disk_mb, 20_000);
+    }
+
+    /// H2 §8.2, §11.3: `share.volumes_mb` is the disk share for persistent volumes, apart from `share.disk_mb`.
+    /// Nothing by default (a node mounts volumes only once its owner says so), and both must fit on the disk.
+    #[test]
+    fn the_volume_share_is_off_by_default_and_fits_the_disk_with_the_job_share() {
+        let hw = Hardware {
+            cores: 8,
+            memory_mb: 16_000,
+            disk_mb: Some(100_000),
+            gpus: &[],
+            gpu_detection_ok: true,
+        };
+        assert_eq!(Share::default().resolve(&hw).unwrap().volumes_mb, 0);
+        let c = Config::parse("[share]\ndisk_mb = 40000\nvolumes_mb = 60000\n", &env()).unwrap();
+        assert_eq!(c.share.volumes_mb, Some(60_000));
+        let r = c.share.resolve(&hw).unwrap();
+        assert_eq!((r.disk_mb, r.volumes_mb), (40_000, 60_000));
+        // One MiB more than the disk holds next to the job share.
+        let over = Share {
+            disk_mb: Some(40_000),
+            volumes_mb: Some(60_001),
+            ..Share::default()
+        };
+        assert_eq!(err_field(over.resolve(&hw)), "share.volumes_mb");
+        // The job share's default (50 GiB) counts too.
+        let with_default = Share {
+            volumes_mb: Some(100_000 - DEFAULT_DISK_MB + 1),
+            ..Share::default()
+        };
+        assert_eq!(err_field(with_default.resolve(&hw)), "share.volumes_mb");
+        // An unknown disk size cannot be checked against; the volume budget still bounds what is mounted.
+        let unknown = Hardware { disk_mb: None, ..hw };
+        assert_eq!(over.resolve(&unknown).unwrap().volumes_mb, 60_001);
+        // An explicit 0 is "no volumes", never an error.
+        let none = Share {
+            volumes_mb: Some(0),
+            ..Share::default()
+        };
+        assert_eq!(none.resolve(&hw).unwrap().volumes_mb, 0);
+    }
+
+    #[test]
+    fn volume_retention_default_and_range() {
+        assert_eq!(Config::parse("", &env()).unwrap().volume_retention_days, 30);
+        assert_eq!(
+            Config::parse("volume_retention_days = 7", &env())
+                .unwrap()
+                .volume_retention_days,
+            7
+        );
+        assert!(Config::parse("volume_retention_days = 3650", &env()).is_ok());
+        for text in ["volume_retention_days = 0", "volume_retention_days = 3651"] {
+            assert_eq!(
+                err_field(Config::parse(text, &env())),
+                "volume_retention_days",
+                "{text}"
+            );
+        }
     }
 
     #[test]

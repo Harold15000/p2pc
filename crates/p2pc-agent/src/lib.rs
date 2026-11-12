@@ -20,6 +20,8 @@
 //! - [`executor`]: the lease executor (T10a): admission, runs in the sandbox, logs, output uploads, `JobFinished`,
 //!   drain and the SI-13 stop, behind [`connection`]'s lease traits.
 //! - [`node`]: the production node as `run` builds it: the data dir's lock, the driver and the executor.
+//! - [`volumes`]: persistent volumes (H2 §11.3): the agent's own per-account directories, their one-holder lock,
+//!   the no-follow check before every mount, the budget, eviction and deletion.
 //! - [`host`] and [`parse`]: file access under a configurable root, and pure parsers.
 
 pub mod config;
@@ -37,3 +39,4 @@ pub mod runner;
 pub mod sandbox;
 #[cfg(test)]
 mod test_logs;
+pub mod volumes;
