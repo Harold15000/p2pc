@@ -306,6 +306,7 @@ mod tests {
             memory_mb: 12_288,
             gpus: vec!["GPU-b".into(), "GPU-a".into()],
             disk_mb: 50_000,
+            volumes_mb: 0,
             warnings: vec![],
         };
         let driver = DriverLimits {
