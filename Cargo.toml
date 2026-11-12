@@ -10,6 +10,7 @@ members = [
   "crates/p2pc-shim",
   "crates/p2pc-device",
   "crates/p2pc-wsl",
+  "scripts/templates-bundle",
 ]
 
 [workspace.package]
@@ -41,6 +42,9 @@ iroh = { version = "~1.4.1", default-features = false, features = ["tls-ring"] }
 # Interface enumeration and the default-route interface, for `p2pc_proto::net::select_addresses`. The same version
 # iroh itself uses.
 netwatch = { version = "0.19.3", default-features = false }
+# Signs and verifies the template bundle with the release key (minisign format, H2 spec §5.1 and §7.6). MIT. Used by
+# `scripts/templates-bundle` only; the hub's verifier (T2-15) may use it or the verify-only `minisign-verify`.
+minisign = "0.10.0"
 rand = "0.10.3"
 # HTTP client of `p2pc-client`. TLS is rustls with the `ring` provider (no OpenSSL, no CMake or NASM on Windows or
 # macOS) and the OS certificate store (rustls-platform-verifier), so a server behind a reverse proxy with a private CA

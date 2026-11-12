@@ -1,0 +1,39 @@
+[package]
+name = "templates-bundle"
+description = "Checks, compiles and signs the template bundle (H2 spec §7.6, SI-H2-13). A release tool, not shipped."
+license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "templates_bundle"
+path = "src/lib.rs"
+
+[[bin]]
+name = "templates-bundle"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+data-encoding.workspace = true
+# minisign signing and verification (the release key's format, spec §5.1). The one new dependency of this crate; see the
+# workspace manifest.
+minisign.workspace = true
+p2pc-proto = { version = "0.1.0", path = "../../crates/p2pc-proto" }
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true
+predicates.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

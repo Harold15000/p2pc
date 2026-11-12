@@ -1,0 +1,96 @@
+# Transcribe audio: whisper.cpp as a batch job on the CPU (H2 spec §7.6 "Templates shipped with the beta").
+#
+# The image is the upstream CPU build `ghcr.io/ggml-org/whisper.cpp:main` (1.15 GB), pinned by digest. It was checked on
+# a test node (plain Podman 4.9.3, WSL2, a 16 GB GPU with a driver that provides CUDA 12.9): `whisper-cli` is on PATH at
+# /app/build/bin/whisper-cli, ffmpeg is at /usr/bin/ffmpeg, and with `--network=none` it transcribed a 30-minute file with
+# the `small` model in 286 s on 4 threads. `transcribe.sh` itself ran end to end there and left only `ggml-small.bin`
+# in the volume. The `small` model (466 MB) comes from `huggingface.co`, redirected to `us.aws.cdn.hf.co`; `hf.co`
+# covers it because an egress entry matches its subdomains.
+#
+# NO GPU. The upstream `main-cuda` image needs CUDA 13.0: with a CUDA 12.9 driver it fell back to the CPU ("CUDA driver
+# version is insufficient"), and on a machine without a GPU it does not start at all (`libcuda.so.1` missing, exit
+# 127). Do not use it until the node image provides CUDA 13. `medium` is about 3 times slower than `small`; `timeout_s`
+# stays at one hour (30 minutes of audio with `small` take about 5 minutes).
+#
+# To move the digest, take the new one from the registry (`skopeo inspect` or `crane digest`), run the image on a test
+# node, raise `bundle_version` in `bundle.toml` and run `templates-bundle check --release`.
+#
+# MODELS. `transcribe.sh` downloads each model from one pinned commit of the Hugging Face repository and checks its
+# SHA-256 on every run, before using it; a file that fails is deleted and the run stops with an error. To move to
+# another commit, change the revision and the three hashes in the script (the LFS object ids of that commit) and the
+# test that pins them.
+
+id = "transcribe"
+version = 1
+title = "Transcribe audio"
+description = "Turn a recording into text with Whisper, on your own computers. It runs on the processor, so it needs no graphics card. The job has a one-hour limit on 4 processor threads, which includes the model download and the conversion. Measured: 30 minutes of audio took 286 s with the small model and 912 s with the medium one, so the hour holds about 6 hours of audio with small and about 1 h 55 min with medium; longer recordings are stopped at the limit. You get the transcript as plain text and as subtitles (SRT and VTT)."
+kind = "batch"
+ui = "transcribe"
+licenses = [
+  "whisper.cpp: MIT",
+  "Whisper models: MIT",
+  "FFmpeg in the image: LGPL-2.1-or-later, or GPL when built with GPL parts",
+]
+# The 1.15 GB image (about 1100 MiB) plus the default `small` model (466 MB, about 445 MiB): about 1550 MiB, rounded up.
+download_mb = 1600
+
+[requirements]
+gpu = "none"
+
+# The recording. It becomes the file /inputs/audio, read-only.
+[[params]]
+name = "audio"
+label = "Audio file"
+type = "blob"
+target = "input:/inputs/audio"
+
+# The spoken language, or `auto` to let the model detect it. The script checks it again before using it.
+[[params]]
+name = "language"
+label = "Language"
+type = "enum"
+values = ["auto", "en", "es", "fr", "de", "it", "pt", "nl", "pl", "ru", "uk", "tr", "ar", "hi", "zh", "ja", "ko"]
+default = "auto"
+target = "env:LANGUAGE"
+
+[[params]]
+name = "model"
+label = "Model"
+type = "enum"
+values = ["base", "small", "medium"]
+default = "small"
+target = "env:MODEL"
+
+[spec]
+name = "Transcribe audio"
+# `main` (CPU).
+image = "ghcr.io/ggml-org/whisper.cpp@sha256:5a7c4d82e5101a4fbbb047139c11638854a6452d1f4363fe3dff64bb758add32"
+command = ["/bin/sh", "/inputs/.template/transcribe.sh"]
+# One hour fits the daily caps this template is meant for (it is a batch job, 1 s to 24 h).
+timeout_s = 3600
+
+# The two values below are the defaults; the parameters replace them whole.
+[spec.env]
+LANGUAGE = "auto"
+MODEL = "small"
+
+[spec.resources]
+cpu = 4
+memory_mb = 4096
+gpu = 0
+disk_mb = 4096
+
+# Fixed by the template: where the script downloads a model from (Hugging Face, which redirects the file to a CDN host
+# under hf.co, `us.aws.cdn.hf.co` on the test node).
+[spec.egress]
+allow = ["huggingface.co", "hf.co"]
+
+# The fixed script, read-only in the container. `from` is read from this directory by the bundle compiler.
+[[spec.files]]
+path = "/inputs/.template/transcribe.sh"
+from = "transcribe/transcribe.sh"
+
+[[spec.volumes]]
+name = "tpl:transcribe/models"
+mount = "/volumes/models"
+max_mb = 5120
