@@ -12,6 +12,9 @@ members = [
   "crates/p2pc-wsl",
   "scripts/templates-bundle",
 ]
+# The desktop app is its own workspace with its own lock file: its Tauri glue (feature `app`) needs a webview toolkit
+# that the workspace gates do not have. `apps/desktop/check.sh` runs its gates (H2 T2-42).
+exclude = ["apps/desktop/src-tauri"]
 
 [workspace.package]
 edition = "2024"
