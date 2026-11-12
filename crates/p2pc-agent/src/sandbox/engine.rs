@@ -144,6 +144,10 @@ pub trait Engine: Send + Sync + 'static {
     fn inspect(&self, name: &str) -> impl Future<Output = Result<ContainerState, EngineError>> + Send;
     /// `podman rm -f`. A missing container is not an error.
     fn remove(&self, name: &str) -> impl Future<Output = Result<(), EngineError>> + Send;
+    /// Whether a container of this name exists, running or not (`podman container exists`). With a successful
+    /// [`Engine::remove`], this is how Podman confirms that a lease's container is gone before the lock of its
+    /// volumes is released (H2 §11.3 "One holder at a time"): an error is never read as "absent".
+    fn container_exists(&self, name: &str) -> impl Future<Output = Result<bool, EngineError>> + Send;
     /// Every container with the `p2pc.lease` label, running or not.
     fn lease_containers(&self) -> impl Future<Output = Result<Vec<LeaseContainer>, EngineError>> + Send;
     /// Removes a job directory inside Podman's user namespace (`podman unshare rm -rf`). With rootless Podman, files
@@ -533,6 +537,20 @@ impl<R: CommandRunner + 'static> Engine for PodmanEngine<R> {
             .map(|_| ())
     }
 
+    async fn container_exists(&self, name: &str) -> Result<bool, EngineError> {
+        // Exit 0: it exists; 1: it does not; anything else (125, a signal, a timeout) is a failure, not an answer.
+        let args = ["container", "exists", "--", name];
+        match self.runner.run(&self.program, &self.podman_args(&args)).await {
+            Ok(out) if out.code == Some(0) => Ok(true),
+            Ok(out) if out.code == Some(1) => Ok(false),
+            Ok(out) => Err(EngineError::new(format!(
+                "podman container exists: {}",
+                out.first_line()
+            ))),
+            Err(e) => Err(describe(&args, &e)),
+        }
+    }
+
     async fn lease_containers(&self) -> Result<Vec<LeaseContainer>, EngineError> {
         let filter = format!("label={LEASE_LABEL}");
         let out = self
@@ -895,6 +913,39 @@ mod tests {
         assert!(!e.image_exists("docker.io/b:1").await.unwrap());
         assert!(e.image_exists("docker.io/c:1").await.is_err());
         e.remove_image("docker.io/b:1").await.unwrap();
+    }
+
+    /// H2 §11.3: "gone" is exit 1 of `podman container exists`, and nothing else. A failure of the command (Podman
+    /// broken, a timeout) must never free a volume's lock.
+    #[tokio::test]
+    async fn container_exists_says_absent_only_on_exit_1() {
+        let name = "p2pc-lse_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let r = FakeRunner::new()
+            .exits(&["podman", "container", "exists", "--", name], 0, "", "")
+            .exits(&["podman", "container", "exists", "--", "p2pc-gone"], 1, "", "")
+            .exits(
+                &["podman", "container", "exists", "--", "p2pc-broken"],
+                125,
+                "",
+                "Error: cannot connect to the storage\n",
+            )
+            .error(
+                &["podman", "container", "exists", "--", "p2pc-slow"],
+                RunError::TimedOut(Duration::from_secs(60)),
+            );
+        let e = engine(r);
+        assert_eq!(e.container_exists(name).await, Ok(true));
+        assert_eq!(e.container_exists("p2pc-gone").await, Ok(false));
+        let broken = e.container_exists("p2pc-broken").await.unwrap_err();
+        assert!(broken.msg.contains("cannot connect to the storage"), "{broken}");
+        assert!(e.container_exists("p2pc-slow").await.unwrap_err().is_timeout());
+        // A Podman that is not there at all is an error too.
+        assert!(e.container_exists("p2pc-unknown").await.is_err());
+        // The events backend goes in front, as for every command.
+        let flag = "--events-backend=file";
+        let r = FakeRunner::new().exits(&["podman", flag, "container", "exists", "--", name], 1, "", "");
+        let e = PodmanEngine::new("podman", r, FakeRunner::new()).with_events_backend("file");
+        assert_eq!(e.container_exists(name).await, Ok(false));
     }
 
     /// T10m: Podman's events logger is `journald` on systemd hosts, which writes one event per container step into

@@ -22,7 +22,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr)]
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use p2pc_agent::executor::SystemClock;
 use p2pc_agent::host::Host;
 use p2pc_agent::platform;
 use p2pc_agent::runner::SystemRunner;
@@ -32,6 +34,7 @@ use p2pc_agent::sandbox::{
     CancelHandle, DriverConfig, Finished, GpuRef, LeaseContext, LeaseReport, NoEgress, PodmanDriver, Sandbox,
     SandboxEvent, error_code, run_lease,
 };
+use p2pc_agent::volumes::{StoreConfig, VolumeStore, dir_name};
 use p2pc_proto::api::{Egress, InputFile, JobSpec, LogStream, Outputs, Placement, Platform, Resources, Retry};
 use p2pc_proto::ids::{AccountId, LeaseId};
 use p2pc_proto::protocol::Outcome;
@@ -122,7 +125,11 @@ struct Ran {
 }
 
 async fn run(d: &RealDriver, job: JobSpec, gpu: Option<GpuRef>) -> Ran {
-    let owner = AccountId::generate();
+    run_as(d, AccountId::generate(), job, gpu).await
+}
+
+/// [`run`] for a lease of `owner` (the volumes of a node belong to its enrolled account).
+async fn run_as(d: &RealDriver, owner: AccountId, job: JobSpec, gpu: Option<GpuRef>) -> Ran {
     let lease = LeaseContext {
         lease_id: LeaseId::generate(),
         epoch: 1,
@@ -560,4 +567,165 @@ async fn a_service_port_is_reached_only_through_the_ingress_bridge() {
         Some(OpenError::StaleLease),
         "detached with the lease"
     );
+}
+
+/// SI-H2-9 against real Podman (H2 §11.1, §11.3; E11 parts 1 and 2a in the product code): a template job's volume is
+/// the agent's own directory, mounted read-write with `:U`; what one job writes, the next one reads; a symbolic link
+/// a job plants (to a file outside the volume) refuses the next mount with `volume_unsafe`, and the link's target
+/// keeps its owner; the owner's deletion gives a fresh volume.
+///
+/// On the test node (see the module docs): `cargo test -p p2pc-agent --test podman_real -- --ignored
+/// --test-threads=1 si_h2_9`.
+#[tokio::test]
+#[ignore = "needs real Podman on a test node; see the module docs"]
+async fn si_h2_9_a_volume_persists_between_jobs_and_a_planted_link_refuses_the_next_mount() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let data = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("target");
+    std::fs::write(&target, b"the owner's file").unwrap();
+    let owner = AccountId::generate();
+    let store = VolumeStore::open(StoreConfig {
+        data_dir: data.path().to_path_buf(),
+        owner,
+        budget_mb: 1024,
+        retention_days: 30,
+        entry_budget: 100_000,
+        clock: Arc::new(SystemClock),
+    })
+    .unwrap();
+    let d = driver_with(data.path(), Vec::new(), |cfg| cfg.volumes = Some(store.clone()));
+    let name = "tpl:transcribe/models";
+    let volume_job = |command: &[&str]| {
+        let mut job = job(command);
+        job.template = Some(serde_json::from_value(serde_json::json!({"id": "transcribe", "version": 1})).unwrap());
+        job.volumes =
+            serde_json::from_value(serde_json::json!([{"name": name, "mount": "/volumes/models", "max_mb": 64}]))
+                .unwrap();
+        job
+    };
+    let exited_0 = |ran: &Ran| {
+        assert_eq!(
+            (ran.finished.outcome, ran.finished.exit_code),
+            (Outcome::Exited, Some(0)),
+            "{:?}",
+            ran.finished
+        );
+    };
+
+    // The first job writes into the volume; the second reads it.
+    let ran = run_as(
+        &d,
+        owner,
+        volume_job(&["sh", "-c", "echo kept > /volumes/models/file && ls -ld /volumes/models"]),
+        None,
+    )
+    .await;
+    exited_0(&ran);
+    let on_host = data
+        .path()
+        .join("volumes")
+        .join(owner.to_string())
+        .join(dir_name(name))
+        .join("data");
+    assert_eq!(std::fs::read(on_host.join("file")).unwrap(), b"kept\n");
+    let ran = run_as(&d, owner, volume_job(&["cat", "/volumes/models/file"]), None).await;
+    exited_0(&ran);
+    assert!(ran.stdout.contains("kept"), "{}", ran.stdout);
+    assert!(store.report_now().volumes[0].in_use_by.is_none());
+
+    // A job plants a link to a file outside the volume. The next mount is refused, and the target keeps its owner.
+    let before = std::fs::metadata(&target).unwrap();
+    let link = ["ln", "-s", target.to_str().unwrap(), "/volumes/models/link"];
+    exited_0(&run_as(&d, owner, volume_job(&link), None).await);
+    let ran = run_as(&d, owner, volume_job(&["true"]), None).await;
+    assert_eq!(
+        (ran.finished.outcome, ran.finished.error.as_deref()),
+        (Outcome::Error, Some(error_code::VOLUME_UNSAFE)),
+        "{:?}",
+        ran.finished
+    );
+    let after = std::fs::metadata(&target).unwrap();
+    assert_eq!(
+        (after.uid(), after.gid(), after.mode()),
+        (before.uid(), before.gid(), before.mode())
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), b"the owner's file");
+    assert!(
+        store.report_now().volumes[0].in_use_by.is_none(),
+        "the lock went with the lease"
+    );
+
+    // The owner deletes it (`VolumeDelete`): never following the link. The next job gets a fresh volume.
+    store.delete(name).unwrap();
+    assert!(!on_host.exists());
+    assert_eq!(std::fs::read(&target).unwrap(), b"the owner's file");
+    let ran = run_as(
+        &d,
+        owner,
+        volume_job(&["sh", "-c", "test ! -e /volumes/models/file"]),
+        None,
+    )
+    .await;
+    exited_0(&ran);
+}
+
+/// SI-H2-9 against real Podman: while a container holds a volume, a second lease is rejected, and the volume is
+/// free again only once the container is gone.
+#[tokio::test]
+#[ignore = "needs real Podman on a test node; see the module docs"]
+async fn si_h2_9_a_volume_has_one_holder_at_a_time() {
+    let data = tempfile::tempdir().unwrap();
+    let owner = AccountId::generate();
+    let store = VolumeStore::open(StoreConfig {
+        data_dir: data.path().to_path_buf(),
+        owner,
+        budget_mb: 1024,
+        retention_days: 30,
+        entry_budget: 100_000,
+        clock: Arc::new(SystemClock),
+    })
+    .unwrap();
+    let d = driver_with(data.path(), Vec::new(), |cfg| cfg.volumes = Some(store.clone()));
+    let volume_lease = |command: &[&str]| {
+        let mut job = job(command);
+        job.template = Some(serde_json::from_value(serde_json::json!({"id": "transcribe", "version": 1})).unwrap());
+        job.volumes =
+            serde_json::from_value(serde_json::json!([{"name": "cache", "mount": "/volumes/cache", "max_mb": 64}]))
+                .unwrap();
+        LeaseContext {
+            lease_id: LeaseId::generate(),
+            epoch: 1,
+            account_id: owner,
+            job,
+            gpu: None,
+        }
+    };
+    let first = volume_lease(&["sleep", "300"]);
+    let first_id = first.lease_id;
+    let (tx, _rx) = mpsc::channel(256);
+    let cancel = CancelHandle::new();
+    let mut job = d.prepare(&owner, first, tx, cancel.clone()).await.unwrap();
+    d.start(&mut job).await.unwrap();
+    assert_eq!(store.report_now().volumes[0].in_use_by, Some(first_id));
+
+    let (tx, _rx2) = mpsc::channel(256);
+    let second = run_lease(&d, &owner, volume_lease(&["true"]), tx, CancelHandle::new()).await;
+    assert!(
+        matches!(
+            second,
+            LeaseReport::Rejected(p2pc_proto::protocol::LeaseRejectReason::InsufficientCapacity)
+        ),
+        "{second:?}"
+    );
+
+    cancel.cancel();
+    let finished = d.wait(&mut job).await.unwrap();
+    assert_eq!(finished.outcome, Outcome::Cancelled);
+    d.cleanup(job).await;
+    assert_eq!(store.report_now().volumes[0].in_use_by, None);
+    let (tx, _rx3) = mpsc::channel(256);
+    let third = run_lease(&d, &owner, volume_lease(&["true"]), tx, CancelHandle::new()).await;
+    assert!(matches!(third, LeaseReport::Finished { .. }), "{third:?}");
 }

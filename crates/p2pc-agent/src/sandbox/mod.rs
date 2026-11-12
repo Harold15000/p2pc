@@ -19,6 +19,9 @@
 //! - [`outputs`]: SI-9 collection with SHA-256.
 //! - [`Egress`]: the seam to the per-job egress proxy; [`ProxyEgress`] plugs in T09's [`crate::egress`]. The
 //!   socket directory is mounted with `:U`.
+//! - **Persistent volumes** (H2 §11.3, [`crate::volumes`]): the one host path beyond the per-job directories. The
+//!   driver takes a lease's volumes at admission ([`Sandbox::admit`]), locks and checks them right before
+//!   `podman create`, measures them while the job runs, and frees them only once Podman confirmed the container gone.
 
 use std::future::Future;
 use std::net::IpAddr;
@@ -82,6 +85,14 @@ pub mod error_code {
     /// A service was still `starting` after its start period, or failed `failure_threshold` consecutive checks after
     /// it was healthy, and the agent stopped it (H2 §7.2).
     pub const HEALTH_CHECK_FAILED: &str = "health_check_failed";
+    /// A volume of the lease holds a symbolic link, an entry that is neither a directory nor a regular file, a
+    /// regular file with more than one hard link, or more entries than the check walks; or a directory of its chain
+    /// is not the agent's own. Nothing was mounted, and the volume is kept for the owner to delete (H2 §11.3 "Check
+    /// before every mount").
+    pub const VOLUME_UNSAFE: &str = "volume_unsafe";
+    /// A volume of the lease went over its `max_mb`, over the entry budget, or could not be measured three times in
+    /// a row (H2 §11.3 "Size": it fails closed, as the disk limit does).
+    pub const VOLUME_LIMIT: &str = "volume_limit";
 }
 
 /// The GPU the scheduler assigned through the lease (T06), by UUID.
@@ -331,6 +342,17 @@ pub trait Sandbox: Send + Sync {
     /// A prepared (and later running) job. Dropping it without [`Sandbox::cleanup`] still cleans up, in the
     /// background (the cleanup guard).
     type Job: Send;
+
+    /// Takes, at admission, what a lease needs that is not part of the offered capacity: its persistent volumes
+    /// (H2 §11.3 "Who may mount", "One holder at a time", "Budget"). The executor calls it from its admission, which
+    /// never waits: it must not block or touch the disk. A lease it accepts is always handed to
+    /// [`Sandbox::prepare`], which gives back what was taken on every path that does not run the job.
+    ///
+    /// # Errors
+    /// The reason of the `LeaseRejected`. A sandbox without volumes accepts every lease here.
+    fn admit(&self, _lease: &LeaseContext) -> Result<(), LeaseRejectReason> {
+        Ok(())
+    }
 
     /// Checks the lease (SI-1 first), creates the job directory, inputs, env file and cgroup, starts the egress
     /// proxy if asked, pulls the image and creates the container.
