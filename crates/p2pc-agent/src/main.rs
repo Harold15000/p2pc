@@ -109,7 +109,9 @@ enum ConfigAction {
 #[derive(Debug, Subcommand)]
 enum ShareAction {
     /// Change the share limits or pause sharing. Checked against this machine (never above its hardware), written to
-    /// agent.toml atomically, and applied by a running agent within seconds. Options left out keep their value.
+    /// agent.toml atomically, and applied by a running agent within seconds, with two exceptions that need a restart
+    /// of the agent: a GPU added to the share, and volume space on an agent that started with none. Options left out
+    /// keep their value.
     Set {
         /// vCPUs to offer; fractions allowed.
         #[arg(long, value_name = "CORES")]
@@ -403,6 +405,7 @@ fn run_cmd(cli: &Cli, env: &Env) -> anyhow::Result<ExitCode> {
                 config: config.clone(),
                 offers: Some(offers),
                 live_share: Some(share.clone()),
+                volumes: volumes.clone(),
             }),
             load: Arc::new(LoadMeter::new(host)),
             inventory_interval: INVENTORY_INTERVAL,
@@ -578,6 +581,17 @@ fn share_set_cmd(cli: &Cli, env: &Env, update: &ShareUpdate) -> anyhow::Result<E
     );
     for warning in &share.warnings {
         println!("warning: {warning}");
+    }
+    // What a running agent cannot take up live: its sandbox driver serves the GPUs it was started with, and it
+    // declares `volumes` at start (review P2 and P3 of T2-23, round 2).
+    if update.gpus.is_some() {
+        println!("note: a GPU added to the share is offered once the agent restarts; a removed one stops at once.");
+    }
+    if update.volumes_mb.is_some() {
+        println!(
+            "note: the volume budget applies at once, except on an agent that started with no volume space: it offers \
+             volumes once it restarts."
+        );
     }
     println!("Saved in {}.", source.path().display());
     Ok(ExitCode::SUCCESS)

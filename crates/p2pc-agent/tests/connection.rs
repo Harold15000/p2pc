@@ -1579,7 +1579,8 @@ async fn an_h2_node_declares_leave_and_approval_and_the_state_file_follows_the_a
 }
 
 /// H2 §6.1, §8.4: while the owner paused sharing, a new lease of the owner gets `draining` and never reaches the
-/// handler; the owner check comes first (SI-1); a resume takes leases again, without a reconnect.
+/// handler; the owner check comes first (SI-1); a resume reconnects (a new `Hello`), and the new session takes leases
+/// again.
 #[tokio::test(start_paused = true)]
 async fn a_paused_node_refuses_new_leases_with_draining_until_resumed() {
     let recorder = Arc::new(Recorder::default());

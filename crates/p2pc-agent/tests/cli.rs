@@ -547,6 +547,21 @@ fn share_set_pauses_and_refuses_what_the_machine_does_not_have() {
         .assert()
         .success();
     assert!(fs::read_to_string(&config).unwrap().contains("paused = false"));
+    // Review of T2-23, round 2: what a running agent takes up only after a restart is said, not left to be found out.
+    agent_without_tools(dir.path())
+        .args(["share", "set", "--gpu", "none", "--volumes-mb", "0", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(contains("a GPU added to the share is offered once the agent restarts"))
+        .stdout(contains("it offers volumes once it restarts"));
+    // A change that needs no restart says nothing of one.
+    agent_without_tools(dir.path())
+        .args(["share", "set", "--cpu", "1", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(contains("restart").not());
 }
 
 /// `leave` needs an enrollment: before `join` it exits 8, like `run`, and dials nothing.
