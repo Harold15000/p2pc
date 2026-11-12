@@ -927,9 +927,9 @@ fn the_generated_sequences_reach_every_lease_outcome() {
 /// What one step of the cap property test does.
 #[derive(Debug, Clone)]
 enum CapOp {
-    /// A batch job of principal `who % 3`, refused when it does not fit the day's cap.
+    /// A batch job of principal `who % 4`, refused when it does not fit the day's cap.
     Batch { who: u8, size: u8, long: bool },
-    /// A service of principal `who % 3`, refused when its day reservation buys under 15 minutes.
+    /// A service of principal `who % 4`, refused when its day reservation buys under 15 minutes.
     Service { who: u8, size: u8, long: bool },
     /// A principal cancels a job (`POST /v1/jobs/{id}/cancel`).
     Cancel(u8),
@@ -964,18 +964,21 @@ fn cap_op() -> impl Strategy<Value = CapOp> {
     ]
 }
 
-/// The cap test's world: the hub's scheduler, two service nodes, three principals and what was observed.
+/// The cap test's world: the hub's scheduler, two service nodes, four principals and what was observed.
 struct CapWorld {
     sched: Scheduler,
     nodes: Vec<NodeId>,
-    /// `(principal, its cap)`: the key and one device capped, one device not.
+    /// `(principal, its cap)`: the key and one device capped, one device with a cap it can never reach
+    /// ([`FAR_CAP`]), one device with none.
     principals: Vec<(Principal, Option<u64>)>,
     jobs: Vec<(JobId, Principal)>,
-    /// Every day reservation seen: `(job, day) → milli-units`.
+    /// The latest day reservation seen: `(job, day) → milli-units`. A new attempt takes it again (H2 §12).
     reservations: BTreeMap<(String, i64), i64>,
 }
 
 const CAP_GPU_HOUR: Units = Units::from_units(10);
+/// A cap no sequence comes near: a million units a day.
+const FAR_CAP: u64 = 1_000_000_000;
 
 impl CapWorld {
     fn principal(&self, who: u8) -> (Principal, Option<u64>) {
@@ -1138,14 +1141,15 @@ async fn agents(fx: &Fx, w: &CapWorld) {
     }
 }
 
-/// The next instant after `now` at which the hub or an agent must act: a midnight, a cap deadline, a timeout (the
-/// agent's, or the watchdog's for a partitioned node).
+/// The next instant after `now` at which the hub or an agent must act: a midnight, a cap stop (one stop grace before
+/// a cap deadline), a timeout (the agent's, or the watchdog's for a partitioned node).
 async fn next_event(fx: &Fx, w: &CapWorld, now: i64) -> i64 {
     let mut next = crate::units::day_of(now) + crate::units::DAY_S;
     let mut conn = fx.db.acquire().await.unwrap();
     for (job, _) in &w.jobs {
         if let Some(d) = crate::units::cap_deadline(&mut conn, *job, CAP_GPU_HOUR).await.unwrap() {
-            let d = d.unix_timestamp();
+            // The hub asks for the stop one stop grace before the deadline.
+            let d = d.unix_timestamp() - crate::units::STOP_GRACE_S;
             if d > now {
                 next = next.min(d);
             }
@@ -1179,7 +1183,7 @@ async fn run_until(fx: &Fx, w: &mut CapWorld, target: i64) {
     }
 }
 
-/// Records the day reservations, which a later step replaces.
+/// Records the day reservations, which a later step replaces (the next midnight, or a new attempt).
 async fn observe(fx: &Fx, w: &mut CapWorld) {
     let rows: Vec<(String, i64, i64)> =
         sqlx::query_as("SELECT job_id, cap_day, cap_reserved_units FROM service_state WHERE cap_day IS NOT NULL")
@@ -1187,11 +1191,7 @@ async fn observe(fx: &Fx, w: &mut CapWorld) {
             .await
             .unwrap();
     for (job, day, units) in rows {
-        let seen = w.reservations.entry((job.clone(), day)).or_insert(units);
-        assert_eq!(
-            *seen, units,
-            "the reservation of {job} for {day} changed within its day"
-        );
+        w.reservations.insert((job, day), units);
     }
 }
 
@@ -1299,7 +1299,7 @@ async fn cap_step(fx: &Fx, w: &mut CapWorld, op: &CapOp) {
         }
         CapOp::Restart => {
             w.sched = fx.another_scheduler();
-            w.sched.catch_up().await;
+            w.sched.catch_up().await.unwrap();
         }
     }
     agents(fx, w).await;
@@ -1307,7 +1307,8 @@ async fn cap_step(fx: &Fx, w: &mut CapWorld, op: &CapOp) {
 }
 
 /// SI-H2-20, after every step: `spent(P, D)` is the reference sum of H2 §12 and stays within each capped principal's
-/// cap; a service's rows for a day exceed that day's reservation only by estimated slices; and invariant 6 holds.
+/// cap; a service's rows for a day exceed that day's reservation only by estimated slices; no job ends `cap_reached`
+/// unless its principal's cap can be reached; and invariant 6 holds.
 async fn check_caps(fx: &Fx, w: &CapWorld) {
     let now = fx.now();
     for &(principal, cap) in &w.principals {
@@ -1356,6 +1357,26 @@ async fn check_caps(fx: &Fx, w: &CapWorld) {
             );
         }
     }
+    // End reasons: only a cap that can be reached stops a service. A requeued attempt with a short `timeout_s`
+    // must end by its timeout, its node or its principal, never by a reservation its lost attempt left behind.
+    for &(principal, cap) in &w.principals {
+        if cap.is_some_and(|c| c < FAR_CAP) {
+            continue;
+        }
+        let (key, device) = crate::store::jobs::principal_binds(principal);
+        let stopped: Vec<String> = sqlx::query_scalar(
+            "SELECT job_id FROM jobs WHERE reason = 'cap_reached' AND (key_id = ?1 OR device_id = ?2)",
+        )
+        .bind(&key)
+        .bind(&device)
+        .fetch_all(&fx.db)
+        .await
+        .unwrap();
+        assert!(
+            stopped.is_empty(),
+            "{principal:?} cannot reach a cap, yet {stopped:?} ended `cap_reached`"
+        );
+    }
     check_slices(fx, true).await;
 }
 
@@ -1379,7 +1400,7 @@ async fn run_caps(key_cap: u64, device_cap: u64, ops: Vec<CapOp>) {
         .await
         .unwrap();
     let mut principals = vec![(Principal::Key(fx.key), Some(key_cap))];
-    for cap in [Some(device_cap), None] {
+    for cap in [Some(device_cap), Some(FAR_CAP), None] {
         let id = p2pc_proto::ids::DeviceId::generate();
         sqlx::query(
             "INSERT INTO devices (device_id, account_id, project_id, iroh_node_id, scopes, daily_unit_cap, \

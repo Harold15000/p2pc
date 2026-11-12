@@ -69,3 +69,27 @@ async fn serve_refuses_a_missing_database() {
         .unwrap_err();
     assert!(err.to_string().contains("p2pc-server init"), "{err}");
 }
+
+/// H2 §12: a hub that cannot catch up its metering does not start, and it finds out before it binds its listener.
+#[tokio::test]
+async fn serve_refuses_to_start_when_the_metering_cannot_catch_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = p2pc_server::init::init(&tmp.path().join("data"), &SystemClock)
+        .await
+        .unwrap();
+    let mut config = Config::load(&out.config_path).unwrap();
+    // The metering reads `service_state`: without it, every try of the catch-up fails.
+    let db = store::open(&config.db_path(), store::OpenMode::Existing).await.unwrap();
+    sqlx::query("ALTER TABLE service_state RENAME TO service_state_gone")
+        .execute(&db)
+        .await
+        .unwrap();
+    db.close().await;
+    // The address is taken: binding it first would fail with another error.
+    let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    config.bind = taken.local_addr().unwrap();
+    let err = p2pc_server::serve::serve(config).await.unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("metering catch-up failed after 4 tries"), "{text}");
+    assert!(!text.contains("cannot listen"), "{text}");
+}
