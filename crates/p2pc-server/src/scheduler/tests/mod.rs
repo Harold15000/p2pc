@@ -1904,12 +1904,21 @@ mt_test!(
         fx.sched.tick().await.clean();
         let sent = fx.sent().leases;
         assert_eq!(sent.len(), 4, "disk, not CPU, is the limit");
+        // The job left out: jobs created in the same second are queued by ID, and IDs made in the same millisecond
+        // are not ordered, so it is not always the last one created.
+        let mut offered = Vec::new();
+        for (_, lease, _) in &sent {
+            offered.push(fx.lease(*lease).await.job_id);
+        }
+        let left: Vec<JobId> = jobs.iter().copied().filter(|j| !offered.contains(j)).collect();
+        assert_eq!(left.len(), 1, "{offered:?}");
+        let left = left[0];
         assert_eq!(
-            fx.offer_count(jobs[4]).await,
+            fx.offer_count(left).await,
             0,
             "the fifth was never offered, so never refused"
         );
-        assert_eq!(fx.status(jobs[4]).await, JobStatus::Queued);
+        assert_eq!(fx.status(left).await, JobStatus::Queued);
         // Accepted and started: still held.
         for (n, lease, epoch) in &sent {
             fx.accept(*n, *lease, *epoch).await;
@@ -1924,7 +1933,7 @@ mt_test!(
         fx.sched.tick().await.clean();
         let next = fx.sent().leases;
         assert_eq!(next.len(), 1);
-        assert_eq!((next[0].0, fx.lease(next[0].1).await.job_id), (node, jobs[4]));
+        assert_eq!((next[0].0, fx.lease(next[0].1).await.job_id), (node, left));
     }
 );
 
