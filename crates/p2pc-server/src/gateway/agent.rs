@@ -13,6 +13,8 @@
 //!   still enrolls (H2 §6.1). A `Hello` gets `Error{not_enrolled}`, the same bytes whether or not the NodeId was ever
 //!   enrolled.
 //! - **Enrolled NodeIds** start with `Hello` (or retry their `Join`, which is idempotent), then heartbeat.
+//! - **`Leave`** (H2 §6.1), from an agent that declared `leave`: the hub deletes the node as `DELETE /v1/nodes/{id}`
+//!   would, audits `node_left`, closes the connection and answers nothing.
 //!
 //! [`NodeHub::send`]: super::NodeHub::send
 
@@ -23,8 +25,8 @@ use p2pc_proto::api::{AuditKind, Inventory};
 use p2pc_proto::auth::JoinToken;
 use p2pc_proto::ids::{AccountId, NodeId};
 use p2pc_proto::protocol::{
-    AgentMsg, FrameError, MAX_FRAME_LEN, PRE_JOIN_MAX_FRAME_LEN, RunningLease, ServerMsg, error_code, read_frame_bytes,
-    write_frame,
+    AgentMsg, FrameError, Leave, MAX_FRAME_LEN, PRE_JOIN_MAX_FRAME_LEN, RunningLease, ServerMsg, capability,
+    error_code, read_frame_bytes, write_frame,
 };
 use serde_json::json;
 use time::OffsetDateTime;
@@ -698,8 +700,29 @@ async fn run(inner: &Inner, control: &mut Control, node: &NodeRow) {
                     }
                 }
             }
-            // The other H2 messages (§6.1) are not served yet: answered exactly as an unknown type (H1 §6).
-            AgentMsg::Unknown | AgentMsg::Leave(_) => Some(error(error_code::UNSUPPORTED_MESSAGE, UNSUPPORTED_MESSAGE)),
+            // H2 §6.1: "remove me". Deleted, audited and closed with no answer; only from an agent that declared
+            // `leave`, any other is answered as for a type the hub does not serve.
+            AgentMsg::Leave(leave) => {
+                inner
+                    .hub()
+                    .touch(node_id, inner.state.clock.now(), inner.limits.last_seen_flush);
+                match leave_node(inner, node, &leave).await {
+                    Ok(Left::Removed) => {
+                        tracing::info!(%node_id, "node left");
+                        return;
+                    }
+                    // Deleted meanwhile by someone else: nothing left to do but close.
+                    Ok(Left::Gone) => return,
+                    Ok(Left::NotDeclared) => Some(error(error_code::UNSUPPORTED_MESSAGE, UNSUPPORTED_MESSAGE)),
+                    Err(e) => {
+                        // Closed with no answer: the agent dials again to confirm, finds the node still enrolled
+                        // and sends `Leave` again.
+                        tracing::warn!(error = %e, %node_id, "cannot remove a node that left");
+                        return;
+                    }
+                }
+            }
+            AgentMsg::Unknown => Some(error(error_code::UNSUPPORTED_MESSAGE, UNSUPPORTED_MESSAGE)),
             // One `Join` or `Hello` per connection.
             AgentMsg::Join { .. } | AgentMsg::Hello { .. } => return,
         };
@@ -709,6 +732,44 @@ async fn run(inner: &Inner, control: &mut Control, node: &NodeRow) {
             return;
         }
     }
+}
+
+/// What a `Leave` came to.
+enum Left {
+    /// The node is deleted, and its connection closed.
+    Removed,
+    /// The node was no longer live (deleted meanwhile).
+    Gone,
+    /// The agent did not declare `leave` in its `Hello`: nothing changed.
+    NotDeclared,
+}
+
+/// `Leave{reason}` from `node` (H2 §6.1): the node is deleted as `DELETE /v1/nodes/{id}` would delete it (its
+/// connection closed, its leases requeued), and `node_left` is audited with the agent's reason. The capability is
+/// read from the node's row, which this connection's `Hello` wrote.
+async fn leave_node(inner: &Inner, node: &NodeRow, leave: &Leave) -> Result<Left, StoreError> {
+    let declared = {
+        let mut conn = inner.state.db.acquire().await?;
+        store::nodes::by_id(&mut conn, node.id)
+            .await?
+            .filter(|n| n.deleted_at.is_none())
+            .map(|n| n.features.iter().any(|f| f == capability::LEAVE))
+    };
+    match declared {
+        None => return Ok(Left::Gone),
+        Some(false) => return Ok(Left::NotDeclared),
+        Some(true) => {}
+    }
+    let mut detail = serde_json::Map::new();
+    detail.insert("reason".to_string(), leave.reason.clone().into());
+    let event = NewEvent::new(AuditKind::NodeLeft, None, Some(node.id.to_string()), detail);
+    Ok(
+        if crate::nodes_api::remove_node(&inner.state, node.account_id, node.id, &event).await? {
+            Left::Removed
+        } else {
+            Left::Gone
+        },
+    )
 }
 
 /// The connection ended: flush `last_seen` and open a disconnection (resolved when the node comes back, or when its
