@@ -4288,6 +4288,13 @@
             "type": "string",
             "description": "Operating system, for example `Ubuntu 24.04`."
           },
+          "owner_paused": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether the owner paused sharing (H2 §6.1, §8.4): while it is true the scheduler treats the node as draining,\nand the agent refuses new leases with `draining`. Sent (true or false) only by an agent that declared\n`share_update`; absent otherwise, which is not paused."
+          },
           "platform": {
             "$ref": "#/components/schemas/Platform",
             "description": "Native Linux or the WSL2 distro."
@@ -4298,6 +4305,15 @@
               "$ref": "#/components/schemas/SandboxCapability"
             },
             "description": "Sandbox drivers."
+          },
+          "volumes_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The disk share for persistent volumes, in MiB, apart from `offered.disk_mb` (H2 §6.1, §11.3). Sent only by an\nagent that declared `share_update`; absent otherwise.",
+            "minimum": 0
           },
           "wsl2": {
             "oneOf": [

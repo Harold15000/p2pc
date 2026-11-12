@@ -1543,6 +1543,23 @@ pub struct Inventory {
     pub disk_total_mb: Option<u64>,
     /// Agent version.
     pub agent_version: String,
+    /// The disk share for persistent volumes, in MiB, apart from `offered.disk_mb` (H2 §6.1, §11.3). Sent only by an
+    /// agent that declared `share_update`; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volumes_mb: Option<u64>,
+    /// Whether the owner paused sharing (H2 §6.1, §8.4): while it is true the scheduler treats the node as draining,
+    /// and the agent refuses new leases with `draining`. Sent (true or false) only by an agent that declared
+    /// `share_update`; absent otherwise, which is not paused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_paused: Option<bool>,
+}
+
+impl Inventory {
+    /// Whether the owner paused sharing (`owner_paused` is `true`). An agent without `share_update` is never paused.
+    #[must_use]
+    pub fn is_owner_paused(&self) -> bool {
+        self.owner_paused == Some(true)
+    }
 }
 
 /// A node as returned by the API.

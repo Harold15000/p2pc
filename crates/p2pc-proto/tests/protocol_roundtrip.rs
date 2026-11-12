@@ -147,13 +147,18 @@ fn inventory() -> impl Strategy<Value = Inventory> {
     (
         (text(), any::<u32>(), any::<u64>(), text(), text()),
         (vec(gpu, 0..3), vec(sandbox, 0..3), capacity(), text(), text()),
-        (platform_bits(), option::of(any::<u64>())),
+        (
+            platform_bits(),
+            option::of(any::<u64>()),
+            option::of(any::<u64>()),
+            option::of(any::<bool>()),
+        ),
     )
         .prop_map(
             |(
                 (model, cores, memory_mb, os, arch),
                 (gpus, sandbox, offered, agent_version, hostname),
-                ((platform, gpu_status, dxg, wsl2), disk_total_mb),
+                ((platform, gpu_status, dxg, wsl2), disk_total_mb, volumes_mb, owner_paused),
             )| Inventory {
                 hostname,
                 platform,
@@ -169,6 +174,8 @@ fn inventory() -> impl Strategy<Value = Inventory> {
                 offered,
                 disk_total_mb,
                 agent_version,
+                volumes_mb,
+                owner_paused,
             },
         )
 }
