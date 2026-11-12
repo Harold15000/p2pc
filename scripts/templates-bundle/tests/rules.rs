@@ -31,7 +31,7 @@ fn the_shipped_templates_pass_every_rule() {
 #[test]
 fn the_shipped_templates_pass_the_release_rules_with_the_verified_digests() {
     // The digests were taken from the registries and the images were run on a test node (Ollama 0.40.16 and the
-    // whisper.cpp `main-cuda` image). A release build refuses a placeholder, so the shipped bundle must pass it.
+    // whisper.cpp CPU image, `main`). A release build refuses a placeholder, so the shipped bundle must pass it.
     let loaded = load_dir(&shipped_dir()).expect("templates/ loads");
     let image_of = |id: &str| {
         loaded
@@ -49,12 +49,62 @@ fn the_shipped_templates_pass_the_release_rules_with_the_verified_digests() {
     );
     assert_eq!(
         image_of("transcribe"),
-        "ghcr.io/ggml-org/whisper.cpp@sha256:fe01def3d6e6f1463eb94b7bcdbe93a5e65fbfd51381050f0b0d77601b18bb1f"
+        "ghcr.io/ggml-org/whisper.cpp@sha256:5a7c4d82e5101a4fbbb047139c11638854a6452d1f4363fe3dff64bb758add32"
     );
     let release = check_bundle(&loaded, Mode::Release);
     assert!(
         release.is_empty(),
         "the shipped bundle fails the release rules: {release:#?}"
+    );
+}
+
+#[test]
+fn the_shipped_transcribe_template_runs_on_the_cpu_image() {
+    // The `main-cuda` image needs CUDA 13.0 (the node's driver gives 12.9, so it fell back to the CPU) and does not
+    // start at all without a GPU (`libcuda.so.1` missing). The CPU image works everywhere and transcribed 30 minutes
+    // of audio with `small` in 286 s on 4 threads, so the template asks for no GPU.
+    use p2pc_proto::api::GpuRequirement;
+    let loaded = load_dir(&shipped_dir()).expect("templates/ loads");
+    let t = loaded
+        .templates
+        .iter()
+        .find(|t| t.info.id == "transcribe")
+        .expect("transcribe");
+    assert_eq!(t.info.requirements.gpu, GpuRequirement::None);
+    assert_eq!(t.info.requirements.min_vram_mb, None);
+    assert_eq!(t.spec.resources.gpu, 0);
+    assert_eq!(
+        t.spec.timeout_s, 3600,
+        "30 minutes of `small` take about 5 minutes; `medium` about 3 times that"
+    );
+    assert_eq!(
+        t.info.download_mb, 1600,
+        "1.15 GB image plus the 466 MB `small` model, in MiB, rounded up"
+    );
+}
+
+#[test]
+fn the_shipped_chat_template_defaults_to_a_model_that_does_not_think() {
+    // `qwen3:4b` answers with its reasoning even with `"think": false`; the `-instruct` variant (Apache-2.0, 2.4 GB)
+    // does not. `gemma3:1b` is gone from the list: its licence is not Apache-2.0 or MIT.
+    use p2pc_proto::api::{ParamType, ParamValue};
+    let loaded = load_dir(&shipped_dir()).expect("templates/ loads");
+    let chat = loaded
+        .templates
+        .iter()
+        .find(|t| t.info.id == "private-chat")
+        .expect("private-chat");
+    let model = chat.info.params.iter().find(|p| p.name == "model").expect("model");
+    let ParamType::Enum { values } = &model.ty else {
+        panic!("model is an enum")
+    };
+    assert_eq!(values, &["qwen3:4b-instruct", "qwen3:1.7b"]);
+    assert_eq!(model.default, Some(ParamValue::Text("qwen3:4b-instruct".to_string())));
+    let licenses = chat.info.licenses.join("\n");
+    assert!(!licenses.to_lowercase().contains("gemma"), "{licenses}");
+    assert_eq!(
+        chat.info.download_mb, 7200,
+        "5.10 GB image plus the 2.4 GB model, in MiB, rounded up"
     );
 }
 

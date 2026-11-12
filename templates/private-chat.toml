@@ -1,18 +1,26 @@
 # Private AI chat: Ollama as a service (H2 spec §7.6 "Templates shipped with the beta").
 #
-# The image and the egress hosts were checked on a test node with plain Podman, through a logging CONNECT proxy (the
-# HTTPS_PROXY path): Ollama 0.40.16 (5.10 GB on disk) pulled `qwen3:4b` (2.4 GB) and ran it on a 16 GB GPU at 163
-# tokens/s, with 5.0 GB of VRAM. A pull reached `registry.ollama.ai`, `ollama.com` and the object-storage host below,
-# and no other.
+# The image and the egress hosts were checked on a test node (plain Podman 4.9.3, through a logging CONNECT proxy, the
+# HTTPS_PROXY path): Ollama 0.40.16 (5.10 GB on disk) pulled a model through `registry.ollama.ai`, `ollama.com` and the
+# object-storage host below, and no other. A 16 GB GPU ran `qwen3:4b` (2.4 GB) at 163 tokens/s with 5.0 GB of VRAM, and
+# `qwen3:4b-instruct` (Apache-2.0, 2.4 GB) at 178 tokens/s.
 #
 # Ollama images must be pinned by digest: an old tag can no longer pull current models. To move the digest, take the
-# new one from the registry (`skopeo inspect` or `crane digest docker.io/ollama/ollama:<tag>`), raise `bundle_version`
-# in `bundle.toml` and run `templates-bundle check --release`.
+# new one from the registry (`skopeo inspect` or `crane digest docker.io/ollama/ollama:<tag>`), run it on a test node,
+# raise `bundle_version` in `bundle.toml` and run `templates-bundle check --release`.
 #
-# THINKING. `qwen3` models answer with a reasoning block first, and on the test node `"think": false` in the request
-# did not stop it. Ollama has no environment setting for this and a template cannot pass request options (the hub
-# forwards the chat request as the client sent it, §7.4), so the chat UI must strip a leading reasoning block (T2-32).
-# `qwen3:1.7b` behaves the same way; `gemma3:1b` has none.
+# THINKING. `qwen3:4b` answers with a reasoning block first, and `"think": false` in the request did not stop it. The
+# default is therefore `qwen3:4b-instruct`, which does not. A template cannot pass Ollama request options (the hub
+# forwards the chat request as the client sent it, §7.4) and Ollama has no environment setting for this. `qwen3:1.7b`
+# is the same family as `qwen3:4b`, so the chat UI (T2-32) should still strip a leading reasoning block.
+#
+# VOLUME. Ollama 0.40.16 writes a relative symlink into its store (`models/manifests-v2/ollama.com/library/<model>/
+# <tag>` points to `../../../../blobs/sha256-…`), and a volume that holds a symlink is refused (`volume_unsafe`) at the
+# next mount (§11.3). Only the blobs are worth keeping: with the volume mounted at `/root/.ollama/models/blobs` alone,
+# no link is written (6 regular files and one directory), and a new container with the blobs kept re-pulls the manifest
+# in 1 s, which the hub's pull per attempt does anyway (§7.6). OPEN: a mount there is refused by the JobSpec rule that a
+# volume mount is under `/volumes/` (§7.1), so the volume below is still mounted at `/volumes/models` with
+# `OLLAMA_MODELS` pointing at it, which keeps the manifests (and the symlink) in the volume. See the PR description.
 
 id = "private-chat"
 version = 1
@@ -24,24 +32,25 @@ singleton = true
 # Shown in the UI before launch: the image, then the models.
 licenses = [
   "Ollama: MIT",
-  "Qwen3 models (qwen3:4b, qwen3:1.7b): Apache-2.0",
-  "Gemma 3 model (gemma3:1b): Gemma Terms of Use",
+  "Qwen3 models (qwen3:4b-instruct, qwen3:1.7b): Apache-2.0",
 ]
-# The 5.10 GB image (its size on disk, so an upper bound for the download) plus the 2.4 GB default model: about 7150 MiB.
+# The 5.10 GB image (its size on disk, so an upper bound for the download, about 4865 MiB) plus the 2.4 GB default
+# model (about 2290 MiB): about 7150 MiB, rounded up.
 download_mb = 7200
 
 [requirements]
 gpu = "preferred"
-min_vram_mb = 4096
+min_vram_mb = 5120
 
 # The model the hub downloads at launch (the `pull` target). The default is at most about 4 B parameters, Apache-2.0,
-# a 2.4 GB download (checked on a test node). Other values are smaller choices for a computer with little memory.
+# a 2.4 GB download that does not think out loud (checked on a test node). `qwen3:1.7b` is the smaller choice for a
+# computer with little memory.
 [[params]]
 name = "model"
 label = "Model"
 type = "enum"
-values = ["qwen3:4b", "qwen3:1.7b", "gemma3:1b"]
-default = "qwen3:4b"
+values = ["qwen3:4b-instruct", "qwen3:1.7b"]
+default = "qwen3:4b-instruct"
 target = "pull"
 
 # Stop the chat after this many idle seconds (900 s to 24 h).

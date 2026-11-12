@@ -75,8 +75,18 @@ model_file="$models/ggml-$model.bin"
 if [ ! -s "$model_file" ]; then
   # Downloaded under a temporary name and renamed when complete, so an interrupted download is never mistaken for
   # the model. The shim's proxy settings carry the traffic through the egress allowlist.
+  #
+  # Bounded, so that a connection that goes quiet cannot hold the job until its whole timeout_s (one hour):
+  #  - --speed-limit/--speed-time: below 1 KiB/s for 60 s is a stall, and curl gives up on that try;
+  #  - --max-time: no try lasts over 25 minutes, even a slow one that keeps moving;
+  #  - --retry 2 with --retry-max-time: at most two more tries, none started after 25 minutes since the first. The
+  #    worst case is therefore about 50 minutes of download, which can still use up the job's hour; the job then ends at
+  #    its timeout, never hangs, and the next run starts clean (stale .part files are removed above).
   url="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-$model.bin"
-  curl --fail --location --silent --show-error --retry 3 --connect-timeout 20 --output "$model_file.part" "$url"
+  curl --fail --location --silent --show-error \
+    --connect-timeout 20 --speed-limit 1024 --speed-time 60 --max-time 1500 \
+    --retry 2 --retry-max-time 1500 \
+    --output "$model_file.part" "$url"
   mv "$model_file.part" "$model_file"
 fi
 

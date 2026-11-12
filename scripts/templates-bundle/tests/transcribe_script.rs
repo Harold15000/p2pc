@@ -137,6 +137,51 @@ fn it_converts_downloads_the_model_once_and_writes_the_three_outputs() {
 }
 
 #[test]
+fn the_model_download_is_bounded_against_a_stall_and_by_a_total_time() {
+    // A download that hangs on a half-open connection must not run until the job's whole `timeout_s`, so curl gets a
+    // floor for the speed over a window (`--speed-limit`/`--speed-time`) and a ceiling for the whole transfer
+    // (`--max-time`) that leaves the conversion and the transcription their time.
+    let sb = sandbox(true);
+    assert!(run(&sb, "auto", "medium").status.success());
+    let curl = calls(&sb, "curl");
+    assert_eq!(curl.len(), 1);
+    let value_of = |flag: &str| -> u64 {
+        let marker = format!("[{flag}] [");
+        let rest = curl[0]
+            .split(&marker)
+            .nth(1)
+            .unwrap_or_else(|| panic!("no {flag} in: {}", curl[0]));
+        rest.split(']')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap_or_else(|_| panic!("{flag} is not a number: {}", curl[0]))
+    };
+    let (floor, window, ceiling) = (
+        value_of("--speed-limit"),
+        value_of("--speed-time"),
+        value_of("--max-time"),
+    );
+    assert!(
+        floor >= 1,
+        "a stalled transfer is one below a floor of at least 1 byte/s"
+    );
+    assert!((10..=300).contains(&window), "the stall window is {window} s");
+    let loaded = templates_bundle::source::load_dir(&shipped_dir()).expect("loads");
+    let timeout_s = loaded
+        .templates
+        .iter()
+        .find(|t| t.info.id == "transcribe")
+        .expect("transcribe")
+        .spec
+        .timeout_s;
+    assert!(
+        ceiling < u64::from(timeout_s) && ceiling >= 600,
+        "--max-time {ceiling} must be under timeout_s {timeout_s} and long enough for the biggest model"
+    );
+}
+
+#[test]
 fn it_leaves_no_working_file_in_outputs() {
     let sb = sandbox(true);
     assert!(run(&sb, "auto", "base").status.success());
