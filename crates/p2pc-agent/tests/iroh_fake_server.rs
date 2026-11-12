@@ -407,6 +407,7 @@ async fn status_after_join_force_to_the_same_server_is_a_fresh_enrollment() {
             ports: None,
             node: None,
             volumes: None,
+            blob_inputs: false,
         },
         connector: Arc::new(agent_connector(addr.clone())),
         backoff_seed: 1,
@@ -534,6 +535,7 @@ async fn run_says_hello_heartbeats_and_routes_over_iroh() {
         ports: None,
         node: None,
         volumes: None,
+        blob_inputs: false,
     };
     let connector = Arc::new(agent_connector(addr));
     let daemon = Daemon {
@@ -642,6 +644,7 @@ async fn the_server_opens_port_streams_on_the_agents_connection_over_iroh() {
         ports: Some(Arc::new(EchoPorts)),
         node: None,
         volumes: None,
+        blob_inputs: false,
     };
     let daemon = Daemon {
         shared,
@@ -769,6 +772,7 @@ async fn a_route_move_ends_in_a_rebind_and_the_new_endpoint_opens_the_gate() {
             ports: None,
             node: None,
             volumes: None,
+            blob_inputs: false,
         },
         connector: connector.clone(),
         backoff_seed: 1,

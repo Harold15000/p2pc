@@ -231,6 +231,7 @@ where
             ports: None,
             node: None,
             volumes: None,
+            blob_inputs: false,
         },
         connector: Arc::new(IrohConnector::new(
             SecretKey::generate(),

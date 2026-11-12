@@ -317,6 +317,8 @@ struct Options {
     owner: Option<AccountId>,
     /// The node's volumes (H2 §11.3); `None` is an agent that declares no `volumes`.
     volumes: Option<VolumeStore>,
+    /// Whether the node fetches blob inputs (H2 §7.5); `false` is an agent that declares no `blob_inputs`.
+    blob_inputs: bool,
 }
 
 impl Default for Options {
@@ -331,6 +333,7 @@ impl Default for Options {
             incoming: None,
             owner: None,
             volumes: None,
+            blob_inputs: false,
         }
     }
 }
@@ -381,6 +384,7 @@ fn start(opts: Options) -> World {
         ports: opts.ports,
         node: opts.node,
         volumes: opts.volumes,
+        blob_inputs: opts.blob_inputs,
     };
     let daemon = Daemon {
         shared,
@@ -2106,6 +2110,51 @@ async fn recv_acking_gives_up_after_its_deadline() {
     // The whole test is bounded in real time too, in case the bound itself is what broke.
     let _ = tokio::time::timeout(RECV_DEADLINE * 2, s.recv_acking()).await;
     unreachable!("recv_acking returned after {:?}", started.elapsed());
+}
+
+/// H2 §6.1: an agent that fetches blob inputs declares `blob_inputs` and takes leases whose job has them; one that
+/// does not is as before: no capability, and such a lease is `invalid_job` before any handler sees it.
+#[tokio::test(start_paused = true)]
+async fn blob_inputs_is_declared_and_leases_with_blob_inputs_are_taken_only_with_it() {
+    let job = json!({
+        "image": "docker.io/library/python:3.12-slim",
+        "command": ["python", "/inputs/run.py"],
+        "resources": {"cpu": 1, "memory_mb": 512, "disk_mb": 1024},
+        "inputs": [{"path": "/inputs/audio", "blob": format!("sha256:{}", "ab".repeat(32))}],
+    });
+    for with_blobs in [false, true] {
+        let recorder = Arc::new(Recorder::default());
+        let (node, _share) = node_controls();
+        let mut w = start(Options {
+            handler: recorder.clone(),
+            node: Some(node),
+            blob_inputs: with_blobs,
+            ..Options::default()
+        });
+        let mut s = w.next_connection().await;
+        let hello = s.handshake(w.owner).await;
+        let expected = if with_blobs {
+            json!(["blob_inputs", "leave", "share_update", "approval"])
+        } else {
+            json!(["leave", "share_update", "approval"])
+        };
+        assert_eq!(hello["features"], expected, "with_blobs = {with_blobs}");
+        let (id, lease) = lease_msg(w.owner, job.clone());
+        s.send(lease).await;
+        let answer = s.recv_not_heartbeat().await.unwrap();
+        if with_blobs {
+            assert_eq!(answer, json!({"type": "lease_accepted", "lease_id": id, "epoch": 1}));
+            assert_eq!(*recorder.offers.lock().unwrap(), [id]);
+        } else {
+            assert_eq!(
+                answer,
+                json!({"type": "lease_rejected", "lease_id": id, "epoch": 1, "reason": "invalid_job"})
+            );
+            assert!(recorder.offers.lock().unwrap().is_empty());
+        }
+        let (_task, _rx) = s.serve(true);
+        w.shutdown().await;
+    }
 }
 
 /// H2 §6.1: an agent with volume space declares `volumes` and takes leases whose job has volumes; one without is as

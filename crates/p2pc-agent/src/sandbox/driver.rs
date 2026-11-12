@@ -60,7 +60,8 @@ use p2pc_proto::api::{
 };
 use p2pc_proto::ids::{AccountId, LeaseId};
 use p2pc_proto::protocol::{HealthState, LeaseRejectReason, MAX_NODE_MEMORY_MB, Outcome, Usage};
-use p2pc_proto::validate::{H2Features, ImageRef, Limits, SpecContext};
+use p2pc_proto::validate::h2_spec::INPUTS_DISK_RESERVE_MB;
+use p2pc_proto::validate::{H2Features, ImageRef, Limits, SpecContext, base64_decoded_len};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, Interval, MissedTickBehavior, Sleep};
@@ -78,6 +79,7 @@ use super::{
     CancelHandle, DISK_CHECK_INTERVAL, Egress, EgressRequest, Finished, GpuRef, HealthChange, LeaseContext, NoEgress,
     Phase, STOP_GRACE, Sandbox, SandboxError, SandboxEvent, UsageSample, error_code, run_lease,
 };
+use crate::blobs::{BlobInputs, BlobRequest, FetchError};
 use crate::config::Runtime;
 use crate::volumes::{Mount, VolumeStore};
 
@@ -138,6 +140,9 @@ pub struct DriverConfig {
     /// The node's persistent volumes (H2 §11.3). `None`, the default: the node mounts no volume, and a lease with
     /// `volumes` is refused as `invalid_job`.
     pub volumes: Option<VolumeStore>,
+    /// The `BlobFetch` client (H2 §6.1, §7.5): how blob inputs reach the job. `None`, the default: a lease with blob
+    /// `inputs` is refused as `invalid_job`.
+    pub blobs: Option<BlobInputs>,
 }
 
 impl DriverConfig {
@@ -165,6 +170,7 @@ impl DriverConfig {
             ingress: None,
             usage_interval: USAGE_INTERVAL,
             volumes: None,
+            blobs: None,
         }
     }
 }
@@ -995,6 +1001,69 @@ impl<E: Engine, C: Cgroups, X: Egress> PodmanDriver<E, C, X> {
     ///    (other jobs may use it; `podman rmi` refuses an image in use anyway).
     ///
     /// The choice is logged once per attempt: `image present, no pull` or `pulling`.
+    /// Fetches the lease's blob inputs into `inputs/` (H2 §6.1, §7.5), one after the other, each over its own
+    /// `BlobFetch` stream named by the lease and its epoch. Together with the inline files they must fit in
+    /// `resources.disk_mb` minus 64 MiB (§7.1): each fetch may take only what is left, and a larger blob is refused
+    /// before any of its bytes is read. A cancel ends the fetch at once. On an error what was written stays in the job
+    /// directory, which the cleanup guard removes.
+    async fn fetch_blob_inputs(
+        &self,
+        dir: &JobDir,
+        lease_id: LeaseId,
+        epoch: u64,
+        job: &JobSpec,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<(), SandboxError> {
+        if job.inputs.is_empty() {
+            return Ok(());
+        }
+        let Some(blobs) = &self.cfg.blobs else {
+            return Err(reject(LeaseRejectReason::InvalidJob));
+        };
+        let inline: u64 = job
+            .files
+            .iter()
+            .map(|f| base64_decoded_len(&f.content_b64).map_or(u64::MAX, |n| u64::try_from(n).unwrap_or(u64::MAX)))
+            .fold(0, u64::saturating_add);
+        let mut room = job
+            .resources
+            .disk_mb
+            .saturating_sub(INPUTS_DISK_RESERVE_MB)
+            .saturating_mul(MIB)
+            .saturating_sub(inline);
+        let mut total = 0u64;
+        for input in &job.inputs {
+            let file = {
+                let (dir, path) = (dir.clone(), input.path.clone());
+                setup_blocking(move || dir.create_input_file(&path))
+                    .await?
+                    .map_err(|e| SandboxError::failed(error_code::INVALID_INPUT, e))?
+            };
+            let mut file = tokio::fs::File::from_std(file);
+            let request = BlobRequest {
+                lease_id,
+                epoch,
+                sha256: input.blob.0,
+            };
+            let fetched = tokio::select! {
+                r = blobs.fetch(request, room, &mut file) => r,
+                () = cancelled(cancel.clone()) => return Err(SandboxError::Cancelled),
+            };
+            let size = fetched.map_err(|e| {
+                let code = match &e {
+                    FetchError::Integrity => error_code::INPUT_INTEGRITY,
+                    FetchError::Write(_) => error_code::SANDBOX_SETUP,
+                    _ => error_code::INVALID_INPUT,
+                };
+                SandboxError::failed(code, format!("blob input {}: {e}", input.path))
+            })?;
+            room = room.saturating_sub(size);
+            total = total.saturating_add(size);
+        }
+        tracing::info!(lease = %lease_id, blobs = job.inputs.len(), bytes = total, "blob inputs fetched and verified");
+        Ok(())
+    }
+
     async fn pull_within_cap(&self, image: &str, cancel: &watch::Receiver<bool>) -> Result<(), SandboxError> {
         let engine = &self.shared.engine;
         let cap = self.cfg.max_image_mb.saturating_mul(MIB);
@@ -1228,13 +1297,13 @@ impl<E: Engine, C: Cgroups, X: Egress> Sandbox for PodmanDriver<E, C, X> {
             armed: true,
         });
         // A lease's job was accepted by the hub (`Stored`). Services are understood only with a health probe, volumes
-        // only with a volume store; blob inputs not at all yet (H2 §6.1: a job this agent does not understand is
-        // `invalid_job`).
+        // only with a volume store, blob inputs only with the `BlobFetch` client (H2 §6.1: a job this agent does not
+        // understand is `invalid_job`).
         let limits = Limits {
             h2: H2Features {
                 services: self.cfg.health_probe.is_some(),
                 volumes: self.cfg.volumes.is_some(),
-                ..H2Features::default()
+                blob_inputs: self.cfg.blobs.is_some(),
             },
             ..Limits::agent()
         };
@@ -1295,12 +1364,20 @@ impl<E: Engine, C: Cgroups, X: Egress> Sandbox for PodmanDriver<E, C, X> {
         if let Some(reservation) = reservation {
             reservation.keep();
         }
-        let env_file = {
-            let (dir, files, shim) = (dir.clone(), job.files.clone(), self.cfg.shim_path.clone());
-            let ports = service_ports.clone();
+        {
+            let (dir, files) = (dir.clone(), job.files.clone());
             setup_blocking(move || {
                 dir.write_inputs(&files)
-                    .map_err(|e| SandboxError::failed(error_code::INVALID_INPUT, e))?;
+                    .map_err(|e| SandboxError::failed(error_code::INVALID_INPUT, e))
+            })
+            .await??;
+        }
+        // H2 §7.5: the blob inputs, next to the inline files, before the env file exists (a fetch may take minutes).
+        self.fetch_blob_inputs(&dir, lease_id, epoch, &job, &cancel).await?;
+        let env_file = {
+            let (dir, shim) = (dir.clone(), self.cfg.shim_path.clone());
+            let ports = service_ports.clone();
+            setup_blocking(move || {
                 dir.install_shim(&shim)
                     .map_err(|e| SandboxError::failed(error_code::SANDBOX_SETUP, format!("shim: {e}")))?;
                 if let Some(ports) = &ports {

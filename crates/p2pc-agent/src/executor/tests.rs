@@ -1541,6 +1541,7 @@ mod through_the_session {
                 ports: None,
                 node: None,
                 volumes: None,
+                blob_inputs: false,
             },
             connector: Arc::new(Pipes {
                 accepted: tx,

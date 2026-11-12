@@ -420,6 +420,8 @@ fn run_cmd(cli: &Cli, env: &Env) -> anyhow::Result<ExitCode> {
             }),
             // `VolumeReport` and `VolumeDelete` (H2 §6.1), when the node offers volume space.
             volumes,
+            // The driver fetches blob inputs over this connection (`node::build`, H2 §7.5).
+            blob_inputs: true,
         };
         let daemon = Daemon {
             shared,

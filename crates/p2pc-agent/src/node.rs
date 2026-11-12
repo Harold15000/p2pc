@@ -38,6 +38,7 @@ use p2pc_proto::ids::AccountId;
 use rustix::fs::{FlockOperation, Mode, OFlags};
 use tokio::sync::watch;
 
+use crate::blobs::BlobInputs;
 use crate::config::Config;
 use crate::connection::{OfferFeed, Uplink};
 use crate::executor::capacity::{DriverLimits, Offer};
@@ -353,6 +354,8 @@ pub fn build(
         store.set_budget_mb(report.as_ref().map_or(0, |r| r.local.share.volumes_mb));
     }
     cfg.volumes = volumes.clone();
+    // Blob inputs (H2 §7.5) come over the agent's connection of the moment, as the outputs go.
+    cfg.blobs = Some(BlobInputs::new(uplink.clone()));
     let driver = PodmanDriver::new(
         cfg,
         PodmanEngine::system("podman", PULL_TIMEOUT),
