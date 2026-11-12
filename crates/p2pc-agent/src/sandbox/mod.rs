@@ -14,6 +14,8 @@
 //! - [`logs`]: 64 KiB chunks, the 64 MiB cap with one marker, and draining after it (batch jobs; a service's logs
 //!   are not capped in total, the executor keeps its most recent 64 MiB, H2 §11.4).
 //! - [`health`]: a service's health check and state machine (H2 §7.2), run by the driver's `wait`.
+//! - [`ingress`]: the ingress bridge (H2 §11.2): the agent's `ingress.sock` in a service's `p2pc/`, which the shim
+//!   dials; port streams and health checks reach the service through it, and the container keeps `--network=none`.
 //! - [`outputs`]: SI-9 collection with SHA-256.
 //! - [`Egress`]: the seam to the per-job egress proxy; [`ProxyEgress`] plugs in T09's [`crate::egress`]. The
 //!   socket directory is mounted with `:U`.
@@ -35,6 +37,7 @@ pub mod disk;
 mod driver;
 pub mod engine;
 pub mod health;
+pub mod ingress;
 pub mod jobdir;
 pub mod logs;
 pub mod outputs;

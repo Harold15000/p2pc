@@ -341,10 +341,11 @@ ARCHIVE=snapshot
 
 # A live build's manifest: archive=live and the versions that were resolved.
 chroot_run() { printf 'podman\t5.0.0-live\nca-certificates\t20261101\n'; }
-ARCHIVE=live ARCHIVE_BUILD_TIME=2026-01-02T03:04:05Z AGENT_PATH="" AGENT_FROM="" SHIM_PATH="" IMAGE_VERSION=9.9.9 SOURCE_DATE_EPOCH=1700000000
+ARCHIVE=live ARCHIVE_BUILD_TIME=2026-01-02T03:04:05Z AGENT_PATH="" AGENT_FROM="" SHIM_PATH="" SERVER_PATH="" IMAGE_VERSION=9.9.9 SOURCE_DATE_EPOCH=1700000000
 write_manifest "$SCRATCH/live-manifest.txt"
 unset -f chroot_run; eval "$orig_chroot_run"
 live_manifest="$(cat "$SCRATCH/live-manifest.txt")"
+assert_contains "$live_manifest" "# p2pc-server not included: this image cannot be a hub" "a manifest says when the image has no hub"
 assert_contains "$live_manifest" "# archive=live" "the live manifest records archive=live"
 assert_contains "$live_manifest" $'podman\t5.0.0-live' "the live manifest records the resolved versions"
 assert_contains "$live_manifest" "archive_build_time=2026-01-02T03:04:05Z" "the live manifest records the build time"
@@ -423,38 +424,54 @@ assert_false "unknown flag is refused" bash "$repo_root/deploy/wsl/build-rootfs.
 assert_false "non-root real build is refused" bash -c '[[ $EUID -ne 0 ]] && exec bash "$1" --out "$2"; exit 1' _ "$repo_root/deploy/wsl/build-rootfs.sh" "$SCRATCH/out2"
 
 # --- T14b2: what the image carries for the agent ------------------------------------------------------------------
-assert_eq "0.2.2" "$DEFAULT_IMAGE_VERSION" "the image version was bumped (0.2.2: the agent config in /var/lib/p2pc)"
+assert_eq "0.3.0" "$DEFAULT_IMAGE_VERSION" "the image version was bumped (0.3.0: the hub in the distro, H2 §8.5)"
 default_plan="$(bash "$script" --dry-run 2>&1)"
-assert_contains "$default_plan" "p2pc-node-0.2.2.tar.gz" "the default image version is 0.2.2"
+assert_contains "$default_plan" "p2pc-node-0.3.0.tar.gz" "the default image version is 0.3.0"
 assert_contains "$default_plan" "/var/lib/p2pc/agent.toml" "the plan names the agent config in /var/lib/p2pc"
 # shellcheck disable=SC2016  # the literal text of the builder's line
 assert_true "the builder writes it 0600" grep -qF 'write_rootfs_file 0600 /var/lib/p2pc/agent.toml' "$script"
 assert_eq "" "$(agent_config_content | grep -v '^#')" "it holds no setting (the built-in defaults), only comments"
 assert_eq "0" "$(grep -c '/etc/p2pc/agent.toml' <<<"$(sed -n '/^write_configuration()/,/^}/p' "$script" | grep -v '^[[:space:]]*#')")" "the image writes no /etc/p2pc/agent.toml"
-for needle in "/usr/local/sbin/p2pc-node-run" "/usr/local/lib/p2pc/boot-status.sh" "/var/log/p2pc"; do
+for needle in "/usr/local/sbin/p2pc-run" "/usr/local/lib/p2pc/boot-status.sh" "/usr/local/lib/p2pc/listeners.sh" "/var/log/p2pc"; do
   assert_contains "$plan" "$needle" "dry-run plan installs $needle"
 done
-for src in p2pc-node-run boot-status.sh; do
+for src in p2pc-run boot-status.sh listeners.sh; do
   assert_true "the builder installs $src into the image" grep -qF "\"\$SCRIPT_DIR/$src\"" "$script"
 done
+# H2 §8.5: p2pc-run replaces p2pc-node-run, whose path stays as a symlink for one release (an existing task, and
+# p2pc-wsl's task XML, still run /usr/local/sbin/p2pc-node-run).
+assert_false "the old runner is no longer a file of the checkout" test -e "$repo_root/deploy/wsl/p2pc-node-run"
+assert_contains "$plan" "/usr/local/sbin/p2pc-node-run -> p2pc-run" "the plan keeps the old path as a symlink to p2pc-run"
+# shellcheck disable=SC2016  # the literal text of the builder's line
+assert_true "the builder makes that symlink (relative, inside the rootfs)" grep -qF 'ln -s p2pc-run "$ROOTFS/usr/local/sbin/p2pc-node-run"' "$script"
+assert_false "the image does not create /var/lib/p2pc-server (p2pc-server init does, 0700; an upgrade compares listings)" \
+  grep -q 'var/lib/p2pc-server' <<<"$(sed -n '/^write_configuration()/,/^}/p' "$script" | grep -v '^[[:space:]]*#')"
 
 # --- --agent-from: the agent comes from the release dist, checked against SHA256SUMS --------------------------------
 target="x86_64-unknown-linux-musl"
-# make_dist <dir> <version...>: a release dir with a p2pc-agent tarball per version (the binary is a copy of an ELF).
+# make_dist <dir> <version...>: a release dir with a p2pc-agent, p2pc-shim and p2pc-server tarball per version, laid out
+# as scripts/release.sh writes them (<stem>/<binary>, plus LICENSE and README; each binary is a copy of an ELF).
 make_dist() {
   local dir="$1" v stem
   shift
   mkdir -p "$dir"
   for v in "$@"; do
-    for bin in p2pc-agent p2pc-shim; do
+    for bin in p2pc-agent p2pc-shim p2pc-server; do
       stem="$bin-$v-$target"
       mkdir -p "$SCRATCH/stage/$stem"
-      # Two different ELF files, so the tests can tell which one landed where.
-      if [[ "$bin" == p2pc-agent ]]; then cp "$(type -P true)" "$SCRATCH/stage/$stem/$bin"; else cp "$(type -P false)" "$SCRATCH/stage/$stem/$bin"; fi
+      # Three different ELF files, so the tests can tell which one landed where.
+      case "$bin" in
+        p2pc-agent) cp "$(type -P true)" "$SCRATCH/stage/$stem/$bin" ;;
+        p2pc-shim) cp "$(type -P false)" "$SCRATCH/stage/$stem/$bin" ;;
+        *) cp "$(type -P env)" "$SCRATCH/stage/$stem/$bin" ;;
+      esac
+      printf 'license of %s\n' "$bin" >"$SCRATCH/stage/$stem/LICENSE"
+      printf 'readme of %s\n' "$bin" >"$SCRATCH/stage/$stem/README"
+      printf 'third-party licenses of %s\n' "$bin" >"$SCRATCH/stage/$stem/THIRD-PARTY-LICENSES"
       tar -C "$SCRATCH/stage" -czf "$dir/$stem.tar.gz" "$stem"
     done
   done
-  (cd "$dir" && sha256sum -- p2pc-agent-*.tar.gz p2pc-shim-*.tar.gz >SHA256SUMS)
+  (cd "$dir" && sha256sum -- p2pc-agent-*.tar.gz p2pc-shim-*.tar.gz p2pc-server-*.tar.gz >SHA256SUMS)
 }
 make_dist "$SCRATCH/dist1" 0.1.0
 assert_eq "p2pc-agent-0.1.0-$target.tar.gz" "$(dist_agent_tarball "$SCRATCH/dist1/SHA256SUMS" "")" "the only agent in SHA256SUMS"
@@ -474,6 +491,32 @@ assert_contains "$agent_plan" "p2pc-shim-0.1.0-$target.tar.gz" "the plan names t
 assert_contains "$agent_plan" "$(sha256_of "$SCRATCH/dist1/p2pc-shim-0.1.0-$target.tar.gz")" "and its SHA-256"
 assert_contains "$agent_plan" "/usr/local/bin/p2pc-shim" "the plan installs p2pc-shim next to the agent"
 assert_eq "p2pc-shim-0.1.0-$target.tar.gz" "$(dist_shim_tarball "p2pc-agent-0.1.0-$target.tar.gz")" "the shim tarball has the agent version"
+# H2 §8.5: the hub (p2pc-server) goes into the image, from the same dist and version, checked the same way.
+assert_eq "p2pc-server-0.1.0-$target.tar.gz" "$(dist_server_tarball "p2pc-agent-0.1.0-$target.tar.gz")" "the server tarball has the agent version"
+assert_false "no server tarball name for something that is not an agent tarball" dist_server_tarball "p2pc-shim-0.1.0-$target.tar.gz"
+assert_contains "$agent_plan" "p2pc-server-0.1.0-$target.tar.gz" "the plan names the server tarball of the same version"
+assert_contains "$agent_plan" "$(sha256_of "$SCRATCH/dist1/p2pc-server-0.1.0-$target.tar.gz")" "and its SHA-256"
+assert_contains "$agent_plan" "/usr/local/bin/p2pc-server" "the plan installs p2pc-server"
+assert_contains "$agent_plan" "/usr/local/share/doc/p2pc-server/README" "and the server's README, its source offer (AGPL-3.0-only)"
+assert_contains "$agent_plan" "/usr/local/share/doc/<binary>/LICENSE and THIRD-PARTY-LICENSES" "every binary ships its license and the third-party licenses"
+cp -r "$SCRATCH/dist1" "$SCRATCH/dist-badserver"
+printf 'x' >>"$SCRATCH/dist-badserver/p2pc-server-0.1.0-$target.tar.gz"
+badserver_plan="$(bash "$script" --dry-run --agent-from "$SCRATCH/dist-badserver" 2>&1)"
+assert_eq "1" "$?" "a tampered server tarball is refused, even in a dry run"
+assert_contains "$badserver_plan" "SHA-256 mismatch" "and says why"
+cp -r "$SCRATCH/dist1" "$SCRATCH/dist-noserver"
+rm "$SCRATCH/dist-noserver/p2pc-server-0.1.0-$target.tar.gz"
+(cd "$SCRATCH/dist-noserver" && grep -v p2pc-server SHA256SUMS >S && mv S SHA256SUMS)
+noserver_plan="$(bash "$script" --dry-run --agent-from "$SCRATCH/dist-noserver" 2>&1)"
+assert_eq "1" "$?" "a dist without p2pc-server is refused (the image could not be a hub)"
+assert_contains "$noserver_plan" "p2pc-server" "and the error names it"
+assert_contains "$default_plan" "hub server        : none" "the plan of a build without --agent-from says it has no hub"
+# --server: a developer build of the hub, only with --agent (like --shim).
+assert_false "--server without --agent is refused" bash "$script" --dry-run --server "$(type -P env)"
+assert_false "--server with a file that is not ELF is refused" bash "$script" --dry-run --agent "$(type -P true)" --server "$script"
+dev_plan="$(bash "$script" --dry-run --agent "$(type -P true)" --server "$(type -P env)" 2>&1)"
+assert_eq "0" "$?" "--agent with --server: a developer build with a hub"
+assert_contains "$dev_plan" "--server: a developer build" "the plan says the hub is a developer build"
 cp -r "$SCRATCH/dist1" "$SCRATCH/dist-badshim"
 printf 'x' >>"$SCRATCH/dist-badshim/p2pc-shim-0.1.0-$target.tar.gz"
 assert_false "a tampered shim tarball is refused, even in a dry run" bash "$script" --dry-run --agent-from "$SCRATCH/dist-badshim"
@@ -518,6 +561,65 @@ extracted_shim="$(
   extract_dist_agent 2>/dev/null && printf '%s' "$SHIM_PATH"
 )"
 assert_true "the shim is extracted too, and it is the shim of the tarball" cmp -s "$extracted_shim" "$(type -P false)"
+extracted_server="$(
+  WORK="$SCRATCH/work-v" AGENT_FROM="$SCRATCH/dist1" AGENT_TARBALL="p2pc-agent-0.1.0-$target.tar.gz"
+  AGENT_TARBALL_SHA="$(sha256_of "$SCRATCH/dist1/$AGENT_TARBALL")"
+  SERVER_TARBALL="p2pc-server-0.1.0-$target.tar.gz" SERVER_TARBALL_SHA="$(sha256_of "$SCRATCH/dist1/p2pc-server-0.1.0-$target.tar.gz")"
+  extract_dist_agent 2>/dev/null && printf '%s\n%s' "$SERVER_PATH" "$SERVER_DOC_DIR"
+)"
+server_bin="$(head -n 1 <<<"$extracted_server")"
+server_doc="$(tail -n 1 <<<"$extracted_server")"
+assert_true "the server is extracted too, and it is the server of the tarball" cmp -s "$server_bin" "$(type -P env)"
+assert_eq "license of p2pc-server" "$(cat "$server_doc/LICENSE" 2>/dev/null)" "and its LICENSE, from the server tarball"
+assert_eq "readme of p2pc-server" "$(cat "$server_doc/README" 2>/dev/null)" "and its README (it says where the source is)"
+assert_eq "third-party licenses of p2pc-server" "$(cat "$server_doc/THIRD-PARTY-LICENSES" 2>/dev/null)" "and its THIRD-PARTY-LICENSES"
+# shellcheck disable=SC2016  # the literal text of the builder's install lines
+assert_true "the builder installs the server next to the agent" grep -qF '"$ROOTFS/usr/local/bin/p2pc-server"' "$script"
+# The license files of all three binaries (review P3): LICENSE and THIRD-PARTY-LICENSES from each verified tarball, and
+# the server's README, installed under /usr/local/share/doc/<binary>/ by install_doc_files.
+docs="$(
+  WORK="$SCRATCH/work-d" AGENT_FROM="$SCRATCH/dist1" AGENT_TARBALL="p2pc-agent-0.1.0-$target.tar.gz"
+  AGENT_TARBALL_SHA="$(sha256_of "$SCRATCH/dist1/$AGENT_TARBALL")"
+  SHIM_TARBALL="p2pc-shim-0.1.0-$target.tar.gz" SHIM_TARBALL_SHA="$(sha256_of "$SCRATCH/dist1/p2pc-shim-0.1.0-$target.tar.gz")"
+  SERVER_TARBALL="p2pc-server-0.1.0-$target.tar.gz" SERVER_TARBALL_SHA="$(sha256_of "$SCRATCH/dist1/p2pc-server-0.1.0-$target.tar.gz")"
+  extract_dist_agent 2>/dev/null || exit 1
+  # The real install sets owner 0:0, which needs root: the test drops only those two options.
+  install() {
+    local a=()
+    while (($# > 0)); do
+      if [[ "$1" == -o || "$1" == -g ]]; then shift 2; else a+=("$1") && shift; fi
+    done
+    command install "${a[@]}"
+  }
+  ROOTFS="$SCRATCH/rootfs-docs"
+  install_doc_files p2pc-agent "$AGENT_DOC_DIR" &&
+    install_doc_files p2pc-shim "$SHIM_DOC_DIR" &&
+    install_doc_files p2pc-server "$SERVER_DOC_DIR" &&
+    printf 'ok'
+)"
+assert_eq "ok" "$docs" "the license files of the three binaries are extracted and installed"
+for bin in p2pc-agent p2pc-shim p2pc-server; do
+  d="$SCRATCH/rootfs-docs/usr/local/share/doc/$bin"
+  assert_eq "license of $bin" "$(cat "$d/LICENSE" 2>/dev/null)" "$bin: LICENSE, from its own tarball"
+  assert_eq "third-party licenses of $bin" "$(cat "$d/THIRD-PARTY-LICENSES" 2>/dev/null)" "$bin: THIRD-PARTY-LICENSES next to it"
+  assert_eq "644" "$(stat -c %a "$d/THIRD-PARTY-LICENSES" 2>/dev/null)" "$bin: mode 0644"
+done
+assert_eq "readme of p2pc-server" "$(cat "$SCRATCH/rootfs-docs/usr/local/share/doc/p2pc-server/README" 2>/dev/null)" "the server's README (the source offer) is installed too"
+assert_false "the agent's README is not needed" test -e "$SCRATCH/rootfs-docs/usr/local/share/doc/p2pc-agent/README"
+# shellcheck disable=SC2016  # the literal text of the builder's lines
+assert_true "write_configuration installs them" grep -qF 'install_doc_files p2pc-server "$SERVER_DOC_DIR"' "$script"
+mkdir -p "$SCRATCH/dist-notp/stage"
+tar -xzf "$SCRATCH/dist1/p2pc-shim-0.1.0-$target.tar.gz" -C "$SCRATCH/dist-notp/stage"
+rm "$SCRATCH/dist-notp/stage/p2pc-shim-0.1.0-$target/THIRD-PARTY-LICENSES"
+tar -C "$SCRATCH/dist-notp/stage" -czf "$SCRATCH/dist-notp/p2pc-shim-0.1.0-$target.tar.gz" "p2pc-shim-0.1.0-$target"
+assert_false "a tarball without THIRD-PARTY-LICENSES is refused" bash -c "
+  source '$script'; WORK='$SCRATCH/work-n' AGENT_FROM='$SCRATCH/dist-notp'; mkdir -p '$SCRATCH/work-n/agent'
+  cp '$SCRATCH/dist-notp/p2pc-shim-0.1.0-$target.tar.gz' '$SCRATCH/work-n/agent/'
+  extract_doc 'p2pc-shim-0.1.0-$target.tar.gz' LICENSE THIRD-PARTY-LICENSES"
+assert_false "a server tarball that changed after the check is refused" bash -c "
+  source '$script'; WORK='$SCRATCH/work-z' AGENT_FROM='$SCRATCH/dist1' AGENT_TARBALL='p2pc-agent-0.1.0-$target.tar.gz'
+  AGENT_TARBALL_SHA=\$(sha256_of '$SCRATCH/dist1/p2pc-agent-0.1.0-$target.tar.gz')
+  SERVER_TARBALL='p2pc-server-0.1.0-$target.tar.gz' SERVER_TARBALL_SHA=$(printf '0%.0s' {1..64}); extract_dist_agent"
 # shellcheck disable=SC2016  # the literal text of the builder's install line
 assert_true "the builder installs the shim next to the agent" grep -qF '"$ROOTFS/usr/local/bin/p2pc-shim"' "$script"
 assert_false "a tarball that changed after the check is refused" bash -c "

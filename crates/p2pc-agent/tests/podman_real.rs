@@ -443,3 +443,121 @@ async fn smoke_container() {
     let smoke = d.smoke().await;
     assert!(smoke.ok, "{smoke:?}");
 }
+
+/// H2 §11.2, SI-H2-7 and SI-H2-10 against real Podman and the real shim: a service that listens on `127.0.0.1:18473`
+/// inside a container with `--network=none` becomes healthy through the ingress bridge (the agent's own
+/// `GET /data.txt`), a port stream reaches it through the shim, a port it does not list and another epoch are
+/// refused, and the port is closed in the node's own network namespace: the bridge is the only way in.
+///
+/// On the test node (see the module docs): `cargo test -p p2pc-agent --test podman_real -- --ignored
+/// a_service_port_is_reached_only_through_the_ingress_bridge`. The image needs busybox's `httpd`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs real Podman and the musl shim on a test node"]
+async fn a_service_port_is_reached_only_through_the_ingress_bridge() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use p2pc_agent::sandbox::ingress::{IngressBridge, OpenError};
+    use p2pc_proto::protocol::HealthState;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    const PORT: u16 = 18473;
+    let data = tempfile::tempdir().unwrap();
+    let bridge = IngressBridge::new();
+    let d = Arc::new(driver_with(data.path(), Vec::new(), |cfg| {
+        cfg.health_probe = Some(Arc::new(bridge.clone()));
+        cfg.ingress = Some(bridge.clone());
+    }));
+    // busybox httpd serves `/inputs` (the job's input file `data.txt`) on loopback, inside the container.
+    let listen = format!("127.0.0.1:{PORT}");
+    let mut spec = job(&["httpd", "-f", "-p", listen.as_str(), "-h", "/inputs"]);
+    spec.kind = p2pc_proto::api::JobKind::Service;
+    spec.service = Some(
+        serde_json::from_value(serde_json::json!({
+            "ports": [{"port": PORT, "name": "web"}],
+            "health": {"http_get": "/data.txt", "port": PORT, "interval_s": 2, "timeout_s": 3,
+                       "start_period_s": 120, "failure_threshold": 3},
+        }))
+        .unwrap(),
+    );
+    let owner = AccountId::generate();
+    let lease_id = LeaseId::generate();
+    let lease = LeaseContext {
+        lease_id,
+        epoch: 1,
+        account_id: owner,
+        job: spec,
+        gpu: None,
+    };
+    let (tx, mut rx) = mpsc::channel(256);
+    let cancel = CancelHandle::new();
+    let mut running = d.prepare(&owner, lease, tx, cancel.clone()).await.unwrap();
+    d.start(&mut running).await.unwrap();
+    let waiting = {
+        let d = Arc::clone(&d);
+        tokio::spawn(async move {
+            let finished = d.wait(&mut running).await;
+            (finished, running)
+        })
+    };
+
+    // Healthy: the agent's check went through the shim to the service and read a 2xx status line.
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(180), rx.recv())
+            .await
+            .expect("the service never became healthy")
+            .expect("the service ended before it was healthy");
+        match event {
+            SandboxEvent::Health(h) if h.state == HealthState::Healthy => break,
+            SandboxEvent::Health(h) if h.state == HealthState::Unhealthy => panic!("unhealthy: {:?}", h.detail),
+            _ => {}
+        }
+    }
+
+    // A port stream: raw bytes both ways.
+    let mut stream = bridge.open_port(lease_id, 1, PORT).await.unwrap();
+    stream.write_all(b"GET /data.txt HTTP/1.0\r\n\r\n").await.unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(30), stream.read_to_end(&mut response))
+        .await
+        .expect("no response through the bridge")
+        .unwrap();
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.starts_with("HTTP/1.") && response.contains(" 200 "),
+        "{response}"
+    );
+    assert!(response.ends_with("input-ok\n"), "{response}");
+
+    // A port the service does not list, and another epoch of the lease (SI-H2-6, SI-H2-7).
+    assert_eq!(
+        bridge.open_port(lease_id, 1, PORT + 1).await.err(),
+        Some(OpenError::PortNotExposed)
+    );
+    assert_eq!(
+        bridge.open_port(lease_id, 2, PORT).await.err(),
+        Some(OpenError::StaleLease)
+    );
+
+    // SI-H2-10: nothing listens on that port in the node's network namespace, on IPv4 or IPv6.
+    for host in ["127.0.0.1", "::1"] {
+        let addr: std::net::SocketAddr = format!("[{host}]:{PORT}")
+            .parse()
+            .or_else(|_| format!("{host}:{PORT}").parse())
+            .unwrap();
+        assert!(
+            std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_err(),
+            "the service's port is open on the node at {addr}"
+        );
+    }
+
+    cancel.cancel();
+    let (finished, running) = waiting.await.unwrap();
+    assert_eq!(finished.unwrap().outcome, Outcome::Cancelled);
+    d.cleanup(running).await;
+    assert_eq!(
+        bridge.open_port(lease_id, 1, PORT).await.err(),
+        Some(OpenError::StaleLease),
+        "detached with the lease"
+    );
+}

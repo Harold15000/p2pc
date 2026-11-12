@@ -7,6 +7,7 @@ import asyncio
 import builtins
 import inspect
 import logging
+import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import aclosing, asynccontextmanager
@@ -19,11 +20,15 @@ import httpx
 from pydantic import BaseModel
 
 from p2pc import _common as c
+from p2pc import h2
+from p2pc._ports import AsyncPortForwarder
 from p2pc.errors import InvalidResponseError, NotFoundError, P2PCConnectionError, P2PCError
+from p2pc.h2 import Blob, TemplateList
 from p2pc.models import (
     ApiKey,
     AsyncJob,
     AuditEvent,
+    BlobInput,
     Egress,
     Estimate,
     InputFile,
@@ -37,7 +42,9 @@ from p2pc.models import (
     Page,
     Placement,
     ServerInfo,
+    ServicePort,
     UsageReport,
+    VolumeSpec,
     WhoAmI,
 )
 
@@ -100,6 +107,9 @@ class AsyncClient:
         self.nodes = AsyncNodesResource(self)
         self.join_tokens = AsyncJoinTokensResource(self)
         self.keys = AsyncKeysResource(self)
+        self.blobs = AsyncBlobsResource(self)
+        self.services = AsyncServicesResource(self)
+        self.templates = AsyncTemplatesResource(self)
 
     def __repr__(self) -> str:
         return self._config.client_repr("AsyncClient")
@@ -143,8 +153,10 @@ class AsyncClient:
         *,
         params: Mapping[str, str] | None = None,
         json: Any = None,
+        content: Any = None,
+        extra_headers: Mapping[str, str] | None = None,
     ) -> Any:
-        headers = self._config.headers()
+        headers = {**self._config.headers(), **(extra_headers or {})}
         LOG.debug("request %s %s", method, path)
         body = c.ResponseBody()
         try:
@@ -153,6 +165,7 @@ class AsyncClient:
                 self._config.url(path),
                 params=params,
                 json=json,
+                content=content,
                 headers=headers,
                 timeout=self._config.timeout,
             ) as response:
@@ -207,6 +220,26 @@ class AsyncClient:
         params = {"limit": str(c.MAX_PAGE_LIMIT), **(extra or {})}
         return [item async for page in self._pages(path, model, params) for item in page.items]
 
+    async def _blob_exists(self, digest: str) -> bool:
+        """``HEAD /v1/blobs/{sha256}``: whether the hub has the blob (a refusal counts as "not
+        known": the upload that follows gets the hub's own answer)."""
+        headers = self._config.headers()
+        try:
+            async with self._http.stream(
+                "HEAD",
+                self._config.url(f"/v1/blobs/{digest}"),
+                headers=headers,
+                timeout=self._config.timeout,
+            ) as response:
+                if 400 <= response.status_code < 500:
+                    return False
+                await self._raise_for_status(response)
+                if "content-length" not in response.headers:
+                    raise InvalidResponseError("the answer to HEAD /v1/blobs has no Content-Length")
+                return True
+        except httpx.TransportError as exc:
+            raise self._connection_error(exc) from None
+
     # --- top-level calls -----------------------------------------------------------------
     async def whoami(self) -> WhoAmI:
         """``GET /v1/whoami``: the presented key and its limits (never its secret)."""
@@ -242,6 +275,7 @@ class AsyncClient:
         placement: Placement | Mapping[str, Any] | None = None,
         max_attempts: int | None = None,
         name: str | None = None,
+        inputs: Mapping[str, Blob | str] | Sequence[BlobInput] | None = None,
     ) -> Estimate:
         """``POST /v1/estimate``: would this job fit, and what would it cost in units?"""
         spec = c.build_spec(
@@ -259,6 +293,7 @@ class AsyncClient:
             placement=placement,
             max_attempts=max_attempts,
             name=name,
+            inputs=inputs,
         )
         data = await self._request("POST", "/v1/estimate", json=spec.to_wire())
         return c.parse_model(Estimate, data)
@@ -307,8 +342,13 @@ class AsyncJobsResource:
         max_attempts: int | None = None,
         idempotency_key: str | None = None,
         name: str | None = None,
+        inputs: Mapping[str, Blob | str] | Sequence[BlobInput] | None = None,
     ) -> AsyncJob:
-        """``POST /v1/jobs``. The arguments are validated against the §7 table first."""
+        """``POST /v1/jobs``. The arguments are validated against the §7 table first.
+
+        ``inputs`` maps a path under ``/inputs`` to a blob, read-only in the job: a
+        :class:`~p2pc.Blob` from ``client.blobs.put`` or a ``"sha256:<hex>"`` string.
+        """
         spec = c.build_spec(
             image,
             command,
@@ -325,6 +365,7 @@ class AsyncJobsResource:
             max_attempts=max_attempts,
             idempotency_key=idempotency_key,
             name=name,
+            inputs=inputs,
         )
         return self._job(await self._c._request("POST", "/v1/jobs", json=spec.to_wire()))
 
@@ -698,3 +739,134 @@ class AsyncKeysResource:
         await self._c._request("DELETE", f"/v1/keys/{c.segment(id)}")
 
     delete = revoke
+
+
+class AsyncBlobsResource:
+    def __init__(self, client: AsyncClient) -> None:
+        self._c = client
+
+    async def put(self, path: str | os.PathLike[str]) -> Blob:
+        """Upload the file at ``path`` as a blob; see :meth:`p2pc.Client.blobs`.
+
+        The file must be a regular file and is opened once: the SHA-256 and the upload read the
+        same descriptor. A blob the hub already has is not sent again (``uploaded=False``).
+        """
+        measured = await _in_thread(h2.measure_file, path)
+        try:
+            if await self._c._blob_exists(measured.digest):
+                return Blob(sha256=measured.digest, size=measured.size, uploaded=False)
+            data = await self._c._request(
+                "POST",
+                "/v1/blobs",
+                content=h2.aupload_chunks(measured.handle, measured.size),
+                extra_headers={
+                    "Content-Length": str(measured.size),
+                    "Content-Type": "application/octet-stream",
+                    "X-P2PC-SHA256": measured.digest,
+                },
+            )
+        finally:
+            await _in_thread(measured.close)
+        blob = c.parse_model(Blob, data)
+        if blob.sha256 != measured.digest:
+            raise InvalidResponseError("the hub stored a blob with another digest than the file's")
+        return blob.model_copy(update={"uploaded": True})
+
+
+class AsyncServicesResource:
+    def __init__(self, client: AsyncClient) -> None:
+        self._c = client
+
+    async def run(
+        self,
+        image: str,
+        command: Sequence[str],
+        *,
+        ports: Sequence[int | tuple[int, str] | ServicePort],
+        health_http: str | None = None,
+        health_tcp: bool = False,
+        idle_timeout_s: int | c._Unset | None = c.UNSET,
+        restart: str | None = None,
+        volumes: Sequence[VolumeSpec | Mapping[str, Any]] | None = None,
+        env: Mapping[str, str] | None = None,
+        files: Sequence[InputFile] | Mapping[str, bytes | str] | None = None,
+        inputs: Mapping[str, Blob | str] | Sequence[BlobInput] | None = None,
+        cpu: float = 1,
+        memory_mb: int = 1024,
+        gpu: int = 0,
+        disk_mb: int | None = None,
+        timeout_s: int | None = None,
+        egress: Egress | Sequence[str] | None = None,
+        placement: Placement | Mapping[str, Any] | None = None,
+        max_attempts: int | None = None,
+        idempotency_key: str | None = None,
+        name: str | None = None,
+    ) -> AsyncJob:
+        """Start a long-lived service (``kind="service"``); see :meth:`p2pc.Client.services`."""
+        spec = c.build_spec(
+            image,
+            command,
+            env=env,
+            files=files,
+            cpu=cpu,
+            memory_mb=memory_mb,
+            gpu=gpu,
+            disk_mb=disk_mb,
+            timeout_s=timeout_s,
+            egress=egress,
+            placement=placement,
+            max_attempts=max_attempts,
+            idempotency_key=idempotency_key,
+            name=name,
+            inputs=inputs,
+            kind="service",
+            service=c.build_service(
+                ports,
+                health_http=health_http,
+                health_tcp=health_tcp,
+                idle_timeout_s=idle_timeout_s,
+                restart=restart,
+            ),
+            volumes=[VolumeSpec.model_validate(v) if isinstance(v, Mapping) else v for v in volumes]
+            if volumes is not None
+            else None,
+        )
+        return self._c.jobs._job(await self._c._request("POST", "/v1/jobs", json=spec.to_wire()))
+
+    def connect(
+        self, job: AsyncJob | str, port: int, *, wait_ready: bool = True
+    ) -> AsyncPortForwarder:
+        """A local loopback port that forwards to ``port`` of the service ``job``.
+
+        ``async with client.services.connect(job, 11434) as local_port:``; see
+        :meth:`p2pc.Client.services` for the rules (loopback only, at most 16 connections).
+        """
+        job_id = job if isinstance(job, str) else job.id
+        c.segment(job_id, "job id")
+        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65_535:
+            raise ValueError("port must be an integer between 1 and 65535")
+        return AsyncPortForwarder(self._c._config, job_id, port, wait_ready=wait_ready)
+
+
+class AsyncTemplatesResource:
+    def __init__(self, client: AsyncClient) -> None:
+        self._c = client
+
+    async def list(self) -> TemplateList:
+        """``GET /v1/templates``: the served template bundle (iterate it for the templates)."""
+        return c.parse_model(TemplateList, await self._c._request("GET", "/v1/templates"))
+
+    async def launch(
+        self,
+        id: str,
+        params: Mapping[str, bool | int | str] | None = None,
+        *,
+        idempotency_key: str | None = None,
+    ) -> AsyncJob:
+        """``POST /v1/templates/{id}/launch``: start a template with ``params``."""
+        body = c.launch_body(params, idempotency_key)
+        return self._c.jobs._job(
+            await self._c._request(
+                "POST", f"/v1/templates/{c.segment(id, 'template id')}/launch", json=body
+            )
+        )

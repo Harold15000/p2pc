@@ -193,6 +193,41 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+### Blobs, services and templates (H2)
+
+```python
+# A file as a job input: uploaded once (the hub is asked first), read-only in the job.
+blob = client.blobs.put("audio.wav")  # a regular file; hashed and sent from one descriptor
+job = client.jobs.run(
+    image="docker.io/library/python:3.12-slim",
+    command=["python", "/inputs/main.py"],
+    inputs={"/inputs/audio": blob},  # a Blob, or a "sha256:<hex>" string; never a path
+)
+
+# A long-lived service, and a local loopback port that forwards to it.
+svc = client.services.run(
+    image="docker.io/library/python:3.12-slim",
+    command=["python", "-m", "http.server", "8000"],
+    ports=[8000],
+    health_tcp=True,
+    idle_timeout_s=3600,  # None = never; leave it out for the default
+)
+with client.services.connect(svc, 8000) as local_port:
+    ...  # talk to http://127.0.0.1:{local_port}; the block ends the listener
+client.jobs.cancel(svc.id)
+
+# Templates: the hub's vetted job recipes.
+for template in client.templates.list():
+    print(template.id, [p.name for p in template.params])
+job = client.templates.launch("transcribe", {"audio": blob, "model": "small"})
+```
+
+`services.connect` listens on `127.0.0.1` only, opens one upgraded connection to the hub per
+local connection (at most 16 at once) and does not go through an HTTP proxy. A refused upgrade
+(`service_not_running`, `port_not_exposed` …) closes that local connection and is kept in
+`.last_error` of the returned object. Every call has an `AsyncClient` twin
+(`async with client.services.connect(...)`).
+
 ### Everything else
 
 ```python
@@ -346,6 +381,14 @@ model or route that the server does not publish yet waits for its server task.
 ## Changelog
 
 ### Unreleased
+
+H2 additions (T2-54, spec §7.8): `client.blobs.put(path)`, `jobs.run(..., inputs={...})` (also on
+`estimate`), `client.services.run(...)` and `client.services.connect(job, port)`, and
+`client.templates.list()` / `launch(...)`, each on `Client` and `AsyncClient`. New request
+models: `ServiceSpec`, `ServicePort`, `HealthCheck`, `VolumeSpec`, `BlobInput`; `JobSpec` gains
+`kind`, `service`, `volumes` and `inputs`. `Blob`, `TemplateInfo`, `TemplateList` and
+`TemplateParam` live in `p2pc.h2` until the OpenAPI document describes the blob and template
+routes.
 
 Aligned with the server's scheduler and ledger (T06) and the T13b review:
 

@@ -2,7 +2,7 @@
 
 //! One control connection, from `Hello` to its end (§6).
 //!
-//! 1. **Handshake.** `Hello{agent_version, features: [], inventory, running}` right after the dial, with the
+//! 1. **Handshake.** `Hello{agent_version, features, inventory, running}` right after the dial, with the
 //!    inventory the daemon detected just before it (fresh for every connection) and the supervisor's leases. The first answer must be `Welcome` (or `Error`), within [`WELCOME_TIMEOUT`].
 //!    - `account_id` must be the enrolled owner (SI-1). Otherwise the connection is closed, an error is logged, and
 //!      the daemon backs off: no lease is ever taken from it.
@@ -26,6 +26,11 @@
 //! Once welcomed, the session publishes its job queue and stream opener on the [`Uplink`], for the jobs' own messages
 //! and uploads (T10a); it withdraws them when it ends.
 //!
+//! **Service ports** (H2 §6.1). A session with a [`PortOpener`] (the node's ingress bridge, [`Shared::ports`])
+//! declares the `service_jobs` capability in `Hello.features`, accepts leases of service jobs, and, once welcomed,
+//! serves the streams the server opens on the connection ([`super::streams`]) until it ends. Without one it is an H1
+//! session: no capability, service leases are `invalid_job`, and no stream of the server is ever accepted.
+//!
 //! **Control frames first** (T10a review, P2-1). Job messages (`JobStarted`, `LogChunk`, `JobFinished`) have their
 //! own queue of [`JOB_QUEUE`] frames, and the writer always takes a waiting control frame (heartbeat, lease answer,
 //! inventory update) before the next job frame: a job logging at full speed delays a heartbeat by at most the frame
@@ -45,10 +50,10 @@ use p2pc_proto::api::Inventory;
 use p2pc_proto::ids::AccountId;
 use p2pc_proto::net::{AddressChange, SelectedAddr};
 use p2pc_proto::protocol::{
-    AGENT_LEASE_TTL_MARGIN_S, AgentMsg, FrameError, LeaseRejectReason, MAX_FRAME_LEN, ServerMsg, error_code,
-    read_frame, write_frame,
+    AGENT_LEASE_TTL_MARGIN_S, AgentMsg, FrameError, LeaseRejectReason, MAX_FRAME_LEN, ServerMsg, capability,
+    error_code, read_frame, write_frame,
 };
-use p2pc_proto::validate::Limits;
+use p2pc_proto::validate::{H2Features, Limits};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::{Notify, Semaphore, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -57,6 +62,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 use super::BoxFuture;
 use super::lease::{LeaseDecision, LeaseHandler, LeaseOffer, LeaseSupervisor};
 use super::load::LoadSource;
+use super::streams::{self, PortOpener, StreamAcceptor};
 use super::transport::{Link, StreamOpener};
 use super::uplink::{Acks, JOB_QUEUE, JobFrame, Port, Uplink};
 use super::watchdog::Watchdog;
@@ -117,6 +123,32 @@ pub struct Shared {
     pub decisions: Arc<Semaphore>,
     /// Where the welcomed session publishes its outbox and streams for the jobs (T10a).
     pub uplink: Uplink,
+    /// Opens the service ports the server asks for with `PortOpen` streams (H2 §6.1): the node's ingress bridge.
+    /// `None` is an H1 agent: it declares no `service_jobs`, takes no service lease and accepts no stream.
+    pub ports: Option<Arc<dyn PortOpener>>,
+}
+
+impl Shared {
+    /// `Hello.features`: `service_jobs` exactly when this node can serve the ports of a service.
+    #[must_use]
+    pub fn features(&self) -> Vec<String> {
+        match self.ports {
+            Some(_) => vec![capability::SERVICE_JOBS.to_string()],
+            None => Vec::new(),
+        }
+    }
+
+    /// The limits a lease's job is parsed with: the agent's, with service jobs understood exactly when the
+    /// capability is declared (H2 §6.1: a job this agent does not understand is `invalid_job`).
+    fn lease_limits(&self) -> Limits {
+        Limits {
+            h2: H2Features {
+                services: self.ports.is_some(),
+                ..H2Features::default()
+            },
+            ..Limits::agent()
+        }
+    }
 }
 
 /// What the `Welcome` said, once checked.
@@ -305,6 +337,10 @@ struct Io {
     writer: JoinHandle<()>,
     close: Option<Box<dyn FnOnce() + Send + Sync>>,
     streams: Arc<dyn StreamOpener>,
+    /// Where the streams the server opens arrive, until the dispatcher takes it.
+    incoming: Option<Arc<dyn StreamAcceptor>>,
+    /// Serves the streams the server opens (H2 §6.1), once welcomed.
+    dispatcher: Option<JoinHandle<()>>,
     /// The number of this session's port on the [`Uplink`], once welcomed.
     port: Option<u64>,
 }
@@ -320,6 +356,7 @@ impl Io {
             recv,
             close,
             streams,
+            incoming,
         } = link;
         Self {
             outbox: out_tx,
@@ -330,7 +367,17 @@ impl Io {
             writer: tokio::spawn(writer(send, out_rx, jobs_rx, acks)),
             close: Some(close),
             streams,
+            incoming,
+            dispatcher: None,
             port: None,
+        }
+    }
+
+    /// Stops serving the server's streams and waits until every one of them is gone.
+    async fn stop_dispatcher(&mut self) {
+        if let Some(dispatcher) = self.dispatcher.take() {
+            dispatcher.abort();
+            let _ = dispatcher.await;
         }
     }
 
@@ -353,6 +400,9 @@ impl Drop for Io {
     fn drop(&mut self) {
         self.reader.abort();
         self.writer.abort();
+        if let Some(dispatcher) = &self.dispatcher {
+            dispatcher.abort();
+        }
         if let Some(close) = self.close.take() {
             close();
         }
@@ -387,6 +437,8 @@ pub async fn run(
     if let Some(port) = io.port.take() {
         shared.uplink.disconnect(port);
     }
+    // The port streams of this connection end with it.
+    io.stop_dispatcher().await;
     decisions.shutdown().await;
     io.finish().await;
     end
@@ -407,7 +459,7 @@ async fn drive(
         agent_version: AGENT_VERSION.to_string(),
         inventory,
         running: shared.supervisor.running(),
-        features: Vec::new(),
+        features: shared.features(),
     };
     if io.outbox.send(hello).await.is_err() {
         return SessionEnd::Lost { welcomed: false };
@@ -476,6 +528,10 @@ async fn drive(
                     tracing::info!(%node_id, %server_version, "connected to the server");
                     on_welcome(&w);
                     io.port = Some(shared.uplink.connect(Port::new(&io.jobs, io.streams.clone())));
+                    // Only now, and only with a bridge: before the Welcome no stream of the server is accepted.
+                    if let (Some(ports), Some(incoming)) = (&shared.ports, io.incoming.take()) {
+                        io.dispatcher = Some(tokio::spawn(streams::serve(incoming, Arc::clone(ports))));
+                    }
                     w
                 }
                 ServerMsg::Error { code, .. } if code == error_code::NOT_ENROLLED => return SessionEnd::NotEnrolled,
@@ -611,7 +667,7 @@ async fn route(shared: &Shared, io: &Io, decisions: &mut JoinSet<()>, msg: Serve
                 return queue(io, reject(LeaseRejectReason::NotOwner));
             }
             // §6 "must understand": strict parse; a failure is a rejected offer, never a closed connection.
-            let job = match job.parse_strict_with(&Limits::agent()) {
+            let job = match job.parse_strict_with(&shared.lease_limits()) {
                 Ok(job) => job,
                 Err(errors) => {
                     let fields: Vec<&str> = errors.iter().map(|e| e.field.as_str()).collect();

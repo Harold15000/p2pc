@@ -24,6 +24,7 @@ pub mod keys;
 pub mod leases;
 pub mod nodes;
 pub mod outputs;
+pub mod usage;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
