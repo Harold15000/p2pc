@@ -5,6 +5,8 @@
 //! - `p2pc/agent/1` ([`agent`]): `Join`, `Hello`, heartbeats and the routing of lease and job messages to
 //!   [`NodeEvents`]; live connections in the [`NodeHub`].
 //! - uploads ([`upload`]): every bidirectional stream after an agent's control stream carries one output file;
+//! - port streams ([`ports`], H2 §6.1, §7.4): the bidirectional streams the **hub** opens on the agent connection of a
+//!   service's node, one `PortOpen` per client connection to a service port, and the relay between the two;
 //! - `p2pc/http/1` ([`tunnel`]): each bidirectional stream relayed to the local REST listener, where the API key is
 //!   checked as for any other request.
 //! - `p2pc/pair/1` ([`pair`]): one `Pair` with a one-time ticket, under its own pre-auth limits. It is in the

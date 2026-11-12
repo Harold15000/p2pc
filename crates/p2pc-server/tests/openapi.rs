@@ -194,3 +194,41 @@ fn the_job_endpoints_document_their_contract() {
         assert!(who[field].is_object(), "WhoAmI.{field}");
     }
 }
+
+/// T2-13 (H2 §7.3, §7.4, §7.7): the port connection documents the upgrade, every status it answers and the error
+/// codes H2 adds for it, each with its HTTP status.
+#[test]
+fn the_port_connection_documents_its_contract() {
+    let doc: serde_json::Value = serde_json::from_str(&p2pc_server::openapi::document()).unwrap();
+    let op = &doc["paths"]["/v1/jobs/{id}/ports/{port}/connect"]["post"];
+    assert!(op.is_object(), "the operation is documented");
+    assert!(op.get("security").is_none(), "it does not opt out of authentication");
+    let responses = op["responses"].as_object().unwrap();
+    let mut statuses: Vec<&str> = responses.keys().map(String::as_str).collect();
+    statuses.sort_unstable();
+    assert_eq!(
+        statuses,
+        [
+            "101", "400", "401", "403", "404", "409", "413", "422", "429", "431", "502"
+        ]
+    );
+    for (status, code) in [
+        ("403", "route_not_allowed"),
+        ("409", "service_not_running"),
+        ("409", "service_not_ready"),
+        ("422", "port_not_exposed"),
+        ("429", "too_many_connections"),
+        ("431", "headers_too_large"),
+        ("502", "node_unreachable"),
+    ] {
+        let description = responses[status]["description"].as_str().unwrap();
+        assert!(description.contains(code), "{status} names {code}: {description}");
+    }
+    let params: Vec<&str> = op["parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(params, ["id", "port", "wait_ready"]);
+}
