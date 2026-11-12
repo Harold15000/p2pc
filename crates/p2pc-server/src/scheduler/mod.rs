@@ -376,6 +376,8 @@ struct Inner {
     queue_resume: Mutex<Option<leases::QueuePosition>>,
     /// The open port connections of every service, which the idle cancel reads (H2 §7.4).
     connections: OpenConnections,
+    /// The latest usage reports of the running services, which their midnight slices read (H2 §12).
+    reports: crate::units::ServiceReports,
 }
 
 /// What placement does with a queued job now.
@@ -507,6 +509,7 @@ impl Scheduler {
                 log_seq: Mutex::new(HashMap::new()),
                 queue_resume: Mutex::new(None),
                 connections,
+                reports: crate::units::ServiceReports::default(),
             }),
         }
     }
@@ -546,7 +549,8 @@ impl Scheduler {
     }
 
     /// One scheduling pass: expire unanswered offers, expire leases of nodes silent for `lease_ttl_s`, end the leases
-    /// found on `pending_approval` nodes (H2 §5.5), ask idle services to stop (H2 §7.4), deliver cancels, run the
+    /// found on `pending_approval` nodes (H2 §5.5), ask idle services to stop (H2 §7.4), meter the services (their
+    /// midnight slices, day reservations and `cap_reached`, H2 §12), deliver cancels, run the
     /// watchdog, send again the `Cancel`s of executions the server ended, forget the log `seq`s of ended leases, then
     /// place queued jobs FIFO.
     ///
@@ -567,6 +571,9 @@ impl Scheduler {
         if let Err(e) = self.stop_idle_services(&mut r).await {
             failed(&mut r, "stop idle services", &e);
         }
+        if let Err(e) = self.meter(&mut r).await {
+            failed(&mut r, "meter services", &e);
+        }
         if let Err(e) = self.deliver_cancels(&mut r).await {
             failed(&mut r, "deliver cancels", &e);
         }
@@ -583,6 +590,30 @@ impl Scheduler {
             failed(&mut r, "place", &e);
         }
         r
+    }
+
+    /// The metering of services (H2 §12, [`crate::units::meter`]): its stops are cancel requests, which the next
+    /// phase delivers.
+    async fn meter(&self, r: &mut TickReport) -> Result<()> {
+        let report = crate::units::meter(
+            &self.inner.db,
+            self.now(),
+            self.inner.timing.gpu_hour_units,
+            &self.inner.reports,
+        )
+        .await?;
+        r.errors += report.errors;
+        Ok(())
+    }
+
+    /// The catch-up at start (H2 §12): the slices of the midnights the hub missed while it was down, one per UTC day,
+    /// and the day reservations of today, written before the server serves requests. A failure is logged; the
+    /// scheduler's passes retry it every second.
+    pub async fn catch_up(&self) {
+        let mut r = TickReport::default();
+        if let Err(e) = self.meter(&mut r).await {
+            failed(&mut r, "catch up the metering", &e);
+        }
     }
 
     /// Sends the effects of a committed transaction.
@@ -806,7 +837,7 @@ impl Scheduler {
                 // §11 (amended 54959f6): a lost attempt held a reservation, so it is billed: the server's estimate,
                 // from its start (or acceptance) to now, when the loss was decided.
                 let record = self.estimated_record(tx, lease, now).await?;
-                leases::insert_usage(tx, lease.id, &record).await?;
+                leases::insert_usage(tx, lease.id, &record, self.inner.timing.gpu_hour_units).await?;
                 requeued = self.job_lost_its_lease(tx, lease, reason, now).await?;
                 fx.ended.push(lease.id);
                 fx.kick = true;
@@ -851,7 +882,7 @@ impl Scheduler {
         self.service_ended(tx, lease, to, now).await?;
         // No report will come for this attempt: the ledger gets the server's estimate.
         let record = self.estimated_record(tx, lease, now).await?;
-        leases::insert_usage(tx, lease.id, &record).await?;
+        leases::insert_usage(tx, lease.id, &record, self.inner.timing.gpu_hour_units).await?;
         fx.send.push((lease.node_id, cancel(lease.id, lease.epoch, reason)));
         // Sent again every `CANCEL_RESEND` until the node confirms the end (`resend_server_cancels`).
         leases::mark_cancel_sent(tx, lease.id, now).await?;
@@ -916,7 +947,7 @@ impl Scheduler {
         // The ledger (§11), with what the row says now (the start may have been implied above).
         let lease_now = leases::get(tx, lease.id).await?.ok_or(StoreError::Corrupt("leases"))?;
         let record = self.usage_record(tx, &lease_now, &msg.usage, now).await?;
-        leases::insert_usage(tx, lease.id, &record).await?;
+        leases::insert_usage(tx, lease.id, &record, self.inner.timing.gpu_hour_units).await?;
         fx.ended.push(lease.id);
         tracing::info!(job_id = %lease.job_id, lease_id = %lease.id, status = %to, "job finished");
         Ok(())
@@ -953,7 +984,7 @@ impl Scheduler {
         }
         leases::attempt_ended(tx, lease.id, JobStatus::Lost, reason, now).await?;
         let record = self.estimated_record(tx, lease, now).await?;
-        leases::insert_usage(tx, lease.id, &record).await?;
+        leases::insert_usage(tx, lease.id, &record, self.inner.timing.gpu_hour_units).await?;
         let requeued = self.job_lost_its_lease(tx, lease, reason, now).await?;
         fx.send.push((lease.node_id, cancel(lease.id, lease.epoch, reason)));
         leases::mark_cancel_sent(tx, lease.id, now).await?;
@@ -1168,6 +1199,12 @@ impl Scheduler {
     pub async fn on_heartbeat(&self, node_id: NodeId, running: &[RunningLease]) -> Result<()> {
         if let Err(e) = self.heartbeat_health(node_id, running).await {
             tracing::warn!(error = %e, %node_id, "cannot store the health a heartbeat repeated");
+        }
+        // H2 §12: the services' cumulative usage, for their midnight slices.
+        if let Err(e) =
+            crate::units::record_heartbeat(&self.inner.db, &self.inner.reports, node_id, running, self.now()).await
+        {
+            tracing::warn!(error = %e, %node_id, "cannot record the usage a heartbeat reported");
         }
         let listed: HashSet<(LeaseId, u64)> = running.iter().map(|r| (r.lease_id, r.epoch)).collect();
         let freed = |held: Vec<LeaseRow>| -> Vec<LeaseRow> {
