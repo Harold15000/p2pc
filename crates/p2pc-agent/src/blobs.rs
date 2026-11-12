@@ -21,7 +21,9 @@
 //! - **Job start** ([`BlobInputs`]). The sandbox driver fetches each blob input of a lease through the welcomed
 //!   session of the moment ([`Uplink`]), waiting for one if the agent is reconnecting. A transport failure (the
 //!   connection went away, a stall) is tried again from an empty destination, at most [`MAX_FETCH_ATTEMPTS`] times in
-//!   all; a refusal or a digest mismatch is the hub's answer and is never tried again.
+//!   all, and never at once on the connection that just failed: the retry waits for another session, up to
+//!   [`STALL_TIMEOUT`] (a session still there by then was fine after all). A refusal or a digest mismatch is the
+//!   hub's answer and is never tried again.
 //!
 //! Errors never quote the hub's bytes beyond a cleaned, bounded refusal reason.
 
@@ -233,6 +235,12 @@ impl BlobInputs {
     /// lease's cancel). A [`FetchError::Transport`] is tried again, after `dest` is emptied, at most
     /// [`MAX_FETCH_ATTEMPTS`] times in all; every other error is final.
     ///
+    /// A retry does not land on the connection that just failed: a dropped connection's port stays published until
+    /// its session ends, and its streams fail at once, which would use up every attempt in an instant. So the retry
+    /// first waits until the session is another one (or gone, and then for the next one). If the same session is
+    /// still there after [`STALL_TIMEOUT`], the connection was fine after all and the retry goes ahead on it, as an
+    /// output upload does.
+    ///
     /// # Errors
     /// The last attempt's [`FetchError`]. What `dest` holds then must be discarded by the caller.
     pub async fn fetch(
@@ -254,6 +262,7 @@ impl BlobInputs {
                     );
                     attempt += 1;
                     dest.reset().await.map_err(|e| FetchError::Write(e.to_string()))?;
+                    let _ = tokio::time::timeout(STALL_TIMEOUT, self.uplink.changed_from(port.session())).await;
                 }
                 other => return other,
             }
@@ -739,7 +748,7 @@ mod tests {
         assert_eq!(streams.opened.load(Ordering::SeqCst), 3);
         server.abort();
 
-        // A connection that never comes back: three attempts, then the transport error.
+        // A session that stays up while its streams keep failing: three attempts, then the transport error.
         let (streams, _ends) = pipes();
         streams.refuse.store(usize::MAX, Ordering::SeqCst);
         let uplink = Uplink::new();
@@ -751,6 +760,53 @@ mod tests {
             streams.opened.load(Ordering::SeqCst),
             usize::try_from(MAX_FETCH_ATTEMPTS).unwrap()
         );
+    }
+
+    /// Review P2 of T2-24: a retry must not land on the connection that just failed. A dropped connection's port
+    /// stays published until its session ends, and its streams fail at once: the fetch makes one attempt there, then
+    /// waits for another welcomed session and succeeds on it. No attempt is burned in between.
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_waits_for_the_next_session_instead_of_the_connection_that_failed() {
+        let data = b"the blob".to_vec();
+        // Session 1: its connection is gone, but the session has not ended yet.
+        let (dead, _dead_ends) = pipes();
+        dead.refuse.store(usize::MAX, Ordering::SeqCst);
+        let uplink = Uplink::new();
+        let (jobs, _rx) = mpsc::channel(4);
+        let first = uplink.connect(Port::new(&jobs, dead.clone()));
+        let inputs = BlobInputs::new(uplink.clone());
+        let req = request(&data);
+        let fetch = tokio::spawn(async move {
+            let mut out = Vec::new();
+            let r = inputs.fetch(req, 1 << 20, &mut out).await;
+            (r, out)
+        });
+        // No time passes here (the clock is paused and the test never idles): everything that can run, runs.
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(dead.opened.load(Ordering::SeqCst), 1, "one attempt, then it waits");
+        assert!(!fetch.is_finished());
+        // The session ends; the agent is reconnecting: still one attempt.
+        uplink.disconnect(first);
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!fetch.is_finished());
+        // Session 2 is welcomed and serves.
+        let (live, ends) = pipes();
+        let server = serve_all(ends, data.clone());
+        let _second = session(&uplink, live.clone());
+        let (r, out) = fetch.await.unwrap();
+        assert_eq!(r, Ok(data.len() as u64));
+        assert_eq!(out, data);
+        assert_eq!(
+            dead.opened.load(Ordering::SeqCst),
+            1,
+            "nothing more on the dead connection"
+        );
+        assert_eq!(live.opened.load(Ordering::SeqCst), 1);
+        server.abort();
     }
 
     /// The hub's refusals and a digest mismatch are answers, not accidents: never tried again.
