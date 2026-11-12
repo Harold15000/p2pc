@@ -532,7 +532,7 @@ mod tests {
             let (account, key) = (f.account, f.key);
             async move {
                 let mut c = db.acquire().await.unwrap();
-                crate::store::leases::spent_between(&mut c, account, p2pc_proto::api::Principal::Key(key), day.0, day.1)
+                crate::store::leases::spent(&mut c, account, p2pc_proto::api::Principal::Key(key), day.0)
                     .await
                     .unwrap()
             }
