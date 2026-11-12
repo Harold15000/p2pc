@@ -211,8 +211,19 @@ mod tests {
         );
     }
 
-    /// §8.7: the uninstaller runs `P2PC.exe --uninstall-cleanup` and stops unless it exits 0; never during an update
-    /// (Tauri's uninstaller sets `$UpdateMode` for `/UPDATE`), which would otherwise delete the distro.
+    /// §8.7: the uninstaller runs `P2PC.exe --uninstall-cleanup` and stops unless it exits 0; never while a newer
+    /// version is being installed, which would otherwise delete the distro.
+    ///
+    /// Two guards, both needed (read in Tauri's NSIS template, tauri-bundler 2.10.4; **not yet run on Windows**, see
+    /// the PR's risks):
+    /// - `$UpdateMode`: set when the uninstaller gets `/UPDATE`. With `/UPDATE` the new installer does not run the old
+    ///   uninstaller at all, so this guard is a second line.
+    /// - `$EXEDIR != $INSTDIR`: a newer installer run by hand preselects "Uninstall before installing" and runs the old
+    ///   uninstaller without `/UPDATE`, in place (`_?=<install dir>`); an uninstall started from Windows runs from a
+    ///   copy in `%TEMP%`. An in-place run skips the cleanup and keeps the app's data folders.
+    ///
+    /// A flag set by the installer's PREINSTALL hook cannot do this: that hook runs in the install section, after the
+    /// page that runs the old uninstaller.
     #[test]
     fn the_uninstaller_runs_the_cleanup_but_never_during_an_update() {
         let nsis = &json(CONFIG)["bundle"]["windows"]["nsis"];
@@ -223,13 +234,20 @@ mod tests {
             .and_then(|r| r.split("!macroend").next())
             .expect("a PREUNINSTALL hook");
         let guard = pre.find("${If} $UpdateMode <> 1").expect("the update guard");
+        let in_place = pre
+            .find("${AndIf} $EXEDIR != $INSTDIR")
+            .expect("the guard against an uninstaller a newer installer started in place");
+        assert!(guard < in_place);
+        // Nothing of the hook runs outside the two guards.
+        let before_guard: Vec<&str> = pre[..guard].lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        assert!(before_guard.is_empty(), "{before_guard:?}");
         let close = pre
             .find("CheckIfAppIsRunning")
             .expect("the running app is closed first");
         let run = pre
             .find(&format!("{}' $0", crate::uninstall::CLEANUP_FLAG))
             .expect("the cleanup is run and waited for");
-        assert!(guard < close && close < run);
+        assert!(in_place < close && close < run);
         assert!(pre.contains("ExecWait"));
         assert!(pre.contains("${If} $0 <> 0"), "a non-zero exit stops the uninstall");
         assert!(pre.contains("Abort"));
@@ -238,7 +256,13 @@ mod tests {
             .nth(1)
             .and_then(|r| r.split("!macroend").next())
             .expect("a POSTUNINSTALL hook");
-        assert!(post.contains("${If} $UpdateMode <> 1"));
+        let post_guard = post.find("${If} $UpdateMode <> 1").expect("the update guard");
+        let post_in_place = post
+            .find("${AndIf} $EXEDIR != $INSTDIR")
+            .expect("the in-place guard: a manual upgrade keeps the app's settings");
+        assert!(post_guard < post_in_place);
+        assert!(post_in_place < post.find("RmDir").expect("the data folders"));
+        assert!(post_in_place < post.find("DeleteRegValue").expect("the RunOnce value"));
         for line in [
             "RmDir /r \"$APPDATA\\${BUNDLEID}\"",
             "RmDir /r \"$LOCALAPPDATA\\${BUNDLEID}\"",
