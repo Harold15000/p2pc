@@ -14,7 +14,10 @@
 //! - [`keystore`]: the device key, DPAPI-protected in `%LOCALAPPDATA%\P2PC\device.key`;
 //! - [`navigation`]: bundled pages only, web links to the system browser;
 //! - [`commands`] and [`capabilities`]: the window's commands and the checks that pin the capability, the CSP and the
-//!   plugin list.
+//!   plugin list;
+//! - [`uninstall`]: the uninstaller's cleanup (T2-45, §8.7);
+//! - [`update`]: the app's updates, the template bundle's delivery, the web app's verification and the distro's upgrade
+//!   (T2-45, §14, §9.6).
 //!
 //! The Tauri glue (builder, tray, window, commands) is the `app` module, behind the cargo feature `app` (off by
 //! default; see `apps/desktop/README.md`).
@@ -30,6 +33,8 @@ pub mod settings;
 pub mod setup;
 pub mod state;
 pub mod tray;
+pub mod uninstall;
+pub mod update;
 
 #[cfg(feature = "app")]
 pub mod app;
