@@ -1303,7 +1303,8 @@ class Inventory(_Response):
     disk_total_mb: int | None = None
     dxg: bool = False
     gpus: list[GpuInfo] = Field(default_factory=list)
-    # Reported only by an agent with `share_update` (H2 §6.1): the disk share for volumes, and the owner's pause.
+    # Reported only by an agent with `share_update` (H2 §6.1): the disk share for volumes,
+    # and the owner's pause.
     owner_paused: bool | None = None
     sandbox: list[SandboxCapability] = Field(default_factory=list)
     volumes_mb: int | None = None
