@@ -1246,3 +1246,50 @@ fn closing_the_window_revokes_the_open_pairing_ticket() {
     s.close_pairing().expect("close again");
     assert_eq!(w.hub.calls().len(), before);
 }
+
+// --- Review round 2 ---
+
+#[test]
+fn try_again_never_takes_an_agent_enrolled_elsewhere_for_ours() {
+    let w = World::new();
+    w.host.script().join = VecDeque::from([JoinResult::AlreadyEnrolled, JoinResult::AlreadyEnrolled]);
+    let s = to_create(&w);
+    for attempt in ["first", "try again"] {
+        let v = s.create_cloud().expect("create");
+        let e = v.error.expect("error");
+        assert_eq!(e.code, SetupErrorCode::HubFailed, "{attempt}");
+        assert!(e.detail.expect("detail").contains("another cloud"), "{attempt}");
+        assert_eq!(v.role, None, "{attempt}");
+        let hub = w.saved().hub.expect("hub");
+        assert!(!hub.joined && !hub.join_started, "{attempt}");
+    }
+    // And after a restart.
+    drop(s);
+    let s = w.start();
+    let v = s.create_cloud().expect("create after restart");
+    assert!(
+        v.error
+            .expect("error")
+            .detail
+            .expect("detail")
+            .contains("another cloud")
+    );
+    assert_eq!(v.role, None);
+    assert!(!w.saved().hub.expect("hub").joined);
+    assert_eq!(w.saved().role, None);
+}
+
+#[test]
+fn the_share_cap_is_cleared_once_a_smaller_share_is_applied() {
+    let w = World::new();
+    let s = to_create(&w);
+    w.host.script().free = VecDeque::from([129 * GIB]);
+    s.create_cloud().expect("create: share too large");
+    assert_eq!(w.saved().hub.and_then(|h| h.share_cap_gib), Some(89));
+    s.apply_share(share(80)).expect("smaller share");
+    assert_eq!(
+        w.saved().hub.expect("hub").share_cap_gib,
+        None,
+        "the create-time check applies the limit again"
+    );
+}

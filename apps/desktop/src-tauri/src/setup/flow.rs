@@ -719,10 +719,12 @@ impl Setup {
             }
             s.commit(|r| {
                 r.share = Some(share);
-                // A new share: the hub's quota is computed again from it.
+                // A new share: the hub's quota is computed again from it, and the cap of an earlier "share too large"
+                // is dropped (the quota check at "Create my cloud" applies the limit again, from fresh free space).
                 if let Some(hub) = r.hub.as_mut() {
                     hub.blobs_quota_mb = None;
                     hub.quota_written = false;
+                    hub.share_cap_gib = None;
                 }
             })
         })
@@ -847,6 +849,11 @@ impl Setup {
                     JoinResult::Joined => {}
                     JoinResult::AlreadyEnrolled if ours_if_enrolled => {}
                     JoinResult::AlreadyEnrolled => {
+                        // A definite answer: enrolled before our token, so in another cloud. It clears the "maybe ours"
+                        // evidence, so "Try again" (or a restart) cannot take it for ours. Only an unknown answer
+                        // (`Failed`) keeps `join_started`.
+                        hub.join_started = false;
+                        save(s, &hub)?;
                         return s.set_error(SetupError::with_detail(
                             SetupErrorCode::HubFailed,
                             "this PC's node is already enrolled in another cloud",
