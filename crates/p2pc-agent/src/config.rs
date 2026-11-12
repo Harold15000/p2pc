@@ -203,6 +203,17 @@ impl ShareUpdate {
         *self == Self::default()
     }
 
+    /// `Some(paused)` when this update only pauses or resumes sharing, and changes no limit.
+    #[must_use]
+    pub fn only_pause(&self) -> Option<bool> {
+        let paused = self.paused?;
+        let rest = Self {
+            paused: None,
+            ..self.clone()
+        };
+        rest.is_empty().then_some(paused)
+    }
+
     /// `share` with this update applied.
     #[must_use]
     pub fn apply(&self, share: &Share) -> Share {
@@ -1423,6 +1434,23 @@ mod tests {
             paused: false,
         };
         assert!(ShareUpdate::default().is_empty());
+        assert_eq!(ShareUpdate::default().only_pause(), None);
+        for paused in [true, false] {
+            let only = ShareUpdate {
+                paused: Some(paused),
+                ..ShareUpdate::default()
+            };
+            assert_eq!(only.only_pause(), Some(paused));
+            let with_a_limit = ShareUpdate {
+                cpu_cores: Some(1.0),
+                ..only
+            };
+            assert_eq!(
+                with_a_limit.only_pause(),
+                None,
+                "a limit is checked against the hardware"
+            );
+        }
         let pause = ShareUpdate {
             paused: Some(true),
             ..ShareUpdate::default()

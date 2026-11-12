@@ -22,7 +22,7 @@ use p2pc_agent::connection::gate::{GateFile, render_gate};
 use p2pc_agent::connection::join::{JoinError, enroll};
 use p2pc_agent::connection::load::LoadMeter;
 use p2pc_agent::connection::session::{
-    Approval, INVENTORY_INTERVAL, LeaveEnd, MAX_PENDING_DECISIONS, NodeControls, Shared,
+    Approval, INVENTORY_INTERVAL, LeaveEnd, LeaveRequest, MAX_PENDING_DECISIONS, NodeControls, Shared, leave_node,
 };
 use p2pc_agent::connection::state::{StateFile, render_node, render_status, status_json};
 use p2pc_agent::connection::token::{self, TokenText};
@@ -482,9 +482,20 @@ fn status_cmd(cli: &Cli, env: &Env, json: bool) -> anyhow::Result<ExitCode> {
     let (_, config) = load(cli, env)?;
     let state = StateFile::in_dir(&config.data_dir).read();
     if json {
-        let identity = Identity::load_or_create(&config.data_dir)?;
+        // The key is created only before enrollment (H2 §5.4 step 2). On an enrolled node a missing key is a lost
+        // identity, never replaced by a new one here: `run` would dial with an unknown NodeId and stop as removed
+        // (review P3 of T2-23). A key that cannot be read is reported as `null`.
+        let identity = if config.server.is_none() {
+            Identity::load_or_create(&config.data_dir)
+        } else {
+            Identity::load(&config.data_dir)
+        };
+        let identity = identity
+            .inspect_err(|e| eprintln!("warning: cannot read this node's identity: {e}"))
+            .ok();
         let running = p2pc_agent::node::agent_running(&config.data_dir);
-        let status = status_json(&config, state.as_ref(), Some(&identity.node_id()), running);
+        let node_id = identity.as_ref().map(Identity::node_id);
+        let status = status_json(&config, state.as_ref(), node_id.as_ref(), running);
         println!("{}", serde_json::to_string_pretty(&status)?);
         return Ok(ExitCode::SUCCESS);
     }
@@ -526,6 +537,21 @@ fn share_set_cmd(cli: &Cli, env: &Env, update: &ShareUpdate) -> anyhow::Result<E
     }
     let (source, mut config) = load(cli, env)?;
     config.share = update.apply(&config.share);
+    // Pausing and resuming change nothing that is offered, so they never wait on (or fail on) the hardware check: an
+    // owner must be able to pause even when the share in force no longer matches the machine (review P3 of T2-23).
+    if let Some(paused) = update.only_pause() {
+        p2pc_agent::config::write_share_update(source.path(), update, env)?;
+        println!(
+            "Sharing {}. Saved in {}.",
+            if paused {
+                "paused: new work is refused, running work continues"
+            } else {
+                "resumed"
+            },
+            source.path().display()
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
     let report = match block_on(inventory::detect(&Host::system(), &SystemRunner::default(), &config))? {
         Ok(report) => report,
         Err(e) => {
@@ -568,7 +594,6 @@ fn leave_cmd(cli: &Cli, env: &Env, reason: &str) -> anyhow::Result<ExitCode> {
     }
     let rt = runtime()?;
     let result = rt.block_on(async move {
-        let started = tokio::time::Instant::now();
         let id = Identity::load(&config.data_dir)?;
         let relays = config.relays();
         let connector = IrohConnector::new(
@@ -577,7 +602,6 @@ fn leave_cmd(cli: &Cli, env: &Env, reason: &str) -> anyhow::Result<ExitCode> {
             server_addr(&server.node_id, &relays)?,
             current_selection(&config.iroh.direct_addresses).await,
         );
-        let inventory = inventory::detect_periodic(&Host::system(), &SystemRunner::default(), &config).await?;
         // The leases a running agent holds go into Hello, so the hub's reconciliation does not take them for lost if
         // the Leave never lands. Without a running agent, nothing runs: the leases file is an earlier run's.
         let running = if p2pc_agent::node::agent_running(&config.data_dir) {
@@ -593,26 +617,19 @@ fn leave_cmd(cli: &Cli, env: &Env, reason: &str) -> anyhow::Result<ExitCode> {
         } else {
             Vec::new()
         };
-        let left = LEAVE_DEADLINE.saturating_sub(started.elapsed());
-        let end = match tokio::time::timeout(left, connector.connect()).await {
-            Ok(Ok(link)) => {
-                let left = LEAVE_DEADLINE.saturating_sub(started.elapsed());
-                p2pc_agent::connection::session::leave(
-                    link,
-                    server.account_id,
-                    inventory.inventory,
-                    running,
-                    leave,
-                    left,
-                )
+        // The detection is inside the 10 s budget too (review P3 of T2-23).
+        let detect = async {
+            inventory::detect_periodic(&Host::system(), &SystemRunner::default(), &config)
                 .await
-            }
-            Ok(Err(e)) => {
-                eprintln!("error: cannot connect to the hub: {e}");
-                return anyhow::Ok(ExitCode::from(exit::FAILURE));
-            }
-            Err(_) => LeaveEnd::TimedOut,
+                .map(|report| report.inventory)
+                .map_err(|e| e.to_string())
         };
+        let request = LeaveRequest {
+            owner: server.account_id,
+            running,
+            leave,
+        };
+        let end = leave_node(&connector, detect, request, LEAVE_DEADLINE).await;
         connector.shutdown().await;
         anyhow::Ok(match end {
             LeaveEnd::Left | LeaveEnd::NotEnrolled => {
@@ -639,6 +656,12 @@ fn leave_failure(end: &LeaveEnd) -> String {
         LeaveEnd::Refused(code) => format!("the hub refused: {code}"),
         LeaveEnd::Lost => "the connection to the hub ended before the request was sent".into(),
         LeaveEnd::TimedOut => format!("no answer from the hub within {} s", LEAVE_DEADLINE.as_secs()),
+        LeaveEnd::Unconfirmed => format!(
+            "the request was sent, but the hub did not confirm the removal within {} s; check the node list on the \
+             hub",
+            LEAVE_DEADLINE.as_secs()
+        ),
+        LeaveEnd::Failed(e) => e.clone(),
     }
 }
 

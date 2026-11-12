@@ -253,6 +253,9 @@ pub enum SessionEnd {
     AddressesChanged(Vec<SelectedAddr>),
     /// The connector asked for a new endpoint with the same addresses (T10l): re-bind and reconnect at once.
     Rebind,
+    /// The owner resumed sharing after a pause (H2 §8.4): reconnect at once, so the new `Hello` makes the hub offer
+    /// the jobs it stopped offering during the pause.
+    Resumed,
     /// The connection dropped, the server went silent, or a frame was bad. `welcomed` tells whether the
     /// `Welcome` had arrived (the backoff starts again from 1 s then).
     Lost {
@@ -539,6 +542,8 @@ async fn drive(
 ) -> SessionEnd {
     // 1. Hello at once, with the inventory detected just before the dial.
     let mut last_inventory = normalized(&inventory);
+    // Whether the owner had paused sharing when this `Hello` went out: a resume after it ends the session (below).
+    let mut paused = shared.owner_paused();
     let hello = AgentMsg::Hello {
         agent_version: AGENT_VERSION.to_string(),
         inventory,
@@ -710,6 +715,14 @@ async fn drive(
                     // The watcher is gone: the share in force stays.
                     share = None;
                     continue;
+                }
+                // A resume. The hub counted every `draining` refusal of the pause against its per-job offer cap, and
+                // only a node change re-arms it; a pause changes nothing on the wire, so a new `Hello` is the one that
+                // does. Reconnect at once (review P2 of T2-23).
+                let now_paused = shared.owner_paused();
+                if std::mem::replace(&mut paused, now_paused) && !now_paused {
+                    tracing::info!("the owner resumed sharing; reconnecting so the hub offers work again");
+                    return SessionEnd::Resumed;
                 }
                 if detection.is_none() {
                     detection = Some(spawn_detection(shared));
@@ -892,7 +905,8 @@ fn queue(io: &Io, msg: AgentMsg) -> Option<SessionEnd> {
 /// How `p2pc-agent leave` ended ([`leave`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeaveEnd {
-    /// `Leave` was written and the hub closed the connection, as it does after it deletes the node (H2 §6.1).
+    /// From [`leave`]: `Leave` was written and the hub closed the connection, as it does after it deletes the node
+    /// (H2 §6.1). From [`leave_node`]: that, and a second connection confirmed it with `not_enrolled`.
     Left,
     /// The hub says this machine is not enrolled: it is already gone.
     NotEnrolled,
@@ -908,6 +922,79 @@ pub enum LeaveEnd {
     Lost,
     /// No end within the deadline.
     TimedOut,
+    /// `Leave` was written and the connection closed, but a second connection could not confirm the removal within the
+    /// deadline ([`leave_node`]): the hub may not have processed it.
+    Unconfirmed,
+    /// Nothing reached the hub: the inventory could not be detected, or the hub could not be dialled.
+    Failed(String),
+}
+
+/// Most connections [`leave_node`] opens: the `Leave`, the confirmation, and one more `Leave` if the confirmation
+/// found the node still enrolled.
+pub const MAX_LEAVE_CONNECTIONS: usize = 3;
+
+/// What `p2pc-agent leave` asks for (H2 §6.1).
+#[derive(Debug, Clone)]
+pub struct LeaveRequest {
+    /// The enrolled owner (SI-1).
+    pub owner: AccountId,
+    /// The leases a running agent still holds, for `Hello.running`.
+    pub running: Vec<p2pc_proto::protocol::RunningLease>,
+    /// The message.
+    pub leave: p2pc_proto::protocol::Leave,
+}
+
+/// The whole of `p2pc-agent leave` (H2 §6.1, §8.7), bounded by `deadline` from start to end (the app gives it 10 s):
+/// the inventory detection for `Hello`, each dial, and each exchange take what is left of it.
+///
+/// The hub answers `Leave` with nothing, so a close after `Leave` cannot tell "removed" from "the network dropped" or
+/// "another connection of this node replaced this one". So after [`LeaveEnd::Left`] it dials once more: `not_enrolled`
+/// confirms the removal ([`LeaveEnd::Left`]); a `Welcome` means the node is still there, and `Leave` is sent again; and
+/// a confirmation that cannot be had within the deadline is [`LeaveEnd::Unconfirmed`]. At most
+/// [`MAX_LEAVE_CONNECTIONS`] connections.
+pub async fn leave_node(
+    connector: &dyn super::Connector,
+    detect: impl std::future::Future<Output = Result<Inventory, String>>,
+    request: LeaveRequest,
+    deadline: Duration,
+) -> LeaveEnd {
+    let started = Instant::now();
+    let left = || deadline.saturating_sub(started.elapsed());
+    let inventory = match tokio::time::timeout(left(), detect).await {
+        Ok(Ok(inventory)) => inventory,
+        Ok(Err(e)) => return LeaveEnd::Failed(format!("cannot detect the inventory for Hello: {e}")),
+        Err(_) => return LeaveEnd::TimedOut,
+    };
+    let mut sent = false;
+    for _ in 0..MAX_LEAVE_CONNECTIONS {
+        let link = match tokio::time::timeout(left(), connector.connect()).await {
+            Ok(Ok(link)) => link,
+            Ok(Err(e)) if !sent => return LeaveEnd::Failed(format!("cannot connect to the hub: {e}")),
+            Ok(Err(_)) | Err(_) if sent => return LeaveEnd::Unconfirmed,
+            Ok(Err(_)) | Err(_) => return LeaveEnd::TimedOut,
+        };
+        let end = leave(
+            link,
+            request.owner,
+            inventory.clone(),
+            request.running.clone(),
+            request.leave.clone(),
+            left(),
+        )
+        .await;
+        match end {
+            // Sent: dial again to confirm (or to send it again).
+            LeaveEnd::Left => sent = true,
+            // Gone: confirmed after a `Leave`, or already gone before.
+            LeaveEnd::NotEnrolled if sent => return LeaveEnd::Left,
+            other if sent => {
+                tracing::warn!(?other, "the removal of this node could not be confirmed");
+                return LeaveEnd::Unconfirmed;
+            }
+            other => return other,
+        }
+    }
+    LeaveEnd::Unconfirmed
 }
 
 /// `p2pc-agent leave` (H2 §6.1, §8.7): on its own connection, `Hello` (with `features: ["leave"]`, `inventory` and the

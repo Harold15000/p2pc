@@ -18,7 +18,8 @@ use p2pc_agent::connection::daemon::{Daemon, DaemonExit};
 use p2pc_agent::connection::lease::{LeaseDecision, LeaseHandler, LeaseOffer, LeaseSupervisor, NotReady};
 use p2pc_agent::connection::load::LoadSource;
 use p2pc_agent::connection::session::{
-    Approval, INVENTORY_INTERVAL, InventorySource, LeaveEnd, MAX_PENDING_DECISIONS, NodeControls, Shared,
+    Approval, INVENTORY_INTERVAL, InventorySource, LeaveEnd, LeaveRequest, MAX_LEAVE_CONNECTIONS,
+    MAX_PENDING_DECISIONS, NodeControls, Shared, leave_node,
 };
 use p2pc_agent::connection::state::{AgentState, ConnectionState, StateFile};
 use p2pc_agent::connection::streams::{HubRecv, HubSend, HubStream, PortIo, PortOpener, StreamAcceptor};
@@ -38,6 +39,19 @@ use tokio::time::Instant;
 const SERVER_ID: &str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
 /// This node's ID on the server, from the `Welcome` of its `join`.
 const AGENT_NODE_ID: &str = "node_01JBQ6Z5E8Y1V8Y6Y3C8V9N2W4";
+/// The longest any helper waits, in (virtual) time: past it the test fails instead of letting the paused clock run on
+/// forever (each virtual hour costs only some 720 heartbeats).
+const TEST_WAIT: Duration = Duration::from_secs(2 * 3600);
+/// Most unread messages [`ServerEnd::serve`] keeps.
+const SERVE_BUFFER: usize = 4096;
+
+/// `f`, or a panic after [`TEST_WAIT`].
+async fn bounded<T>(what: &str, f: impl std::future::Future<Output = T>) -> T {
+    match tokio::time::timeout(TEST_WAIT, f).await {
+        Ok(v) => v,
+        Err(_) => panic!("no {what} within {} s of (virtual) time", TEST_WAIT.as_secs()),
+    }
+}
 
 // ---------------------------------------------------------------------------------------------------------------
 // The fake world: a connector over pipes, a fake server end, recording traits.
@@ -89,19 +103,26 @@ struct ServerEnd {
 }
 
 impl ServerEnd {
-    /// The next agent message, as JSON; `None` when the agent closed.
+    /// The next agent message, as JSON; `None` when the agent closed. Panics after [`TEST_WAIT`] of (virtual) time.
     async fn recv(&mut self) -> Option<Value> {
+        bounded("an agent message", self.recv_raw()).await
+    }
+
+    async fn recv_raw(&mut self) -> Option<Value> {
         read_frame::<Value, _>(&mut self.r, MAX_FRAME_LEN).await.ok().flatten()
     }
 
-    /// The next agent message that is not a heartbeat.
+    /// The next agent message that is not a heartbeat, within [`TEST_WAIT`] in all.
     async fn recv_not_heartbeat(&mut self) -> Option<Value> {
-        loop {
-            let m = self.recv().await?;
-            if m["type"] != "heartbeat" {
-                return Some(m);
+        bounded("an agent message that is not a heartbeat", async {
+            loop {
+                let m = self.recv_raw().await?;
+                if m["type"] != "heartbeat" {
+                    return Some(m);
+                }
             }
-        }
+        })
+        .await
     }
 
     async fn send(&mut self, msg: Value) {
@@ -128,16 +149,19 @@ impl ServerEnd {
         hello
     }
 
-    /// Drains whatever the agent sends, in the background, acknowledging heartbeats when `ack` is set.
-    fn serve(mut self, ack: bool) -> (JoinHandle<()>, mpsc::UnboundedReceiver<Value>) {
-        let (tx, rx) = mpsc::unbounded_channel();
+    /// Drains whatever the agent sends, in the background, acknowledging heartbeats when `ack` is set. Keeps at most
+    /// [`SERVE_BUFFER`] unread messages and drops the rest: on the paused clock a test that waits on something else lets
+    /// virtual time run, and the heartbeats with it, so an unbounded buffer grows without limit (it once took one test
+    /// binary to 13.8 GB).
+    fn serve(mut self, ack: bool) -> (JoinHandle<()>, mpsc::Receiver<Value>) {
+        let (tx, rx) = mpsc::channel(SERVE_BUFFER);
         let task = tokio::spawn(async move {
-            while let Some(m) = self.recv().await {
+            while let Some(m) = self.recv_raw().await {
                 if ack && m["type"] == "heartbeat" {
                     let seq = m["seq"].clone();
                     self.send(json!({"type": "heartbeat_ack", "seq": seq})).await;
                 }
-                let _ = tx.send(m);
+                let _ = tx.try_send(m);
             }
         });
         (task, rx)
@@ -399,11 +423,11 @@ impl World {
     }
 
     async fn next_connection(&mut self) -> ServerEnd {
-        self.accepted.recv().await.unwrap()
+        bounded("a new connection", self.accepted.recv()).await.unwrap()
     }
 
     async fn next_event(&mut self) -> (Instant, Event) {
-        self.events.recv().await.unwrap()
+        bounded("a supervisor event", self.events.recv()).await.unwrap()
     }
 
     async fn shutdown(self) -> DaemonExit {
@@ -602,7 +626,7 @@ async fn a_release_sends_a_heartbeat_at_once_listing_what_is_still_held() {
     assert_eq!(hello["running"], json!([running]));
     let welcomed = Instant::now();
     let (_task, mut rx) = s.serve(true);
-    let next_beat = async |rx: &mut mpsc::UnboundedReceiver<Value>| loop {
+    let next_beat = async |rx: &mut mpsc::Receiver<Value>| loop {
         let m = rx.recv().await.unwrap();
         if m["type"] == "heartbeat" {
             return (Instant::now() - welcomed, m);
@@ -1575,14 +1599,16 @@ async fn a_paused_node_refuses_new_leases_with_draining_until_resumed() {
         json!({"type": "lease_rejected", "lease_id": id, "epoch": 1, "reason": "draining"})
     );
     assert!(recorder.offers.lock().unwrap().is_empty());
-    // Resume.
+    // Resume: a new connection (review P2, see `a_resume_reconnects_at_once_…`), which takes leases again.
     share.send_replace(Share::default());
+    let mut s = w.next_connection().await;
+    let _ = s.handshake(w.owner).await;
     let (id, lease) = lease_msg(w.owner, good_job());
     s.send(lease).await;
     let answer = s.recv_not_heartbeat().await.unwrap();
     assert_eq!(answer, json!({"type": "lease_accepted", "lease_id": id, "epoch": 1}));
     assert_eq!(*recorder.offers.lock().unwrap(), [id]);
-    assert_eq!(w.connector.attempts.lock().unwrap().len(), 1, "never reconnected");
+    assert_eq!(w.connector.attempts.lock().unwrap().len(), 2);
     let (_task, _rx) = s.serve(true);
     w.shutdown().await;
 }
@@ -1610,12 +1636,13 @@ async fn a_share_change_sends_inventory_update_within_seconds() {
     while let Ok(m) = rx.try_recv() {
         assert_ne!(m["type"], "inventory_update", "{m}");
     }
-    // Fewer cores offered: the new offer is sent at once.
+    // Fewer cores offered (still paused, so the session stays): the new offer is sent at once.
     w.inventory.0.lock().unwrap().offered =
         serde_json::from_value(json!({"cpu": 2.0, "memory_mb": 4096, "gpu": 0})).unwrap();
     share.send_replace(Share {
         cpu_cores: Some(2.0),
         memory_mb: Some(4096),
+        paused: true,
         ..Share::default()
     });
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1628,6 +1655,11 @@ async fn a_share_change_sends_inventory_update_within_seconds() {
     assert_eq!(sent.len(), 1, "{sent:?}");
     assert_eq!(sent[0]["inventory"]["offered"]["cpu"], json!(2.0));
     assert_eq!(sent[0]["inventory"]["offered"]["memory_mb"], 4096);
+    assert_eq!(
+        w.connector.attempts.lock().unwrap().len(),
+        1,
+        "a share change is no reconnect"
+    );
     w.shutdown().await;
 }
 
@@ -1755,4 +1787,201 @@ async fn leave_reports_why_the_node_was_not_removed() {
         took >= Duration::from_secs(10) && took < Duration::from_secs(13),
         "{took:?}"
     );
+}
+
+/// Review P2: a paused node's `draining` refusals count against the hub's offer cap, and a pause or resume does not
+/// change the wire inventory, so only a new `Hello` re-arms the queued jobs (`node_changed`). A resume therefore ends
+/// the session and reconnects at once, without backoff; a pause, or a share change that keeps sharing on, does not.
+#[tokio::test(start_paused = true)]
+async fn a_resume_reconnects_at_once_so_the_hub_offers_the_queued_jobs_again() {
+    let (node, share) = node_controls();
+    share.send_replace(Share {
+        paused: true,
+        ..Share::default()
+    });
+    let mut w = start(Options {
+        node: Some(node),
+        ..Options::default()
+    });
+    let mut s = w.next_connection().await;
+    let _ = s.handshake(w.owner).await;
+    let (_task, _rx) = s.serve(true);
+    // Still paused, other values: no reconnect.
+    share.send_replace(Share {
+        paused: true,
+        cpu_cores: Some(2.0),
+        ..Share::default()
+    });
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(
+        w.connector.attempts.lock().unwrap().len(),
+        1,
+        "no reconnect while paused"
+    );
+    // Resume: a new connection and a new Hello at once, well inside the first backoff step (1 s).
+    let resumed_at = Instant::now();
+    share.send_replace(Share::default());
+    let mut s = tokio::time::timeout(Duration::from_millis(500), w.next_connection())
+        .await
+        .expect("no new connection after the resume");
+    let hello = s.recv().await.unwrap();
+    assert_eq!(hello["type"], "hello");
+    assert!(
+        resumed_at.elapsed() < Duration::from_millis(500),
+        "{:?}",
+        resumed_at.elapsed()
+    );
+    s.welcome(w.owner, 60).await;
+    let (_task, _rx) = s.serve(true);
+    // Pausing again, and changing the share while sharing, keep the connection.
+    share.send_replace(Share {
+        paused: true,
+        ..Share::default()
+    });
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(
+        w.connector.attempts.lock().unwrap().len(),
+        2,
+        "a pause does not reconnect"
+    );
+    w.shutdown().await;
+}
+
+fn pipe_connector() -> (Arc<PipeConnector>, mpsc::UnboundedReceiver<ServerEnd>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    (
+        Arc::new(PipeConnector {
+            accepted: tx,
+            refuse: AtomicBool::new(false),
+            attempts: Mutex::new(Vec::new()),
+            rebinds: Mutex::new(Vec::new()),
+            incoming: None,
+        }),
+        rx,
+    )
+}
+
+fn leave_request(owner: AccountId) -> LeaveRequest {
+    LeaveRequest {
+        owner,
+        running: vec![],
+        leave: leave_reason(),
+    }
+}
+
+/// The hub's side of a connection on which the node is still enrolled: `Welcome`, read `Leave`, close.
+async fn hub_takes_leave(mut s: ServerEnd, owner: AccountId) {
+    assert_eq!(s.recv().await.unwrap()["type"], "hello");
+    s.welcome(owner, 60).await;
+    assert_eq!(s.recv().await.unwrap()["type"], "leave");
+}
+
+/// The hub's side of a connection after the node was removed.
+async fn hub_says_not_enrolled(mut s: ServerEnd) {
+    assert_eq!(s.recv().await.unwrap()["type"], "hello");
+    s.send(json!({"type": "error", "code": "not_enrolled", "message": "x"}))
+        .await;
+    assert_eq!(s.recv().await, None);
+}
+
+async fn detected() -> Result<Inventory, String> {
+    Ok(inventory("node-1"))
+}
+
+/// Review P3 of T2-23: a close after `Leave` is "removed" only once a second connection confirms it with `not_enrolled`;
+/// a node still enrolled gets `Leave` again.
+#[tokio::test(start_paused = true)]
+async fn leave_node_confirms_the_removal_on_a_second_connection() {
+    let owner = AccountId::generate();
+    let (connector, mut ends) = pipe_connector();
+    let hub = tokio::spawn(async move {
+        hub_takes_leave(ends.recv().await.unwrap(), owner).await;
+        hub_says_not_enrolled(ends.recv().await.unwrap()).await;
+    });
+    let end = leave_node(&*connector, detected(), leave_request(owner), Duration::from_secs(10)).await;
+    hub.await.unwrap();
+    assert_eq!(end, LeaveEnd::Left);
+    assert_eq!(connector.attempts.lock().unwrap().len(), 2);
+    // The first `Leave` was lost (the node is still there at the confirmation): sent again, then confirmed.
+    let (connector, mut ends) = pipe_connector();
+    let hub = tokio::spawn(async move {
+        hub_takes_leave(ends.recv().await.unwrap(), owner).await;
+        hub_takes_leave(ends.recv().await.unwrap(), owner).await;
+        hub_says_not_enrolled(ends.recv().await.unwrap()).await;
+    });
+    let end = leave_node(&*connector, detected(), leave_request(owner), Duration::from_secs(10)).await;
+    hub.await.unwrap();
+    assert_eq!(end, LeaveEnd::Left);
+    assert_eq!(connector.attempts.lock().unwrap().len(), MAX_LEAVE_CONNECTIONS);
+    // Already gone before anything was sent.
+    let (connector, mut ends) = pipe_connector();
+    let hub = tokio::spawn(async move { hub_says_not_enrolled(ends.recv().await.unwrap()).await });
+    let end = leave_node(&*connector, detected(), leave_request(owner), Duration::from_secs(10)).await;
+    hub.await.unwrap();
+    assert_eq!(end, LeaveEnd::NotEnrolled);
+    assert_eq!(connector.attempts.lock().unwrap().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn leave_node_reports_a_removal_it_cannot_confirm() {
+    let owner = AccountId::generate();
+    // The hub cannot be dialled again after the first `Leave`.
+    let (connector, mut ends) = pipe_connector();
+    let refuse = connector.clone();
+    let hub = tokio::spawn(async move {
+        hub_takes_leave(ends.recv().await.unwrap(), owner).await;
+        refuse.refuse.store(true, Ordering::SeqCst);
+    });
+    let end = leave_node(&*connector, detected(), leave_request(owner), Duration::from_secs(10)).await;
+    hub.await.unwrap();
+    assert_eq!(end, LeaveEnd::Unconfirmed);
+    // Every connection takes the `Leave` and closes, and none ever says `not_enrolled`.
+    let (connector, mut ends) = pipe_connector();
+    let hub = tokio::spawn(async move {
+        for _ in 0..MAX_LEAVE_CONNECTIONS {
+            hub_takes_leave(ends.recv().await.unwrap(), owner).await;
+        }
+    });
+    let end = leave_node(&*connector, detected(), leave_request(owner), Duration::from_secs(10)).await;
+    hub.await.unwrap();
+    assert_eq!(end, LeaveEnd::Unconfirmed);
+    assert_eq!(connector.attempts.lock().unwrap().len(), MAX_LEAVE_CONNECTIONS);
+    // The hub cannot be dialled at all: nothing reached it.
+    let (connector, _ends) = pipe_connector();
+    connector.refuse.store(true, Ordering::SeqCst);
+    let end = leave_node(&*connector, detected(), leave_request(owner), Duration::from_secs(10)).await;
+    assert!(
+        matches!(end, LeaveEnd::Failed(ref e) if e.contains("cannot connect")),
+        "{end:?}"
+    );
+}
+
+/// Review P3 of T2-23: the detection is inside the 10 s budget; a slow one ends as `TimedOut` at the deadline, before
+/// any dial.
+#[tokio::test(start_paused = true)]
+async fn leave_node_bounds_the_detection_by_the_deadline() {
+    let owner = AccountId::generate();
+    let (connector, _ends) = pipe_connector();
+    let slow = async {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        Ok(inventory("node-1"))
+    };
+    let started = Instant::now();
+    let end = leave_node(&*connector, slow, leave_request(owner), Duration::from_secs(10)).await;
+    assert_eq!(end, LeaveEnd::TimedOut);
+    assert_eq!(started.elapsed(), Duration::from_secs(10));
+    assert!(connector.attempts.lock().unwrap().is_empty(), "never dialled");
+    // A failed detection: nothing is sent either.
+    let end = leave_node(
+        &*connector,
+        async { Err("no RAM size".to_string()) },
+        leave_request(owner),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        matches!(end, LeaveEnd::Failed(ref e) if e.contains("no RAM size")),
+        "{end:?}"
+    );
+    assert!(connector.attempts.lock().unwrap().is_empty());
 }

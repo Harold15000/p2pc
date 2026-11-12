@@ -298,7 +298,9 @@ fn join_reads_the_token_from_stdin_never_from_argv() {
 /// The binary, isolated from the developer's own config and home.
 fn agent(home: &Path) -> Command {
     let mut cmd = cargo_bin_cmd!("p2pc-agent");
-    cmd.env("HOME", home).env_remove("P2PC_AGENT_CONFIG");
+    cmd.env("HOME", home)
+        .env_remove("P2PC_AGENT_CONFIG")
+        .timeout(std::time::Duration::from_secs(120));
     cmd
 }
 
@@ -513,7 +515,7 @@ fn share_set_pauses_and_refuses_what_the_machine_does_not_have() {
         .arg(&config)
         .assert()
         .success()
-        .stdout(contains("; paused."));
+        .stdout(contains("Sharing paused"));
     let text = fs::read_to_string(&config).unwrap();
     assert!(text.contains("# mine") && text.contains("zone = \"home\""), "{text}");
     assert!(text.contains("paused = true"), "{text}");
@@ -558,4 +560,80 @@ fn leave_before_joining() {
         .assert()
         .code(8)
         .stderr(contains("not enrolled"));
+}
+
+/// Review P3 of T2-23: pausing is a safety control and offers less, so it is never refused because the share in force
+/// no longer matches the machine; a change of a limit still is.
+#[test]
+fn share_set_pauses_even_when_the_share_in_force_does_not_fit_the_machine() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(dir.path(), "[share]\ncpu_cores = 100000.0\n");
+    agent_without_tools(dir.path())
+        .args(["share", "set", "--paused", "true", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(contains("Sharing paused"));
+    assert!(fs::read_to_string(&config).unwrap().contains("paused = true"));
+    agent_without_tools(dir.path())
+        .args(["share", "set", "--paused", "false", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(contains("Sharing resumed"));
+    // A limit, even a smaller one, is checked against the machine as a whole.
+    agent_without_tools(dir.path())
+        .args(["share", "set", "--memory-mb", "1", "--config"])
+        .arg(&config)
+        .assert()
+        .code(1)
+        .stderr(contains("share.cpu_cores"));
+}
+
+/// Review P3 of T2-23: on an enrolled node, `status --json` never creates a key in place of a lost one; it reports
+/// `null`, and exits 0.
+#[test]
+fn status_json_never_replaces_the_key_of_an_enrolled_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        dir.path(),
+        &format!(
+            "[server]\nnode_id = \"{SERVER_ID}\"\naccount_id = \"acc_01JBQ6Z5E8Y1V8Y6Y3C8V9N2W4\"\n\
+             agent_node_id = \"node_01JBQ6Z5E8Y1V8Y6Y3C8V9N2W4\"\n"
+        ),
+    );
+    let out = agent(dir.path())
+        .args(["status", "--json", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(status["enrolled"], true);
+    assert!(status["iroh_node_id"].is_null(), "{status}");
+    assert!(status["node_phrase"].is_null(), "{status}");
+    assert!(
+        !dir.path().join("data/identity.key").exists(),
+        "no new key for an enrolled node"
+    );
+    // A key that cannot be used (here: readable by others, refused as H1 refuses it) is `null` too, with exit 0, and is
+    // left as it is.
+    fs::create_dir_all(dir.path().join("data")).unwrap();
+    let key = dir.path().join("data/identity.key");
+    fs::write(&key, [7u8; 32]).unwrap();
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
+    let out = agent(dir.path())
+        .args(["status", "--json", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .stderr(contains("cannot read this node's identity"))
+        .get_output()
+        .stdout
+        .clone();
+    let status: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert!(status["iroh_node_id"].is_null(), "{status}");
+    assert_eq!(fs::read(&key).unwrap(), [7u8; 32]);
 }

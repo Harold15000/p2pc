@@ -259,6 +259,8 @@ impl Daemon {
                     self.connector.renew_endpoint().await;
                     continue;
                 }
+                // The owner resumed sharing: a new `Hello` at once, with no backoff.
+                SessionEnd::Resumed => continue,
                 SessionEnd::WrongOwner => state.set(ConnectionState::WrongOwner),
                 SessionEnd::Lost { .. } => state.set(ConnectionState::BackingOff),
                 SessionEnd::Failed(e) => {
