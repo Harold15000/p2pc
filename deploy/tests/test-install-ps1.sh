@@ -54,19 +54,40 @@ P2PC_PS1="$ps1" P2PC_README="$here/../README.md" pwsh -NoProfile -NonInteractive
   Check "unknown value"            "unknown" (Get-StateProbe -ExitCode 0 -Output "P2PC_STATE=maybe")
   Check "wrong case"               "unknown" (Get-StateProbe -ExitCode 0 -Output "p2pc_state=absent")
   Check "marker inside a longer line" "unknown" (Get-StateProbe -ExitCode 0 -Output "xP2PC_STATE=absent")
-  # --- the listing filter ---------------------------------------------------------------------------------------------
-  Check "ignores tmp"              $true  (Test-StateListingIgnored "700:0:0:d:tmp")
-  Check "ignores tmp content"      $true  (Test-StateListingIgnored "600:0:0:f:tmp/nvidia-cdi.abc.yaml")
-  Check "ignores boot-status"      $true  (Test-StateListingIgnored "600:0:0:f:boot-status.json")
-  Check "keeps the identity key"   $false (Test-StateListingIgnored "600:0:0:f:identity.key")
-  Check "keeps a nested tmp name"  $false (Test-StateListingIgnored "700:0:0:d:jobs/tmp")
-  Check "keeps the root entry"     $false (Test-StateListingIgnored "700:0:0:d:")
-  Check "ignores a socket"         $true  (Test-StateListingIgnored "755:0:0:s:run/agent.sock")
-  Check "ignores a FIFO"           $true  (Test-StateListingIgnored "600:0:0:p:jobs/ctl.fifo")
-  Check "ignores a nested socket"  $true  (Test-StateListingIgnored "600:0:0:s:a/b/c.sock")
-  Check "keeps a file named like a type" $false (Test-StateListingIgnored "600:0:0:f:s")
-  Check "keeps a directory"        $false (Test-StateListingIgnored "700:0:0:d:jobs")
-  Check "keeps a symlink"          $false (Test-StateListingIgnored "777:0:0:l:link")
+  # H2 8.3: the hub data (/var/lib/p2pc-server) without the agent state is its own answer, never "absent"
+  Check "hub data only"            "hub-only" (Get-StateProbe -ExitCode 0 -Output "P2PC_STATE=hub-only`n")
+  Check "hub data only, wrong case" "unknown" (Get-StateProbe -ExitCode 0 -Output "P2PC_STATE=HUB-ONLY")
+  # --- the listing filter (paths are relative to /var/lib: p2pc/... and, on the hub PC, p2pc-server/...) ---------------
+  Check "ignores tmp"              $true  (Test-StateListingIgnored "700:0:0:d:p2pc/tmp")
+  Check "ignores tmp content"      $true  (Test-StateListingIgnored "600:0:0:f:p2pc/tmp/nvidia-cdi.abc.yaml")
+  Check "ignores boot-status"      $true  (Test-StateListingIgnored "600:0:0:f:p2pc/boot-status.json")
+  Check "ignores a boot-status temp" $true (Test-StateListingIgnored "600:0:0:f:p2pc/.boot-status.AbC123")
+  Check "keeps the identity key"   $false (Test-StateListingIgnored "600:0:0:f:p2pc/identity.key")
+  Check "keeps a nested tmp name"  $false (Test-StateListingIgnored "700:0:0:d:p2pc/jobs/tmp")
+  Check "keeps the root entry"     $false (Test-StateListingIgnored "700:0:0:d:p2pc")
+  Check "keeps the hub root entry" $false (Test-StateListingIgnored "700:0:0:d:p2pc-server")
+  Check "keeps the hub database"   $false (Test-StateListingIgnored "600:0:0:f:p2pc-server/p2pc.db")
+  Check "keeps the hub tmp (only p2pc-boot files of p2pc/ are skipped)" $false (Test-StateListingIgnored "700:0:0:d:p2pc-server/tmp")
+  Check "keeps a hub boot-status name" $false (Test-StateListingIgnored "600:0:0:f:p2pc-server/boot-status.json")
+  Check "ignores a socket"         $true  (Test-StateListingIgnored "755:0:0:s:p2pc/run/agent.sock")
+  Check "ignores a FIFO"           $true  (Test-StateListingIgnored "600:0:0:p:p2pc/jobs/ctl.fifo")
+  Check "ignores a nested socket"  $true  (Test-StateListingIgnored "600:0:0:s:p2pc/a/b/c.sock")
+  Check "ignores a hub socket"     $true  (Test-StateListingIgnored "600:0:0:s:p2pc-server/x.sock")
+  Check "keeps a file named like a type" $false (Test-StateListingIgnored "600:0:0:f:p2pc/s")
+  Check "keeps a directory"        $false (Test-StateListingIgnored "700:0:0:d:p2pc/jobs")
+  Check "keeps a symlink"          $false (Test-StateListingIgnored "777:0:0:l:p2pc/link")
+  # --- Get-StateListing: one find over /var/lib that lists p2pc and p2pc-server only, paths relative to /var/lib --------
+  function Invoke-InDistro { param([string[]]$Command) $script:listingArgs = $Command; return (New-Object psobject -Property @{ ExitCode = 0; Output = "700:0:0:d:p2pc`n600:0:0:f:p2pc/identity.key`n600:0:0:f:p2pc/boot-status.json`n700:0:0:d:p2pc-server`n600:0:0:f:p2pc-server/p2pc.db`n" }) }
+  $listing = Get-StateListing
+  Set-Item -Path function:local:Invoke-InDistro -Value $realInvokeInDistro
+  Check "listing: 26 arguments" 26 $script:listingArgs.Count
+  Check "listing: one find from /var/lib" "/usr/bin/find /var/lib -mindepth 1" (($script:listingArgs[0..3]) -join " ")
+  Check "listing: everything but p2pc and p2pc-server is pruned" "! -path /var/lib/p2pc ! -path /var/lib/p2pc/* ! -path /var/lib/p2pc-server ! -path /var/lib/p2pc-server/* -prune -o" (($script:listingArgs[4..17]) -join " ")
+  Check "listing: paths relative to /var/lib, no sockets or FIFOs" "! -type s ! -type p -printf %m:%U:%G:%y:%P\n" (($script:listingArgs[18..25]) -join " ")
+  Check "listing: four entries (the boot status file is not compared)" 4 @($listing).Count
+  foreach ($e in @("700:0:0:d:p2pc", "600:0:0:f:p2pc/identity.key", "700:0:0:d:p2pc-server", "600:0:0:f:p2pc-server/p2pc.db")) {
+      Check ("listing: compares " + $e) $true ($listing -ccontains $e)
+  }
   # --- Get-BackupsToPrune: keep the newest 3 COMPLETED backups, never touch a failed one ------------------------------
   $ok = @("p2pc-state-20261101120000.ok.tar","p2pc-state-20261102120000.ok.tar","p2pc-state-20261103120000.ok.tar","p2pc-state-20261104120000.ok.tar","p2pc-state-20261105120000.ok.tar")
   Check "keeps the newest 3, prunes the 2 oldest" "p2pc-state-20261102120000.ok.tar,p2pc-state-20261101120000.ok.tar" ((Get-BackupsToPrune -Names $ok -Keep 3) -join ",")
@@ -266,7 +287,7 @@ P2PC_PS1="$ps1" P2PC_README="$here/../README.md" pwsh -NoProfile -NonInteractive
   $stateBytes = [byte[]](1..250)
   $sha = [System.Security.Cryptography.SHA256]::Create()
   $stateHash = ([BitConverter]::ToString($sha.ComputeHash($stateBytes)) -replace "-", "").ToLowerInvariant()
-  $script:listBefore = @("700:0:0:d:", "600:0:0:f:identity.key")
+  $script:listBefore = @("700:0:0:d:p2pc", "600:0:0:f:p2pc/identity.key", "700:0:0:d:p2pc-server", "600:0:0:f:p2pc-server/p2pc.db")
   $script:listAfter = $script:listBefore
   $script:listCalls = 0
   $script:probeAnswer = "P2PC_STATE=present"
@@ -443,6 +464,21 @@ P2PC_PS1="$ps1" P2PC_README="$here/../README.md" pwsh -NoProfile -NonInteractive
   Invoke-UpgradeSafely
   Check "fail 23: exit code" 23 $script:ExitCode
   Check "fail 23: the old distro is untouched, so its task is started again" $true (($script:wslCalls -join "|").EndsWith("task:register-disabled|task:enable|task:start"))
+  # H2 8.3: the hub data without the agent state is never dropped, not even with -Force (it holds the whole cloud)
+  Reset-Upgrade
+  $script:probeAnswer = "P2PC_STATE=hub-only"
+  $Force = [switch]$true
+  Invoke-UpgradeSafely
+  $Force = [switch]$false
+  Check "hub data only: exit 23, even with -Force" 23 $script:ExitCode
+  Check "hub data only: nothing unregistered" 0 @($script:wslCalls | Where-Object { $_ -like "--unregister*" }).Count
+  Check "hub data only: nothing archived" 0 @($script:inDistro | Where-Object { $_ -like "/bin/bash -c *" }).Count
+  Check "hub data only: the message names the hub data" 1 @($script:logged | Where-Object { $_.Contains("/var/lib/p2pc-server") -and $_.Contains("NOT touched") }).Count
+  # the upgrade archives both directories (one archive, one listing)
+  Reset-Upgrade
+  Invoke-UpgradeSafely
+  Check "upgrade ok: the archive script carries /var/lib/p2pc-server too" 1 @($script:inDistro | Where-Object { $_ -like "/bin/bash -c *./p2pc-server*" }).Count
+  Check "upgrade ok: the log names both directories" 1 @($script:logged | Where-Object { $_.Contains("Exported /var/lib/p2pc and /var/lib/p2pc-server") }).Count
   # no task registered: the upgrade neither stops nor starts one
   Reset-Upgrade
   $script:taskRegistered = $false
