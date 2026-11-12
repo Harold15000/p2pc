@@ -979,28 +979,6 @@ impl<E: Engine, C: Cgroups, X: Egress> PodmanDriver<E, C, X> {
         }
     }
 
-    /// Makes `image` available within the size cap (§9 "Images").
-    ///
-    /// 1. **Pull only what is missing.** An image already in the store is used as it is when its reference is a
-    ///    digest, or a tag other than `latest` (an image with no tag is `latest`): no manifest read, no pull, so no
-    ///    registry request at all (Docker Hub limits anonymous pulls per IP, and a batch of jobs on one image would
-    ///    hit the limit). The cap is checked on its local size. An image that is over it is refused, never removed.
-    ///    `latest` is pulled for every attempt, present or not. If the store cannot be asked, this step is skipped.
-    /// 2. **Pulls of the same image are shared.** One lease at a time is in the pull step of an image; the others
-    ///    wait for it (a cancel ends the wait at once), then look at the store again: an image that a pull has just
-    ///    put there is used as it is. If the pull failed, they take its result when trying again cannot change it (the
-    ///    pull ran into its timeout, or the image is over the cap); otherwise one of them tries again, and the others
-    ///    take the result of that try. A hung registry therefore costs one pull timeout, not one per lease.
-    /// 3. The registry's manifest gives the layer sizes **before** any pull ([`Engine::manifest_size`]: `skopeo
-    ///    inspect --raw` where the node has it, else `podman manifest inspect`): over the cap, the image is refused
-    ///    without being pulled.
-    /// 4. If neither can read the manifest (Podman 4.9 cannot read a single-image OCI manifest), the pull goes
-    ///    ahead, bounded by the pull timeout, and the cap is checked on the pulled image instead; a warning is
-    ///    logged once per driver. The disk floor still protects the owner's disk.
-    /// 5. A refused or failed pull removes what it left behind, but never an image that was already present
-    ///    (other jobs may use it; `podman rmi` refuses an image in use anyway).
-    ///
-    /// The choice is logged once per attempt: `image present, no pull` or `pulling`.
     /// Fetches the lease's blob inputs into `inputs/` (H2 §6.1, §7.5), one after the other, each over its own
     /// `BlobFetch` stream named by the lease and its epoch. Together with the inline files they must fit in
     /// `resources.disk_mb` minus 64 MiB (§7.1): each fetch may take only what is left, and a larger blob is refused
@@ -1064,6 +1042,28 @@ impl<E: Engine, C: Cgroups, X: Egress> PodmanDriver<E, C, X> {
         Ok(())
     }
 
+    /// Makes `image` available within the size cap (§9 "Images").
+    ///
+    /// 1. **Pull only what is missing.** An image already in the store is used as it is when its reference is a
+    ///    digest, or a tag other than `latest` (an image with no tag is `latest`): no manifest read, no pull, so no
+    ///    registry request at all (Docker Hub limits anonymous pulls per IP, and a batch of jobs on one image would
+    ///    hit the limit). The cap is checked on its local size. An image that is over it is refused, never removed.
+    ///    `latest` is pulled for every attempt, present or not. If the store cannot be asked, this step is skipped.
+    /// 2. **Pulls of the same image are shared.** One lease at a time is in the pull step of an image; the others
+    ///    wait for it (a cancel ends the wait at once), then look at the store again: an image that a pull has just
+    ///    put there is used as it is. If the pull failed, they take its result when trying again cannot change it (the
+    ///    pull ran into its timeout, or the image is over the cap); otherwise one of them tries again, and the others
+    ///    take the result of that try. A hung registry therefore costs one pull timeout, not one per lease.
+    /// 3. The registry's manifest gives the layer sizes **before** any pull ([`Engine::manifest_size`]: `skopeo
+    ///    inspect --raw` where the node has it, else `podman manifest inspect`): over the cap, the image is refused
+    ///    without being pulled.
+    /// 4. If neither can read the manifest (Podman 4.9 cannot read a single-image OCI manifest), the pull goes
+    ///    ahead, bounded by the pull timeout, and the cap is checked on the pulled image instead; a warning is
+    ///    logged once per driver. The disk floor still protects the owner's disk.
+    /// 5. A refused or failed pull removes what it left behind, but never an image that was already present
+    ///    (other jobs may use it; `podman rmi` refuses an image in use anyway).
+    ///
+    /// The choice is logged once per attempt: `image present, no pull` or `pulling`.
     async fn pull_within_cap(&self, image: &str, cancel: &watch::Receiver<bool>) -> Result<(), SandboxError> {
         let engine = &self.shared.engine;
         let cap = self.cfg.max_image_mb.saturating_mul(MIB);
