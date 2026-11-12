@@ -74,6 +74,12 @@ struct MockState {
     /// `inspect` shows a container that never started (`podman start` itself failed).
     never_started: bool,
     containers: Vec<LeaseContainer>,
+    /// `podman rm` fails.
+    fail_remove: bool,
+    /// What `podman container exists` answers; `None`: the command itself fails.
+    container_exists: Option<bool>,
+    /// The `meta.json` of every volume in the argv of the last `create`, as it was then.
+    volume_metas_at_create: Vec<String>,
 }
 
 #[derive(Clone, Default)]
@@ -201,6 +207,20 @@ impl Engine for MockEngine {
         let env_at = argv.iter().position(|a| a == "--env-file").unwrap();
         s.env_file_at_create = fs::read_to_string(&argv[env_at + 1]).ok();
         s.create_argv = Some(argv.to_vec());
+        // What each mounted volume's `meta.json` says at this moment: the lock must be on disk before the container
+        // exists.
+        s.volume_metas_at_create = argv
+            .iter()
+            .zip(argv.iter().skip(1))
+            .filter(|(flag, _)| *flag == "-v")
+            .filter_map(|(_, spec)| {
+                let host = Path::new(spec.split(':').next()?);
+                let is_volume = host.ends_with("data") && host.components().any(|c| c.as_os_str() == "volumes");
+                is_volume
+                    .then(|| fs::read_to_string(host.parent()?.join("meta.json")).ok())
+                    .flatten()
+            })
+            .collect();
         if s.fail_create {
             return Err(EngineError::new("podman create exited with 125: Error: boom".into()));
         }
@@ -269,7 +289,19 @@ impl Engine for MockEngine {
 
     async fn remove(&self, name: &str) -> Result<(), EngineError> {
         self.record(format!("rm {name}"));
+        if self.0.lock().unwrap().fail_remove {
+            return Err(EngineError::new("podman rm exited with 125: Error: boom".into()));
+        }
         Ok(())
+    }
+
+    async fn container_exists(&self, name: &str) -> Result<bool, EngineError> {
+        self.record(format!("exists {name}"));
+        self.0
+            .lock()
+            .unwrap()
+            .container_exists
+            .ok_or_else(|| EngineError::new("podman container exists: Error: boom".into()))
     }
 
     async fn lease_containers(&self) -> Result<Vec<LeaseContainer>, EngineError> {
@@ -2874,5 +2906,855 @@ fn a_service_gets_its_ingress_socket_in_the_read_only_mount() {
         assert_eq!(entries, [SOCKET_NAME, PORTS_FILE, "shim"]);
         d.cleanup(job).await;
         assert!(fs::symlink_metadata(&socket).is_err());
+    });
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Persistent volumes (H2 §11.3, SI-H2-9)
+
+use crate::volumes::{StoreConfig, VolumeStore, dir_name};
+
+/// The wall clock of the volume store, set by the test.
+#[derive(Debug)]
+struct WallClock(Mutex<time::OffsetDateTime>);
+
+impl crate::executor::Clock for WallClock {
+    fn now(&self) -> time::OffsetDateTime {
+        *self.0.lock().unwrap()
+    }
+}
+
+impl WallClock {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(Mutex::new(
+            time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(),
+        )))
+    }
+
+    fn advance(&self, by: time::Duration) {
+        *self.0.lock().unwrap() += by;
+    }
+}
+
+impl Fx {
+    /// The node's volumes in the fixture's data dir, with `budget_mb` of volume space. Opening it again is an agent
+    /// restart.
+    fn volume_store(&self, budget_mb: u64) -> VolumeStore {
+        self.volume_store_with(budget_mb, 1000, WallClock::new())
+    }
+
+    fn volume_store_with(&self, budget_mb: u64, entry_budget: usize, clock: Arc<WallClock>) -> VolumeStore {
+        VolumeStore::open(StoreConfig {
+            data_dir: self.data.path().to_path_buf(),
+            owner: self.owner,
+            budget_mb,
+            retention_days: 30,
+            entry_budget,
+            clock,
+        })
+        .unwrap()
+    }
+
+    fn volume_driver(&self, store: &VolumeStore, engine: MockEngine) -> PodmanDriver<MockEngine, FsCgroups> {
+        let mut cfg = self.cfg(Platform::Wsl2);
+        cfg.volumes = Some(store.clone());
+        self.driver_with(cfg, engine)
+    }
+
+    /// `<data_dir>/volumes/<account_id>/<hash>` of the volume `name`.
+    fn volume_dir(&self, name: &str) -> PathBuf {
+        self.data
+            .path()
+            .join("volumes")
+            .join(self.owner.to_string())
+            .join(dir_name(name))
+    }
+
+    /// The batch job of a launch of the `transcribe` template, with `volumes` as `(name, mount, max_mb)`.
+    fn volume_lease(&self, volumes: &[(&str, &str, u64)]) -> LeaseContext {
+        let mut lease = self.lease();
+        lease.job.template =
+            Some(serde_json::from_value(serde_json::json!({"id": "transcribe", "version": 1})).unwrap());
+        lease.job.volumes = volumes
+            .iter()
+            .map(|(name, mount, max_mb)| {
+                serde_json::from_value(serde_json::json!({"name": name, "mount": mount, "max_mb": max_mb})).unwrap()
+            })
+            .collect();
+        lease
+    }
+
+    /// One lease with the volume `models`, 64 MiB.
+    fn models_lease(&self) -> LeaseContext {
+        self.volume_lease(&[("models", "/volumes/models", 64)])
+    }
+}
+
+fn volume_meta(fx: &Fx, name: &str) -> serde_json::Value {
+    serde_json::from_slice(&fs::read(fx.volume_dir(name).join("meta.json")).unwrap()).unwrap()
+}
+
+fn in_use_by(store: &VolumeStore, name: &str) -> Option<LeaseId> {
+    let report = store.report_now();
+    report
+        .volumes
+        .iter()
+        .find(|v| v.name == name)
+        .unwrap_or_else(|| panic!("no volume {name} in {report:?}"))
+        .in_use_by
+}
+
+fn error_of(report: LeaseReport) -> Option<String> {
+    let f = finished(report);
+    assert_eq!(f.outcome, Outcome::Error, "{f:?}");
+    f.error
+}
+
+/// SI-H2-9: the volumes of a template job are mounted from the agent's own per-account, hash-named directories,
+/// read-write with `U`; the lock is on disk before the container is created and free once it is removed; what the job
+/// left in the volume is there for the next one.
+#[test]
+fn a_job_mounts_its_volumes_from_the_agents_own_directories() {
+    guarded(Clock::Real, || async {
+        let fx = Fx::new();
+        let store = fx.volume_store(1024);
+        let engine = MockEngine::with(|s| s.exit_now = Some(0));
+        let d = fx.volume_driver(&store, engine.clone());
+        let lease = fx.volume_lease(&[
+            ("tpl:transcribe/models", "/volumes/models", 512),
+            ("cache", "/volumes/cache/hf", 64),
+        ]);
+        let id = lease.lease_id;
+        assert_eq!(d.admit(&lease), Ok(()));
+        let f = finished(run(&d, &fx, lease).await.0);
+        assert_eq!((f.outcome, f.exit_code), (Outcome::Exited, Some(0)));
+
+        let argv = engine.0.lock().unwrap().create_argv.clone().unwrap();
+        let job_dir = fx.jobs_dir().join(id.to_string());
+        let mounts: Vec<&String> = argv
+            .iter()
+            .zip(argv.iter().skip(1))
+            .filter(|(flag, _)| *flag == "-v")
+            .map(|(_, spec)| spec)
+            .collect();
+        assert_eq!(
+            mounts,
+            [
+                &format!("{}/inputs:/inputs:ro,U", job_dir.display()),
+                &format!("{}/outputs:/outputs:rw,U", job_dir.display()),
+                &format!("{}/p2pc:/.p2pc:ro,U", job_dir.display()),
+                &format!(
+                    "{}/data:/volumes/models:rw,U",
+                    fx.volume_dir("tpl:transcribe/models").display()
+                ),
+                &format!("{}/data:/volumes/cache/hf:rw,U", fx.volume_dir("cache").display()),
+            ],
+            "the three per-job directories, then the agent's own volume directories, and nothing else"
+        );
+        assert!(argv.contains(&"--network=none".to_string()) && argv.contains(&"--cap-drop=all".to_string()));
+        // The lock was on disk when the container was created: the lease and its container, for both volumes.
+        let metas = engine.0.lock().unwrap().volume_metas_at_create.clone();
+        assert_eq!(metas.len(), 2);
+        for meta in metas {
+            let meta: serde_json::Value = serde_json::from_str(&meta).unwrap();
+            assert_eq!(meta["holder"]["lease_id"], id.to_string());
+            assert_eq!(meta["holder"]["container"], format!("p2pc-{id}"));
+        }
+        // `podman rm` succeeded: the lock is free, and nothing had to ask whether the container exists.
+        assert_eq!(volume_meta(&fx, "cache").get("holder"), None);
+        assert_eq!(in_use_by(&store, "tpl:transcribe/models"), None);
+        assert!(store.orphaned().is_empty());
+        assert_eq!(engine.count("exists"), 0);
+        assert!(!job_dir.exists(), "the job directory went; the volumes stay");
+
+        // What a job leaves is there for the next one.
+        fs::write(fx.volume_dir("cache").join("data/model.bin"), b"weights").unwrap();
+        let again = fx.volume_lease(&[("cache", "/volumes/cache", 64)]);
+        finished(run(&d, &fx, again).await.0);
+        assert_eq!(
+            fs::read(fx.volume_dir("cache").join("data/model.bin")).unwrap(),
+            b"weights"
+        );
+    });
+}
+
+/// A service is the other kind of job that mounts a volume (H2 §11.3 "Who may mount").
+#[test]
+fn a_service_mounts_its_volume() {
+    guarded(Clock::Real, || async {
+        let fx = Fx::new();
+        let store = fx.volume_store(1024);
+        let engine = MockEngine::default();
+        let mut cfg = fx.service_cfg(FakeProbe::new([], Probe::Pass));
+        cfg.volumes = Some(store.clone());
+        let d = fx.driver_with(cfg, engine.clone());
+        let mut lease = service_lease(&fx, None, 600);
+        lease.job.volumes =
+            serde_json::from_value(serde_json::json!([{"name": "models", "mount": "/volumes/models", "max_mb": 64}]))
+                .unwrap();
+        let id = lease.lease_id;
+        let (tx, _rx) = events();
+        let job = d.prepare(&fx.owner, lease, tx, CancelHandle::new()).await.unwrap();
+        let argv = engine.0.lock().unwrap().create_argv.clone().unwrap();
+        assert!(
+            argv.contains(&format!(
+                "{}/data:/volumes/models:rw,U",
+                fx.volume_dir("models").display()
+            )),
+            "{argv:?}"
+        );
+        assert_eq!(in_use_by(&store, "models"), Some(id));
+        d.cleanup(job).await;
+        assert_eq!(in_use_by(&store, "models"), None);
+    });
+}
+
+/// SI-H2-9: every lease that may not mount a volume is refused before anything exists for it: a node without
+/// volumes, a batch job that is not a template job, another account's lease, a name or a mount that is a path, and a
+/// volume that does not fit the budget.
+#[test]
+fn a_lease_that_may_not_mount_a_volume_is_refused_before_anything_exists() {
+    guarded(Clock::Real, || async {
+        use LeaseRejectReason as R;
+        let fx = Fx::new();
+        // A driver without a volume store does not understand volumes at all.
+        let engine = MockEngine::default();
+        let plain = fx.driver(engine.clone());
+        assert_eq!(plain.admit(&fx.models_lease()), Err(R::InvalidJob));
+        assert_eq!(
+            run(&plain, &fx, fx.models_lease()).await.0,
+            LeaseReport::Rejected(R::InvalidJob)
+        );
+        assert!(fx.data_entries().is_empty() && engine.calls().is_empty());
+
+        let store = fx.volume_store(1024);
+        let d = fx.volume_driver(&store, engine.clone());
+        let before = fx.data_entries();
+        // A batch job that is not a template launch.
+        let mut batch = fx.models_lease();
+        batch.job.template = None;
+        // Another account's lease: SI-1 comes first, and its directory is never derived.
+        let mut foreign = fx.models_lease();
+        foreign.account_id = AccountId::generate();
+        let foreign_dir = fx.data.path().join("volumes").join(foreign.account_id.to_string());
+        // Another template's volume.
+        let other_template = fx.volume_lease(&[("tpl:private-chat/models", "/volumes/models", 64)]);
+        let cases = [
+            ("a batch job without a template", batch, R::InvalidJob),
+            ("another account", foreign, R::NotOwner),
+            ("another template's volume", other_template, R::InvalidJob),
+            (
+                "a name with a slash",
+                fx.volume_lease(&[("a/b", "/volumes/v", 64)]),
+                R::InvalidJob,
+            ),
+            (
+                "a name with dots",
+                fx.volume_lease(&[("../../etc", "/volumes/v", 64)]),
+                R::InvalidJob,
+            ),
+            (
+                "a name with NUL",
+                fx.volume_lease(&[("a\0b", "/volumes/v", 64)]),
+                R::InvalidJob,
+            ),
+            (
+                "a mount outside /volumes",
+                fx.volume_lease(&[("v", "/etc", 64)]),
+                R::InvalidJob,
+            ),
+            (
+                "a mount with dots",
+                fx.volume_lease(&[("v", "/volumes/../etc", 64)]),
+                R::InvalidJob,
+            ),
+            (
+                "a mount that adds an option",
+                fx.volume_lease(&[("v", "/volumes/v:ro", 64)]),
+                R::InvalidJob,
+            ),
+            (
+                "a mount that adds a path",
+                fx.volume_lease(&[("v", "/volumes/v:/etc", 64)]),
+                R::InvalidJob,
+            ),
+            (
+                "more than the volume budget",
+                fx.volume_lease(&[("big", "/volumes/big", 1025)]),
+                R::InsufficientCapacity,
+            ),
+        ];
+        for (what, lease, reason) in cases {
+            // At admission, as the executor asks; and from `prepare`, whoever calls it.
+            if lease.account_id == fx.owner {
+                assert_eq!(d.admit(&lease), Err(reason), "{what}");
+            }
+            assert_eq!(run(&d, &fx, lease).await.0, LeaseReport::Rejected(reason), "{what}");
+        }
+        assert!(engine.calls().is_empty(), "no command ran: {:?}", engine.calls());
+        assert_eq!(fx.data_entries(), before, "nothing was created");
+        assert!(!foreign_dir.exists());
+        assert!(store.report_now().volumes.is_empty());
+    });
+}
+
+/// What admission took goes back when `prepare` refuses the lease before it gets anywhere.
+#[test]
+fn volumes_taken_at_admission_go_back_when_prepare_refuses_the_lease() {
+    guarded(Clock::Real, || async {
+        let fx = Fx::new();
+        let store = fx.volume_store(1024);
+        let mut cfg = fx.cfg(Platform::Wsl2);
+        cfg.volumes = Some(store.clone());
+        cfg.ready = false;
+        let d = fx.driver_with(cfg, MockEngine::default());
+        let lease = fx.models_lease();
+        assert_eq!(d.admit(&lease), Ok(()));
+        // Held from admission on.
+        assert_eq!(
+            d.admit(&fx.models_lease()),
+            Err(LeaseRejectReason::InsufficientCapacity)
+        );
+        assert_eq!(
+            run(&d, &fx, lease).await.0,
+            LeaseReport::Rejected(LeaseRejectReason::UnsupportedSandbox)
+        );
+        assert_eq!(d.admit(&fx.models_lease()), Ok(()), "the volume is free again");
+        assert!(!fx.volume_dir("models").exists(), "and nothing was written for it");
+    });
+}
+
+/// H2 §11.3 "One holder at a time": while a lease holds a volume, a second lease is rejected.
+#[test]
+fn a_volume_is_mounted_by_one_lease_at_a_time() {
+    guarded(Clock::Paused, || async {
+        let fx = Fx::new();
+        let store = fx.volume_store(1024);
+        let engine = MockEngine::default();
+        let d = fx.volume_driver(&store, engine.clone());
+        let mut first = fx.models_lease();
+        first.job.timeout_s = 3600;
+        let first_id = first.lease_id;
+        let cancel = CancelHandle::new();
+        let mut job = prepare_and_start(&d, &fx, first, cancel.clone()).await;
+        assert_eq!(in_use_by(&store, "models"), Some(first_id));
+        assert_eq!(
+            run(&d, &fx, fx.models_lease()).await.0,
+            LeaseReport::Rejected(LeaseRejectReason::InsufficientCapacity)
+        );
+        assert_eq!(engine.count("create"), 1, "nothing was created for the second lease");
+        // Another volume is free to take.
+        let other = fx.volume_lease(&[("other", "/volumes/other", 64)]);
+        assert_eq!(d.admit(&other), Ok(()));
+        store.cancel_reservation(&other.lease_id, other.epoch);
+
+        cancel.cancel();
+        engine.exit(143);
+        d.wait(&mut job).await.unwrap();
+        // The lease ended; the lock goes with the container, in `cleanup`.
+        assert_eq!(in_use_by(&store, "models"), Some(first_id));
+        d.cleanup(job).await;
+        assert_eq!(in_use_by(&store, "models"), None);
+        let engine2 = MockEngine::with(|s| s.exit_now = Some(0));
+        let d = fx.volume_driver(&store, engine2);
+        assert_eq!(
+            finished(run(&d, &fx, fx.models_lease()).await.0).outcome,
+            Outcome::Exited
+        );
+    });
+}
+
+/// SI-H2-9: a symlink (to a file and to a directory outside the volume), a FIFO and a hard-linked file, planted in a
+/// volume before it is mounted again, each fail the lease with `volume_unsafe` before any container is created; the
+/// link's target is untouched; the volume is kept as it is.
+#[test]
+fn a_planted_link_fifo_or_hard_link_fails_the_lease_with_volume_unsafe() {
+    use std::os::unix::fs::{MetadataExt, symlink};
+    type Plant = fn(&Path, &Path);
+    let cases: [(&str, Plant); 5] = [
+        ("a symlink to a file", |data, outside| {
+            symlink(outside.join("secret"), data.join("link")).unwrap();
+        }),
+        ("a symlink to a directory", |data, outside| {
+            symlink(outside, data.join("dir-link")).unwrap();
+        }),
+        ("a nested symlink", |data, outside| {
+            fs::create_dir(data.join("sub")).unwrap();
+            symlink(outside, data.join("sub/dir-link")).unwrap();
+        }),
+        ("a FIFO", |data, _| {
+            rustix::fs::mknodat(
+                rustix::fs::CWD,
+                data.join("pipe"),
+                rustix::fs::FileType::Fifo,
+                rustix::fs::Mode::from_raw_mode(0o600),
+                0,
+            )
+            .unwrap();
+        }),
+        ("a hard-linked file", |data, outside| {
+            fs::hard_link(outside.join("secret"), data.join("hard")).unwrap();
+        }),
+    ];
+    for (what, plant) in cases {
+        guarded(Clock::Real, move || async move {
+            let fx = Fx::new();
+            let outside = tempfile::tempdir().unwrap();
+            fs::write(outside.path().join("secret"), b"the owner's file").unwrap();
+            let store = fx.volume_store(1024);
+            let engine = MockEngine::with(|s| s.exit_now = Some(0));
+            let d = fx.volume_driver(&store, engine.clone());
+            // A first job used the volume and planted something in it.
+            finished(run(&d, &fx, fx.models_lease()).await.0);
+            let data = fx.volume_dir("models").join("data");
+            plant(&data, outside.path());
+            let facts = |p: &Path| {
+                let m = fs::symlink_metadata(p).unwrap();
+                (m.uid(), m.gid(), m.mode(), m.len())
+            };
+            let (file_before, dir_before) = (facts(&outside.path().join("secret")), facts(outside.path()));
+            let created = engine.count("create");
+
+            for attempt in 0..2 {
+                let lease = fx.models_lease();
+                let id = lease.lease_id;
+                assert_eq!(
+                    error_of(run(&d, &fx, lease).await.0).as_deref(),
+                    Some(error_code::VOLUME_UNSAFE),
+                    "{what}, attempt {attempt}"
+                );
+                // The cleanup of a lease that failed in `prepare` runs in the background.
+                d.drain_background().await;
+                assert_eq!(engine.count("create"), created, "{what}: no container was created");
+                assert_eq!(engine.count("start"), 1, "{what}: and none was started");
+                // The lease's lock went with it (Podman confirmed there is no container of it).
+                assert_eq!(in_use_by(&store, "models"), None, "{what}");
+                assert!(!fx.jobs_dir().join(id.to_string()).exists(), "{what}");
+            }
+            // The target keeps its owner, its mode and its content; the volume is kept for the owner to delete.
+            assert_eq!(facts(&outside.path().join("secret")), file_before, "{what}");
+            assert_eq!(facts(outside.path()), dir_before, "{what}");
+            assert_eq!(
+                fs::read(outside.path().join("secret")).unwrap(),
+                b"the owner's file",
+                "{what}"
+            );
+            assert!(
+                fs::read_dir(&data).unwrap().count() >= 1,
+                "{what}: not repaired in place"
+            );
+            store.delete("models").unwrap();
+            assert_eq!(fs::read(outside.path().join("secret")).unwrap(), b"the owner's file");
+            assert_eq!(
+                finished(run(&d, &fx, fx.models_lease()).await.0).outcome,
+                Outcome::Exited,
+                "{what}: a fresh volume after the owner deleted it"
+            );
+        });
+    }
+}
+
+/// SI-H2-9: a symlink replacing `data/` or `<hash>/` itself fails the lease with `volume_unsafe`, and nothing is
+/// mounted or written where it points.
+#[test]
+fn a_symlink_in_place_of_the_volume_directory_fails_the_lease_with_volume_unsafe() {
+    for replace_data in [true, false] {
+        guarded(Clock::Real, move || async move {
+            let fx = Fx::new();
+            let outside = tempfile::tempdir().unwrap();
+            let store = fx.volume_store(1024);
+            let engine = MockEngine::with(|s| s.exit_now = Some(0));
+            let d = fx.volume_driver(&store, engine.clone());
+            finished(run(&d, &fx, fx.models_lease()).await.0);
+            let path = if replace_data {
+                fx.volume_dir("models").join("data")
+            } else {
+                fx.volume_dir("models")
+            };
+            fs::rename(&path, fx.data.path().join("moved-away")).unwrap();
+            std::os::unix::fs::symlink(outside.path(), &path).unwrap();
+            assert_eq!(
+                error_of(run(&d, &fx, fx.models_lease()).await.0).as_deref(),
+                Some(error_code::VOLUME_UNSAFE)
+            );
+            d.drain_background().await;
+            assert_eq!(engine.count("create"), 1, "only the first job's container");
+            assert_eq!(
+                fs::read_dir(outside.path()).unwrap().count(),
+                0,
+                "nothing was written through the link"
+            );
+        });
+    }
+}
+
+/// SI-H2-9, the one-holder lock: a lease that ends while `podman rm` fails keeps the lock, the volume is reported in
+/// use by it, and a second lease is rejected. Every sweep retries the removal; only Podman's own word that the
+/// container is gone frees the volume, and a command that fails is not that word.
+#[test]
+fn a_lease_that_ends_while_podman_rm_fails_keeps_the_lock() {
+    guarded(Clock::Real, || async {
+        let fx = Fx::new();
+        let store = fx.volume_store(1024);
+        let engine = MockEngine::with(|s| {
+            s.exit_now = Some(0);
+            s.fail_remove = true;
+            s.container_exists = Some(true);
+        });
+        let d = fx.volume_driver(&store, engine.clone());
+        let lease = fx.models_lease();
+        let id = lease.lease_id;
+        // The job itself ran and ended.
+        let f = finished(run(&d, &fx, lease).await.0);
+        assert_eq!((f.outcome, f.exit_code), (Outcome::Exited, Some(0)));
+        assert!(engine.calls().contains(&format!("exists p2pc-{id}")));
+
+        let still_held = |why: &str| {
+            assert_eq!(store.orphaned(), [id], "{why}");
+            assert_eq!(in_use_by(&store, "models"), Some(id), "{why}");
+            assert_eq!(
+                volume_meta(&fx, "models")["holder"]["lease_id"],
+                id.to_string(),
+                "{why}"
+            );
+        };
+        still_held("podman rm failed and the container still exists");
+        let created = engine.count("create");
+        assert_eq!(
+            run(&d, &fx, fx.models_lease()).await.0,
+            LeaseReport::Rejected(LeaseRejectReason::InsufficientCapacity)
+        );
+        assert_eq!(
+            d.admit(&fx.models_lease()),
+            Err(LeaseRejectReason::InsufficientCapacity)
+        );
+        assert_eq!(engine.count("create"), created);
+        assert!(matches!(
+            store.delete("models"),
+            Err(crate::volumes::DeleteError::InUse(Some(lease))) if lease == id
+        ));
+
+        // The sweep retries the removal. Still failing, and the container still there: nothing changes.
+        d.maintain_volumes().await;
+        still_held("the retry failed too");
+        // Podman cannot even say whether it exists: that confirms nothing.
+        engine.0.lock().unwrap().container_exists = None;
+        d.maintain_volumes().await;
+        still_held("an error is not an answer");
+        // `podman container exists` reports it absent.
+        engine.0.lock().unwrap().container_exists = Some(false);
+        d.maintain_volumes().await;
+        assert!(store.orphaned().is_empty());
+        assert_eq!(in_use_by(&store, "models"), None);
+        assert_eq!(volume_meta(&fx, "models").get("holder"), None);
+
+        // Or `podman rm` works at a later sweep.
+        engine.0.lock().unwrap().container_exists = Some(true);
+        let lease = fx.models_lease();
+        let id = lease.lease_id;
+        finished(run(&d, &fx, lease).await.0);
+        assert_eq!(in_use_by(&store, "models"), Some(id));
+        engine.0.lock().unwrap().fail_remove = false;
+        d.maintain_volumes().await;
+        assert_eq!(in_use_by(&store, "models"), None);
+        assert_eq!(
+            finished(run(&d, &fx, fx.models_lease()).await.0).outcome,
+            Outcome::Exited
+        );
+    });
+}
+
+/// SI-H2-9, the one-holder lock across a restart: an agent restarted with an orphaned container still holding the
+/// volume walks and mounts nothing until its sweep has removed the container and Podman reports it absent.
+#[test]
+fn a_restarted_agent_mounts_nothing_until_its_sweep_confirmed_the_orphan_gone() {
+    guarded(Clock::Real, || async {
+        let fx = Fx::new();
+        let held_by = {
+            let store = fx.volume_store(1024);
+            let d = fx.volume_driver(&store, MockEngine::default());
+            let lease = fx.models_lease();
+            let id = lease.lease_id;
+            let (tx, _rx) = events();
+            let job = d.prepare(&fx.owner, lease, tx, CancelHandle::new()).await.unwrap();
+            // The agent is killed here: no cleanup runs, and its container lives on.
+            std::mem::forget(job);
+            id
+        };
+        // What that container can still do: plant a link. A walk would refuse it with `volume_unsafe`, so any other
+        // refusal shows that nothing was walked.
+        std::os::unix::fs::symlink("/etc", fx.volume_dir("models").join("data/planted")).unwrap();
+        // A job directory of the dead process, as the sweep finds it.
+        assert!(fx.jobs_dir().join(held_by.to_string()).exists());
+
+        // The restart. Podman still has the container, and cannot remove it yet.
+        let store = fx.volume_store(1024);
+        let engine = MockEngine::with(|s| {
+            s.exit_now = Some(0);
+            s.fail_remove = true;
+            s.container_exists = Some(true);
+            s.containers = vec![LeaseContainer {
+                name: format!("p2pc-{held_by}"),
+                lease: held_by.to_string(),
+            }];
+        });
+        let d = fx.volume_driver(&store, engine.clone());
+        assert_eq!(
+            in_use_by(&store, "models"),
+            Some(held_by),
+            "held from the start, before any sweep"
+        );
+        assert_eq!(
+            run(&d, &fx, fx.models_lease()).await.0,
+            LeaseReport::Rejected(LeaseRejectReason::InsufficientCapacity),
+            "even before the sweep ran"
+        );
+        let report = d.sweep_orphans(&HashSet::new()).await;
+        assert!(report.volume_locks.is_empty(), "{report:?}");
+        assert!(!report.errors.is_empty());
+        assert_eq!(in_use_by(&store, "models"), Some(held_by));
+        assert_eq!(
+            run(&d, &fx, fx.models_lease()).await.0,
+            LeaseReport::Rejected(LeaseRejectReason::InsufficientCapacity),
+            "rejected, not walked: the container may still write to the volume"
+        );
+        assert_eq!(engine.count("create"), 0);
+        assert_eq!(
+            volume_meta(&fx, "models")["holder"]["lease_id"],
+            held_by.to_string(),
+            "the lock on disk is untouched"
+        );
+
+        // The sweep removes the container: Podman confirms it gone, and only then is the lock cleared.
+        engine.0.lock().unwrap().fail_remove = false;
+        let report = d.sweep_orphans(&HashSet::new()).await;
+        assert_eq!(report.containers, [format!("p2pc-{held_by}")]);
+        assert_eq!(report.volume_locks, [held_by.to_string()]);
+        assert_eq!(in_use_by(&store, "models"), None);
+        assert_eq!(volume_meta(&fx, "models").get("holder"), None);
+        // Now the volume is walked for the next lease, which finds the link.
+        assert_eq!(
+            error_of(run(&d, &fx, fx.models_lease()).await.0).as_deref(),
+            Some(error_code::VOLUME_UNSAFE)
+        );
+        d.drain_background().await;
+        assert_eq!(engine.count("create"), 0);
+        // And, once clean, mounted.
+        fs::remove_file(fx.volume_dir("models").join("data/planted")).unwrap();
+        assert_eq!(
+            finished(run(&d, &fx, fx.models_lease()).await.0).outcome,
+            Outcome::Exited
+        );
+        assert_eq!(engine.count("create"), 1);
+    });
+}
+
+/// A lease the sweep is told is active keeps its volume: the sweep never frees what a running lease holds.
+#[test]
+fn the_sweep_leaves_the_volumes_of_active_leases_alone() {
+    guarded(Clock::Real, || async {
+        let fx = Fx::new();
+        let held_by = {
+            let store = fx.volume_store(1024);
+            let d = fx.volume_driver(&store, MockEngine::default());
+            let lease = fx.models_lease();
+            let id = lease.lease_id;
+            let (tx, _rx) = events();
+            std::mem::forget(d.prepare(&fx.owner, lease, tx, CancelHandle::new()).await.unwrap());
+            id
+        };
+        let store = fx.volume_store(1024);
+        let engine = MockEngine::default();
+        let d = fx.volume_driver(&store, engine.clone());
+        let report = d.sweep_orphans(&HashSet::from([held_by])).await;
+        assert!(report.volume_locks.is_empty());
+        assert_eq!(in_use_by(&store, "models"), Some(held_by));
+        assert!(!engine.calls().contains(&format!("rm p2pc-{held_by}")));
+    });
+}
+
+/// H2 §11.3 "Size": a volume over its `max_mb` stops the lease with `volume_limit`, measured every 2 s like the
+/// disk, and it fails closed like the disk: over the entry budget, or unmeasurable three times in a row.
+#[test]
+fn a_volume_over_its_limit_stops_the_lease_with_volume_limit() {
+    type Fill = fn(&Path);
+    let cases: [(&str, Fill, &str); 3] = [
+        (
+            "over max_mb",
+            |volume| {
+                // A sparse file: its apparent size counts.
+                fs::File::create(volume.join("data/blob"))
+                    .unwrap()
+                    .set_len(65 << 20)
+                    .unwrap();
+            },
+            "kill Kill at 2s",
+        ),
+        (
+            "over the entry budget",
+            |volume| {
+                for i in 0..6 {
+                    fs::write(volume.join("data").join(i.to_string()), b"").unwrap();
+                }
+            },
+            "kill Kill at 2s",
+        ),
+        (
+            "unmeasurable three times",
+            |volume| {
+                fs::rename(volume.join("data"), volume.join("gone")).unwrap();
+            },
+            "kill Kill at 6s",
+        ),
+    ];
+    for (what, fill, kill) in cases {
+        guarded(Clock::Paused, move || async move {
+            let fx = Fx::new();
+            let store = fx.volume_store_with(1024, 5, WallClock::new());
+            let engine = MockEngine::default();
+            let d = fx.volume_driver(&store, engine.clone());
+            let mut lease = fx.models_lease();
+            lease.job.timeout_s = 3600;
+            mark_t0();
+            let mut job = prepare_and_start(&d, &fx, lease, CancelHandle::new()).await;
+            fill(&fx.volume_dir("models"));
+            let f = d.wait(&mut job).await.unwrap();
+            assert_eq!(
+                (f.outcome, f.error.as_deref()),
+                (Outcome::Error, Some(error_code::VOLUME_LIMIT)),
+                "{what}"
+            );
+            assert_eq!(
+                kills(&engine),
+                [kill],
+                "{what}: SIGKILL, no grace, as for the disk limit"
+            );
+            d.cleanup(job).await;
+            assert_eq!(store.orphaned(), Vec::<LeaseId>::new(), "{what}");
+        });
+    }
+}
+
+/// A volume within its limit never stops the job, however long it runs.
+#[test]
+fn a_volume_within_its_limit_is_left_alone() {
+    guarded(Clock::Paused, || async {
+        let fx = Fx::new();
+        let store = fx.volume_store(1024);
+        let engine = MockEngine::default();
+        let d = fx.volume_driver(&store, engine.clone());
+        let mut lease = fx.models_lease();
+        lease.job.timeout_s = 3600;
+        mark_t0();
+        let mut job = prepare_and_start(&d, &fx, lease, CancelHandle::new()).await;
+        fs::File::create(fx.volume_dir("models").join("data/blob"))
+            .unwrap()
+            .set_len(63 << 20)
+            .unwrap();
+        let exit = exit_at(&engine, 600, 0);
+        let f = d.wait(&mut job).await.unwrap();
+        exit.await.unwrap();
+        assert_eq!((f.outcome, f.exit_code), (Outcome::Exited, Some(0)));
+        assert!(kills(&engine).is_empty());
+        d.cleanup(job).await;
+        assert_eq!(
+            store.report_now().volumes[0].size_mb,
+            64,
+            "63 MiB and a directory, rounded up"
+        );
+    });
+}
+
+/// The data disk: below the floor while `path` exists.
+#[derive(Debug)]
+struct FullWhile(Mutex<Option<PathBuf>>);
+
+impl disk::FreeSpace for FullWhile {
+    fn space(&self, _: &Path) -> std::io::Result<disk::DiskSpace> {
+        let full = self.0.lock().unwrap().as_ref().is_some_and(|p| p.exists());
+        Ok(disk::DiskSpace {
+            free_bytes: if full { 1 << 30 } else { 50 << 30 },
+            total_bytes: 100 << 30,
+        })
+    }
+}
+
+/// H2 §11.3 "Retention": under the H1 disk floor the agent evicts unused volumes before it refuses a lease or kills
+/// a job.
+#[test]
+fn under_the_disk_floor_unused_volumes_go_before_a_job_does() {
+    guarded(Clock::Paused, || async {
+        let fx = Fx::new();
+        let clock = WallClock::new();
+        let store = fx.volume_store_with(1024, 1000, clock.clone());
+        let space = Arc::new(FullWhile(Mutex::new(None)));
+        let engine = MockEngine::default();
+        let mut cfg = fx.cfg(Platform::Wsl2);
+        cfg.volumes = Some(store.clone());
+        cfg.free_space = space.clone();
+        let d = fx.driver_with(cfg, engine.clone());
+        // Two unused volumes.
+        for name in ["first", "second"] {
+            let lease = fx.volume_lease(&[(name, "/volumes/v", 64)]);
+            let (tx, _rx) = events();
+            let job = d.prepare(&fx.owner, lease, tx, CancelHandle::new()).await.unwrap();
+            d.cleanup(job).await;
+            clock.advance(time::Duration::hours(1));
+        }
+        assert_eq!(store.report_now().volumes.len(), 2);
+
+        // Below the floor while `first` is on disk: a new lease is taken, and `first` is gone.
+        *space.0.lock().unwrap() = Some(fx.volume_dir("first"));
+        let mut lease = fx.lease();
+        lease.job.timeout_s = 3600;
+        mark_t0();
+        let mut job = prepare_and_start(&d, &fx, lease, CancelHandle::new()).await;
+        assert!(!fx.volume_dir("first").exists());
+        assert!(fx.volume_dir("second").exists(), "no more than it takes");
+
+        // Below the floor again while the job runs: `second` goes, the job does not.
+        *space.0.lock().unwrap() = Some(fx.volume_dir("second"));
+        let exit = exit_at(&engine, 10, 0);
+        let f = d.wait(&mut job).await.unwrap();
+        exit.await.unwrap();
+        assert_eq!((f.outcome, f.exit_code), (Outcome::Exited, Some(0)));
+        assert!(kills(&engine).is_empty());
+        assert!(!fx.volume_dir("second").exists());
+        d.cleanup(job).await;
+
+        // Nothing unused is left: now the floor does what it does in H1.
+        *space.0.lock().unwrap() = Some(fx.data.path().to_path_buf());
+        assert_eq!(
+            run(&d, &fx, fx.lease()).await.0,
+            LeaseReport::Rejected(LeaseRejectReason::InsufficientCapacity)
+        );
+    });
+}
+
+/// The periodic upkeep deletes the unused volumes past their retention, and never one in use.
+#[test]
+fn the_upkeep_expires_unused_volumes() {
+    guarded(Clock::Real, || async {
+        let fx = Fx::new();
+        let clock = WallClock::new();
+        let store = fx.volume_store_with(1024, 1000, clock.clone());
+        let engine = MockEngine::with(|s| s.exit_now = Some(0));
+        let d = fx.volume_driver(&store, engine.clone());
+        finished(run(&d, &fx, fx.volume_lease(&[("stale", "/volumes/v", 64)])).await.0);
+        let held = fx.volume_lease(&[("held", "/volumes/v", 64)]);
+        let (tx, _rx) = events();
+        let job = d.prepare(&fx.owner, held, tx, CancelHandle::new()).await.unwrap();
+        clock.advance(time::Duration::days(29));
+        d.maintain_volumes().await;
+        assert!(fx.volume_dir("stale").exists());
+        clock.advance(time::Duration::days(1));
+        d.maintain_volumes().await;
+        assert!(!fx.volume_dir("stale").exists());
+        clock.advance(time::Duration::days(365));
+        d.maintain_volumes().await;
+        assert!(fx.volume_dir("held").exists(), "a volume in use never expires");
+        d.cleanup(job).await;
+        // A driver without volumes has nothing to keep.
+        fx.driver(MockEngine::default()).maintain_volumes().await;
     });
 }

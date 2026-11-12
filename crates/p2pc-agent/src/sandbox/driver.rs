@@ -3,14 +3,18 @@
 //! [`PodmanDriver`]: the §9 lifecycle on top of an [`Engine`], a [`Cgroups`] tree and an [`Egress`] provider.
 //!
 //! ```text
-//! prepare: SI-1 owner check → validation, sandbox class, GPU → job dir, inputs, shim, env file → lease cgroup
+//! prepare: SI-1 owner check → validation, sandbox class, GPU → the lease's volumes (taken, in memory)
+//!          → job dir, inputs, shim, env file → lease cgroup
 //!          → egress socket (if asked) → ingress socket and ports file (a service)
-//!          → pull if missing (phase "pulling") → size cap → podman create → delete env file
+//!          → pull if missing (phase "pulling") → size cap
+//!          → volumes: lock on disk, then the no-follow check → podman create → delete env file
 //! start:   podman start --attach (logs and exit code) → log pump
-//! wait:    exit, or timeout / cancel (SIGTERM, grace, SIGKILL), or disk limit (SIGKILL); then cgroup counters
+//! wait:    exit, or timeout / cancel (SIGTERM, grace, SIGKILL), or disk or volume limit (SIGKILL); then cgroup
+//!          counters
 //!          services also: health checks (a failure stops them with SIGTERM, grace, SIGKILL) and usage samples
 //! collect: podman rm -f, then the SI-9 walk of outputs/
-//! cleanup: podman rm -f, remove the cgroup, remove the job dir; also run by the guard on errors and panics
+//! cleanup: podman rm -f, the volumes' lock (freed only if Podman confirms the container gone), remove the cgroup,
+//!          remove the job dir; also run by the guard on errors and panics
 //! ```
 //!
 //! **Services** (H2 §7.2, §11) are the same sandbox, with the same fixed argv, that lives longer: up to their
@@ -26,6 +30,20 @@
 //! `ingress.sock`, which `prepare` creates in the job's `p2pc/` next to `ports.json` before the container exists, and
 //! which `cleanup` removes. Both sit in the read-only `/.p2pc` mount the container already has: the `podman create`
 //! argv of a service is the batch job's, `--network=none` included, and no port is published anywhere.
+//!
+//! **Persistent volumes** (H2 §11.3, [`crate::volumes`]; hard rule 3's one exception). A lease with `volumes` is
+//! taken only by a driver that has a [`VolumeStore`] ([`DriverConfig::volumes`]), and only for a service or a template
+//! job of the enrolled account. The order is what keeps the exception narrow:
+//! 1. the volumes are taken in memory at admission ([`Sandbox::admit`], and again in `prepare`): a second lease gets
+//!    `insufficient_capacity`;
+//! 2. right before `podman create`, the holder is written to each volume's `meta.json` and the whole tree is walked
+//!    without following links ([`VolumeStore::lock_and_check`]); a refusal fails the lease with `volume_unsafe` and
+//!    nothing is mounted;
+//! 3. the argv gets one `-v <the agent's own directory>:<mount>:rw,U` per volume ([`argv`]);
+//! 4. while the job runs, each volume is measured with the disk (`volume_limit`);
+//! 5. the lock is freed **only** when Podman confirmed that the container is gone: `podman rm` succeeded, or
+//!    `podman container exists` reports it absent. Otherwise it stays, and [`PodmanDriver::sweep_orphans`] (at start)
+//!    and [`PodmanDriver::maintain_volumes`] (every minute) retry the removal.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -61,6 +79,7 @@ use super::{
     Phase, STOP_GRACE, Sandbox, SandboxError, SandboxEvent, UsageSample, error_code, run_lease,
 };
 use crate::config::Runtime;
+use crate::volumes::{Mount, VolumeStore};
 
 const MIB: u64 = 1024 * 1024;
 /// Default largest image the agent accepts, in MiB.
@@ -116,6 +135,9 @@ pub struct DriverConfig {
     /// How often a service's usage is sampled from its lease cgroup for the heartbeat (H2 §11.4: at most once a
     /// minute). Shorter values are raised to [`USAGE_INTERVAL`].
     pub usage_interval: Duration,
+    /// The node's persistent volumes (H2 §11.3). `None`, the default: the node mounts no volume, and a lease with
+    /// `volumes` is refused as `invalid_job`.
+    pub volumes: Option<VolumeStore>,
 }
 
 impl DriverConfig {
@@ -142,6 +164,7 @@ impl DriverConfig {
             health_probe: None,
             ingress: None,
             usage_interval: USAGE_INTERVAL,
+            volumes: None,
         }
     }
 }
@@ -342,20 +365,89 @@ pub struct SweepReport {
     pub job_dirs: Vec<String>,
     /// Lease cgroups (lease IDs).
     pub cgroups: Vec<String>,
+    /// Leases whose volume locks were freed: Podman confirmed their containers gone (H2 §11.3).
+    pub volume_locks: Vec<String>,
     /// What could not be listed or removed.
     pub errors: Vec<String>,
 }
 
-/// Removes the container, then the cgroup, then the job directory. Logs failures; never panics.
-async fn cleanup_steps<E: Engine, C: Cgroups>(shared: &Shared<E, C>, lease: &LeaseId, name: &str, dir: &JobDir) {
-    if let Err(e) = shared.engine.remove(name).await {
+/// Removes the container, settles the lock of the lease's volumes, then removes the cgroup and the job directory.
+/// Logs failures; never panics.
+async fn cleanup_steps<E: Engine, C: Cgroups>(
+    shared: &Shared<E, C>,
+    lease: &LeaseId,
+    name: &str,
+    dir: &JobDir,
+    volumes: Option<&VolumeStore>,
+) {
+    let removed = shared.engine.remove(name).await;
+    if let Err(e) = &removed {
         tracing::warn!(lease = %lease, error = %e, "cannot remove the container; the next orphan sweep will");
+    }
+    if let Some(store) = volumes {
+        settle_volume_lock(&shared.engine, store, lease, name, removed.is_ok()).await;
     }
     if let Err(e) = shared.cgroups.remove(lease).await {
         tracing::warn!(lease = %lease, error = %e, "cannot remove the lease cgroup");
     }
     if let Err(e) = remove_job_dir(&shared.engine, dir).await {
         tracing::warn!(lease = %lease, error = %e, "cannot remove the job directory");
+    }
+}
+
+/// Whether Podman confirms that the container `name` is gone (H2 §11.3 "One holder at a time"): `podman rm` on it
+/// succeeded (`removed`), or `podman container exists` reports it absent. A failure of either command confirms
+/// nothing.
+async fn container_gone<E: Engine>(engine: &E, name: &str, removed: bool) -> bool {
+    removed || matches!(engine.container_exists(name).await, Ok(false))
+}
+
+/// The end of a lease's run, for its volumes: the lock is freed when Podman confirmed the container gone, and kept
+/// otherwise (the volume is then reported `in_use_by` the lease, and every sweep retries the removal).
+async fn settle_volume_lock<E: Engine>(engine: &E, store: &VolumeStore, lease: &LeaseId, name: &str, removed: bool) {
+    let gone = container_gone(engine, name, removed).await;
+    if !gone {
+        tracing::warn!(
+            lease_id = %lease,
+            container = name,
+            "the container could not be confirmed gone: its volumes stay locked, and the sweep retries the removal"
+        );
+    }
+    let (store, lease) = (store.clone(), *lease);
+    let settled = blocking(move || {
+        if gone {
+            store.release(&lease);
+        } else {
+            store.orphan(&lease);
+        }
+    })
+    .await;
+    if let Err(e) = settled {
+        tracing::warn!(error = %e, "cannot settle the lock of a lease's volumes");
+    }
+}
+
+/// What [`VolumeStore::reserve`] took for a lease, until the cleanup guard exists: dropped on an early return of
+/// `prepare`, it gives the volumes back. Nothing was written for them yet, and no container was created.
+struct Reservation {
+    store: VolumeStore,
+    lease_id: LeaseId,
+    epoch: u64,
+    armed: bool,
+}
+
+impl Reservation {
+    /// The cleanup guard has the volumes now.
+    fn keep(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.store.cancel_reservation(&self.lease_id, self.epoch);
+        }
     }
 }
 
@@ -409,6 +501,8 @@ struct Guard<E: Engine, C: Cgroups> {
     lease: LeaseId,
     name: String,
     dir: JobDir,
+    /// The store that holds the lease's volumes, if it has any: their lock is settled with the container's removal.
+    volumes: Option<VolumeStore>,
     armed: bool,
 }
 
@@ -417,15 +511,16 @@ impl<E: Engine, C: Cgroups> Drop for Guard<E, C> {
         if !self.armed {
             return;
         }
-        let (shared, lease, name, dir) = (
+        let (shared, lease, name, dir, volumes) = (
             Arc::clone(&self.shared),
             self.lease,
             self.name.clone(),
             self.dir.clone(),
+            self.volumes.clone(),
         );
         match tokio::runtime::Handle::try_current() {
             Ok(rt) => {
-                let task = rt.spawn(async move { cleanup_steps(&shared, &lease, &name, &dir).await });
+                let task = rt.spawn(async move { cleanup_steps(&shared, &lease, &name, &dir, volumes.as_ref()).await });
                 self.shared
                     .background
                     .lock()
@@ -433,7 +528,8 @@ impl<E: Engine, C: Cgroups> Drop for Guard<E, C> {
                     .push(task);
             }
             Err(_) => {
-                // No runtime (process exit): the directory now, the container and cgroup at the next sweep.
+                // No runtime (process exit): the directory now, the container and cgroup at the next sweep. A
+                // volume's lock stays on disk until that sweep confirmed the container gone.
                 let _ = dir.remove();
             }
         }
@@ -460,6 +556,8 @@ pub struct PodmanJob<E: Engine, C: Cgroups, S> {
     ingress: Option<IngressSession>,
     /// A service's health policy and probe; `None` for a batch job.
     service: Option<ServiceRun>,
+    /// The persistent volumes the container mounts (H2 §11.3), locked for this lease.
+    volumes: Vec<Mount>,
     guard: Guard<E, C>,
 }
 
@@ -537,6 +635,8 @@ enum Stop {
     Floor,
     /// A service's health check failed (H2 §7.2).
     Health,
+    /// A volume went over its `max_mb` or could not be measured (H2 §11.3 "Size").
+    Volume,
     /// The exit future failed.
     Lost,
 }
@@ -651,6 +751,8 @@ impl<E: Engine, C: Cgroups, X: Egress> PodmanDriver<E, C, X> {
         let active: HashSet<String> = active.iter().map(ToString::to_string).collect();
         let mut report = SweepReport::default();
         let engine = &self.shared.engine;
+        // Whether the node's containers were listed and every one of a lease this process does not run is gone.
+        let mut swept = true;
         match engine.lease_containers().await {
             Ok(list) => {
                 for c in list {
@@ -659,11 +761,24 @@ impl<E: Engine, C: Cgroups, X: Egress> PodmanDriver<E, C, X> {
                     }
                     match engine.remove(&c.name).await {
                         Ok(()) => report.containers.push(c.name),
-                        Err(e) => report.errors.push(e.msg),
+                        Err(e) => {
+                            swept = false;
+                            report.errors.push(e.msg);
+                        }
                     }
                 }
             }
-            Err(e) => report.errors.push(e.msg),
+            Err(e) => {
+                swept = false;
+                report.errors.push(e.msg);
+            }
+        }
+        // H2 §11.3: only now, with their containers confirmed gone, do the volumes those leases held become free.
+        if let Some(store) = &self.cfg.volumes {
+            report.volume_locks = self.release_orphaned_locks(store, &active).await;
+            if swept {
+                store.sweep_finished();
+            }
         }
         // Listing and removing run off the runtime thread (`blocking`, `remove_job_dir`).
         let jobs = self.cfg.data_dir.join(JOBS_DIR);
@@ -693,6 +808,94 @@ impl<E: Engine, C: Cgroups, X: Egress> PodmanDriver<E, C, X> {
             }
         }
         report
+    }
+
+    /// Retries the removal of the containers that still hold a volume though their lease has no run in this process
+    /// (it ended while `podman rm` failed, or an earlier agent process left it), and frees the lock of each one that
+    /// Podman confirms gone (H2 §11.3). The container is named by the lease, never by a string read from disk.
+    /// Returns the leases whose volumes were freed.
+    async fn release_orphaned_locks(&self, store: &VolumeStore, active: &HashSet<String>) -> Vec<String> {
+        let engine = &self.shared.engine;
+        let mut released = Vec::new();
+        for lease in store.orphaned() {
+            if active.contains(&lease.to_string()) {
+                continue;
+            }
+            let name = argv::container_name(&lease);
+            let removed = match engine.remove(&name).await {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(lease_id = %lease, error = %e, "cannot remove a container that holds a volume");
+                    false
+                }
+            };
+            if !container_gone(engine, &name, removed).await {
+                tracing::warn!(lease_id = %lease, container = %name, "a volume stays locked: its container is not confirmed gone");
+                continue;
+            }
+            let store = store.clone();
+            if blocking(move || store.release(&lease)).await.unwrap_or(false) {
+                tracing::info!(lease_id = %lease, "the lock of a lease's volumes is free: its container is gone");
+                released.push(lease.to_string());
+            }
+        }
+        released
+    }
+
+    /// One round of volume upkeep (H2 §11.3), run every [`crate::volumes::MAINTENANCE_INTERVAL`]: retries the
+    /// removal of containers that still hold a volume, then deletes the unused volumes past their retention.
+    pub async fn maintain_volumes(&self) {
+        let Some(store) = self.cfg.volumes.clone() else {
+            return;
+        };
+        self.release_orphaned_locks(&store, &HashSet::new()).await;
+        if let Err(e) = blocking(move || store.collect_garbage()).await {
+            tracing::warn!(error = %e, "the volume collection failed");
+        }
+    }
+
+    /// H2 §11.3 "Retention": under the disk floor, unused volumes go before a job is refused or killed. Whether
+    /// the disk is above the floor afterwards.
+    async fn evict_volumes_for_floor(&self) -> bool {
+        let Some(store) = self.cfg.volumes.clone() else {
+            return false;
+        };
+        let free_space = Arc::clone(&self.cfg.free_space);
+        blocking(move || store.evict_for_floor(free_space.as_ref()))
+            .await
+            .unwrap_or(false)
+    }
+
+    /// Measures the lease's volumes as the disk is measured (H2 §11.3 "Size"): over `max_mb` or over the entry
+    /// budget stops the job, and so do three measurements in a row that could not be made.
+    async fn volumes_over<S>(&self, job: &PodmanJob<E, C, S>, failed: &mut u32) -> Option<Stop> {
+        let store = job.guard.volumes.clone().filter(|_| !job.volumes.is_empty())?;
+        let (lease_id, epoch, expected) = (job.lease_id, job.epoch, job.volumes.len());
+        let usage = blocking(move || store.usage(&lease_id, epoch))
+            .await
+            .unwrap_or_default();
+        // A volume that is not locked for this lease any more cannot be vouched for either.
+        let mut unmeasured = usage.len() != expected;
+        for volume in &usage {
+            match &volume.used {
+                Ok(TreeUsage::Bytes(bytes)) if *bytes <= volume.max_bytes => {}
+                Ok(used) => {
+                    tracing::warn!(lease_id = %lease_id, volume = %volume.name, ?used, max_bytes = volume.max_bytes, "a volume is over its limit; stopping the job");
+                    return Some(Stop::Volume);
+                }
+                Err(e) => {
+                    tracing::debug!(lease_id = %lease_id, volume = %volume.name, error = %e, "cannot measure a volume");
+                    unmeasured = true;
+                }
+            }
+        }
+        if unmeasured {
+            *failed += 1;
+            (*failed >= disk::MAX_FAILED_MEASUREMENTS).then_some(Stop::Volume)
+        } else {
+            *failed = 0;
+            None
+        }
     }
 
     fn gpu_device(&self, job: &JobSpec, gpu: Option<&GpuRef>) -> Result<Option<GpuDevice>, SandboxError> {
@@ -730,7 +933,12 @@ impl<E: Engine, C: Cgroups, X: Egress> PodmanDriver<E, C, X> {
         let free_space = Arc::clone(&self.cfg.free_space);
         let data_dir = self.cfg.data_dir.clone();
         match tokio::task::spawn_blocking(move || free_space.space(&data_dir)).await {
-            Ok(Ok(space)) if space.below_floor() => return Measurement::BelowFloor,
+            // Unused volumes go before the job does (H2 §11.3 "Retention").
+            Ok(Ok(space)) if space.below_floor() => {
+                if !self.evict_volumes_for_floor().await {
+                    return Measurement::BelowFloor;
+                }
+            }
             Ok(Ok(_)) => {}
             _ => return Measurement::Failed,
         }
@@ -915,9 +1123,11 @@ impl<E: Engine, C: Cgroups, X: Egress> PodmanDriver<E, C, X> {
     /// runs on the blocking pool.
     async fn floor_allows_new_leases(&self) -> bool {
         let (free_space, data_dir) = (Arc::clone(&self.cfg.free_space), self.cfg.data_dir.clone());
-        blocking(move || free_space.space(&data_dir))
+        let above = blocking(move || free_space.space(&data_dir))
             .await
-            .is_ok_and(|space| space.is_ok_and(|s| !s.below_floor()))
+            .is_ok_and(|space| space.is_ok_and(|s| !s.below_floor()));
+        // Below it (or unreadable, which evicts nothing): unused volumes go before a lease is refused.
+        above || self.evict_volumes_for_floor().await
     }
 }
 
@@ -964,6 +1174,19 @@ fn smoke_job(image: &str) -> JobSpec {
 impl<E: Engine, C: Cgroups, X: Egress> Sandbox for PodmanDriver<E, C, X> {
     type Job = PodmanJob<E, C, X::Session>;
 
+    /// H2 §11.3: the lease's volumes are taken here, in memory, so that a lease that may not mount them, or whose
+    /// volume another lease holds, or that does not fit the volume budget, is a `LeaseRejected` and never starts.
+    fn admit(&self, lease: &LeaseContext) -> Result<(), LeaseRejectReason> {
+        if lease.job.volumes.is_empty() {
+            return Ok(());
+        }
+        match &self.cfg.volumes {
+            Some(store) => store.reserve(lease.lease_id, lease.epoch, &lease.account_id, &lease.job),
+            // H2 §6.1: a job this agent does not understand.
+            None => Err(LeaseRejectReason::InvalidJob),
+        }
+    }
+
     async fn prepare(
         &self,
         enrolled: &AccountId,
@@ -978,21 +1201,37 @@ impl<E: Engine, C: Cgroups, X: Egress> Sandbox for PodmanDriver<E, C, X> {
         let LeaseContext {
             lease_id,
             epoch,
+            account_id,
             job,
             gpu,
-            ..
         } = lease;
-        // A lease's job was accepted by the hub (`Stored`). Services are understood only with a health probe; volumes
-        // and blob inputs not at all yet (H2 §6.1: a job this agent does not understand is `invalid_job`).
+        // What admission took for the lease's volumes ([`Sandbox::admit`]) goes back on every return below, until
+        // the cleanup guard has it.
+        let volume_store = self.cfg.volumes.clone().filter(|_| !job.volumes.is_empty());
+        let reservation = volume_store.clone().map(|store| Reservation {
+            store,
+            lease_id,
+            epoch,
+            armed: true,
+        });
+        // A lease's job was accepted by the hub (`Stored`). Services are understood only with a health probe, volumes
+        // only with a volume store; blob inputs not at all yet (H2 §6.1: a job this agent does not understand is
+        // `invalid_job`).
         let limits = Limits {
             h2: H2Features {
                 services: self.cfg.health_probe.is_some(),
+                volumes: self.cfg.volumes.is_some(),
                 ..H2Features::default()
             },
             ..Limits::agent()
         };
         if job.validate_in(&limits, SpecContext::Stored).is_err() {
             return Err(reject(LeaseRejectReason::InvalidJob));
+        }
+        // H2 §11.3 "Who may mount", "One holder at a time", "Budget": the same answer as at admission (taking the
+        // volumes again for the same lease changes nothing), for a lease that did not come through the executor.
+        if let Some(store) = &volume_store {
+            store.reserve(lease_id, epoch, &account_id, &job).map_err(reject)?;
         }
         let service = match (job.kind, &job.service, &self.cfg.health_probe) {
             (JobKind::Batch, None, _) => None,
@@ -1035,8 +1274,13 @@ impl<E: Engine, C: Cgroups, X: Egress> Sandbox for PodmanDriver<E, C, X> {
             lease: lease_id,
             name: name.clone(),
             dir: dir.clone(),
+            volumes: volume_store.clone(),
             armed: true,
         };
+        // The guard settles the volumes from here on: with the container's removal, as every other path does.
+        if let Some(reservation) = reservation {
+            reservation.keep();
+        }
         let env_file = {
             let (dir, files, shim) = (dir.clone(), job.files.clone(), self.cfg.shim_path.clone());
             let ports = service_ports.clone();
@@ -1097,6 +1341,26 @@ impl<E: Engine, C: Cgroups, X: Egress> Sandbox for PodmanDriver<E, C, X> {
         let _ = events.send(SandboxEvent::Phase(Phase::Pulling)).await;
         self.pull_within_cap(&job.image, &cancel).await?;
 
+        // H2 §11.3: the lock goes to disk and the tree is walked without following links, as late as possible and
+        // before `podman create`. A refusal mounts nothing; the lock then stays with the lease until the guard has
+        // made sure that no container of it exists.
+        let volumes = match &volume_store {
+            Some(store) => {
+                let store = store.clone();
+                setup_blocking(move || store.lock_and_check(&lease_id, epoch))
+                    .await?
+                    .map_err(|e| {
+                        let code = if e.is_unsafe() {
+                            error_code::VOLUME_UNSAFE
+                        } else {
+                            error_code::SANDBOX_SETUP
+                        };
+                        SandboxError::failed(code, e)
+                    })?
+            }
+            None => Vec::new(),
+        };
+
         let cgroup_parent = cgroups.parent_arg(&lease_id);
         let argv = argv::create_argv(&ArgvParams {
             platform: self.cfg.platform,
@@ -1111,6 +1375,7 @@ impl<E: Engine, C: Cgroups, X: Egress> Sandbox for PodmanDriver<E, C, X> {
             gpu,
             image: &job.image,
             command: &job.command,
+            volumes: &volumes,
         })
         .map_err(|e| SandboxError::failed(error_code::CREATE_FAILED, e))?;
         let _ = events.send(SandboxEvent::Phase(Phase::Creating)).await;
@@ -1142,6 +1407,7 @@ impl<E: Engine, C: Cgroups, X: Egress> Sandbox for PodmanDriver<E, C, X> {
             egress,
             ingress,
             service,
+            volumes,
             guard,
         })
     }
@@ -1201,6 +1467,7 @@ impl<E: Engine, C: Cgroups, X: Egress> Sandbox for PodmanDriver<E, C, X> {
         let mut stats = CgroupStats::default();
         let mut oom_reported = false;
         let mut failed_measurements = 0u32;
+        let mut failed_volume_measurements = 0u32;
 
         // Set when the exit future failed: the container may still run, and nothing will tell us when it ends.
         let mut exit_lost = false;
@@ -1266,6 +1533,11 @@ impl<E: Engine, C: Cgroups, X: Egress> Sandbox for PodmanDriver<E, C, X> {
                             failed_measurements += 1;
                             (failed_measurements >= disk::MAX_FAILED_MEASUREMENTS).then_some(Stop::Disk)
                         }
+                    };
+                    // The volumes, measured like the disk (H2 §11.3 "Size").
+                    let over = match over {
+                        Some(reason) => Some(reason),
+                        None => self.volumes_over(job, &mut failed_volume_measurements).await,
                     };
                     if let Some(reason) = over {
                         stop = Some(reason);
@@ -1360,6 +1632,7 @@ impl<E: Engine, C: Cgroups, X: Egress> Sandbox for PodmanDriver<E, C, X> {
             (Some(Stop::Cancelled), _) => (Outcome::Cancelled, None, None),
             (Some(Stop::Disk), _) => (Outcome::Error, None, Some(error_code::DISK_LIMIT)),
             (Some(Stop::Floor), _) => (Outcome::Error, None, Some(error_code::DISK_FLOOR)),
+            (Some(Stop::Volume), _) => (Outcome::Error, None, Some(error_code::VOLUME_LIMIT)),
             (Some(Stop::Health), _) => (Outcome::Error, None, Some(error_code::HEALTH_CHECK_FAILED)),
             // Exit 137 alone is not an OOM: only the cgroup counter or Podman's flag say so (§9 "Memory").
             (None, _) if oom => (Outcome::Error, code, Some(error_code::MEMORY_LIMIT)),
@@ -1405,7 +1678,14 @@ impl<E: Engine, C: Cgroups, X: Egress> Sandbox for PodmanDriver<E, C, X> {
         // Detaches the lease from the ingress bridge and removes its socket: no new port stream reaches it.
         drop(job.ingress.take());
         *job.exit.get_mut().unwrap_or_else(PoisonError::into_inner) = None;
-        cleanup_steps(&self.shared, &job.lease_id, &job.name, &job.dir).await;
+        cleanup_steps(
+            &self.shared,
+            &job.lease_id,
+            &job.name,
+            &job.dir,
+            job.guard.volumes.as_ref(),
+        )
+        .await;
     }
 
     async fn smoke(&self) -> SmokeResult {

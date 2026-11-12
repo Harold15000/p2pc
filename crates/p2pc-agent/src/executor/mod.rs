@@ -12,7 +12,10 @@
 //! 4. a draining node gets `draining`; a passed `deadline` gets `deadline_passed`;
 //! 5. a node that is not ready (RAM unknown, sandbox not ready, no inventory yet) gets `agent_not_ready`;
 //! 6. the lease must fit the **offered** capacity still free: CPU, memory, disk, and a free offerable GPU picked by
-//!    UUID ([`capacity`]); otherwise `insufficient_capacity` (or `gpu_selection_unsupported` on WSL2).
+//!    UUID ([`capacity`]); otherwise `insufficient_capacity` (or `gpu_selection_unsupported` on WSL2);
+//! 7. the sandbox must take what the lease needs beyond that capacity ([`Sandbox::admit`]): its persistent volumes
+//!    (H2 §11.3). A job that may not mount them is `invalid_job`; a volume another lease holds, or one that does not
+//!    fit the volume budget, is `insufficient_capacity`.
 //!
 //! The capacity is reserved on accept and released when the run's **cleanup** ends (the container is removed and the job
 //! directory deleted), on every path. It does not wait for the server to confirm `JobFinished` (T06e): the server holds
@@ -513,15 +516,30 @@ where
             Ok(r) => r,
             Err(reason) => return reject(reason),
         };
+        let (kind, job_name) = (offer.job.kind, offer.job.name.clone());
+        let ctx = LeaseContext {
+            lease_id: offer.lease_id,
+            epoch: offer.epoch,
+            account_id: offer.account_id,
+            job: offer.job,
+            gpu: reservation.gpu.clone().map(|uuid| GpuRef { uuid }),
+        };
+        // The last check, so that nothing is taken for a lease another check refuses: the lease's volumes (H2
+        // §11.3). In memory only; `prepare` gives them back if the job does not run.
+        if let Err(reason) = self.inner.sandbox.admit(&ctx) {
+            state.ledger.release(&key);
+            tracing::info!(lease_id = %key.0, epoch = key.1, %reason, "lease refused");
+            return LeaseDecision::Reject(reason);
+        }
         // A newer epoch replaces the running one: the old run is stopped and goes silent (its reservation stays
         // held until its container is gone).
-        if let Some((old, run)) = state.listed(&offer.lease_id) {
-            tracing::info!(lease_id = %old.0, old_epoch = old.1, epoch = offer.epoch, "a newer epoch replaces a running lease");
+        if let Some((old, run)) = state.listed(&key.0) {
+            tracing::info!(lease_id = %old.0, old_epoch = old.1, epoch = key.1, "a newer epoch replaces a running lease");
             retire(run);
         }
         let cancel = CancelHandle::new();
         // H2 §11.4: a service keeps its most recent logs in a ring; a batch run keeps H1's queue.
-        let run_outbox = Arc::new(match offer.job.kind {
+        let run_outbox = Arc::new(match kind {
             JobKind::Service => RunOutbox::ring(
                 self.inner.service_ring.0.load(Ordering::Relaxed),
                 self.inner.service_ring.1.load(Ordering::Relaxed),
@@ -537,7 +555,7 @@ where
                 outbox: Arc::clone(&run_outbox),
                 listed: true,
                 phase: RunPhase::Preparing,
-                job_name: offer.job.name.clone(),
+                job_name,
                 accepted_at: now,
                 started_at: None,
                 done: done_rx,
@@ -546,13 +564,6 @@ where
                 usage: None,
             },
         );
-        let ctx = LeaseContext {
-            lease_id: offer.lease_id,
-            epoch: offer.epoch,
-            account_id: offer.account_id,
-            job: offer.job,
-            gpu: reservation.gpu.clone().map(|uuid| GpuRef { uuid }),
-        };
         let guard = RunGuard {
             inner: Arc::clone(&self.inner),
             key,
