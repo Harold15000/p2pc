@@ -8,10 +8,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use p2pc_wsl::Layout;
-use p2pc_wsl::runner::{CommandRunner, Host, Pause, in_distro};
-use p2pc_wsl::uninstall::{BackupRule, UninstallError, Uninstalled};
+use p2pc_wsl::runner::{CommandRunner, Host, Output, Pause, in_distro};
+use p2pc_wsl::uninstall::{BackupRule, Registration, UninstallError, Uninstalled};
 
-use super::CleanupHost;
+use super::{CleanupHost, HubData};
 use crate::autostart::{RUN_VALUE_NAME, RunKey};
 use crate::setup::wsl_host::{AGENT_BIN, AGENT_CONFIG};
 
@@ -21,8 +21,27 @@ pub const APP_IDENTIFIER: &str = "p2pc.desktop";
 /// `p2pc-agent leave`'s exit code once the hub removed the node (`p2pc-agent`'s `exit::NOT_ENROLLED`).
 const LEAVE_REMOVED: i32 = 7;
 
-/// The hub's data directory in the distro (`P2PC_DATA_DIR`, §8.5).
-pub const HUB_DATA_DIR: &str = "/var/lib/p2pc-server";
+/// Prints exactly one marker: does the distro hold the hub's data directory (`P2PC_DATA_DIR`, §8.5)?
+pub const HUB_PROBE_SCRIPT: &str =
+    "if [ -e /var/lib/p2pc-server ]; then echo P2PC_HUB=present; else echo P2PC_HUB=absent; fi";
+
+/// The probe's answer: exit 0 and exactly one known marker, or [`HubData::Unknown`].
+pub fn parse_hub_probe(out: &Output) -> HubData {
+    if !out.success() {
+        return HubData::Unknown;
+    }
+    let text = out.stdout_text();
+    let markers: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("P2PC_HUB="))
+        .collect();
+    match markers.as_slice() {
+        ["P2PC_HUB=present"] => HubData::Present,
+        ["P2PC_HUB=absent"] => HubData::Absent,
+        _ => HubData::Unknown,
+    }
+}
 
 /// The time limit of `p2pc-agent status --json`.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(30);
@@ -78,9 +97,19 @@ impl<R: CommandRunner, P: Pause> CleanupHost for WslCleanupHost<R, P> {
         }
     }
 
-    fn hub_data_present(&self) -> bool {
-        let inv = in_distro(&["/usr/bin/test", "-e", HUB_DATA_DIR]).timeout(STATUS_TIMEOUT);
-        self.host().run_wsl(&inv).is_ok_and(|o| o.success())
+    fn hub_data(&self) -> HubData {
+        // Without a distro there is no hub data (and step 4 unregisters nothing). A registration that is not known, or
+        // a probe that fails, is unknown, never absent.
+        match p2pc_wsl::uninstall::registration(self.host()) {
+            Ok(Registration::Registered) => {}
+            Ok(Registration::NotRegistered | Registration::WslMissing) => return HubData::Absent,
+            Err(_) => return HubData::Unknown,
+        }
+        let inv = in_distro(&["/bin/sh", "-c", HUB_PROBE_SCRIPT]).timeout(STATUS_TIMEOUT);
+        match self.host().run_wsl(&inv) {
+            Ok(out) => parse_hub_probe(&out),
+            Err(_) => HubData::Unknown,
+        }
     }
 
     fn remove_node(&self, rule: BackupRule) -> Result<Uninstalled, UninstallError> {
@@ -130,12 +159,17 @@ mod tests {
 
     struct Agent {
         reply: Output,
+        /// The answer of `wsl --list --quiet`.
+        list: RefCell<Output>,
         calls: RefCell<Vec<Invocation>>,
     }
 
     impl CommandRunner for Agent {
         fn run(&self, inv: &Invocation) -> Result<Output, RunError> {
             self.calls.borrow_mut().push(inv.clone());
+            if inv.arguments().first().map(String::as_str) == Some("--list") {
+                return Ok(self.list.borrow().clone());
+            }
             Ok(self.reply.clone())
         }
     }
@@ -186,6 +220,7 @@ mod tests {
         let h = WslCleanupHost {
             runner: Agent {
                 reply,
+                list: RefCell::new(Output::with(0, "Ubuntu\np2pc-node\n")),
                 calls: RefCell::new(Vec::new()),
             },
             pause: NoPause,
@@ -224,13 +259,51 @@ mod tests {
     #[test]
     fn the_hub_s_data_is_probed_in_the_distro() {
         let dir = tempfile::tempdir().unwrap();
-        let (h, _) = host(Output::with(0, ""), dir.path(), vec![]);
-        assert!(h.hub_data_present());
-        let inv = h.runner.calls.borrow()[0].clone();
-        assert_eq!(&inv.arguments()[5..], ["/usr/bin/test", "-e", "/var/lib/p2pc-server"]);
+        let (h, _) = host(Output::with(0, "P2PC_HUB=present\n"), dir.path(), vec![]);
+        assert_eq!(h.hub_data(), HubData::Present);
+        let inv = h.runner.calls.borrow().last().unwrap().clone();
+        assert_eq!(&inv.arguments()[5..], ["/bin/sh", "-c", HUB_PROBE_SCRIPT]);
+        assert!(HUB_PROBE_SCRIPT.contains("/var/lib/p2pc-server"));
         assert!(inv.time_limit().is_some());
+        let (h, _) = host(Output::with(0, "P2PC_HUB=absent\n"), dir.path(), vec![]);
+        assert_eq!(h.hub_data(), HubData::Absent);
+    }
+
+    #[test]
+    fn a_probe_that_fails_is_unknown_never_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        // The distro does not start, wsl.exe errors, the answer is empty or garbled: exit 1 alone is not "absent".
+        for reply in [
+            Output::with(1, ""),
+            Output::with(-1, "Error code: Wsl/Service/CreateInstance/E_FAIL"),
+            Output::with(0, ""),
+            Output::with(0, "P2PC_HUB=present\nP2PC_HUB=absent\n"),
+            Output::with(0, "P2PC_HUB=maybe\n"),
+            Output::with(1, "P2PC_HUB=absent\n"),
+        ] {
+            let (h, _) = host(reply.clone(), dir.path(), vec![]);
+            assert_eq!(h.hub_data(), HubData::Unknown, "{reply:?}");
+        }
+        // The listing itself failed and the registry did not answer: unknown, and the distro is not asked.
+        let (h, _) = host(Output::with(0, "P2PC_HUB=absent\n"), dir.path(), vec![]);
+        *h.runner.list.borrow_mut() = Output::with(1, "Error code: Wsl/Service/0x80070422");
+        assert_eq!(h.hub_data(), HubData::Unknown);
+        assert!(
+            h.runner
+                .calls
+                .borrow()
+                .iter()
+                .all(|i| !i.arguments().contains(&"-d".to_owned()))
+        );
+    }
+
+    #[test]
+    fn without_the_distro_there_is_no_hub_data() {
+        let dir = tempfile::tempdir().unwrap();
         let (h, _) = host(Output::with(1, ""), dir.path(), vec![]);
-        assert!(!h.hub_data_present());
+        *h.runner.list.borrow_mut() = Output::with(0, "Ubuntu\n");
+        assert_eq!(h.hub_data(), HubData::Absent);
+        assert_eq!(h.runner.calls.borrow().len(), 1, "only the listing ran");
     }
 
     #[test]

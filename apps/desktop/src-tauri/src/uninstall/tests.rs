@@ -19,14 +19,14 @@ struct Pc {
     task_fails: bool,
     kept: Vec<PathBuf>,
     leave_fails: bool,
-    hub_data: bool,
+    hub_data: HubData,
 }
 
 impl CleanupHost for Pc {
     fn own_node_id(&self) -> Option<String> {
         Some("node-hub".into())
     }
-    fn hub_data_present(&self) -> bool {
+    fn hub_data(&self) -> HubData {
         self.hub_data
     }
     fn agent_leave(&self, timeout: Duration) -> Result<(), String> {
@@ -290,10 +290,27 @@ fn a_failed_upgrade_s_backup_is_kept_and_named_unless_the_box_is_ticked() {
 #[test]
 fn an_unknown_role_on_a_pc_with_the_hub_s_data_needs_the_hub_checkbox() {
     let hub_pc = Pc {
-        hub_data: true,
+        hub_data: HubData::Present,
         ..Pc::default()
     };
     assert_eq!(effective_role(None, &hub_pc), Some(Role::Hub));
+    // A probe that failed is never "no hub data": the checkbox is required, and without it nothing is deleted.
+    let unknown = Pc {
+        hub_data: HubData::Unknown,
+        ..Pc::default()
+    };
+    assert_eq!(effective_role(None, &unknown), Some(Role::Hub));
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_cleanup(
+        &unknown,
+        &UnwiredHubNodes,
+        &Clock::default(),
+        &mut log(dir.path()),
+        effective_role(None, &unknown),
+        Confirmation::default(),
+    );
+    assert_eq!(out, CleanupOutcome::Cancelled);
+    assert!(unknown.steps.borrow().is_empty());
     assert_eq!(
         effective_role(Some(Role::Joined), &hub_pc),
         Some(Role::Joined),

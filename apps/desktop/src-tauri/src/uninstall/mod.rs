@@ -132,15 +132,29 @@ pub trait CleanupHost {
     fn remove_node(&self, rule: BackupRule) -> Result<Uninstalled, UninstallError>;
     /// Step 6: the app's data folders and the `Run` and `RunOnce` values. Returns what could not be removed.
     fn remove_app_traces(&self) -> Vec<String>;
-    /// The distro holds the hub's data (`/var/lib/p2pc-server`).
-    fn hub_data_present(&self) -> bool;
+    /// Whether the distro holds the hub's data (`/var/lib/p2pc-server`).
+    fn hub_data(&self) -> HubData;
+}
+
+/// Whether the distro holds the hub's data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HubData {
+    Present,
+    /// A positive answer: the distro said so, or there is no distro.
+    #[default]
+    Absent,
+    /// The probe failed (a timeout, the distro not starting, a `wsl.exe` error): never taken as absent.
+    Unknown,
 }
 
 /// The role the confirmation and the cleanup use: the one `setup.json` recorded, or, when that is unknown (a missing or
-/// unreadable record), the hub's when the distro holds the hub's data. The hub PC's explicit checkbox (§8.7 step 1) is
-/// then never skipped because a record was lost.
+/// unreadable record), the hub's unless the distro positively holds no hub data. The hub PC's explicit checkbox (§8.7
+/// step 1) is then never skipped because a record was lost, nor because the probe failed too (fail closed).
 pub fn effective_role(recorded: Option<Role>, host: &dyn CleanupHost) -> Option<Role> {
-    recorded.or_else(|| host.hub_data_present().then_some(Role::Hub))
+    recorded.or_else(|| match host.hub_data() {
+        HubData::Present | HubData::Unknown => Some(Role::Hub),
+        HubData::Absent => None,
+    })
 }
 
 /// How the cleanup ended.
