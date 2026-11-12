@@ -770,6 +770,8 @@ pub mod fixtures {
                 },
                 disk_total_mb: None,
                 agent_version: "0.1.0".into(),
+                volumes_mb: None,
+                owner_paused: None,
             },
             free: Capacity {
                 cpu: 3.5,

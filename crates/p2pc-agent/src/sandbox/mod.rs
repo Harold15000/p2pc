@@ -9,6 +9,9 @@
 //!   is no other way in.
 //! - [`argv`]: the §9 fixed `podman create` argv (SI-2), a pure function.
 //! - [`jobdir`]: `<data_dir>/jobs/<lease_id>/` and the `O_NOFOLLOW` input writer.
+//! - **Blob inputs** (H2 §7.5, [`crate::blobs::BlobInputs`]): `prepare` fetches each one over a `BlobFetch` stream,
+//!   verifies it and writes it under `inputs/`, within `resources.disk_mb` minus 64 MiB with the inline files. What
+//!   they take comes off the job's running disk limit.
 //! - [`cgroup`]: the per-lease cgroup (`--cgroup-parent`), read for `oom_kill` and `pids.events`.
 //! - [`engine`]: the Podman operations, behind a trait.
 //! - [`logs`]: 64 KiB chunks, the 64 MiB cap with one marker, and draining after it (batch jobs; a service's logs
@@ -70,9 +73,13 @@ pub mod error_code {
     pub const IMAGE_TOO_LARGE: &str = "image_too_large";
     /// The job asked for egress and the proxy could not start.
     pub const EGRESS_UNAVAILABLE: &str = "egress_unavailable";
-    /// An input file could not be written (traversal, symlink, bad content).
+    /// An input file could not be written (traversal, symlink, bad content), or a blob input is not deliverable: the
+    /// hub refused it, or it does not fit in `resources.disk_mb` minus 64 MiB (H2 §7.5).
     pub const INVALID_INPUT: &str = "invalid_input";
-    /// The job directory, env file, shim or cgroup could not be set up.
+    /// A blob input's bytes do not hash to its digest (H2 §6.1 "Blob integrity"): a `start_failed`-class error.
+    pub const INPUT_INTEGRITY: &str = crate::blobs::INPUT_INTEGRITY;
+    /// The job directory, env file, shim or cgroup could not be set up, or a blob input did not arrive: its fetch
+    /// failed on the way every time, or it could not be written.
     pub const SANDBOX_SETUP: &str = "sandbox_setup";
     /// `podman create` failed.
     pub const CREATE_FAILED: &str = "create_failed";

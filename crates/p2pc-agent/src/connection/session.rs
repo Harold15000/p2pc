@@ -37,13 +37,20 @@
 //! answered with a fresh report ([`crate::volumes::serve_session`], on its own task, so a slow deletion never stalls
 //! the connection's reads). Without a store, a lease with volumes is `invalid_job` and `VolumeDelete` is ignored.
 //!
+//! **Blob inputs** (H2 §6.1, §7.5). A session whose executor fetches them ([`Shared::blob_inputs`]) declares
+//! `blob_inputs` and accepts leases whose job has blob `inputs`; the driver fetches them over this connection's
+//! streams ([`crate::blobs::BlobInputs`]). Without it, such a lease is `invalid_job`.
+//!
 //! **The owner's share and the node's approval** (H2 §5.5, §6.1, §8.4). A session with [`NodeControls`]
-//! ([`Shared::node`]) declares `leave` and `approval`:
+//! ([`Shared::node`]) declares `leave`, `share_update` and `approval`:
 //! - `Welcome.pending_approval` and `NodeApproved` are recorded in [`Approval`], which `p2pc-agent status` shows.
 //!   Informative only: the scheduler enforces approval, the agent gates nothing on it;
+//! - every inventory it sends (`Hello`, `InventoryUpdate`) carries `owner_paused` and `volumes_mb`, the two fields that
+//!   come with `share_update` ([`Shared::share_fields`]); a session without node controls sends neither;
 //! - while the owner paused sharing (`share.paused`, `owner_paused`), every new lease is refused with `draining`,
 //!   after the owner check; running leases continue, and the H1 drain of the server stays separate;
-//! - a share change re-detects the inventory at once, so a new offer goes out as `InventoryUpdate` in seconds.
+//! - a share change re-detects the inventory at once, so a new offer, or the pause itself, goes out as
+//!   `InventoryUpdate` in seconds.
 //!
 //! [`leave`] is `p2pc-agent leave`'s own short connection: `Hello`, `Welcome`, `Leave`, and the hub's close.
 //!
@@ -151,6 +158,10 @@ pub struct Shared {
     /// The node's persistent volumes (H2 §11.3), when the owner gave them a share of the disk. `None`: the agent
     /// declares no `volumes`, takes no lease with volumes, and sends no `VolumeReport`.
     pub volumes: Option<VolumeStore>,
+    /// Whether the lease executor fetches blob inputs (its driver has the `BlobFetch` client, H2 §7.5): the agent then
+    /// declares `blob_inputs` and takes leases whose job has blob `inputs`. `false` is an H1 agent: such a lease is
+    /// `invalid_job`.
+    pub blob_inputs: bool,
 }
 
 /// What an H2 node adds to a session (H2 §5.5, §6.1, §8.4).
@@ -207,11 +218,9 @@ impl Approval {
 
 impl Shared {
     /// `Hello.features`, in the order of the spec's table (H2 §6.1): `service_jobs` exactly when this node can serve
-    /// the ports of a service, `volumes` exactly when it mounts persistent volumes, and `leave` and `approval` for an H2
-    /// node ([`Shared::node`]).
-    ///
-    /// `share_update` is not declared: it promises `Inventory.volumes_mb` and `owner_paused`, which the wire inventory
-    /// does not carry yet. The share is still applied live, and a paused node refuses every lease with `draining`.
+    /// the ports of a service, `volumes` exactly when it mounts persistent volumes, `blob_inputs` exactly when it
+    /// fetches blob inputs, and `leave`, `share_update` and `approval` for an H2 node ([`Shared::node`]), which applies
+    /// the owner's share live and reports it.
     #[must_use]
     pub fn features(&self) -> Vec<String> {
         let mut features = Vec::new();
@@ -221,11 +230,31 @@ impl Shared {
         if self.volumes.is_some() {
             features.push(capability::VOLUMES.to_string());
         }
+        if self.blob_inputs {
+            features.push(capability::BLOB_INPUTS.to_string());
+        }
         if self.node.is_some() {
             features.push(capability::LEAVE.to_string());
+            features.push(capability::SHARE_UPDATE.to_string());
             features.push(capability::APPROVAL.to_string());
         }
         features
+    }
+
+    /// Sets the fields of an outgoing inventory that come with `share_update` (H2 §6.1), from the share in force when it
+    /// is sent: `owner_paused`, and `volumes_mb` as the detection resolved it (none reported: no volume space). Without
+    /// node controls the capability is not declared, so neither field is sent.
+    pub fn share_fields(&self, inventory: &mut Inventory) {
+        match &self.node {
+            Some(node) => {
+                inventory.owner_paused = Some(node.share.borrow().paused);
+                inventory.volumes_mb = Some(inventory.volumes_mb.unwrap_or(0));
+            }
+            None => {
+                inventory.owner_paused = None;
+                inventory.volumes_mb = None;
+            }
+        }
     }
 
     /// Whether the owner paused sharing (`owner_paused`).
@@ -233,14 +262,14 @@ impl Shared {
         self.node.as_ref().is_some_and(|n| n.share.borrow().paused)
     }
 
-    /// The limits a lease's job is parsed with: the agent's, with service jobs and volumes understood exactly when
-    /// their capability is declared (H2 §6.1: a job this agent does not understand is `invalid_job`).
+    /// The limits a lease's job is parsed with: the agent's, with service jobs, volumes and blob inputs understood
+    /// exactly when their capability is declared (H2 §6.1: a job this agent does not understand is `invalid_job`).
     fn lease_limits(&self) -> Limits {
         Limits {
             h2: H2Features {
                 services: self.ports.is_some(),
                 volumes: self.volumes.is_some(),
-                ..H2Features::default()
+                blob_inputs: self.blob_inputs,
             },
             ..Limits::agent()
         }
@@ -586,6 +615,8 @@ async fn drive(
     on_welcome: impl FnOnce(&Welcomed),
 ) -> SessionEnd {
     // 1. Hello at once, with the inventory detected just before the dial.
+    let mut inventory = inventory;
+    shared.share_fields(&mut inventory);
     let mut last_inventory = normalized(&inventory);
     // Whether the owner had paused sharing when this `Hello` went out: a resume after it ends the session (below).
     let mut paused = shared.owner_paused();
@@ -773,9 +804,9 @@ async fn drive(
                     share = None;
                     continue;
                 }
-                // A resume. The hub counted every `draining` refusal of the pause against its per-job offer cap, and
-                // only a node change re-arms it; a pause changes nothing on the wire, so a new `Hello` is the one that
-                // does. Reconnect at once (review P2 of T2-23).
+                // A resume. The hub counted every `draining` refusal of the pause against its per-job offer cap. The
+                // resume is on the wire too (`owner_paused`), but a new `Hello` is what makes the hub offer again
+                // whatever its version does with an `InventoryUpdate`: reconnect at once (review P2 of T2-23).
                 let now_paused = shared.owner_paused();
                 if std::mem::replace(&mut paused, now_paused) && !now_paused {
                     tracing::info!("the owner resumed sharing; reconnecting so the hub offers work again");
@@ -795,7 +826,8 @@ async fn drive(
             }, if detection.is_some() => {
                 detection = std::mem::take(&mut detect_again).then(|| spawn_detection(shared));
                 match result {
-                    Ok(Ok(inventory)) => {
+                    Ok(Ok(mut inventory)) => {
+                        shared.share_fields(&mut inventory);
                         let now = normalized(&inventory);
                         if now != last_inventory {
                             tracing::info!("the inventory changed; sending InventoryUpdate");
@@ -1089,6 +1121,10 @@ async fn drive_leave(
     running: Vec<p2pc_proto::protocol::RunningLease>,
     leave: p2pc_proto::protocol::Leave,
 ) -> LeaveEnd {
+    // `leave` declares no `share_update` (H2 §6.1): neither of its fields goes out.
+    let mut inventory = inventory;
+    inventory.owner_paused = None;
+    inventory.volumes_mb = None;
     let hello = AgentMsg::Hello {
         agent_version: AGENT_VERSION.to_string(),
         inventory,
