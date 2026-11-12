@@ -85,7 +85,7 @@ fn cancels(msgs: &[ServerMsg]) -> Vec<(LeaseId, String)> {
 }
 
 #[tokio::test]
-async fn a_service_is_accepted_with_its_defaults_and_volumes_and_blob_inputs_are_still_refused() {
+async fn a_service_is_accepted_with_its_defaults_and_a_batch_job_keeps_the_h1_rules() {
     let app = TestApp::new().await;
     let r = app
         .call(Method::POST, "/v1/jobs", Some(&app.admin), Some(service(json!({}))))
@@ -131,8 +131,9 @@ async fn a_service_is_accepted_with_its_defaults_and_volumes_and_blob_inputs_are
     long["timeout_s"] = json!(2_592_001);
     let r = app.call(Method::POST, "/v1/jobs", Some(&app.admin), Some(long)).await;
     assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{:?}", r.body);
-    // Volumes and blob inputs are not served yet: still refused.
-    let mut with_volume = service(json!({}));
+    // A batch job has no volumes (they are for services and template launches, T2-15), and a blob input must be a
+    // blob of the account (T2-14).
+    let mut with_volume = batch.clone();
     with_volume["volumes"] = json!([{"name": "data", "mount": "/volumes/data", "max_mb": 64}]);
     let mut with_blob = batch;
     with_blob["inputs"] = json!([{"path": "/inputs/a", "blob": format!("sha256:{}", "0".repeat(64))}]);

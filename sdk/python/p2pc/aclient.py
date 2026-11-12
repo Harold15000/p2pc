@@ -23,7 +23,7 @@ from p2pc import _common as c
 from p2pc import h2
 from p2pc._ports import AsyncPortForwarder
 from p2pc.errors import InvalidResponseError, NotFoundError, P2PCConnectionError, P2PCError
-from p2pc.h2 import Blob, TemplateList
+from p2pc.h2 import Blob
 from p2pc.models import (
     ApiKey,
     AsyncJob,
@@ -43,6 +43,7 @@ from p2pc.models import (
     Placement,
     ServerInfo,
     ServicePort,
+    TemplateList,
     UsageReport,
     VolumeSpec,
     WhoAmI,

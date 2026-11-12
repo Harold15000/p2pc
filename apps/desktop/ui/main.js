@@ -42,6 +42,10 @@ function render(status) {
   $("hub-notice").hidden = !status.hub_notice;
   $("hub-notice").textContent = status.hub_notice ?? "";
 
+  // Hub PC: its own node was removed from the cloud while the hub keeps running (H2 §8.5, §8.8).
+  $("node-notice").hidden = !status.node_notice;
+  $("node-notice").textContent = status.node_notice ?? "";
+
   $("attention").hidden = !status.attention;
   $("attention").textContent = status.attention ? `Problem: ${status.attention}` : "";
 

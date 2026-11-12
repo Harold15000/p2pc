@@ -232,3 +232,78 @@ fn the_port_connection_documents_its_contract() {
         .collect();
     assert_eq!(params, ["id", "port", "wait_ready"]);
 }
+
+/// T2-15 (H2 §7.3, §7.6, §7.7): the template and volume routes document every status they answer and the error
+/// codes H2 adds for them, each with its HTTP status.
+#[test]
+fn the_template_and_volume_routes_document_their_contract() {
+    let doc: serde_json::Value = serde_json::from_str(&p2pc_server::openapi::document()).unwrap();
+    let paths = &doc["paths"];
+    let statuses = |path: &str, method: &str| -> Vec<String> {
+        let op = &paths[path][method];
+        assert!(op.is_object(), "{method} {path} is documented");
+        assert!(op.get("security").is_none(), "{method} {path} does not opt out");
+        let mut v: Vec<String> = op["responses"].as_object().unwrap().keys().cloned().collect();
+        v.sort();
+        v
+    };
+    assert_eq!(statuses("/v1/templates", "get"), ["200", "401", "403"]);
+    assert_eq!(
+        statuses("/v1/templates/{id}/launch", "post"),
+        ["200", "201", "401", "402", "403", "404", "409", "422", "503"]
+    );
+    assert_eq!(statuses("/v1/volumes", "get"), ["200", "401", "403", "422"]);
+    assert_eq!(
+        statuses("/v1/volumes/{node_id}/{name}", "delete"),
+        ["204", "401", "403", "404", "409", "503"]
+    );
+    for (path, method, status, code) in [
+        ("/v1/templates/{id}/launch", "post", "402", "cap_exceeded"),
+        ("/v1/templates/{id}/launch", "post", "403", "image_not_allowed"),
+        ("/v1/templates/{id}/launch", "post", "404", "unknown_template"),
+        ("/v1/templates/{id}/launch", "post", "409", "singleton_running"),
+        ("/v1/templates/{id}/launch", "post", "409", "idempotency_conflict"),
+        ("/v1/templates/{id}/launch", "post", "422", "invalid_params"),
+        ("/v1/templates/{id}/launch", "post", "422", "unknown_blob"),
+        ("/v1/templates/{id}/launch", "post", "503", "templates_unavailable"),
+        ("/v1/volumes/{node_id}/{name}", "delete", "409", "volume_in_use"),
+        ("/v1/volumes/{node_id}/{name}", "delete", "503", "node_offline"),
+    ] {
+        let description = paths[path][method]["responses"][status]["description"]
+            .as_str()
+            .unwrap();
+        assert!(description.contains(code), "{method} {path} {status} names {code}");
+    }
+    // The launch takes `LaunchTemplate` and answers a `Job`; the listing never carries a JobSpec or a route.
+    let launch = &paths["/v1/templates/{id}/launch"]["post"];
+    let body = &launch["requestBody"]["content"]["application/json"]["schema"]["$ref"];
+    assert!(body.as_str().unwrap().ends_with("/LaunchTemplate"), "{body}");
+    let schemas = &doc["components"]["schemas"];
+    assert_eq!(schemas["LaunchTemplate"]["additionalProperties"], false);
+    let info = schemas["TemplateInfo"]["properties"].as_object().unwrap();
+    assert!(!info.contains_key("spec") && !info.contains_key("allowed_routes"));
+    // `{name}` is documented as one percent-encoded segment.
+    let name = paths["/v1/volumes/{node_id}/{name}"]["delete"]["parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "name")
+        .unwrap();
+    assert!(
+        name["description"]
+            .as_str()
+            .unwrap()
+            .contains("tpl%3Aprivate-chat%2Fmodels")
+    );
+    // `service.setup` is in the job's service view.
+    assert!(schemas["ServiceView"]["properties"]["setup"].is_object());
+    for name in [
+        "TemplateList",
+        "TemplateInfo",
+        "TemplateParam",
+        "VolumeInfo",
+        "ServiceSetup",
+    ] {
+        assert!(schemas[name].is_object(), "{name}");
+    }
+}

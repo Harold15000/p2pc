@@ -21,6 +21,9 @@ clap.workspace = true
 data-encoding.workspace = true
 hyper = { version = "1.12.0", default-features = false, features = ["server", "http1"] }
 iroh.workspace = true
+# The release key's public half (H2 §5.1): the hub verifies a template bundle file against it (§7.6). MIT, and
+# already in the lock file through `templates-bundle`.
+minisign.workspace = true
 # The §10 endpoint plumbing shared with the agent (bind, interface snapshot, network watcher), Apache-2.0.
 p2pc-net = { path = "../p2pc-net", version = "0.1.0" }
 semver.workspace = true
@@ -36,6 +39,9 @@ sha2.workspace = true
 # Runtime queries only (`sqlx::query`/`query_as` with binds). `macros` is needed for `sqlx::migrate!`, which embeds
 # the migrations at build time and needs no DATABASE_URL.
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite-bundled", "migrate", "macros"] }
+# The template bundle (H2 §7.6), Apache-2.0: its type, `verify_bundle`, the rule check that also runs on load, and
+# `build_spec`, the one implementation of the parameter targets (SI-H2-13).
+templates-bundle = { path = "../../scripts/templates-bundle", version = "0.1.0" }
 thiserror.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "net", "sync", "time", "io-util"] }
@@ -48,6 +54,12 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
 utoipa.workspace = true
+
+[build-dependencies]
+# `build.rs` compiles `templates/` into the bundle the hub embeds (H2 §7.6 "The hub embeds the bundle of its own
+# release"), and checks the release public key given at build time.
+minisign.workspace = true
+templates-bundle = { path = "../../scripts/templates-bundle", version = "0.1.0" }
 
 [dev-dependencies]
 assert_cmd.workspace = true

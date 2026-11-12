@@ -3042,6 +3042,179 @@
         }
       }
     },
+    "/v1/templates": {
+      "get": {
+        "tags": [
+          "templates"
+        ],
+        "summary": "The served bundle (H2 §7.6): what a UI needs to offer and launch each template, with `bundle_version`. The vetted\nJobSpec and the `allowed_routes` of a template stay on the hub.",
+        "description": "When the hub may serve no bundle (the bundle it loaded last is gone or damaged, and it never serves an older\none), the list is empty and `bundle_error` says why.",
+        "operationId": "list_templates",
+        "responses": {
+          "200": {
+            "description": "The templates of the bundle the hub serves, with `bundle_version`; an empty list, `bundle_version: null` and `bundle_error` when it can serve none.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TemplateList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid key.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller has neither `jobs:read` nor `templates:launch`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/templates/{id}/launch": {
+      "post": {
+        "tags": [
+          "templates"
+        ],
+        "summary": "Launches a template: builds its JobSpec from `params` through the template's parameter targets, sets\n`template: {id, version, pull}` and creates the job with the caller as its principal.",
+        "description": "- **`params`**: values by parameter name; a parameter left out takes the template's default. An unknown\n  parameter, a wrong type, a value outside the template's bounds or an enum value it does not list gets\n  `422 invalid_params`. A `blob` parameter names a blob of the caller's account (`422 unknown_blob`).\n- **Singleton templates**: while an instance is `queued`, `assigned` or `running`, the launch returns it (`200`)\n  and creates nothing; if the launch names a `pull` model other than the instance's, `409 singleton_running`\n  with the instance's id and model in `detail`.\n- **Limits of the caller**: its `allowed_images` (`403 image_not_allowed`) and its `daily_unit_cap`\n  (`402 cap_exceeded`, naming the template, the units it needs and the units left today). A batch template needs\n  its estimate (resources × `timeout_s`); a service template needs 15 minutes of runtime from the day's\n  reservation, and is stopped when the day's cap is reached.\n- **Idempotency**: `idempotency_key` works as for jobs, scoped to the caller: the same key with the same launch\n  returns the job (`200`), with another launch `409 idempotency_conflict`.",
+        "operationId": "launch_template",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The template's id, as `GET /v1/templates` lists it.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LaunchTemplate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The running instance of a `singleton` template, or the job this caller already launched with the idempotency key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "The job was created and is queued.",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`/v1/jobs/{id}`"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid key, or the caller was revoked or expired while the request was in flight.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "`cap_exceeded`: the caller's daily unit cap does not allow the template; `detail` names the template, the units it needs and the units left today.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: the caller lacks `templates:launch`. `image_not_allowed`: its allowed images do not cover the template's image.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`unknown_template`: the served bundle has no template with this id.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`singleton_running`: an instance of this singleton template is live with another model; `detail` has its id and model. `idempotency_conflict`: the caller already used the idempotency key with another launch.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_params`: an unknown parameter, a wrong type, a value outside the template's bounds or not one of its values. `unknown_blob`: a `blob` parameter the caller's account does not hold. `inputs_exceed_disk`. `invalid_body`, `validation_failed`: the body itself.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`templates_unavailable`: the hub may serve no template bundle now.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/usage": {
       "get": {
         "tags": [
@@ -3141,6 +3314,165 @@
           },
           "422": {
             "description": "Invalid `from`, `to` (`from` must be before `to`), `limit` or `cursor`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/volumes": {
+      "get": {
+        "tags": [
+          "volumes"
+        ],
+        "summary": "The volumes on the caller's nodes, from each node's latest report (H2 §11.3): by node, then by name.",
+        "description": "`max_mb` is the limit of the job that mounted the volume on that node last (`0` when the hub knows no such job),\nand `in_use_by` the job whose lease holds it now.",
+        "operationId": "list_volumes",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1-100 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "`next_cursor` of the previous page.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of volumes.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_VolumeInfo"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid key.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller lacks the nodes:read scope.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid `limit` or `cursor`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/volumes/{node_id}/{name}": {
+      "delete": {
+        "tags": [
+          "volumes"
+        ],
+        "summary": "Deletes a volume from the node that holds it: the hub sends `VolumeDelete`, and the node's next report no\nlonger lists the volume.",
+        "description": "`{name}` is **one** percent-encoded path segment: `tpl:private-chat/models` is sent as\n`tpl%3Aprivate-chat%2Fmodels`. The hub decodes the segment once and checks the result with the JobSpec's volume\nname rule; anything else, like a volume the node did not report, is `404`.",
+        "operationId": "delete_volume",
+        "parameters": [
+          {
+            "name": "node_id",
+            "in": "path",
+            "description": "The node that holds the volume (`node_…`).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The volume's name as one percent-encoded path segment: `tpl:private-chat/models` is `tpl%3Aprivate-chat%2Fmodels`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The node was told to delete the volume."
+          },
+          "401": {
+            "description": "Missing or invalid key, or the caller was revoked or expired while the request was in flight.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller lacks the admin scope.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such node in this account, or the node reported no volume of that name.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`volume_in_use`: a job holds the volume.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`node_offline`: the node is not connected. The deletion is not queued.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -4028,6 +4360,15 @@
             "minimum": 0
           }
         }
+      },
+      "GpuRequirement": {
+        "type": "string",
+        "description": "What a template needs from a GPU (H2 §7.6 `requirements.gpu`).",
+        "enum": [
+          "required",
+          "preferred",
+          "none"
+        ]
       },
       "GpuStatus": {
         "type": "object",
@@ -4999,6 +5340,30 @@
       "KeyId": {
         "type": "string",
         "description": "The public ID of an API key: 12 characters of lowercase base32 (spec §5).\n\nIt is not secret. It appears in the key itself (`p2pc_sk_<key_id>_<secret>`) and in `GET /v1/keys`."
+      },
+      "LaunchTemplate": {
+        "type": "object",
+        "description": "Body of `POST /v1/templates/{id}/launch` (H2 §7.3, §7.6). Validate with [`LaunchTemplate::validate`]; the\nparameters themselves are checked against the template (`422 invalid_params`).",
+        "properties": {
+          "idempotency_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "As for jobs: scoped to the principal, never returned."
+          },
+          "params": {
+            "type": "object",
+            "description": "Parameter values by name.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ParamValue"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": false
       },
       "LogLine": {
         "type": "object",
@@ -6145,6 +6510,77 @@
           }
         }
       },
+      "Page_VolumeInfo": {
+        "type": "object",
+        "description": "A cursor-paginated list (`limit` ≤ 100).",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "description": "One volume of `GET /v1/volumes`, from the latest `VolumeReport`s (H2 §7.3, §11.3).",
+              "required": [
+                "name",
+                "node_id",
+                "size_mb",
+                "max_mb"
+              ],
+              "properties": {
+                "in_use_by": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/JobId",
+                      "description": "The job that holds it now, if any (a volume has at most one holder)."
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "last_used_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time",
+                  "description": "When a job last used it."
+                },
+                "max_mb": {
+                  "type": "integer",
+                  "format": "int64",
+                  "description": "Its limit, in MiB.",
+                  "minimum": 0
+                },
+                "name": {
+                  "type": "string",
+                  "description": "The volume's name, as in the JobSpec (`tpl:<id>/<name>` for template volumes)."
+                },
+                "node_id": {
+                  "$ref": "#/components/schemas/NodeId",
+                  "description": "The node that holds it."
+                },
+                "size_mb": {
+                  "type": "integer",
+                  "format": "int64",
+                  "description": "Its measured size, in MiB.",
+                  "minimum": 0
+                }
+              }
+            },
+            "description": "The items of this page."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pass as `cursor` to get the next page. `None` on the last page."
+          }
+        }
+      },
       "PairingTicketCreated": {
         "type": "object",
         "description": "Response of `POST /v1/devices/pairing-tickets` (H2 §5.2): returned once. `Debug` redacts `ticket` and `url`\n(the URL carries the ticket in its fragment).",
@@ -6287,6 +6723,109 @@
             "description": "The device's scopes."
           }
         }
+      },
+      "ParamType": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "One of the template's values.",
+            "required": [
+              "values",
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "enum"
+                ]
+              },
+              "values": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "The allowed values."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "An integer within the template's bounds, inclusive.",
+            "required": [
+              "min",
+              "max",
+              "type"
+            ],
+            "properties": {
+              "max": {
+                "type": "integer",
+                "format": "int64",
+                "description": "Largest value."
+              },
+              "min": {
+                "type": "integer",
+                "format": "int64",
+                "description": "Smallest value."
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "int"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "`true` or `false`.",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "bool"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A blob digest, `sha256:<64 hex>`, of the caller's account.",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "blob"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "The type of a template parameter (H2 §7.6): `{\"type\": \"enum\", \"values\": [...]}`, `{\"type\": \"int\", \"min\": …,\n\"max\": …}`, `{\"type\": \"bool\"}` or `{\"type\": \"blob\"}`."
+      },
+      "ParamValue": {
+        "oneOf": [
+          {
+            "type": "boolean",
+            "description": "A `bool` parameter."
+          },
+          {
+            "type": "integer",
+            "format": "int64",
+            "description": "An `int` parameter."
+          },
+          {
+            "type": "string",
+            "description": "An `enum` value or a `blob` digest."
+          }
+        ],
+        "description": "A parameter value in a launch request (H2 §7.6): a bool, an integer, or a string (enum values and blob\ndigests)."
       },
       "Placement": {
         "type": "object",
@@ -7043,6 +7582,146 @@
           }
         }
       },
+      "TemplateInfo": {
+        "type": "object",
+        "description": "A template as `GET /v1/templates` lists it (H2 §7.6): what the UI needs to offer and launch it. The JobSpec and\nthe allowed routes stay on the hub ([`Template`]).",
+        "required": [
+          "id",
+          "version",
+          "title",
+          "kind",
+          "ui"
+        ],
+        "properties": {
+          "description": {
+            "type": "string",
+            "description": "Description for the UI."
+          },
+          "download_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Estimate of the first-run download, in MiB, shown before launch.",
+            "minimum": 0
+          },
+          "id": {
+            "type": "string",
+            "description": "The template's id, `[a-z][a-z0-9-]{0,62}`."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/JobKind",
+            "description": "`batch` or `service`."
+          },
+          "licenses": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The image and model licenses, shown in the UI."
+          },
+          "params": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TemplateParam"
+            },
+            "description": "Its parameters."
+          },
+          "requirements": {
+            "$ref": "#/components/schemas/TemplateRequirements",
+            "description": "Hardware requirements."
+          },
+          "singleton": {
+            "type": "boolean",
+            "description": "One shared instance per account and project (H2 §7.6)."
+          },
+          "title": {
+            "type": "string",
+            "description": "Title for the UI."
+          },
+          "ui": {
+            "$ref": "#/components/schemas/TemplateUi",
+            "description": "The web app UI it gets."
+          },
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The template's version, from 1.",
+            "minimum": 0
+          }
+        }
+      },
+      "TemplateList": {
+        "type": "object",
+        "description": "Response of `GET /v1/templates` (H2 §7.3, §7.6).",
+        "properties": {
+          "bundle_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why no bundle can be served, if so."
+          },
+          "bundle_version": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The served bundle's version; `null` when none can be served.",
+            "minimum": 0
+          },
+          "templates": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TemplateInfo"
+            },
+            "description": "The templates (empty when no bundle can be served)."
+          }
+        }
+      },
+      "TemplateParam": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ParamType",
+            "description": "The type and its bounds or values."
+          },
+          {
+            "type": "object",
+            "required": [
+              "name",
+              "target"
+            ],
+            "properties": {
+              "default": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/ParamValue",
+                    "description": "The value used when a launch leaves it out; a parameter without one is required."
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "label": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "A label for the UI."
+              },
+              "name": {
+                "type": "string",
+                "description": "The parameter's name, the key of `params` in a launch."
+              },
+              "target": {
+                "type": "string",
+                "description": "Where the value goes: `env:<NAME>`, `argv:<index>`, `field:<field>`, `input:<path>` or `pull`."
+              }
+            }
+          }
+        ],
+        "description": "A template parameter (H2 §7.6)."
+      },
       "TemplateRef": {
         "type": "object",
         "description": "The template a job was launched from (H2 §7.6). Read-only: only a template launch sets it.\n\n**Strict** (request type): the `POST /v1/jobs` body, and what the agent parses a lease's job into (`LeaseJob::parse_strict`). Unknown fields are rejected, which catches typos and refuses a lease the agent would not fully understand (§6). Responses use the lenient twin, [`JobSpecView`].",
@@ -7097,6 +7776,34 @@
             "minimum": 0
           }
         }
+      },
+      "TemplateRequirements": {
+        "type": "object",
+        "description": "A template's hardware requirements (H2 §7.6).",
+        "properties": {
+          "gpu": {
+            "$ref": "#/components/schemas/GpuRequirement",
+            "description": "GPU need."
+          },
+          "min_vram_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Smallest GPU memory, in MiB, if it matters.",
+            "minimum": 0
+          }
+        }
+      },
+      "TemplateUi": {
+        "type": "string",
+        "description": "The UI a template gets in the web app (H2 §7.6, §9.4).",
+        "enum": [
+          "chat",
+          "transcribe",
+          "none"
+        ]
       },
       "Units": {
         "type": "integer",
@@ -7225,6 +7932,57 @@
             "type": "integer",
             "format": "int64",
             "description": "CPU time actually used (cgroup stats), in milliseconds.",
+            "minimum": 0
+          }
+        }
+      },
+      "VolumeInfo": {
+        "type": "object",
+        "description": "One volume of `GET /v1/volumes`, from the latest `VolumeReport`s (H2 §7.3, §11.3).",
+        "required": [
+          "name",
+          "node_id",
+          "size_mb",
+          "max_mb"
+        ],
+        "properties": {
+          "in_use_by": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/JobId",
+                "description": "The job that holds it now, if any (a volume has at most one holder)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "last_used_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When a job last used it."
+          },
+          "max_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Its limit, in MiB.",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string",
+            "description": "The volume's name, as in the JobSpec (`tpl:<id>/<name>` for template volumes)."
+          },
+          "node_id": {
+            "$ref": "#/components/schemas/NodeId",
+            "description": "The node that holds it."
+          },
+          "size_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Its measured size, in MiB.",
             "minimum": 0
           }
         }
@@ -7461,6 +8219,14 @@
     {
       "name": "blobs",
       "description": "Content-addressed job inputs, per account (H2 §7.5). No route returns blob contents."
+    },
+    {
+      "name": "templates",
+      "description": "The vetted one-click workloads of the bundle the hub serves, and their launch (H2 §7.6)."
+    },
+    {
+      "name": "volumes",
+      "description": "The persistent volumes the nodes hold (H2 §7.3, §11.3)."
     }
   ]
 }

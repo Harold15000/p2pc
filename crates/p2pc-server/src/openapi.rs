@@ -9,18 +9,22 @@ use std::sync::OnceLock;
 
 use p2pc_proto::api::{
     ApiKeyInfo, AuditEvent, AuditKind, BlobInfo, BlobList, BlobUploaded, Capacity, CpuInfo, CreateApiKey,
-    CreateJoinRequest, CreateJoinToken, CreatePairingTicket, DeviceInfo, Estimate, GpuInfo, GpuStatus, GpuStatusKind,
-    Health, Inventory, Job, JobAttempt, JobSpec, JobSpecView, JobStatus, JoinRequestCreated, JoinRequestInfo,
-    JoinRequestState, JoinRequestToken, JoinTokenInfo, JoinTokenResponse, LogLine, LogStream, NewApiKey, Node,
-    NodeApproval, NodeState, OutputEntry, Page, PairingTicketCreated, PairingTicketInfo, Platform, Principal, Problem,
-    RevealJoinRequest, SandboxCapability, SandboxClass, Scope, ServerInfo, SmokeResult, UsageGroupBy, UsageReport,
-    UsageTotals, WhoAmI, Wsl2Health,
+    CreateJoinRequest, CreateJoinToken, CreatePairingTicket, DeviceInfo, Estimate, GpuInfo, GpuRequirement, GpuStatus,
+    GpuStatusKind, Health, Inventory, Job, JobAttempt, JobSpec, JobSpecView, JobStatus, JoinRequestCreated,
+    JoinRequestInfo, JoinRequestState, JoinRequestToken, JoinTokenInfo, JoinTokenResponse, LaunchTemplate, LogLine,
+    LogStream, NewApiKey, Node, NodeApproval, NodeState, OutputEntry, Page, PairingTicketCreated, PairingTicketInfo,
+    ParamType, ParamValue, Platform, Principal, Problem, RevealJoinRequest, SandboxCapability, SandboxClass, Scope,
+    ServerInfo, SmokeResult, TemplateInfo, TemplateList, TemplateParam, TemplateRequirements, TemplateUi, UsageGroupBy,
+    UsageReport, UsageTotals, VolumeInfo, WhoAmI, Wsl2Health,
 };
 use p2pc_proto::validate::{ErrorCode, FieldError};
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
-use crate::{app, artifacts_api, blobs_api, devices_api, jobs_api, join_requests_api, nodes_api, ports_api, usage_api};
+use crate::{
+    app, artifacts_api, blobs_api, devices_api, jobs_api, join_requests_api, nodes_api, ports_api, templates_api,
+    usage_api, volumes_api,
+};
 
 /// Name of the security scheme.
 pub const BEARER: &str = "bearer";
@@ -79,6 +83,10 @@ pub const BEARER: &str = "bearer";
         blobs_api::head_blob,
         blobs_api::list_blobs,
         blobs_api::delete_blob,
+        templates_api::list_templates,
+        templates_api::launch_template,
+        volumes_api::list_volumes,
+        volumes_api::delete_volume,
     ),
     components(schemas(
         Problem,
@@ -145,6 +153,17 @@ pub const BEARER: &str = "bearer";
         BlobUploaded,
         BlobInfo,
         BlobList,
+        TemplateList,
+        TemplateInfo,
+        TemplateParam,
+        ParamType,
+        ParamValue,
+        TemplateRequirements,
+        GpuRequirement,
+        TemplateUi,
+        LaunchTemplate,
+        VolumeInfo,
+        Page<VolumeInfo>,
     )),
     modifiers(&BearerAuth),
     security(("bearer" = [])),
@@ -159,6 +178,8 @@ pub const BEARER: &str = "bearer";
         (name = "jobs", description = "Submit, list, inspect, cancel and estimate jobs."),
         (name = "usage", description = "The usage ledger: finished attempts and the units they cost."),
         (name = "blobs", description = "Content-addressed job inputs, per account (H2 §7.5). No route returns blob contents."),
+        (name = "templates", description = "The vetted one-click workloads of the bundle the hub serves, and their launch (H2 §7.6)."),
+        (name = "volumes", description = "The persistent volumes the nodes hold (H2 §7.3, §11.3)."),
     )
 )]
 pub struct ApiDoc;

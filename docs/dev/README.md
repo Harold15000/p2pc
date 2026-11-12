@@ -30,6 +30,19 @@ changing an endpoint or an API type, regenerate it and commit the result:
 P2PC_UPDATE_OPENAPI=1 cargo test -p p2pc-server --test openapi
 ```
 
+### The template bundle in the hub
+
+`p2pc-server` embeds the template bundle of its own build: `crates/p2pc-server/build.rs` compiles `templates/` with
+`scripts/templates-bundle`, so a template that breaks a bundle rule stops the build. Two build-time variables,
+both optional:
+
+| Variable | Meaning |
+|---|---|
+| `P2PC_TEMPLATES_RELEASE` | Set (to anything but `0`) by a release build: a placeholder image digest stops the build. |
+| `P2PC_RELEASE_PUBLIC_KEY` | The release key's public half, the base64 line of a minisign public key file. The hub verifies a newer bundle file in `<data>/templates/` against it. Without it the hub loads no bundle file and serves its embedded bundle only. |
+
+No key is in the repository. Tests sign their bundles with a throwaway key made at test time.
+
 ## The agent's environment
 
 `p2pc-agent` reads these environment variables (the flags and `agent.toml` win where they overlap):

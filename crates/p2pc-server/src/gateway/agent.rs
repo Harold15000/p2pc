@@ -682,10 +682,24 @@ async fn run(inner: &Inner, control: &mut Control, node: &NodeRow) {
                 inner.events.on_message(node_id, msg).await;
                 None
             }
-            // The other H2 messages (§6.1) are not served yet: answered exactly as an unknown type (H1 §6).
-            AgentMsg::Unknown | AgentMsg::VolumeReport(_) | AgentMsg::Leave(_) => {
-                Some(error(error_code::UNSUPPORTED_MESSAGE, UNSUPPORTED_MESSAGE))
+            // H2 §6.1: the node's volumes, kept for `GET /v1/volumes` (T2-15). Only an agent that declared `volumes`
+            // sends it; any other is answered as for a type the hub does not serve.
+            AgentMsg::VolumeReport(report) => {
+                inner
+                    .hub()
+                    .touch(node_id, inner.state.clock.now(), inner.limits.last_seen_flush);
+                match crate::volumes_api::on_report(&inner.state, node_id, report).await {
+                    Ok(true) => None,
+                    Ok(false) => Some(error(error_code::UNSUPPORTED_MESSAGE, UNSUPPORTED_MESSAGE)),
+                    Err(e) => {
+                        // The agent reports again in ten minutes, and when a lease that mounted a volume ends.
+                        tracing::warn!(error = %e, %node_id, "cannot store a volume report");
+                        None
+                    }
+                }
             }
+            // The other H2 messages (§6.1) are not served yet: answered exactly as an unknown type (H1 §6).
+            AgentMsg::Unknown | AgentMsg::Leave(_) => Some(error(error_code::UNSUPPORTED_MESSAGE, UNSUPPORTED_MESSAGE)),
             // One `Join` or `Hello` per connection.
             AgentMsg::Join { .. } | AgentMsg::Hello { .. } => return,
         };

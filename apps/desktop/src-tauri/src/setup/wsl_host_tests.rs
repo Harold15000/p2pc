@@ -391,7 +391,7 @@ fn the_share_is_set_with_the_agent_s_share_set() {
             "--memory-mb",
             "8192",
             "--gpu",
-            "true",
+            "all",
             "--disk-mb",
             "51200",
             "--volumes-mb",
@@ -399,6 +399,29 @@ fn the_share_is_set_with_the_agent_s_share_set() {
         ]
         .map(String::from)
     );
+}
+
+#[test]
+fn the_gpu_setting_is_sent_as_all_or_none_never_as_a_boolean() {
+    // `p2pc-agent share set --gpu` takes `all`, `none` or GPU UUIDs (crates/p2pc-agent `GpuShare`), not `true|false`.
+    for (gpu, word) in [(true, "all"), (false, "none")] {
+        let share = ShareRecord {
+            cpu: 2,
+            memory_mb: 2048,
+            gpu,
+            share_gib: 50,
+            disk_mb: 25_600,
+            volumes_mb: 25_600,
+        };
+        let command = share_set_command(&share);
+        let at = command.iter().position(|a| a == "--gpu").expect("--gpu");
+        assert_eq!(command[at + 1], word, "gpu = {gpu}");
+        assert!(
+            !command.iter().any(|a| a == "true" || a == "false"),
+            "no boolean word in {command:?}"
+        );
+        assert_eq!(command.len(), 15, "the other flags are unchanged: {command:?}");
+    }
 }
 
 #[test]

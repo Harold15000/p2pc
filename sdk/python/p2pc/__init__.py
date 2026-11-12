@@ -22,7 +22,7 @@ from p2pc.errors import (
     UnprocessableError,
     UnsafePathError,
 )
-from p2pc.h2 import Blob, TemplateInfo, TemplateList, TemplateParam
+from p2pc.h2 import Blob
 from p2pc.models import (
     AUDIT_KINDS,
     GPU_STATUS_KINDS,
@@ -71,6 +71,9 @@ from p2pc.models import (
     ServicePort,
     ServiceSpec,
     SmokeResult,
+    TemplateInfo,
+    TemplateList,
+    TemplateParam,
     UsageReport,
     UsageTotals,
     VolumeSpec,
