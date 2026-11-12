@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# iroh-relay 1.4.1 on a PaaS that only offers HTTP(S) and WebSockets (H2 spec §10.2), as measured in experiment E12.
+# The platform's edge terminates TLS and forwards WebSockets; this relay speaks plain HTTP behind it.
+#
+# `$PORT` is the one placeholder: the entrypoint replaces it with the platform's port before iroh-relay reads the file.
+
+# Relay traffic between endpoints (end-to-end encrypted: the relay cannot read it).
+enable_relay = true
+# No `tls` section: every relay service, the `/ping` probe route included, on plain HTTP on this address.
+http_bind_addr = "[::]:$PORT"
+# QUIC address discovery needs TLS and UDP on the relay, and the platform has no UDP: off. Nodes get it from another
+# relay in their map (H2 §10.3).
+enable_quic_addr_discovery = false
+# No metrics server: nothing listens beyond the relay's own port.
+enable_metrics = false
+# Open to any NodeId: pairing makes devices unknowable in advance (H2 §10.2). The limits below bound the cost.
+access = "everyone"
+
+[limits]
+# New connections accepted per second, and the burst above that rate.
+accept_conn_limit = 10.0
+accept_conn_burst = 40
+
+[limits.client.rx]
+# What each client may send through the relay: 4 MiB/s steady, bursts of up to 16 MiB.
+bytes_per_second = 4194304
+max_burst_bytes = 16777216
