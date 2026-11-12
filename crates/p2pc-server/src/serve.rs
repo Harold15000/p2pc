@@ -70,11 +70,14 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     let gc = crate::gc::spawn(state.clone());
     // H2 §5.5: every 2 s, close the connections of devices revoked (by any process) or past their expiry.
     let sweep = crate::devices_api::spawn_liveness_sweep(state.clone());
+    // H2 §7.6: `<data>/templates/` is read again every 60 s.
+    let bundles = state.bundle.spawn_reload();
     tracing::info!(address = %state.server.address(), "server address");
     serve_on(listener, state, shutdown_signal()).await?;
     scheduling.abort();
     gc.abort();
     sweep.abort();
+    bundles.abort();
     gateway.shutdown().await;
     // Write the failed authentications still queued before closing the database.
     failures.flush().await;

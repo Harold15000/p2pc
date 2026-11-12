@@ -26,6 +26,7 @@ pub mod leases;
 pub mod nodes;
 pub mod outputs;
 pub mod ports;
+pub mod templates;
 pub mod usage;
 
 use std::path::{Path, PathBuf};

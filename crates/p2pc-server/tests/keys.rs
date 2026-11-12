@@ -208,7 +208,8 @@ async fn revoke_is_idempotent_and_audited() {
         .unwrap()
         .clone();
     assert_eq!(row["revoked_at"], "2026-11-05T10:05:00Z");
-    // Audit, newest first: the revoked key's failed attempt, one key_revoked (not two), the key_created events.
+    // Audit, newest first: the revoked key's failed attempt, one key_revoked (not two), the key_created events and,
+    // between them, the hub's own first start, which loaded its template bundle (H2 §7.6).
     app.flush_audit().await;
     let audit = app.get("/v1/audit", &app.admin).await.json();
     let kinds: Vec<&str> = audit["items"]
@@ -217,7 +218,16 @@ async fn revoke_is_idempotent_and_audited() {
         .iter()
         .map(|e| e["kind"].as_str().unwrap())
         .collect();
-    assert_eq!(kinds, ["auth_failed", "key_revoked", "key_created", "key_created"]);
+    assert_eq!(
+        kinds,
+        [
+            "auth_failed",
+            "key_revoked",
+            "key_created",
+            "template_bundle_loaded",
+            "key_created"
+        ]
+    );
     assert_eq!(audit["items"][0]["subject_id"], id);
     let revoked = &audit["items"][1];
     assert_eq!(revoked["subject_id"], id);
@@ -317,8 +327,10 @@ async fn accounts_cannot_see_or_revoke_each_others_keys() {
 #[tokio::test]
 async fn audit_is_paginated_newest_first_and_filters_by_kind() {
     let app = TestApp::new().await;
-    // Subjects in creation order: init's admin key, then three more.
-    let mut created = vec![app.admin_key.key_id().to_string()];
+    // Subjects in creation order: init's admin key, the template bundle the hub loaded at its first start (H2 §7.6;
+    // the subject is its version), then three more keys.
+    let bundle_version = app.state.bundle.served().unwrap().version().to_string();
+    let mut created = vec![app.admin_key.key_id().to_string(), bundle_version];
     for _ in 0..3 {
         let (_, v) = app.create_key(json!({"scopes": ["jobs:read"]})).await;
         created.push(v["id"].as_str().unwrap().to_string());
@@ -345,7 +357,7 @@ async fn audit_is_paginated_newest_first_and_filters_by_kind() {
         "{ids:?}"
     );
     let unique: std::collections::BTreeSet<_> = ids.iter().collect();
-    assert_eq!(unique.len(), 4);
+    assert_eq!(unique.len(), 5);
     let v = app.get("/v1/audit?kind=key_revoked", &app.admin).await.json();
     assert_eq!(v["items"], json!([]));
     let v = app.get("/v1/audit?kind=key_created&limit=1", &app.admin).await.json();

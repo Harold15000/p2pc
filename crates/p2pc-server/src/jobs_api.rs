@@ -181,13 +181,9 @@ fn prepare(state: &AppState, mut spec: JobSpec, headers: &HeaderMap) -> Result<P
     }
     let limits = Limits {
         allowed_registries: Some(state.config.allowed_registries.clone()),
-        // Service jobs are served from T2-12 on, blob inputs from T2-14 on. Volumes stay refused until their own task
-        // (T2-15) turns them on.
-        h2: H2Features {
-            services: true,
-            blob_inputs: true,
-            ..H2Features::default()
-        },
+        // Service jobs are served from T2-12 on, blob inputs from T2-14 on and volumes from T2-15 on. A client's
+        // body is validated as `SpecContext::Create`: volumes only on a service, and never a `tpl:` name.
+        h2: H2Features::ALL,
         ..Limits::default()
     };
     spec.validate(&limits).map_err(|e| ApiError::validation(&e))?;

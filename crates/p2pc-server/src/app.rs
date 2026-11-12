@@ -36,7 +36,7 @@ use crate::nodes_api;
 use crate::store::audit::NewEvent;
 use crate::store::keys::{KeyCursor, MAX_DAILY_UNIT_CAP_MILLI, NewKey, Revoke};
 use crate::store::{self, Db, StoreError};
-use crate::{blobs_api, devices_api, jobs_api, join_requests_api};
+use crate::{blobs_api, devices_api, jobs_api, join_requests_api, templates_api};
 
 /// Default page size of list endpoints.
 pub const DEFAULT_PAGE_LIMIT: u32 = 50;
@@ -77,9 +77,13 @@ pub struct AppState {
     /// scheduler's idle cancel and by `GET /v1/jobs/{id}`.
     pub connections: crate::scheduler::OpenConnections,
     /// Which templates are `singleton` (H2 §7.6), for the template view of the job routes (§5.5), and their
-    /// `allowed_routes`, for the filter of their service ports (§7.4). Until the template bundle is loaded (T2-15) it
-    /// is [`jobs_api::NoTemplates`]: no template, so no singleton instance and no allowed route.
+    /// `allowed_routes`, for the filter of their service ports (§7.4): the bundle the hub serves now ([`Self::bundle`]).
+    /// With no bundle served there is no template, so no singleton instance and no allowed route.
     pub templates: Arc<dyn jobs_api::TemplateCatalog>,
+    /// The template bundle the hub serves (H2 §7.6), with its anti-rollback high-water mark: `GET /v1/templates` and
+    /// the launch read it. Replace it with [`AppState::set_bundle`], which keeps [`Self::templates`] on the same
+    /// bundle.
+    pub bundle: crate::templates::TemplateStore,
     /// The port relay (H2 §7.4): the limits and the accounting of the service port connections. It counts them in
     /// `connections`.
     pub ports: crate::gateway::ports::PortRelay,
@@ -111,7 +115,12 @@ impl AppState {
         let logs = crate::logs::LogStore::new(&config.data_dir);
         let outputs = crate::outputs::OutputStore::new(&config.data_dir, db.clone(), clock.clone(), logs.clone());
         let blobs = crate::blobs::BlobStore::new(&config.data_dir);
+        // H2 §7.6: the embedded bundle, or a newer signed one from `<data>/templates/`, never one below the mark.
+        let bundle =
+            crate::templates::TemplateStore::open(db.clone(), clock.clone(), owner_account, &config.data_dir).await?;
         Ok(Self {
+            templates: Arc::new(bundle.clone()),
+            bundle,
             blobs,
             logs,
             outputs,
@@ -128,8 +137,13 @@ impl AppState {
             devices: crate::devices_api::DeviceSessions::default(),
             connections,
             ports,
-            templates: Arc::new(jobs_api::NoTemplates),
         })
+    }
+
+    /// Serves `bundle` instead: the listing, the launch, the template view and the port filter all read it.
+    pub fn set_bundle(&mut self, bundle: crate::templates::TemplateStore) {
+        self.templates = Arc::new(bundle.clone());
+        self.bundle = bundle;
     }
 }
 
@@ -224,6 +238,8 @@ fn build(state: AppState, transport: Transport) -> Router {
         .route("/v1/jobs/{id}/cancel", post(jobs_api::cancel_job))
         .route("/v1/jobs/{id}/outputs", get(crate::artifacts_api::list_outputs))
         .route("/v1/estimate", post(jobs_api::estimate))
+        .route("/v1/templates", get(templates_api::list_templates))
+        .route("/v1/templates/{id}/launch", post(templates_api::launch_template))
         .route("/v1/usage", get(crate::usage_api::get_usage))
         .route("/v1/blobs", get(blobs_api::list_blobs))
         .route(
