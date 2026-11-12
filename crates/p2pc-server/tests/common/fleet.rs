@@ -7,6 +7,7 @@
 // Helpers are not `#[test]` functions: a failed `expect` here is a test failure with its message.
 #![allow(clippy::expect_used)]
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
@@ -21,6 +22,7 @@ use p2pc_proto::protocol::{
     AgentMsg, LogData, MAX_FRAME_LEN, Outcome, RunningLease, ServerMsg, UploadAck, UploadHeader, Usage, decode_frame,
     read_frame_bytes, write_frame,
 };
+use p2pc_server::app::AppState;
 use p2pc_server::config::Config;
 use p2pc_server::gateway::endpoint::bind;
 use p2pc_server::gateway::{EndpointOptions, Gateway, GatewayConfig, GatewayLimits};
@@ -58,14 +60,24 @@ impl Fleet {
     }
 
     /// With the config edited before the state is built, and gateway limits.
-    pub async fn start_with(edit: impl FnOnce(&mut Config), mut limits: GatewayLimits) -> Self {
-        let app = TestApp::with_config(edit).await;
+    pub async fn start_with(edit: impl FnOnce(&mut Config), limits: GatewayLimits) -> Self {
+        Self::start_full(edit, |_| {}, limits, "127.0.0.1:9".parse().unwrap()).await
+    }
+
+    /// [`Fleet::start_with`], with the app state edited before anything is built from it (a template catalog), and
+    /// the REST listener the `p2pc/http/1` tunnel relays to.
+    pub async fn start_full(
+        edit: impl FnOnce(&mut Config),
+        prepare: impl FnOnce(&mut AppState),
+        mut limits: GatewayLimits,
+        rest: SocketAddr,
+    ) -> Self {
+        let mut app = TestApp::with_config(edit).await;
+        prepare(&mut app.state);
+        app.router = p2pc_server::app::router(app.state.clone());
         let state = app.state.clone();
         let scheduler = Scheduler::new(&state, Arc::new(state.hub.clone()));
-        let mut config = GatewayConfig::new(
-            EndpointOptions::loopback_without_relays(),
-            "127.0.0.1:9".parse().unwrap(),
-        );
+        let mut config = GatewayConfig::new(EndpointOptions::loopback_without_relays(), rest);
         // The background sweep never runs during a test.
         limits.sweep_interval = StdDuration::from_secs(3600);
         config.limits = limits;
