@@ -761,7 +761,31 @@ wait "$runner_pid"
 assert_eq "0" "$?" "TERM: 0"
 assert_eq "TERM" "$(cat "$NR_STATE/hub-signals" 2>/dev/null)" "the hub got TERM"
 
-# An agent asked to stop (exit 0) with the hub enabled: the hub keeps running too.
+# An agent that ends with 0 while the hub is enabled is started again at the next poll: the runner stays up for the hub,
+# so nothing else would ever start the agent again (with the hub disabled, exit 0 still ends the runner, as in H1).
+new_run
+enable_hub
+printf '0\n' >"$NR_STATE/codes"
+mkfifo "$NR_STATE/hub-started.fifo" "$NR_STATE/started.fifo"
+with_ticks
+runner_exec &
+runner_pid=$!
+read_fifo "$NR_STATE/hub-started.fifo" >/dev/null
+flock "$NR_STATE/agent.lock" true
+assert_eq "1" "$(agent_runs)" "the agent ran and ended with 0"
+assert_contains "$(status_of)" "exit_code=0" "node-run.status says so"
+touch "$NR_STATE/long" # its next run lasts until a signal
+await_tick >/dev/null
+release_tick
+assert_eq "started" "$(read_fifo "$NR_STATE/started.fifo")" "at the next poll, with the hub enabled, the agent is started again"
+assert_eq "2" "$(agent_runs)" "a second run"
+assert_false "and the hub was not touched" test -e "$NR_STATE/hub-signals"
+kill -TERM "$runner_pid"
+wait "$runner_pid"
+assert_eq "0" "$?" "TERM: 0"
+assert_eq "TERM" "$(cat "$NR_STATE/agent-signals" 2>/dev/null)" "the restarted agent got TERM"
+assert_eq "1" "$(hub_runs)" "the hub ran once, all along"
+# ... but with hub.enabled gone by the next poll, nothing is restarted: nothing is left, exit 0 (an ordinary end).
 new_run
 enable_hub
 printf '0\n' >"$NR_STATE/codes"
@@ -772,12 +796,12 @@ runner_pid=$!
 read_fifo "$NR_STATE/hub-started.fifo" >/dev/null
 flock "$NR_STATE/agent.lock" true
 await_tick >/dev/null
-release_tick
-assert_eq "tick" "$(await_tick)" "agent exit 0 with the hub enabled: the runner keeps running"
 disable_hub
 release_tick
 wait "$runner_pid"
-assert_eq "0" "$?" "then hub.enabled removed: nothing left, exit 0 (an ordinary end)"
+assert_eq "0" "$?" "hub.enabled removed after the agent's exit 0: the runner ends with 0"
+assert_eq "1" "$(agent_runs)" "and the agent was not started again"
+# A terminal code is never restarted, hub or not (covered above: exit 64 once the hub is disabled).
 
 # --- the runner never logs the environment or a token: it has none to log ----------------------------------------------------
 assert_false "p2pc-run never reads a token" grep -qi 'token' "$runner"

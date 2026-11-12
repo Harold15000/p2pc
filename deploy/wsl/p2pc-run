@@ -22,7 +22,9 @@
 #        it is missing: the agent refuses a named config file that does not exist, and with an empty one it stops for
 #        good with "not joined" (exit 8) instead of crash-looping;
 #     4. stops the agent for good on its terminal exit codes (crates/p2pc-agent/src/connection/exit.rs: 6 agent too old,
-#        7 not enrolled any more, 8 never joined); on exit 0 (the agent was asked to stop) it is not restarted either.
+#        7 not enrolled any more, 8 never joined); on exit 0 (the agent was asked to stop) its supervisor ends too, and
+#        the agent is started again at the next poll only while the hub is enabled (the runner stays up for the hub, so
+#        nothing else would start it; with the hub disabled the runner ends, as in H1).
 #        Why it stopped goes to /var/lib/p2pc/node-run.status (key=value lines, mode 0600), which `install.ps1 -Status`
 #        shows. A terminal stop also records a stamp (the SHA-256 of agent.toml and of the agent binary): if the task
 #        could not be disabled, the next start finds that stamp unchanged and does not run the agent; a new enrollment
@@ -551,7 +553,7 @@ main() {
 
   (supervise_agent) &
   AGENT_SUP=$!
-  local agent_rc=0 hub_hold=0 ended rc
+  local agent_rc=0 hub_hold=0 agent_again=0 ended rc
   local -a pids
   while :; do
     # The hub follows hub.enabled. After its supervisor ended by itself (it never should), wait for one poll before
@@ -584,10 +586,19 @@ main() {
       "$TICK_PID")
         TICK_PID=""
         hub_hold=0
+        # An agent that ended with 0 (a requested stop) while the hub is enabled is started again at the poll: the runner
+        # stays up for the hub, so nothing else would start it. A terminal stop (64) is never restarted.
+        if ((agent_again)) && [[ -z "$AGENT_SUP" && -e "$HUB_FLAG" ]]; then
+          runner_log "the agent ended with 0 while the hub is enabled: starting it again"
+          (supervise_agent) &
+          AGENT_SUP=$!
+        fi
+        agent_again=0
         ;;
       "$AGENT_SUP")
         AGENT_SUP=""
         agent_rc=$rc
+        ((rc == 0)) && agent_again=1
         ;;
       "$HUB_SUP")
         HUB_SUP=""
