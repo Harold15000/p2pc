@@ -783,6 +783,8 @@ impl Scheduler {
             // H2 §7.2: a running service is `starting` until its first passing check.
             if lease.job_kind == JobKind::Service {
                 leases::service_started(tx, lease.job_id, now).await?;
+                // H2 §7.6: a new attempt starts with a fresh `setup` (the hub's model pull, `crate::model_pull`).
+                crate::store::setup::attempt_started(tx, lease.job_id, now).await?;
                 // H2 §12: the reservation again, from the attempt's start.
                 crate::units::attempt_began(tx, lease.job_id, now, self.inner.timing.gpu_hour_units).await?;
             }

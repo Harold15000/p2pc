@@ -76,6 +76,8 @@ pub enum Act {
         second: Vec<u8>,
         gate: Option<Arc<Semaphore>>,
     },
+    /// Reads one HTTP request, answers these bytes and then **resets** the stream: a connection that breaks.
+    Reset(Vec<u8>),
     /// Answers `PortOpenAck{ok: false}` with this reason.
     Refuse(&'static str),
     /// Accepts the connection and never sends a byte.
@@ -147,6 +149,22 @@ impl Node {
     /// leases at once. The service behind it is the same.
     pub async fn restart(self, fleet: &Fleet) -> Self {
         let agent = fleet.restart_with(self.agent, &["service_jobs"]).await;
+        tokio::spawn(accept(agent.conn.clone(), self.service.clone()));
+        Self { agent, ..self }
+    }
+
+    /// The agent's connection breaks and comes back with a `Hello` that still lists `running`: the hub keeps those
+    /// leases, and every stream it had open to the service is gone. The service behind it is the same.
+    pub async fn reconnect(self, fleet: &Fleet, running: &[(LeaseId, u64)]) -> Self {
+        let agent = fleet.reconnect(self.agent, &["service_jobs"], running).await;
+        tokio::spawn(accept(agent.conn.clone(), self.service.clone()));
+        Self { agent, ..self }
+    }
+
+    /// The agent reconnects declaring `features` (H2 §6.1) instead of `service_jobs` alone, for a node that also
+    /// holds volumes. Its `Hello` lists no lease. The service behind it is the same.
+    pub async fn with_features(self, fleet: &Fleet, features: &[&str]) -> Self {
+        let agent = fleet.restart_with(self.agent, features).await;
         tokio::spawn(accept(agent.conn.clone(), self.service.clone()));
         Self { agent, ..self }
     }
@@ -287,6 +305,15 @@ async fn connection(mut send: SendStream, mut recv: RecvStream, service: Arc<Ser
             };
             let _ = send.finish();
             clean
+        }
+        Act::Reset(answer) => {
+            let _ = write_frame(&mut send, &accepted).await;
+            if read_request(&mut recv, &mut bytes).await {
+                let _ = send.write_all(&answer).await;
+                // What was written may or may not arrive before the reset: either way the stream breaks.
+                let _ = send.reset(0u32.into());
+            }
+            drain(&mut recv, &mut bytes).await
         }
         Act::Http { first, second, gate } => {
             let _ = write_frame(&mut send, &accepted).await;
