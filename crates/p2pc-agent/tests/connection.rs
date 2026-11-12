@@ -18,13 +18,14 @@ use p2pc_agent::connection::lease::{LeaseDecision, LeaseHandler, LeaseOffer, Lea
 use p2pc_agent::connection::load::LoadSource;
 use p2pc_agent::connection::session::{INVENTORY_INTERVAL, InventorySource, MAX_PENDING_DECISIONS, Shared};
 use p2pc_agent::connection::state::{AgentState, ConnectionState, StateFile};
+use p2pc_agent::connection::streams::{HubRecv, HubSend, HubStream, PortIo, PortOpener, StreamAcceptor};
 use p2pc_agent::connection::transport::{ConnectError, Connector, Link};
 use p2pc_agent::connection::watchdog::Watchdog;
 use p2pc_agent::connection::{BoxFuture, Uplink, exit};
 use p2pc_proto::api::Inventory;
 use p2pc_proto::ids::{AccountId, LeaseId, NodeId};
 use p2pc_proto::net::{AddressChange, SelectedAddr};
-use p2pc_proto::protocol::{Load, MAX_FRAME_LEN, RunningLease, read_frame, write_frame};
+use p2pc_proto::protocol::{Load, MAX_FRAME_LEN, PortOpen, RunningLease, read_frame, write_frame};
 use serde_json::{Value, json};
 use tokio::io::{DuplexStream, ReadHalf, WriteHalf};
 use tokio::sync::{Notify, Semaphore, mpsc, watch};
@@ -45,6 +46,8 @@ struct PipeConnector {
     refuse: AtomicBool,
     attempts: Mutex<Vec<Instant>>,
     rebinds: Mutex<Vec<Vec<SelectedAddr>>>,
+    /// Where the streams the fake server opens arrive, for the tests of H2 §6.1.
+    incoming: Option<Arc<dyn StreamAcceptor>>,
 }
 
 impl Connector for PipeConnector {
@@ -58,7 +61,11 @@ impl Connector for PipeConnector {
             let (ar, aw) = tokio::io::split(agent);
             let (sr, sw) = tokio::io::split(server);
             let _ = self.accepted.send(ServerEnd { r: sr, w: sw });
-            Ok(Link::new(Box::new(aw), Box::new(ar), Box::new(|| {})))
+            let link = Link::new(Box::new(aw), Box::new(ar), Box::new(|| {}));
+            Ok(match &self.incoming {
+                Some(incoming) => link.with_incoming(incoming.clone()),
+                None => link,
+            })
         })
     }
 
@@ -271,6 +278,10 @@ struct Options {
     agent_lease_ttl: Duration,
     /// A state file left by an earlier `run`, written before the daemon starts.
     earlier_state: Option<AgentState>,
+    /// The node's port opener (its ingress bridge); `None` is an H1 agent.
+    ports: Option<Arc<dyn PortOpener>>,
+    /// Where the streams the fake server opens arrive.
+    incoming: Option<Arc<dyn StreamAcceptor>>,
 }
 
 impl Default for Options {
@@ -280,6 +291,8 @@ impl Default for Options {
             handler_with_events: None,
             agent_lease_ttl: Duration::from_secs(45),
             earlier_state: None,
+            ports: None,
+            incoming: None,
         }
     }
 }
@@ -292,6 +305,7 @@ fn start(opts: Options) -> World {
         refuse: AtomicBool::new(false),
         attempts: Mutex::new(Vec::new()),
         rebinds: Mutex::new(Vec::new()),
+        incoming: opts.incoming,
     });
     let (ev_tx, events) = mpsc::unbounded_channel();
     let handler = match opts.handler_with_events {
@@ -326,6 +340,7 @@ fn start(opts: Options) -> World {
         inventory_interval: INVENTORY_INTERVAL,
         decisions: Arc::new(Semaphore::new(MAX_PENDING_DECISIONS)),
         uplink: Uplink::new(),
+        ports: opts.ports,
     };
     let daemon = Daemon {
         shared,
@@ -1227,4 +1242,224 @@ async fn shutdown_stops_every_job_before_the_agent_exits() {
     let mut events = std::mem::replace(&mut w.events, mpsc::unbounded_channel().1);
     assert_eq!(w.shutdown().await, DaemonExit::Shutdown);
     assert_eq!(events.try_recv().map(|e| e.1), Ok(Event::StopAll("shutdown")));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Service ports (H2 §6.1): the capability, service leases, and the streams the server opens
+
+/// The agent's sending half of a server-opened stream, over a pipe.
+struct PipeSend(DuplexStream);
+
+impl tokio::io::AsyncWrite for PipeSend {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
+impl HubSend for PipeSend {
+    fn reset(&mut self, _code: u32) {}
+}
+
+/// The agent's receiving half of a server-opened stream, over a pipe.
+struct PipeRecv(DuplexStream);
+
+impl tokio::io::AsyncRead for PipeRecv {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl HubRecv for PipeRecv {
+    fn stop(&mut self, _code: u32) {}
+}
+
+/// The streams the fake server opened, in order.
+#[derive(Debug)]
+struct PipeAcceptor(tokio::sync::Mutex<mpsc::UnboundedReceiver<HubStream>>);
+
+impl StreamAcceptor for PipeAcceptor {
+    fn accept(&self) -> BoxFuture<'_, Result<HubStream, ConnectError>> {
+        Box::pin(async move {
+            match self.0.lock().await.recv().await {
+                Some(stream) => Ok(stream),
+                None => Err(ConnectError("no more streams".into())),
+            }
+        })
+    }
+}
+
+/// The fake server's end of a stream it opened.
+struct ServerStream {
+    to_agent: DuplexStream,
+    from_agent: DuplexStream,
+}
+
+/// The fake server opens a stream on the agent's connection.
+fn open_stream(streams: &mpsc::UnboundedSender<HubStream>) -> ServerStream {
+    let (agent_send, from_agent) = tokio::io::duplex(64 * 1024);
+    let (to_agent, agent_recv) = tokio::io::duplex(64 * 1024);
+    let stream = HubStream {
+        send: Box::new(PipeSend(agent_send)),
+        recv: Box::new(PipeRecv(agent_recv)),
+    };
+    streams.send(stream).unwrap();
+    ServerStream { to_agent, from_agent }
+}
+
+/// A port opener that connects every port to an echo, and records what it was asked for.
+#[derive(Debug, Default)]
+struct EchoPorts {
+    opened: Mutex<Vec<PortOpen>>,
+}
+
+impl PortOpener for EchoPorts {
+    fn open<'a>(&'a self, open: &'a PortOpen) -> BoxFuture<'a, Result<Box<dyn PortIo>, &'static str>> {
+        self.opened.lock().unwrap().push(open.clone());
+        Box::pin(async move {
+            let (agent, service) = tokio::io::duplex(64 * 1024);
+            tokio::spawn(async move {
+                let (mut r, mut w) = tokio::io::split(service);
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+            Ok(Box::new(agent) as Box<dyn PortIo>)
+        })
+    }
+}
+
+fn service_job() -> Value {
+    json!({
+        "kind": "service",
+        "image": "docker.io/library/python:3.12-slim",
+        "command": ["python", "-m", "http.server", "8080"],
+        "resources": {"cpu": 1, "memory_mb": 512},
+        "service": {"ports": [{"port": 8080, "name": "web"}]},
+    })
+}
+
+/// H2 §6.1: an agent whose node can serve the ports of a service declares `service_jobs` and takes service leases.
+/// Without that it is an H1 agent: no capability, and a service lease is `invalid_job` before any handler sees it.
+#[tokio::test(start_paused = true)]
+async fn service_jobs_is_declared_and_service_leases_are_taken_only_with_a_port_opener() {
+    for with_ports in [false, true] {
+        let recorder = Arc::new(Recorder::default());
+        let mut w = start(Options {
+            handler: recorder.clone(),
+            ports: with_ports.then(|| Arc::new(EchoPorts::default()) as Arc<dyn PortOpener>),
+            ..Options::default()
+        });
+        let mut s = w.next_connection().await;
+        let hello = s.handshake(w.owner).await;
+        let expected = if with_ports { json!(["service_jobs"]) } else { json!([]) };
+        assert_eq!(hello["features"], expected, "with_ports = {with_ports}");
+        let (id, lease) = lease_msg(w.owner, service_job());
+        s.send(lease).await;
+        let answer = s.recv_not_heartbeat().await.unwrap();
+        if with_ports {
+            assert_eq!(answer, json!({"type": "lease_accepted", "lease_id": id, "epoch": 1}));
+            assert_eq!(*recorder.offers.lock().unwrap(), [id]);
+        } else {
+            assert_eq!(
+                answer,
+                json!({"type": "lease_rejected", "lease_id": id, "epoch": 1, "reason": "invalid_job"})
+            );
+            assert!(recorder.offers.lock().unwrap().is_empty());
+        }
+        // A batch lease is taken either way.
+        let (batch, lease) = lease_msg(w.owner, good_job());
+        s.send(lease).await;
+        let answer = s.recv_not_heartbeat().await.unwrap();
+        assert_eq!(answer, json!({"type": "lease_accepted", "lease_id": batch, "epoch": 1}));
+        let (_task, _rx) = s.serve(true);
+        assert_eq!(w.shutdown().await, DaemonExit::Shutdown);
+    }
+}
+
+/// H2 §6.1: the streams the server opens are served once the session is welcomed, never before, and they end with
+/// the session.
+#[tokio::test(start_paused = true)]
+async fn the_servers_streams_are_served_only_after_the_welcome_and_end_with_the_session() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let (streams, accepted) = mpsc::unbounded_channel();
+    let ports = Arc::new(EchoPorts::default());
+    let mut w = start(Options {
+        ports: Some(ports.clone()),
+        incoming: Some(Arc::new(PipeAcceptor(tokio::sync::Mutex::new(accepted)))),
+        ..Options::default()
+    });
+    let lease = LeaseId::generate();
+    let port_open = json!({"type": "port_open", "lease_id": lease, "epoch": 4, "port": 8080, "conn_id": 9});
+    let mut s = w.next_connection().await;
+    assert_eq!(s.recv().await.unwrap()["type"], "hello");
+
+    // Before its Welcome the server opens a stream: nothing takes it.
+    let mut early = open_stream(&streams);
+    write_frame(&mut early.to_agent, &port_open).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(
+        ports.opened.lock().unwrap().is_empty(),
+        "a stream was served before the Welcome"
+    );
+
+    // Welcomed: it is served, with the agent's ack first and then the bytes of the port.
+    s.welcome(w.owner, 60).await;
+    let ack: Value = read_frame(&mut early.from_agent, MAX_FRAME_LEN).await.unwrap().unwrap();
+    assert_eq!(ack, json!({"ok": true}));
+    assert_eq!(
+        *ports.opened.lock().unwrap(),
+        [PortOpen {
+            lease_id: lease,
+            epoch: 4,
+            port: 8080,
+            conn_id: 9
+        }]
+    );
+    early.to_agent.write_all(b"ping").await.unwrap();
+    drop(early.to_agent);
+    let mut echoed = Vec::new();
+    early.from_agent.read_to_end(&mut echoed).await.unwrap();
+    assert_eq!(echoed, b"ping");
+
+    // A stream that is open when the connection goes away ends with it.
+    let mut open = open_stream(&streams);
+    write_frame(&mut open.to_agent, &port_open).await.unwrap();
+    let ack: Value = read_frame(&mut open.from_agent, MAX_FRAME_LEN).await.unwrap().unwrap();
+    assert_eq!(ack, json!({"ok": true}));
+    drop(s);
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(60), open.from_agent.read_to_end(&mut rest))
+        .await
+        .expect("the port stream outlived its session")
+        .unwrap();
+    assert!(rest.is_empty());
+
+    // The next session serves streams again.
+    let mut s = w.next_connection().await;
+    s.handshake(w.owner).await;
+    let mut again = open_stream(&streams);
+    write_frame(&mut again.to_agent, &port_open).await.unwrap();
+    let ack: Value = read_frame(&mut again.from_agent, MAX_FRAME_LEN).await.unwrap().unwrap();
+    assert_eq!(ack, json!({"ok": true}));
+    let (_task, _rx) = s.serve(true);
+    assert_eq!(w.shutdown().await, DaemonExit::Shutdown);
 }
