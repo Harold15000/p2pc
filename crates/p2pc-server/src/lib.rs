@@ -18,6 +18,7 @@
 //! - [`logs`] (with [`fsutil`]): stored job logs (§7, §12);
 //! - [`templates`]: the template bundle the hub serves, with its anti-rollback high-water mark (H2 §7.6), and
 //!   [`templates_api`]: the listing and the launch;
+//! - [`model_pull`]: the hub's own model pull of a template service, `service.setup` (H2 §7.6);
 //! - [`volumes_api`]: the volumes the nodes report, their listing and deletion (H2 §7.3);
 //! - [`openapi`]: the generated OpenAPI 3.1 document;
 //! - [`init`] and [`serve`]: the two subcommands.
@@ -44,6 +45,7 @@ pub mod jobs_api;
 pub mod join_requests_api;
 pub mod logging;
 pub mod logs;
+pub mod model_pull;
 pub mod node_directory;
 pub mod nodes_api;
 pub mod openapi;

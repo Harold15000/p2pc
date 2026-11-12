@@ -333,6 +333,22 @@ pub struct PortStream {
     _place: OwnedSemaphorePermit,
 }
 
+impl PortStream {
+    /// The two directions of the stream, for a request the hub sends to the service itself: its model pull (H2
+    /// §7.6, [`crate::model_pull`]). Client connections never get here: [`serve`] relays them.
+    pub fn io(&mut self) -> (&mut SendStream, &mut RecvStream) {
+        (&mut self.send, &mut self.recv)
+    }
+
+    /// The hub's own conversation on the stream ended cleanly: its side is finished, and dropping the stream
+    /// resets nothing.
+    pub fn finish(&mut self) {
+        // An error means that direction already ended.
+        let _ = self.send.finish();
+        self.ended = true;
+    }
+}
+
 impl Drop for PortStream {
     fn drop(&mut self) {
         if !self.ended {

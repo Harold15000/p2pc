@@ -26,6 +26,7 @@ pub mod leases;
 pub mod nodes;
 pub mod outputs;
 pub mod ports;
+pub mod setup;
 pub mod templates;
 pub mod usage;
 pub mod volumes;

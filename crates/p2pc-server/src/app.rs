@@ -84,6 +84,9 @@ pub struct AppState {
     /// the launch read it. Replace it with [`AppState::set_bundle`], which keeps [`Self::templates`] on the same
     /// bundle.
     pub bundle: crate::templates::TemplateStore,
+    /// The hub's own model pull of template services (H2 §7.6), which `service.setup` reports. `serve` runs it;
+    /// nothing pulls until it is spawned or scanned.
+    pub puller: crate::model_pull::ModelPuller,
     /// The port relay (H2 §7.4): the limits and the accounting of the service port connections. It counts them in
     /// `connections`.
     pub ports: crate::gateway::ports::PortRelay,
@@ -121,6 +124,7 @@ impl AppState {
         Ok(Self {
             templates: Arc::new(bundle.clone()),
             bundle,
+            puller: crate::model_pull::ModelPuller::default(),
             blobs,
             logs,
             outputs,
