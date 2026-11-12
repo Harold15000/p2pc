@@ -808,7 +808,7 @@
           "jobs"
         ],
         "summary": "One job of the caller, with its `attempts` (§7): `[{attempt, node_id, outcome, reason, started_at, ended_at}]`,\noldest first. `outcome` uses the job-state words (`running` while the attempt is in progress). A job of another\naccount answers `404`, exactly like one that does not exist (SI-7), and so does a job outside the caller's\ntemplate view (H2 §5.5).",
-        "description": "A service adds `service` (H2 §7.2): `health` and `health_since` while it runs, `ports`, `open_connections`,\n`last_activity_at`, `idle_deadline`, `deadline` and `restarts_24h`.",
+        "description": "A service adds `service` (H2 §7.2): `health` and `health_since` while it runs, `ports`, `open_connections`,\n`last_activity_at`, `idle_deadline`, `deadline`, `restarts_24h` and `traffic`, today's totals of its port\nconnections (H2 §12).",
         "operationId": "get_job",
         "parameters": [
           {
@@ -1237,6 +1237,152 @@
           },
           "410": {
             "description": "`expired`: the output was deleted after the retention period.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/jobs/{id}/ports/{port}/connect": {
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Opens a connection into a port of a running service: an HTTP/1.1 upgrade (`Connection: Upgrade`,\n`Upgrade: p2pc-port/1`, no body). After `101 Switching Protocols` the connection is a raw, bidirectional byte\nstream to `127.0.0.1:<port>` inside the service's container.",
+        "description": "**Who may connect** (H2 §5.5, SI-H2-5). With `services:connect`, any service of the caller's project. Without it\nbut with `templates:launch`, a template service of the caller's template view. Any other job answers `404`.\n\n**Template services are filtered** for every caller that is not `admin`: the upgraded connection carries **one**\nHTTP/1.1 request, which the hub forwards only if its method and path are one of the template's `allowed_routes`\n(exact match, no query). The request line and headers must fit in 8 KiB and 64 headers, and a body needs\n`Content-Length`, at most 1 MiB. The hub answers a refused request itself, inside the upgraded connection:\n`400 invalid_request` (`Transfer-Encoding`, `Upgrade`, `Expect`, `CONNECT`, a duplicate or non-numeric\n`Content-Length`, a malformed header line, or a `Connection` option naming a field that is not hop-by-hop),\n`403 route_not_allowed`, `413 too_large`, `431 headers_too_large`, and `502 node_unreachable` when the node\ncannot be reached. An allowed request is forwarded with `Connection: close`, and the response is relayed until\nthe service closes; the next request needs a new connection.\n\n**Limits.** 64 open connections per service and 16 per caller per service; a connection closes after\n`port_idle_s` (600 s by default) with no byte in either direction.",
+        "operationId": "connect",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The job ID (`job_…`) of a service.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "port",
+            "in": "path",
+            "description": "A port of the service's `service.ports`.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "wait_ready",
+            "in": "query",
+            "description": "With `true`, a service that is still `starting` is waited for, up to 30 s, instead of answered\n`409 service_not_ready`.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "The connection is upgraded (`Upgrade: p2pc-port/1`): raw bytes to the port, or, for a template service and a caller that is not `admin`, one HTTP request filtered by the template's `allowed_routes`."
+          },
+          "400": {
+            "description": "`upgrade_required`: the request is not an upgrade to `p2pc-port/1`, or it has a body. `invalid_query`: an unknown or invalid query parameter. Inside a filtered connection, `invalid_request`: a request the hub never forwards.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid key, or the caller was revoked or expired while the request was in flight.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: the caller has neither `services:connect` nor `templates:launch`. `route_not_allowed`: the template allows no request on this port to a caller that is not `admin`, or (inside a filtered connection) not this one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such job in this account and project, or (for a caller with only `templates:launch`) not a template service of its template view.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`service_not_running`: the job is not running. `service_not_ready`: its health is still `starting` (`?wait_ready=true` waits up to 30 s instead).",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Inside a filtered connection, `too_large`: the request body is over 1 MiB.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`port_not_exposed`: the port is not in the service's `service.ports`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "`too_many_connections`: the service has 64 open connections, the caller has 16 to this service, the hub's `port_conn_budget` for API-key clients is in use, or the node's connection carries its most port streams.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "431": {
+            "description": "Inside a filtered connection, `headers_too_large`: the request line and headers are over 8 KiB or 64 headers.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "`node_unreachable`: the hub could not open the stream to the service's node, or the node's agent refused it; `detail` has the agent's reason (`stale_lease`, `port_not_exposed`, `not_ready`, `too_many_connections`, `connect_failed`).",
             "content": {
               "application/problem+json": {
                 "schema": {

@@ -28,9 +28,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use iroh::endpoint::{Connection, VarInt};
 use p2pc_proto::ids::NodeId;
-use p2pc_proto::protocol::ServerMsg;
+use p2pc_proto::protocol::{MAX_PORT_STREAMS_PER_CONNECTION, ServerMsg};
 use time::{Duration, OffsetDateTime};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc};
 
 /// Messages a node's outgoing queue holds before [`NodeHub::send`] fails with [`SendError::Full`].
 ///
@@ -62,6 +62,17 @@ pub enum HubEvent {
     Disconnected(NodeId),
 }
 
+/// Why [`NodeHub::port_stream`] gave no connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PortStreamError {
+    /// The node has no live, activated connection.
+    #[error("the node is not connected")]
+    NotConnected,
+    /// The node's connection already carries [`MAX_PORT_STREAMS_PER_CONNECTION`] port streams (H2 §6.1).
+    #[error("the node's connection carries its most port streams")]
+    TooMany,
+}
+
 /// Why [`NodeHub::send`] failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SendError {
@@ -80,6 +91,8 @@ struct Session {
     conn: Connection,
     /// `Some` until [`NodeHub::activate`]: messages sent meanwhile, queued after the `Welcome`.
     pending: Option<Vec<ServerMsg>>,
+    /// The port streams the hub may still open on this connection (H2 §6.1: 256 at once).
+    port_streams: Arc<Semaphore>,
 }
 
 impl Session {
@@ -210,6 +223,25 @@ impl NodeHub {
         })
     }
 
+    /// The live, activated connection of `node_id`, to open one hub-opened port stream on (H2 §6.1), with one of
+    /// the connection's [`MAX_PORT_STREAMS_PER_CONNECTION`] places: the stream holds the permit for its life. A
+    /// pending connection gives none: its agent has not been welcomed yet.
+    pub fn port_stream(&self, node_id: NodeId) -> Result<(Connection, OwnedSemaphorePermit), PortStreamError> {
+        let state = self.lock();
+        let session = state
+            .nodes
+            .get(&node_id)
+            .and_then(|l| l.session.as_ref())
+            .filter(|s| s.is_active())
+            .ok_or(PortStreamError::NotConnected)?;
+        let permit = session
+            .port_streams
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| PortStreamError::TooMany)?;
+        Ok((session.conn.clone(), permit))
+    }
+
     /// Whether `node_id` has a live, activated connection.
     #[must_use]
     pub fn is_connected(&self, node_id: NodeId) -> bool {
@@ -252,6 +284,7 @@ impl NodeHub {
                 tx,
                 conn,
                 pending: Some(Vec::new()),
+                port_streams: Arc::new(Semaphore::new(MAX_PORT_STREAMS_PER_CONNECTION)),
             });
             (old, id)
         };

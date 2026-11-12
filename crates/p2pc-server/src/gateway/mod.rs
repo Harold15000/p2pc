@@ -27,6 +27,7 @@ pub mod endpoint;
 pub mod hub;
 pub mod limits;
 pub mod pair;
+pub mod ports;
 mod tunnel;
 mod upload;
 
@@ -47,7 +48,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 pub use self::endpoint::{EndpointOptions, ServerIdentity};
-pub use self::hub::{Expired, HubEvent, NodeHub, OfflineReason, SendError};
+pub use self::hub::{Expired, HubEvent, NodeHub, OfflineReason, PortStreamError, SendError};
 pub use self::limits::GatewayLimits;
 use self::limits::{DeviceBudget, MinuteLimiter};
 use crate::app::AppState;
