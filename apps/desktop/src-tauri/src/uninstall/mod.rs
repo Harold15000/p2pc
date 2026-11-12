@@ -132,6 +132,15 @@ pub trait CleanupHost {
     fn remove_node(&self, rule: BackupRule) -> Result<Uninstalled, UninstallError>;
     /// Step 6: the app's data folders and the `Run` and `RunOnce` values. Returns what could not be removed.
     fn remove_app_traces(&self) -> Vec<String>;
+    /// The distro holds the hub's data (`/var/lib/p2pc-server`).
+    fn hub_data_present(&self) -> bool;
+}
+
+/// The role the confirmation and the cleanup use: the one `setup.json` recorded, or, when that is unknown (a missing or
+/// unreadable record), the hub's when the distro holds the hub's data. The hub PC's explicit checkbox (§8.7 step 1) is
+/// then never skipped because a record was lost.
+pub fn effective_role(recorded: Option<Role>, host: &dyn CleanupHost) -> Option<Role> {
+    recorded.or_else(|| host.hub_data_present().then_some(Role::Hub))
 }
 
 /// How the cleanup ended.

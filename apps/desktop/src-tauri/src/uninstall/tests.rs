@@ -19,11 +19,15 @@ struct Pc {
     task_fails: bool,
     kept: Vec<PathBuf>,
     leave_fails: bool,
+    hub_data: bool,
 }
 
 impl CleanupHost for Pc {
     fn own_node_id(&self) -> Option<String> {
         Some("node-hub".into())
+    }
+    fn hub_data_present(&self) -> bool {
+        self.hub_data
     }
     fn agent_leave(&self, timeout: Duration) -> Result<(), String> {
         assert_eq!(timeout, LEAVE_TIMEOUT);
@@ -281,6 +285,40 @@ fn a_failed_upgrade_s_backup_is_kept_and_named_unless_the_box_is_ticked() {
     );
     assert!(matches!(&out, CleanupOutcome::Done { kept_backups, .. } if kept_backups.is_empty()));
     assert_eq!(pc.steps.borrow()[0], "remove DeleteAll");
+}
+
+#[test]
+fn an_unknown_role_on_a_pc_with_the_hub_s_data_needs_the_hub_checkbox() {
+    let hub_pc = Pc {
+        hub_data: true,
+        ..Pc::default()
+    };
+    assert_eq!(effective_role(None, &hub_pc), Some(Role::Hub));
+    assert_eq!(
+        effective_role(Some(Role::Joined), &hub_pc),
+        Some(Role::Joined),
+        "a recorded role stands"
+    );
+    assert_eq!(effective_role(None, &Pc::default()), None);
+    // Without the checkbox nothing is deleted.
+    let dir = tempfile::tempdir().unwrap();
+    let role = effective_role(None, &hub_pc);
+    let out = run_cleanup(
+        &hub_pc,
+        &UnwiredHubNodes,
+        &Clock::default(),
+        &mut log(dir.path()),
+        role,
+        Confirmation::default(),
+    );
+    assert_eq!(out, CleanupOutcome::Cancelled);
+    assert!(hub_pc.steps.borrow().is_empty());
+    let plan = UninstallPlan {
+        backups_dir: PathBuf::from("B"),
+        verified: vec![],
+        unfinished: vec![],
+    };
+    assert_eq!(UninstallView::new(role, &plan).hub_consequence, Some(HUB_CONSEQUENCE));
 }
 
 #[test]

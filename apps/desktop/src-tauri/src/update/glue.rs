@@ -20,7 +20,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use p2pc_wsl::Layout;
-use p2pc_wsl::runner::{Host, SystemRunner, ThreadPause, in_distro, powershell};
+use p2pc_wsl::runner::{Host, Invocation, SystemRunner, ThreadPause, WSL_EXE, in_distro, powershell};
 use serde::Serialize;
 use tauri::{AppHandle, Manager, Url};
 use tauri_plugin_updater::{Updater, UpdaterExt};
@@ -37,7 +37,7 @@ use super::templates::{HubTemplates, check_templates};
 use super::web::{Offer, WebCheck, WebVerdict, verify_web_app};
 use crate::core::CommandError;
 use crate::setup::wsl_host::{AGENT_BIN, AGENT_CONFIG, compiled_image_pin};
-use crate::state::Role;
+use crate::state::{Role, State as AppState};
 
 /// The update requests' time limit (the check and the artifact's download).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
@@ -133,17 +133,27 @@ impl Updates {
             .as_ref()
             .and_then(PendingFiles::load)
             .and_then(|(answer, _)| answer.get("version").and_then(|v| v.as_str()).map(str::to_owned));
+        let state_file = local.as_deref().map(UpdateStateFile::in_dir);
+        // A deferral survives a restart (`update-state.json`).
+        let deferral = state_file.as_ref().and_then(|f| f.load().distro_deferral);
         Self {
             release: Release::compiled(),
-            state_file: local.as_deref().map(UpdateStateFile::in_dir),
+            state_file,
             pending,
             ready: Mutex::new(ready),
             web: Mutex::new(None),
             distro: Mutex::new(None),
-            deferral: Mutex::new(None),
+            deferral: Mutex::new(deferral),
             distro_error: Mutex::new(None),
             busy: Mutex::new(false),
         }
+    }
+
+    /// Sets or clears the deferral, in memory and in `update-state.json`.
+    fn set_deferral(&self, deferral: Option<Deferral>) -> Result<(), CommandError> {
+        *lock(&self.deferral)? = deferral;
+        self.update_state(|s| s.distro_deferral = deferral);
+        Ok(())
     }
 
     fn state(&self) -> UpdateState {
@@ -377,32 +387,55 @@ fn read_distro_plan(release: &Release, role: Role) -> Option<(DistroPlan, bool)>
     Some((distro::plan(&facts), work_running))
 }
 
-/// Reads the distro's plan and keeps it for the window.
-pub async fn refresh_distro_plan(app: &AppHandle, role: Option<Role>) -> Result<Option<DistroPlan>, CommandError> {
+/// `p2pc-node` runs now (`wsl --list --running --quiet`, which starts no distro).
+fn distro_running() -> bool {
+    let (runner, pause) = (SystemRunner, ThreadPause);
+    let inv = Invocation::new(WSL_EXE)
+        .args(["--list", "--running", "--quiet"])
+        .timeout(IN_DISTRO_TIMEOUT);
+    Host::new(&runner, &pause)
+        .run_wsl(&inv)
+        .ok()
+        .filter(|o| o.success())
+        .is_some_and(|o| distro::is_running(&o.text()))
+}
+
+/// Reads the distro's plan, but only while the node is meant to run and its distro already runs
+/// ([`distro::may_read_plan`]); otherwise nothing is read and `None` is kept. `Some((plan, work running))`.
+fn read_plan_if_running(release: &Release, facts: AppFacts) -> Option<(DistroPlan, bool)> {
+    let role = facts.role?;
+    if !distro::may_read_plan(facts.state, distro_running()) {
+        return None;
+    }
+    read_distro_plan(release, role)
+}
+
+/// Reads the distro's plan (when it may be read) and keeps it for the window.
+pub async fn refresh_distro_plan(app: &AppHandle, facts: AppFacts) -> Result<Option<DistroPlan>, CommandError> {
     let updates = app.state::<Updates>();
-    let Some(role) = role else {
-        return Ok(None);
-    };
     let release = updates.release.clone();
-    let plan = tauri::async_runtime::spawn_blocking(move || read_distro_plan(&release, role).map(|(p, _)| p))
+    let plan = tauri::async_runtime::spawn_blocking(move || read_plan_if_running(&release, facts).map(|(p, _)| p))
         .await
         .map_err(|_| CommandError::Internal)?;
     *lock(&updates.distro)? = plan.clone();
     Ok(plan)
 }
 
-/// A manual or automatic check: the app, the bundle (hub PC), the web app and the distro's plan.
-pub async fn check_now(app: &AppHandle, role: Option<Role>) -> Result<(), CommandError> {
+/// A manual or automatic check: the app, the bundle (hub PC) and the distro's plan. The web app only with `with_web`:
+/// automatic checks (with the user's yes) verify it daily; without that, only its own button does (§9.6 item 2).
+pub async fn check_now(app: &AppHandle, facts: AppFacts, with_web: bool) -> Result<(), CommandError> {
     let updates = app.state::<Updates>();
     let _busy = Busy::take(&updates.busy)?;
     let started = now();
     updates.update_state(|s| s.attempted(started));
     let reached = check_app(app).await.unwrap_or(false);
-    if role == Some(Role::Hub) {
+    if facts.role == Some(Role::Hub) {
         check_bundle(app).await;
     }
-    let _ = verify_web(app).await;
-    let _ = refresh_distro_plan(app, role).await;
+    if with_web {
+        let _ = verify_web(app).await;
+    }
+    let _ = refresh_distro_plan(app, facts).await;
     if reached {
         updates.update_state(|s| s.succeeded(started));
     }
@@ -429,10 +462,10 @@ pub async fn choose_distro_upgrade(app: &AppHandle, choice: Choice) -> Result<bo
     let offset = tauri::async_runtime::spawn_blocking(utc_offset).await.unwrap_or(0);
     let deferral = distro::defer(choice, now(), offset);
     if deferral.due(now(), false) && choice == Choice::Now {
-        *lock(&updates.deferral)? = None;
+        updates.set_deferral(None)?;
         return Ok(true);
     }
-    *lock(&updates.deferral)? = Some(deferral);
+    updates.set_deferral(Some(deferral))?;
     Ok(false)
 }
 
@@ -446,7 +479,8 @@ fn may_upgrade(plan: &DistroPlan) -> bool {
 pub async fn run_distro_upgrade(app: &AppHandle) -> Result<(), CommandError> {
     let updates = app.state::<Updates>();
     let _busy = Busy::take(&updates.busy)?;
-    let outcome = tauri::async_runtime::spawn_blocking(|| -> Result<(), String> {
+    let pinned = updates.release.image_version.clone();
+    let outcome = tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
         let layout = Layout::from_env().ok_or("not on Windows")?;
         let pin = compiled_image_pin().ok_or("this build has no node image pin")?;
         let fetch = p2pc_wsl::image::HttpFetcher::new().map_err(|e| e.to_string())?;
@@ -469,9 +503,13 @@ pub async fn run_distro_upgrade(app: &AppHandle) -> Result<(), CommandError> {
         let mut opts = p2pc_wsl::upgrade::UpgradeOptions::new(SystemTime::now());
         opts.task = Some(&ctx);
         match p2pc_wsl::upgrade::upgrade(host, &layout, &image, &opts) {
-            Ok(_) => {
+            Ok(upgraded) => {
                 let _ = std::fs::remove_file(&dest);
-                Ok(())
+                // The build's image and its version must agree, or the plan would upgrade again every hour.
+                match &pinned {
+                    Some(v) => distro::check_upgraded(&upgraded.image_version, v),
+                    None => Ok(()),
+                }
             }
             Err(f) => Err(match &f.kept_backup {
                 Some(b) => format!("{} The backup of this PC's state was kept: {}", f.error, b.display()),
@@ -481,7 +519,7 @@ pub async fn run_distro_upgrade(app: &AppHandle) -> Result<(), CommandError> {
     })
     .await
     .map_err(|_| CommandError::Internal)?;
-    *lock(&updates.deferral)? = None;
+    updates.set_deferral(None)?;
     *lock(&updates.distro_error)? = outcome.as_ref().err().cloned();
     outcome.map_err(|_| CommandError::Failed)
 }
@@ -492,6 +530,8 @@ pub struct AppFacts {
     pub update_checks: Option<bool>,
     pub in_first_run: bool,
     pub role: Option<Role>,
+    /// The app's state (§8.4): the distro is never started in `stopped` or `attention`.
+    pub state: AppState,
 }
 
 /// Starts the background thread: the kept update at start (never in first run), then, every hour, the automatic check
@@ -507,16 +547,21 @@ where
     std::thread::spawn(move || {
         let start = facts(&app);
         let _ = tauri::async_runtime::block_on(install(&app, InstallMoment::AppStart, start.in_first_run));
+        // §9.6 item 2: "at start and daily" with the user's yes.
+        if policy::web_verify_at_start(start.update_checks, start.in_first_run) {
+            let _ = tauri::async_runtime::block_on(verify_web(&app));
+        }
         loop {
             let f = facts(&app);
             let state = app.state::<Updates>().state();
             if policy::auto_check_due(f.update_checks, f.in_first_run, &state, now()) {
-                let _ = tauri::async_runtime::block_on(check_now(&app, f.role));
+                let _ = tauri::async_runtime::block_on(check_now(&app, f, true));
             }
-            if let (Some(role), false) = (f.role, f.in_first_run) {
+            if !f.in_first_run {
                 let updates = app.state::<Updates>();
                 let release = updates.release.clone();
-                let read = read_distro_plan(&release, role);
+                // Never in `stopped` or `attention`, and never by starting a distro that does not run.
+                let read = read_plan_if_running(&release, f);
                 if let Ok(mut shown) = updates.distro.lock() {
                     *shown = read.as_ref().map(|(p, _)| p.clone());
                 }

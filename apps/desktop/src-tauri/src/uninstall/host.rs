@@ -21,6 +21,9 @@ pub const APP_IDENTIFIER: &str = "p2pc.desktop";
 /// `p2pc-agent leave`'s exit code once the hub removed the node (`p2pc-agent`'s `exit::NOT_ENROLLED`).
 const LEAVE_REMOVED: i32 = 7;
 
+/// The hub's data directory in the distro (`P2PC_DATA_DIR`, §8.5).
+pub const HUB_DATA_DIR: &str = "/var/lib/p2pc-server";
+
 /// The time limit of `p2pc-agent status --json`.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -73,6 +76,11 @@ impl<R: CommandRunner, P: Pause> CleanupHost for WslCleanupHost<R, P> {
                 p2pc_wsl::import::sanitize_message(&out.stderr_text())
             )),
         }
+    }
+
+    fn hub_data_present(&self) -> bool {
+        let inv = in_distro(&["/usr/bin/test", "-e", HUB_DATA_DIR]).timeout(STATUS_TIMEOUT);
+        self.host().run_wsl(&inv).is_ok_and(|o| o.success())
     }
 
     fn remove_node(&self, rule: BackupRule) -> Result<Uninstalled, UninstallError> {
@@ -211,6 +219,18 @@ mod tests {
         assert_eq!(inv.time_limit(), Some(Duration::from_secs(10)));
         let (h, _) = host(Output::with(1, ""), dir.path(), vec![]);
         assert!(h.agent_leave(Duration::from_secs(10)).is_err());
+    }
+
+    #[test]
+    fn the_hub_s_data_is_probed_in_the_distro() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, _) = host(Output::with(0, ""), dir.path(), vec![]);
+        assert!(h.hub_data_present());
+        let inv = h.runner.calls.borrow()[0].clone();
+        assert_eq!(&inv.arguments()[5..], ["/usr/bin/test", "-e", "/var/lib/p2pc-server"]);
+        assert!(inv.time_limit().is_some());
+        let (h, _) = host(Output::with(1, ""), dir.path(), vec![]);
+        assert!(!h.hub_data_present());
     }
 
     #[test]

@@ -15,9 +15,9 @@
 //! The upgrade itself is `p2pc-wsl`'s state-preserving procedure ([`p2pc_wsl::upgrade::upgrade`]).
 
 use semver::Version;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use crate::state::Role;
+use crate::state::{Role, State};
 
 /// "Later": at most this long.
 pub const LATER_MAX_SECS: u64 = 72 * 3600;
@@ -105,8 +105,8 @@ pub enum Choice {
     Later,
 }
 
-/// When a chosen upgrade runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// When a chosen upgrade runs. Kept in `update-state.json`, so it survives a restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Deferral {
     /// Not before this time (seconds since the epoch).
     pub at: u64,
@@ -118,6 +118,30 @@ impl Deferral {
     /// The upgrade runs now.
     pub fn due(&self, now: u64, work_running: bool) -> bool {
         now >= self.at && !(self.only_when_idle && work_running)
+    }
+}
+
+/// The background thread may read the distro's plan (which runs `wsl.exe -d p2pc-node`, and so starts the distro): only
+/// while the node is meant to run (`sharing` or `paused`) and its distro already runs. Never in `stopped` ("nothing
+/// runs", §8.4), in `attention` (`hub_gone` "never retries on its own", §8.8), `setup` or `updating`.
+pub fn may_read_plan(state: State, distro_running: bool) -> bool {
+    matches!(state, State::Sharing | State::Paused) && distro_running
+}
+
+/// `p2pc-node` is in the output of `wsl --list --running --quiet`.
+pub fn is_running(list: &str) -> bool {
+    list.lines().any(|l| l.trim() == p2pc_wsl::DISTRO_NAME)
+}
+
+/// After an upgrade, the distro runs the pinned version (its `/etc/p2pc-distro-version` line). A mismatch means the
+/// build's image pin and its version disagree: it is reported, and nothing upgrades again on its own.
+pub fn check_upgraded(image_version_line: &str, pinned: &Version) -> Result<(), String> {
+    match parse_image_version(image_version_line) {
+        Some(v) if v == *pinned => Ok(()),
+        got => Err(format!(
+            "The P2PC distro was updated, but it reports version {} instead of {pinned}: this app build's image and its version do not match. It will not be updated again on its own.",
+            got.map_or_else(|| "unknown".to_owned(), |v| v.to_string())
+        )),
     }
 }
 
@@ -230,6 +254,32 @@ mod tests {
         assert_eq!(parse_image_version("image_version=0.3.0\nbuilt=x"), Some(v("0.3.0")));
         assert_eq!(parse_image_version("built=x"), None);
         assert_eq!(parse_image_version("image_version=latest"), None);
+    }
+
+    #[test]
+    fn the_plan_is_read_only_while_the_node_is_meant_to_run_and_its_distro_runs() {
+        assert!(may_read_plan(State::Sharing, true));
+        assert!(may_read_plan(State::Paused, true));
+        assert!(
+            !may_read_plan(State::Sharing, false),
+            "never starts a distro that is not running"
+        );
+        for s in [State::Stopped, State::Attention, State::Setup, State::Updating] {
+            assert!(!may_read_plan(s, true), "{s:?}");
+        }
+        assert!(is_running("Ubuntu\np2pc-node\n"));
+        assert!(!is_running("Ubuntu\np2pc-node-old\n"));
+    }
+
+    #[test]
+    fn an_upgrade_must_end_on_the_pinned_version() {
+        assert_eq!(check_upgraded("image_version=0.3.0", &v("0.3.0")), Ok(()));
+        assert!(
+            check_upgraded("image_version=0.2.9", &v("0.3.0"))
+                .unwrap_err()
+                .contains("0.2.9 instead of 0.3.0")
+        );
+        assert!(check_upgraded("", &v("0.3.0")).is_err());
     }
 
     #[test]

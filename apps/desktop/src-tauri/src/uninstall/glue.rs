@@ -21,7 +21,7 @@ use tauri::{AppHandle, Context, Manager, WebviewUrl, WebviewWindowBuilder, Windo
 
 use super::host::WslCleanupHost;
 use super::log::UninstallLog;
-use super::{CleanupOutcome, Confirmation, UninstallView, UnwiredHubNodes, exit, run_cleanup};
+use super::{CleanupOutcome, Confirmation, UninstallView, UnwiredHubNodes, effective_role, exit, run_cleanup};
 use crate::autostart;
 use crate::capabilities::MAIN_WINDOW;
 use crate::core::CommandError;
@@ -129,19 +129,38 @@ fn build_window(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// The confirmation: the hub PC's consequence and the kept backups.
+/// The host the cleanup runs on (the app's folders are only needed by step 6).
+fn cleanup_host(layout: Layout, app_dirs: Vec<PathBuf>) -> WslCleanupHost<SystemRunner, ThreadPause> {
+    let (run, run_once) = run_keys();
+    WslCleanupHost {
+        runner: SystemRunner,
+        pause: ThreadPause,
+        layout,
+        app_dirs,
+        run,
+        run_once,
+    }
+}
+
+/// The confirmation: the hub PC's consequence and the kept backups. On a blocking thread: it may ask the distro.
 #[tauri::command]
-fn uninstall_view() -> Result<UninstallView, CommandError> {
-    let layout = Layout::from_env();
-    let plan = layout.as_ref().map_or_else(
-        || UninstallPlan {
-            backups_dir: PathBuf::new(),
-            verified: Vec::new(),
-            unfinished: Vec::new(),
-        },
-        UninstallPlan::read,
-    );
-    Ok(UninstallView::new(role(layout.as_ref()), &plan))
+async fn uninstall_view() -> Result<UninstallView, CommandError> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let Some(layout) = Layout::from_env() else {
+            let none = UninstallPlan {
+                backups_dir: PathBuf::new(),
+                verified: Vec::new(),
+                unfinished: Vec::new(),
+            };
+            return UninstallView::new(None, &none);
+        };
+        let plan = UninstallPlan::read(&layout);
+        let recorded = role(Some(&layout));
+        let host = cleanup_host(layout, Vec::new());
+        UninstallView::new(effective_role(recorded, &host), &plan)
+    })
+    .await
+    .map_err(|_| CommandError::Internal)
 }
 
 /// The cleanup, once, on a blocking thread.
@@ -181,16 +200,9 @@ async fn uninstall_run(app: AppHandle, confirm: Confirmation) -> Result<CleanupO
                 log: log.path_text(),
             };
         };
-        let role = role(Some(&layout));
-        let (run, run_once) = run_keys();
-        let host = WslCleanupHost {
-            runner: SystemRunner,
-            pause: ThreadPause,
-            layout,
-            app_dirs,
-            run,
-            run_once,
-        };
+        let recorded = role(Some(&layout));
+        let host = cleanup_host(layout, app_dirs);
+        let role = effective_role(recorded, &host);
         run_cleanup(&host, &UnwiredHubNodes, &ThreadPause, &mut log, role, confirm)
     })
     .await

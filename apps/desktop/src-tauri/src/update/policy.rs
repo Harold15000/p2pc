@@ -51,6 +51,8 @@ pub struct UpdateState {
     /// The highest `web_version` this app verified (§9.6). The effective mark is never below the app's own release's
     /// web build ([`super::web::effective_mark`]).
     pub web_mark: Option<String>,
+    /// The distro upgrade the user put off ("Tonight at 03:00", "Later", §14.2).
+    pub distro_deferral: Option<super::distro::Deferral>,
 }
 
 impl UpdateState {
@@ -78,6 +80,12 @@ pub fn auto_check_due(update_checks: Option<bool>, in_first_run: bool, state: &U
         Some(t) if t > now => true,
         Some(t) => now - t >= AUTO_CHECK_INTERVAL_SECS,
     }
+}
+
+/// With automatic checks on, the web app is verified at start too (§9.6 item 2: "at start and daily"); without them,
+/// only on "Verify web app". Never during first run.
+pub fn web_verify_at_start(update_checks: Option<bool>, in_first_run: bool) -> bool {
+    update_checks == Some(true) && !in_first_run
 }
 
 /// What the app shows about its checks.
@@ -210,6 +218,14 @@ mod tests {
     }
 
     #[test]
+    fn the_web_app_is_verified_at_start_only_with_a_yes() {
+        assert!(web_verify_at_start(Some(true), false));
+        assert!(!web_verify_at_start(Some(false), false));
+        assert!(!web_verify_at_start(None, false));
+        assert!(!web_verify_at_start(Some(true), true));
+    }
+
+    #[test]
     fn automatic_checks_run_at_most_once_a_day() {
         let mut s = UpdateState::default();
         s.attempted(NOW);
@@ -276,8 +292,12 @@ mod tests {
         let mut s = UpdateState::default();
         s.succeeded(NOW);
         s.web_mark = Some("0.3.0".into());
+        s.distro_deferral = Some(super::super::distro::Deferral {
+            at: NOW + 3600,
+            only_when_idle: true,
+        });
         f.save(&s).unwrap();
-        assert_eq!(f.load(), s);
+        assert_eq!(f.load(), s, "the deferral survives a restart");
         fs::write(dir.path().join("sub").join(STATE_FILE), b"[1,2]").unwrap();
         assert_eq!(f.load(), UpdateState::default());
     }

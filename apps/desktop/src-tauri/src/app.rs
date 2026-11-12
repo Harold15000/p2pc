@@ -594,6 +594,7 @@ fn app_facts(app: &AppHandle) -> AppFacts {
             update_checks: None,
             in_first_run: true,
             role: None,
+            state: AppState::Setup,
         };
     };
     let machine = current_machine(app);
@@ -601,6 +602,7 @@ fn app_facts(app: &AppHandle) -> AppFacts {
         update_checks: shared.settings.lock().ok().and_then(|s| s.update_checks),
         in_first_run: machine.state() == AppState::Setup,
         role: machine.role(),
+        state: machine.state(),
     }
 }
 
@@ -632,7 +634,7 @@ fn update_status(app: AppHandle) -> Result<UpdateView, CommandError> {
 #[tauri::command]
 async fn update_check(app: AppHandle) -> Result<UpdateView, CommandError> {
     let facts = app_facts(&app);
-    updates::check_now(&app, facts.role).await?;
+    updates::check_now(&app, facts, false).await?;
     app.state::<Updates>().view(facts.update_checks)
 }
 

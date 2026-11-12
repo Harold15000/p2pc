@@ -13,8 +13,8 @@
 //! | a valid signature, `web_version` ≥ the mark, every file matching | [`WebVerdict::Verified`]: the mark rises; a build newer than the app's is a notice; a `min_hub_version` above the local hub is the update-the-hub notice |
 //! | no manifest, no signature, a bad one or another key's | [`WebVerdict::NotSigned`]: the warning, or "Not verified: self-built copy" off the official origin |
 //! | a valid signature below the mark | [`WebVerdict::Rollback`] |
-//! | a valid signature and a file that does not match (or is missing) | [`WebVerdict::Tampered`]: the red warning |
-//! | no answer (DNS, TLS, timeout, a 5xx) | [`WebVerdict::Unreachable`]: nothing is concluded; the mark stays |
+//! | a valid signature and a file that does not match (or is missing, 404/410, or too large) | [`WebVerdict::Tampered`]: the red warning |
+//! | no answer (DNS, TLS, timeout, any other status such as a 5xx or 429), for the manifest or any file | [`WebVerdict::Unreachable`]: nothing is concluded; the mark stays |
 //!
 //! It detects untargeted tampering only: a host can serve different bytes to different clients (§9.6).
 //!
@@ -279,8 +279,12 @@ pub fn verify_web_app(fetch: &dyn Fetch, key: Option<&ReleaseKey>, check: &WebCh
     for f in &m.files {
         let body = match fetch.get(&format!("{origin}/{}", f.path), MAX_FILE_BYTES) {
             Ok(b) => b,
-            Err(FetchError::Network(e)) => return keep(unreachable(FetchError::Network(e))),
-            Err(_) => return keep(WebVerdict::Tampered { path: f.path.clone() }),
+            // Only a missing file or one larger than any build's is the build's own doing; any other status (a 5xx, 429,
+            // 403) or a broken request concludes nothing, as for the manifest.
+            Err(e @ (FetchError::Network(_) | FetchError::Status(_))) => return keep(unreachable(e)),
+            Err(FetchError::NotFound | FetchError::TooLarge(_)) => {
+                return keep(WebVerdict::Tampered { path: f.path.clone() });
+            }
         };
         if !sha256_hex(&body).eq_ignore_ascii_case(&f.sha256) {
             return keep(WebVerdict::Tampered { path: f.path.clone() });
@@ -502,6 +506,37 @@ mod tests {
         let fetch = FakeFetch::default();
         serve(&fetch, ORIGIN, &b, Some(&k.sign(&b.manifest, "web")));
         fetch.fail(&format!("{ORIGIN}/index.html"), FetchError::NotFound);
+        let r = verify_web_app(&fetch, Some(&key), &check(&own, None, None));
+        assert_eq!(
+            r.verdict,
+            WebVerdict::Tampered {
+                path: "index.html".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_server_error_on_a_file_concludes_nothing() {
+        let k = TestKey::new();
+        let key = ReleaseKey::parse(&k.public_base64()).unwrap();
+        let own = v("0.2.0");
+        let b = build("0.2.1", "0.2.0");
+        for status in [500, 502, 503, 429, 403] {
+            let fetch = FakeFetch::default();
+            serve(&fetch, ORIGIN, &b, Some(&k.sign(&b.manifest, "web")));
+            fetch.fail(&format!("{ORIGIN}/assets/app-1a2b.js"), FetchError::Status(status));
+            let r = verify_web_app(&fetch, Some(&key), &check(&own, Some("0.2.0"), None));
+            assert!(
+                matches!(r.verdict, WebVerdict::Unreachable { .. }),
+                "{status}: {:?}",
+                r.verdict
+            );
+            assert!(!r.verdict.is_warning() && r.verdict.offers().is_empty(), "{status}");
+            assert_eq!(r.new_mark, None, "{status}: the mark is unchanged");
+        }
+        let fetch = FakeFetch::default();
+        serve(&fetch, ORIGIN, &b, Some(&k.sign(&b.manifest, "web")));
+        fetch.fail(&format!("{ORIGIN}/index.html"), FetchError::TooLarge(MAX_FILE_BYTES));
         let r = verify_web_app(&fetch, Some(&key), &check(&own, None, None));
         assert_eq!(
             r.verdict,
