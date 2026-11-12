@@ -14,6 +14,8 @@
 //!   bytes); Rust streams the child's stdout to the file itself. Both are byte-exact and both check the SHA-256;
 //! - the task is removed with `schtasks /Delete` (the app never loads the ScheduledTasks module) instead of
 //!   `Unregister-ScheduledTask`, and an unreadable task state stops the uninstall instead of reading as "no task";
+//! - the backup's time stamp is UTC here and local time in `install.ps1` (`Get-Date -Format 'yyyyMMddHHmmss'`), so the
+//!   names of backups from both do not order by time: the upgrade never prunes the backup it just verified;
 //! - the uninstall deletes the whole of `%LOCALAPPDATA%\P2PC` (§8.7 step 5) where the script deletes its own files
 //!   only; both apply the same backup rule.
 //!

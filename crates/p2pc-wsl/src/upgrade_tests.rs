@@ -436,6 +436,22 @@ fn an_agent_only_upgrade_keeps_the_newest_three_verified_backups() {
 }
 
 #[test]
+fn the_backup_just_verified_is_never_pruned_even_when_another_sorts_newer() {
+    // A backup install.ps1 made an hour ago on a PC at UTC+2 carries a later (local) stamp than this one (UTC).
+    let rig = Rig::new(Sim::default());
+    let b = rig.layout.backups_dir();
+    fs::create_dir_all(&b).unwrap();
+    fs::write(b.join("p2pc-state-20251112103000.ok.tar"), b"older, stamped later").unwrap();
+    let got = rig.run(false).unwrap();
+    assert!(got.carried_hub, "the hub keeps one verified backup");
+    assert_eq!(rig.backups(), [format!("p2pc-state-{STAMP}.ok.tar")]);
+    assert_eq!(
+        fs::read(b.join(format!("p2pc-state-{STAMP}.ok.tar"))).unwrap(),
+        archive()
+    );
+}
+
+#[test]
 fn every_refusal_before_the_unregister_leaves_the_old_distro_and_restarts_the_node() {
     let cases: Vec<(&str, Sim, bool)> = vec![
         (

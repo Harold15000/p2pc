@@ -1200,15 +1200,19 @@ impl Steps<'_, '_> {
         fs::rename(&state_file, &ok).map_err(io_err(format!("renaming {}", state_file.display())))?;
         self.kept_backup = None;
         let keep = if self.carried_hub { 1 } else { BACKUP_KEEP };
+        // The backup just made is always kept, and counts as one of `keep`: names order by time only when they come
+        // from one clock, and `install.ps1` stamps local time where this crate stamps UTC (see parity.rs).
+        let just_made = format!("p2pc-state-{stamp}.ok.tar");
         let names: Vec<String> = fs::read_dir(&backups)
             .map(|rd| {
                 rd.filter_map(Result::ok)
                     .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
                     .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| *n != just_made)
                     .collect()
             })
             .unwrap_or_default();
-        for old in backups_to_prune(&names, keep) {
+        for old in backups_to_prune(&names, keep.saturating_sub(1)) {
             if let Err(e) = fs::remove_file(backups.join(&old)) {
                 tracing::warn!(backup = %old, error = %e, "could not delete an old verified backup");
             }

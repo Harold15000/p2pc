@@ -24,11 +24,18 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::import::{distro_names, sanitize_message};
-use crate::runner::{Host, RunError, schtasks};
+use std::time::Duration;
+
+use crate::import::sanitize_message;
+use crate::runner::{Host, Invocation, RunError, WSL_EXE, schtasks};
 use crate::task::{self, TASK_PATH, TaskState};
 use crate::upgrade::{is_state_backup_name, is_verified_backup_name};
 use crate::{DISTRO_NAME, Layout};
+
+/// The time limit of `wsl --list --quiet`: a hung `wsl.exe` must not freeze the uninstaller.
+pub const LIST_TIMEOUT: Duration = Duration::from_secs(120);
+/// The time limit of `wsl --unregister p2pc-node`: generous, it deletes the distro's whole virtual disk.
+pub const UNREGISTER_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// Which state backups (`Get-StateBackupFiles -Kind`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,15 +204,27 @@ pub fn remove_task(host: Host<'_>) -> Result<bool, UninstallError> {
 
 /// Step 4: `wsl --unregister p2pc-node` when it is registered. Never touches another distro.
 pub fn remove_distro(host: Host<'_>) -> Result<DistroRemoval, UninstallError> {
-    let names = match distro_names(host) {
-        Ok(n) => n,
+    let list = Invocation::new(WSL_EXE)
+        .args(["--list", "--quiet"])
+        .timeout(LIST_TIMEOUT);
+    let names: Vec<String> = match host.run_wsl(&list) {
+        Ok(out) => out
+            .text()
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_owned)
+            .collect(),
         Err(e) if e.is_not_found() => return Ok(DistroRemoval::WslMissing),
         Err(e) => return Err(UninstallError::Wsl(e)),
     };
     if !names.iter().any(|n| n == DISTRO_NAME) {
         return Ok(DistroRemoval::NotInstalled);
     }
-    let out = host.wsl(["--unregister", DISTRO_NAME]).map_err(UninstallError::Wsl)?;
+    let unregister = Invocation::new(WSL_EXE)
+        .args(["--unregister", DISTRO_NAME])
+        .timeout(UNREGISTER_TIMEOUT);
+    let out = host.run_wsl(&unregister).map_err(UninstallError::Wsl)?;
     if !out.success() {
         return Err(UninstallError::Unregister {
             code: out.code,
@@ -512,6 +531,30 @@ mod tests {
         assert_eq!(got.distro, DistroRemoval::WslMissing);
         assert!(!got.task_removed);
         assert!(!r.layout.root().join("setup.json").exists());
+    }
+
+    #[test]
+    fn a_hung_wsl_stops_the_uninstall_within_its_time_limit() {
+        let r = rig();
+        r.task("none").distros("p2pc-node\r\n").runner.on_seq(
+            |i| starts(i, WSL_EXE, &["--unregister"]),
+            vec![Err(RunError::TimedOut {
+                program: WSL_EXE.into(),
+                limit: UNREGISTER_TIMEOUT,
+            })],
+        );
+        let err = uninstall(r.host(), &r.layout, BackupRule::Default).unwrap_err();
+        assert!(matches!(err, UninstallError::Wsl(RunError::TimedOut { .. })), "{err:?}");
+        assert!(r.layout.root().join("setup.json").exists(), "nothing deleted");
+        let calls = r.runner.calls();
+        let limit = |args: &[&str]| {
+            calls
+                .iter()
+                .find(|i| starts(i, WSL_EXE, args))
+                .and_then(Invocation::time_limit)
+        };
+        assert_eq!(limit(&["--list"]), Some(LIST_TIMEOUT));
+        assert_eq!(limit(&["--unregister"]), Some(UNREGISTER_TIMEOUT));
     }
 
     #[test]
