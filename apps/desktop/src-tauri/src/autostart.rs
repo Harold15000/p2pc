@@ -16,7 +16,10 @@ use std::path::Path;
 /// The `Run` key under `HKEY_CURRENT_USER`.
 pub const RUN_KEY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 
-/// The app's value name under the `Run` key (§8.7 step 6 deletes it on uninstall).
+/// The `RunOnce` key under `HKEY_CURRENT_USER`: first-run step 2a reopens the app there after the reboot (H2 §8.2).
+pub const RUN_ONCE_KEY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\RunOnce";
+
+/// The app's value name under the `Run` and `RunOnce` keys (§8.7 step 6 deletes both on uninstall).
 pub const RUN_VALUE_NAME: &str = "P2PC";
 
 /// The argument the `Run` entry passes, so that a start at sign-in stays in the tray (see [`crate::launch`]).
@@ -36,7 +39,7 @@ pub enum AutostartError {
     Unsupported,
 }
 
-/// String values under `HKCU\…\Run`.
+/// String values under `HKCU\…\Run` (or `RunOnce`).
 pub trait RunKey {
     /// The value `name`, or `None` when there is none.
     fn get(&self, name: &str) -> Result<Option<String>, AutostartError>;
@@ -67,6 +70,13 @@ pub fn command_line(exe: &Path) -> Result<String, AutostartError> {
     Ok(format!("\"{text}\" {AUTOSTART_FLAG}"))
 }
 
+/// The `RunOnce` command line for `exe`: the quoted path alone, so the app opens its window (at first-run step 2, which
+/// `setup.json` resumes at). The same path rules as [`command_line`].
+pub fn open_command_line(exe: &Path) -> Result<String, AutostartError> {
+    let line = command_line(exe)?;
+    Ok(line.trim_end_matches(AUTOSTART_FLAG).trim_end().to_owned())
+}
+
 /// Makes the `Run` value match `enabled` for the app at `exe`.
 pub fn reconcile(key: &dyn RunKey, enabled: bool, exe: &Path) -> Result<Change, AutostartError> {
     // A value that cannot be read (for example of another registry type) counts as "present and different", so that
@@ -92,11 +102,16 @@ pub fn reconcile(key: &dyn RunKey, enabled: bool, exe: &Path) -> Result<Change, 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WindowsRunKey;
 
+/// The real `HKCU\…\RunOnce` key (Windows deletes the value before it runs the command).
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WindowsRunOnceKey;
+
 #[cfg(windows)]
 mod windows_impl {
     use windows_registry::CURRENT_USER;
 
-    use super::{AutostartError, RUN_KEY_PATH, RunKey, WindowsRunKey};
+    use super::{AutostartError, RUN_KEY_PATH, RUN_ONCE_KEY_PATH, RunKey, WindowsRunKey, WindowsRunOnceKey};
 
     /// `HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)`: the key or the value does not exist.
     const NOT_FOUND: i32 = 0x8007_0002_u32 as i32;
@@ -105,37 +120,59 @@ mod windows_impl {
         e.map_err(|e| AutostartError::Registry(e.code().0))
     }
 
+    fn get(path: &str, name: &str) -> Result<Option<String>, AutostartError> {
+        let key = match CURRENT_USER.open(path) {
+            Ok(key) => key,
+            Err(e) if e.code().0 == NOT_FOUND => return Ok(None),
+            Err(e) => return Err(AutostartError::Registry(e.code().0)),
+        };
+        match key.get_string(name) {
+            Ok(value) => Ok(Some(value)),
+            Err(e) if e.code().0 == NOT_FOUND => Ok(None),
+            Err(e) => Err(AutostartError::Registry(e.code().0)),
+        }
+    }
+
+    fn set(path: &str, name: &str, value: &str) -> Result<(), AutostartError> {
+        let key = CURRENT_USER
+            .create(path)
+            .map_err(|e| AutostartError::Registry(e.code().0))?;
+        registry(key.set_string(name, value))
+    }
+
+    fn remove(path: &str, name: &str) -> Result<(), AutostartError> {
+        let key = match CURRENT_USER.options().read().write().open(path) {
+            Ok(key) => key,
+            Err(e) if e.code().0 == NOT_FOUND => return Ok(()),
+            Err(e) => return Err(AutostartError::Registry(e.code().0)),
+        };
+        match key.remove_value(name) {
+            Err(e) if e.code().0 == NOT_FOUND => Ok(()),
+            other => registry(other),
+        }
+    }
+
     impl RunKey for WindowsRunKey {
         fn get(&self, name: &str) -> Result<Option<String>, AutostartError> {
-            let key = match CURRENT_USER.open(RUN_KEY_PATH) {
-                Ok(key) => key,
-                Err(e) if e.code().0 == NOT_FOUND => return Ok(None),
-                Err(e) => return Err(AutostartError::Registry(e.code().0)),
-            };
-            match key.get_string(name) {
-                Ok(value) => Ok(Some(value)),
-                Err(e) if e.code().0 == NOT_FOUND => Ok(None),
-                Err(e) => Err(AutostartError::Registry(e.code().0)),
-            }
+            get(RUN_KEY_PATH, name)
         }
-
         fn set(&self, name: &str, value: &str) -> Result<(), AutostartError> {
-            let key = CURRENT_USER
-                .create(RUN_KEY_PATH)
-                .map_err(|e| AutostartError::Registry(e.code().0))?;
-            registry(key.set_string(name, value))
+            set(RUN_KEY_PATH, name, value)
         }
-
         fn remove(&self, name: &str) -> Result<(), AutostartError> {
-            let key = match CURRENT_USER.options().read().write().open(RUN_KEY_PATH) {
-                Ok(key) => key,
-                Err(e) if e.code().0 == NOT_FOUND => return Ok(()),
-                Err(e) => return Err(AutostartError::Registry(e.code().0)),
-            };
-            match key.remove_value(name) {
-                Err(e) if e.code().0 == NOT_FOUND => Ok(()),
-                other => registry(other),
-            }
+            remove(RUN_KEY_PATH, name)
+        }
+    }
+
+    impl RunKey for WindowsRunOnceKey {
+        fn get(&self, name: &str) -> Result<Option<String>, AutostartError> {
+            get(RUN_ONCE_KEY_PATH, name)
+        }
+        fn set(&self, name: &str, value: &str) -> Result<(), AutostartError> {
+            set(RUN_ONCE_KEY_PATH, name, value)
+        }
+        fn remove(&self, name: &str) -> Result<(), AutostartError> {
+            remove(RUN_ONCE_KEY_PATH, name)
         }
     }
 }
@@ -203,6 +240,16 @@ mod tests {
     fn the_command_line_quotes_the_path_and_passes_the_flag() {
         let line = command_line(&exe()).expect("command line");
         assert_eq!(line, format!("\"{}\" --autostart", exe().display()));
+    }
+
+    #[test]
+    fn the_run_once_command_line_opens_the_window() {
+        let line = open_command_line(&exe()).expect("command line");
+        assert_eq!(line, format!("\"{}\"", exe().display()));
+        assert_eq!(
+            open_command_line(Path::new("relative.exe")),
+            Err(AutostartError::UnusablePath)
+        );
     }
 
     #[test]

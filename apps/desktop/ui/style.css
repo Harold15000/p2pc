@@ -55,3 +55,48 @@ button {
 #error {
   color: #d1242f;
 }
+
+/* First run (H2 §8.2, T2-43). */
+.warning {
+  color: #9a6700;
+}
+
+.error-box {
+  border-left: 3px solid #d1242f;
+  padding-left: 0.75rem;
+}
+
+.error,
+.check-failed {
+  color: #d1242f;
+}
+
+.detail,
+.progress {
+  opacity: 0.8;
+}
+
+.paired,
+.ready {
+  font-weight: 600;
+}
+
+fieldset {
+  border: none;
+  padding: 0;
+  margin: 1rem 0;
+}
+
+fieldset label {
+  margin-right: 1.5rem;
+}
+
+.share input[type="range"] {
+  width: 100%;
+}
+
+canvas {
+  display: block;
+  margin: 1rem 0;
+  image-rendering: pixelated;
+}

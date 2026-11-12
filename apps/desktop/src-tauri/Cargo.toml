@@ -31,9 +31,20 @@ app = ["dep:tauri", "dep:tauri-build", "dep:tauri-plugin-single-instance", "dep:
 [dependencies]
 # The device key: 32 bytes from the OS generator (already in the tree through `rand`).
 getrandom = "0.4.3"
+# The device key's public half, the app's device NodeId (`p2pc-server init --owner-device`, H2 §5.3, §8.2 step 4). The
+# root workspace's version and features (key types only, no networking).
+iroh-base = { version = "~1.4.1", default-features = false, features = ["key"] }
+# The WSL side of first run (H2 §8.3, T2-40): checks, image download, import, the scheduled task, `wsl.exe` runs.
+p2pc-wsl = { version = "0.1.0", path = "../../../crates/p2pc-wsl" }
+# The pairing QR code of first-run step 5 (H2 §8.2), as a module matrix the window draws: the ticket never reaches the
+# webview as text. The CLI's version, without its image renderers.
+qrcode = { version = "0.14.1", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
+# The hub's `server.toml`: "Create my cloud" sets `[blobs] blobs_quota_mb` (H2 §7.5, §8.2) in the file `p2pc-server init`
+# wrote. Already in the tree through Tauri; the root workspace's version.
+toml = { version = "1.2.0", default-features = false, features = ["std", "serde", "parse", "display"] }
 # The navigation guard reads the URLs the webview asks for (Tauri hands them over as `url::Url`).
 url = "2.5.8"
 # The device key is wiped from memory when dropped.

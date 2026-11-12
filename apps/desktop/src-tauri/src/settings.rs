@@ -3,10 +3,10 @@
 //! The app's own settings, in `settings.json` in the app's config folder (`%APPDATA%\<app identifier>`, which the
 //! uninstaller deletes, H2 §8.7 step 6).
 //!
-//! This task has one setting: start at sign-in (§8.1: "started at sign-in from `HKCU\…\Run` (opt-out in Settings)").
-//! Later tasks add theirs (the update-check choice of §8.2 step 1, "Keep this PC awake" of §8.6) as new fields with
-//! `#[serde(default)]`, so an older file still loads; unknown fields are ignored, so a newer file still loads after a
-//! downgrade.
+//! The settings: start at sign-in (§8.1: "started at sign-in from `HKCU\…\Run` (opt-out in Settings)"), the
+//! update-check choice of §8.2 step 1 (T2-43; T2-45's updater reads it), and "Keep this PC awake while sharing" of §8.2
+//! step 3 and §8.6 (T2-43 records it). New fields take their default (`#[serde(default)]`), so an older file still
+//! loads; unknown fields are ignored, so a newer file still loads after a downgrade.
 
 use std::fs;
 use std::io::{self, Read, Write};
@@ -26,11 +26,20 @@ pub const MAX_FILE_LEN: u64 = 64 * 1024;
 pub struct Settings {
     /// Start the app at sign-in (`HKCU\…\Run`). On by default, opt-out (§8.1).
     pub autostart: bool,
+    /// "Check for updates and verify the web app automatically" (§8.2 step 1, §14.1, hard rule 6). `None` until the
+    /// user picked one: nothing is preselected, and without a yes the app never checks on its own.
+    pub update_checks: Option<bool>,
+    /// "Keep this PC awake while sharing" (§8.2 step 3, §8.6). Off by default.
+    pub keep_awake: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { autostart: true }
+        Self {
+            autostart: true,
+            update_checks: None,
+            keep_awake: false,
+        }
     }
 }
 
@@ -146,6 +155,29 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_install_has_no_update_choice_and_does_not_keep_the_pc_awake() {
+        let s = Settings::default();
+        assert_eq!(s.update_checks, None, "nothing preselected (§8.2 step 1)");
+        assert!(!s.keep_awake, "off by default (§8.6)");
+    }
+
+    #[test]
+    fn an_older_file_without_the_new_fields_still_loads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = SettingsFile::in_dir(dir.path());
+        fs::write(file.path(), br#"{"autostart": false}"#).expect("write");
+        let s = file.load().expect("load");
+        assert_eq!((s.autostart, s.update_checks, s.keep_awake), (false, None, false));
+        let chosen = Settings {
+            update_checks: Some(true),
+            keep_awake: true,
+            ..Settings::default()
+        };
+        file.save(&chosen).expect("save");
+        assert_eq!(file.load().expect("load"), chosen);
+    }
+
+    #[test]
     fn no_file_means_defaults() {
         let dir = tempfile::tempdir().expect("tempdir");
         let file = SettingsFile::in_dir(dir.path());
@@ -156,7 +188,10 @@ mod tests {
     fn saved_settings_load_back_and_no_temporary_file_is_left() {
         let dir = tempfile::tempdir().expect("tempdir");
         let file = SettingsFile::in_dir(&dir.path().join("nested"));
-        let off = Settings { autostart: false };
+        let off = Settings {
+            autostart: false,
+            ..Settings::default()
+        };
         file.save(&off).expect("save");
         assert_eq!(file.load().expect("load"), off);
         let names: Vec<_> = fs::read_dir(dir.path().join("nested"))
@@ -173,7 +208,13 @@ mod tests {
         fs::write(file.path(), br#"{}"#).expect("write");
         assert_eq!(file.load().expect("load"), Settings::default());
         fs::write(file.path(), br#"{"autostart": false, "from_a_newer_app": 1}"#).expect("write");
-        assert_eq!(file.load().expect("load"), Settings { autostart: false });
+        assert_eq!(
+            file.load().expect("load"),
+            Settings {
+                autostart: false,
+                ..Settings::default()
+            }
+        );
     }
 
     #[test]
@@ -229,7 +270,10 @@ mod tests {
                 trusted: true
             }
         );
-        let off = Settings { autostart: false };
+        let off = Settings {
+            autostart: false,
+            ..Settings::default()
+        };
         file.save(&off).expect("save");
         assert_eq!(
             startup(Some(&file)),

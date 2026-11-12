@@ -16,7 +16,7 @@
 //! [`Machine::controls`] lists exactly the ones [`Machine::apply`] accepts, so the tray and the window never offer a
 //! control that would be refused.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// The six states of §8.4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -112,7 +112,7 @@ impl TrayColor {
 
 /// Whether this PC hosts the cloud's hub (§8.4 "On the hub PC", §8.6) or joined another PC's cloud. Known once first
 /// run has finished (§8.2 step 4: "Create my cloud" or "Join my cloud").
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
     /// This PC hosts the hub.
