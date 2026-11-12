@@ -322,6 +322,7 @@ fn run_cmd(cli: &Cli, env: &Env) -> anyhow::Result<ExitCode> {
             executor,
             offers,
             ingress,
+            volumes,
         } = node::build(
             &config,
             facts,
@@ -334,6 +335,9 @@ fn run_cmd(cli: &Cli, env: &Env) -> anyhow::Result<ExitCode> {
         executor.startup().await;
         let _leases = executor.spawn_status_writer(LeasesFile::in_dir(&config.data_dir));
         let executor = Arc::new(executor);
+        // Volume upkeep (H2 §11.3): retries the removal of containers that still hold a volume, and expires unused
+        // volumes.
+        tokio::spawn(node::keep_volumes(executor.clone()));
         let shared = Shared {
             owner: server.account_id,
             agent_lease_ttl: ttl,
@@ -351,6 +355,8 @@ fn run_cmd(cli: &Cli, env: &Env) -> anyhow::Result<ExitCode> {
             uplink,
             // The hub's port streams go through the driver's ingress bridge (H2 §6.1, §11.2).
             ports: Some(Arc::new(ingress)),
+            // `VolumeReport` and `VolumeDelete` (H2 §6.1), when the node offers volume space.
+            volumes,
         };
         let daemon = Daemon {
             shared,

@@ -9,6 +9,11 @@
 //! - **The driver is built once**, from [`NodeFacts`] detected at start: the §9.0 platform, the sandbox readiness,
 //!   the shim next to the agent binary, the lease cgroups of the profile, the offerable GPUs. What it cannot serve is
 //!   never offered ([`DriverLimits`]), and the inventory says so (P3-5).
+//! - **Persistent volumes** (H2 §11.3): [`open_volumes`] loads `<data_dir>/volumes` once, before the driver is built;
+//!   every holder it finds stays held until the orphan sweep of [`crate::executor::Executor::startup`] confirmed its
+//!   container gone. The driver always gets the store (leftover volumes still expire and are deleted). The node
+//!   declares the `volumes` capability, and reports its volumes, only when the owner gave them a share of the disk
+//!   (`share.volumes_mb` of at least one volume's minimum): [`Node::volumes`]. [`keep_volumes`] is the periodic upkeep.
 //! - **Hairpin NAT** (§9, T10a review P2-2, T10e): the egress proxy gets the node's public addresses as a **live**
 //!   source (iroh's observed addresses, [`crate::connection::endpoint::IrohConnector::public_addrs`]), which are kept
 //!   until a fresh observation of the same family replaces them. Egress jobs fail with `egress_unavailable` while the
@@ -36,7 +41,7 @@ use tokio::sync::watch;
 use crate::config::Config;
 use crate::connection::{OfferFeed, Uplink};
 use crate::executor::capacity::{DriverLimits, Offer};
-use crate::executor::{Clock, Executor};
+use crate::executor::{Clock, Executor, SystemClock};
 use crate::host::Host;
 use crate::identity::ensure_private_dir;
 use crate::inventory::{self, Report};
@@ -45,6 +50,7 @@ use crate::sandbox::cgroup::{FsCgroups, HostCgroups, SystemdCgroups, user_servic
 use crate::sandbox::engine::{PULL_TIMEOUT, PodmanEngine};
 use crate::sandbox::ingress::IngressBridge;
 use crate::sandbox::{DriverConfig, KnownPublicAddrs, PodmanDriver, ProxyEgress};
+use crate::volumes::{MAINTENANCE_INTERVAL, StoreConfig, VOLUME_MB_RANGE, VolumeStore};
 
 /// The lock file inside the data dir.
 pub const LOCK_FILE: &str = "agent.lock";
@@ -195,6 +201,47 @@ pub struct NodeFacts {
     pub shim: PathBuf,
     /// The lease cgroups, or why there are none.
     pub cgroups: Result<HostCgroups<SystemRunner>, String>,
+    /// The node's persistent volumes as found on disk ([`open_volumes`]); `None` when the node is not enrolled or
+    /// they could not be opened: no volume is mounted then.
+    pub volumes: Option<VolumeStore>,
+}
+
+/// Opens the persistent volumes of `owner` under the data dir (H2 §11.3), on the blocking pool. The budget starts
+/// at 0: [`build`] sets it from the detected share. An error is logged and means "no volumes": nothing is mounted
+/// from a `volumes/` directory that is not the agent's own.
+pub async fn open_volumes(config: &Config, owner: AccountId, clock: Arc<dyn Clock>) -> Option<VolumeStore> {
+    let cfg = StoreConfig {
+        data_dir: config.data_dir.clone(),
+        owner,
+        budget_mb: 0,
+        retention_days: config.volume_retention_days,
+        // H1's entry budget of the disk measurement (H2 §11.3).
+        entry_budget: crate::sandbox::outputs::MAX_ENTRIES,
+        clock,
+    };
+    match tokio::task::spawn_blocking(move || VolumeStore::open(cfg)).await {
+        Ok(Ok(store)) => Some(store),
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "cannot open the node's volumes; no volume will be mounted");
+            None
+        }
+        Err(_) => {
+            tracing::error!("opening the node's volumes panicked; no volume will be mounted");
+            None
+        }
+    }
+}
+
+/// Runs the volume upkeep of the node's driver every [`MAINTENANCE_INTERVAL`], for as long as the agent runs: it
+/// retries the removal of containers that still hold a volume and deletes the unused volumes past their retention
+/// ([`PodmanDriver::maintain_volumes`]).
+pub async fn keep_volumes(executor: Arc<Executor<NodeDriver>>) {
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + MAINTENANCE_INTERVAL, MAINTENANCE_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        executor.sandbox().maintain_volumes().await;
+    }
 }
 
 impl NodeFacts {
@@ -213,11 +260,16 @@ impl NodeFacts {
         let platform = report
             .as_ref()
             .map_or_else(|| crate::platform::detect(host), |r| r.inventory.platform);
+        let volumes = match &config.server {
+            Some(server) => open_volumes(config, server.account_id, Arc::new(SystemClock)).await,
+            None => None,
+        };
         Self {
             platform,
             report,
             shim: shim_path(),
             cgroups: host_cgroups(platform),
+            volumes,
         }
     }
 }
@@ -232,6 +284,10 @@ pub struct Node {
     /// The ingress bridge (H2 §11.2), shared with the driver: the session opens service ports through it
     /// ([`crate::connection::session::Shared::ports`]).
     pub ingress: IngressBridge,
+    /// The node's volumes, when the owner gave them a share of the disk: the session then declares the `volumes`
+    /// capability and reports them ([`crate::connection::session::Shared::volumes`]). `None` otherwise; the driver
+    /// has the store either way.
+    pub volumes: Option<VolumeStore>,
 }
 
 /// Builds the driver and the executor from `facts`. `public_addrs` is the live source of the node's public addresses
@@ -252,6 +308,7 @@ pub fn build(
         report,
         shim,
         cgroups,
+        volumes,
     } = facts;
     let mut problems = Vec::new();
     match &report {
@@ -289,6 +346,13 @@ pub fn build(
     let ingress = IngressBridge::new();
     cfg.health_probe = Some(Arc::new(ingress.clone()));
     cfg.ingress = Some(ingress.clone());
+    // Persistent volumes (H2 §11.3): the budget is the owner's `share.volumes_mb` as this detection resolved it
+    // (nothing without a detection). The driver gets the store whatever the budget, so that what is on disk still
+    // expires, is deleted, and stays locked while a container holds it.
+    if let Some(store) = &volumes {
+        store.set_budget_mb(report.as_ref().map_or(0, |r| r.local.share.volumes_mb));
+    }
+    cfg.volumes = volumes.clone();
     let driver = PodmanDriver::new(
         cfg,
         PodmanEngine::system("podman", PULL_TIMEOUT),
@@ -300,10 +364,14 @@ pub fn build(
         .as_ref()
         .map(|r| Offer::from_detection(&r.inventory, &r.local.share, &limits));
     let (tx, rx) = watch::channel(first);
+    // A node that has no room for even the smallest volume never declares the capability: it could take no lease
+    // that needs it (H2 §6.1).
+    let volumes = volumes.filter(|store| ready && store.budget_mb() >= *VOLUME_MB_RANGE.start());
     Node {
         executor: Executor::new(driver, owner, uplink, rx, clock),
         offers: OfferFeed { tx, driver: limits },
         ingress,
+        volumes,
     }
 }
 
@@ -339,6 +407,7 @@ mod tests {
                 report: None,
                 shim: dir.path().join("no-shim"),
                 cgroups: Err("no delegation".into()),
+                volumes: None,
             },
             AccountId::generate(),
             Uplink::new(),
@@ -526,6 +595,7 @@ mod tests {
         use crate::executor::status::LEASES_FILE;
         use crate::identity::IDENTITY_FILE;
         use crate::sandbox::jobdir::JOBS_DIR;
+        use crate::volumes::VOLUMES_DIR;
 
         let parent = open_parent();
         let data = parent.path().join("data");
@@ -534,6 +604,7 @@ mod tests {
         std::fs::write(data.join(STATE_FILE), b"{}").unwrap();
         std::fs::write(data.join(LEASES_FILE), b"{}").unwrap();
         std::fs::create_dir(data.join(JOBS_DIR)).unwrap();
+        std::fs::create_dir(data.join(VOLUMES_DIR)).unwrap();
         for own in [IDENTITY_FILE, STATE_FILE, LEASES_FILE] {
             std::fs::write(data.join(format!(".{own}.00000000deadbeef.tmp")), b"x").unwrap();
         }
