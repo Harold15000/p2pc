@@ -1,0 +1,115 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Placeholder UI of the desktop app (H2 T2-42) until the web app build (T2-31) replaces it. It calls only the app's
+// own commands (H2 §8.9) and writes text with `textContent` only, never HTML.
+
+const { invoke } = window.__TAURI__.core;
+
+// The fixed codes of `CommandError` (src/core.rs).
+const MESSAGES = {
+  invalid_argument: "That is not a valid choice.",
+  not_allowed: "That is not possible right now.",
+  busy: "Another action is still running.",
+  not_available: "This is not available in this version of the app yet.",
+  failed: "That did not work. Try again.",
+  internal: "Something went wrong. Restart P2PC.",
+};
+
+// What the window says before a control that loses work or takes the cloud offline (H2 §8.4).
+const CONFIRMATIONS = {
+  stop_sharing: "Stop sharing this PC? Work running here stops and is retried on another PC.",
+  stop_sharing_this_pc: "Stop sharing this PC? Its running jobs are cancelled. Your cloud stays on.",
+  turn_off_cloud:
+    "Turn off your cloud? Your phone and your other PCs lose your cloud until you turn it on again.",
+};
+
+const $ = (id) => document.getElementById(id);
+
+function showError(code) {
+  $("error").textContent = MESSAGES[code] ?? MESSAGES.failed;
+  $("error").hidden = false;
+}
+
+function clearError() {
+  $("error").hidden = true;
+  $("error").textContent = "";
+}
+
+function render(status) {
+  $("dot").className = `dot ${status.tray}`;
+  $("state").textContent = status.label;
+
+  $("hub-notice").hidden = !status.hub_notice;
+  $("hub-notice").textContent = status.hub_notice ?? "";
+
+  $("attention").hidden = !status.attention;
+  $("attention").textContent = status.attention ? `Problem: ${status.attention}` : "";
+
+  const controls = $("controls");
+  controls.replaceChildren();
+  for (const c of status.controls) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = c.confirm ? `${c.label}…` : c.label;
+    button.addEventListener("click", () => (c.confirm ? askConfirmation(c) : runControl(c.id)));
+    controls.append(button);
+  }
+}
+
+function askConfirmation(c) {
+  $("confirm-text").textContent = CONFIRMATIONS[c.id] ?? `${c.label}?`;
+  $("confirm-yes").textContent = c.label;
+  $("confirm-yes").onclick = () => {
+    $("confirm").hidden = true;
+    runControl(c.id);
+  };
+  $("confirm").hidden = false;
+}
+
+async function refresh() {
+  try {
+    render(await invoke("status"));
+  } catch (code) {
+    showError(code);
+  }
+}
+
+async function runControl(name) {
+  clearError();
+  try {
+    render(await invoke("control", { name }));
+  } catch (code) {
+    showError(code);
+    await refresh();
+  }
+}
+
+async function loadSettings() {
+  try {
+    const settings = await invoke("settings");
+    $("autostart").checked = settings.autostart;
+  } catch (code) {
+    showError(code);
+  }
+}
+
+$("confirm-no").addEventListener("click", () => {
+  $("confirm").hidden = true;
+});
+
+$("autostart").addEventListener("change", async (event) => {
+  const enabled = event.target.checked;
+  clearError();
+  try {
+    const settings = await invoke("set_autostart", { enabled });
+    $("autostart").checked = settings.autostart;
+  } catch (code) {
+    $("autostart").checked = !enabled;
+    showError(code);
+  }
+});
+
+window.addEventListener("focus", refresh);
+setInterval(refresh, 5000);
+refresh();
+loadSettings();
