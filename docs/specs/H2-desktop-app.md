@@ -1805,8 +1805,9 @@ unprivileged.
 Volumes rest on the exception to hard rule 3 (§4.3, ADR-015 **Accepted**), in force since O-16 (2026-11-11).
 
 - **Layout.** `/var/lib/p2pc/volumes/<account_id>/<hex(sha256(name))[..32]>/` with `data/` (mounted) and `meta.json`
-  (name, created, last used). The agent creates these directories itself (0700, created with `mkdirat` under
-  directory descriptors, never following a link). Names never become paths directly, and no path from the JobSpec
+  (name, created, last used). The agent creates these directories itself (the account and volume directories 0700,
+  `data/` 0755 like H1's mounted job subdirectories, so that a non-root image user can reach it after `:U`; it is
+  reachable only through its 0700 parents), with `mkdirat` under directory descriptors, never following a link). Names never become paths directly, and no path from the JobSpec
   is ever mounted.
 - **Who may mount.** The agent mounts a volume only into a lease whose job is `kind = "service"` or carries `template`,
   and only from the directory of that job's account; anything else is rejected as `invalid_job` (the hub already
