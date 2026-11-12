@@ -12,6 +12,7 @@
 mod common;
 
 use common::fleet::{FakeAgent, Fleet};
+use common::ports::eventually;
 use p2pc_proto::ids::NodeId;
 use p2pc_proto::protocol::{AgentMsg, ServerMsg, error_code};
 use serde_json::{Value, json};
@@ -81,8 +82,12 @@ async fn leave_removes_the_node_audits_node_left_and_closes_without_an_answer() 
     assert_eq!(left[0].1["reason"], "uninstall");
     // `node_left`, not `node_deleted`: nobody but the node asked.
     assert!(audit_rows(&fleet, "node_deleted").await.is_empty());
-    // As for `DELETE /v1/nodes/{id}`: the node's work goes back to the queue, and the node is no longer listed.
-    assert_eq!(job_status(&fleet, &job).await, "queued");
+    // As for `DELETE /v1/nodes/{id}`: the node's work goes back to the queue (the hub does it right after it closed
+    // the connection, so the test looks again), and the node is no longer listed.
+    eventually("the job is requeued", || async {
+        (job_status(&fleet, &job).await == "queued").then_some(())
+    })
+    .await;
     let nodes = fleet.app.get("/v1/nodes", &fleet.app.admin).await.json();
     assert_eq!(nodes["items"].as_array().unwrap().len(), 0, "{nodes}");
     // Its NodeId is no longer enrolled: the agent that comes back is told `not_enrolled` (and exits 7).
