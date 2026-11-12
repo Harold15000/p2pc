@@ -9,7 +9,10 @@
 //! - the main window may call exactly the app's own commands ([`crate::commands::COMMANDS`]); no core, shell,
 //!   filesystem, HTTP or opener permission, and no remote origin;
 //! - the webview loads only bundled assets, under a strict CSP with no `eval` and no inline script;
-//! - the only Tauri plugins are single instance and opener, both used from Rust only.
+//! - the only Tauri plugins are single instance, opener and the updater, all used from Rust only; the updater's
+//!   configuration requires a signed version, allows no downgrade and nothing "dangerous", and installs `passive`
+//!   (§14.1);
+//! - the uninstaller runs the cleanup through the NSIS hooks, never during an update (§8.7).
 
 use crate::commands::COMMANDS;
 
@@ -29,8 +32,15 @@ pub fn main_window_permissions() -> Vec<String> {
     COMMANDS.iter().map(|c| permission(c)).collect()
 }
 
-/// The Tauri plugins the app may depend on. Neither adds a permission to the webview: the app grants none of theirs.
-pub const ALLOWED_PLUGINS: [&str; 2] = ["tauri-plugin-opener", "tauri-plugin-single-instance"];
+/// The Tauri plugins the app may depend on. None adds a permission to the webview: the app grants none of theirs.
+pub const ALLOWED_PLUGINS: [&str; 3] = [
+    "tauri-plugin-opener",
+    "tauri-plugin-single-instance",
+    "tauri-plugin-updater",
+];
+
+/// The NSIS hooks file (`bundle.windows.nsis.installerHooks`, relative to `src-tauri`).
+pub const NSIS_HOOKS: &str = "nsis/hooks.nsh";
 
 #[cfg(test)]
 mod tests {
@@ -43,6 +53,7 @@ mod tests {
     const CAPABILITY: &str = include_str!("../capabilities/main.json");
     const CONFIG: &str = include_str!("../tauri.conf.json");
     const MANIFEST: &str = include_str!("../Cargo.toml");
+    const HOOKS: &str = include_str!("../nsis/hooks.nsh");
 
     fn json(text: &str) -> Value {
         serde_json::from_str(text).expect("valid JSON")
@@ -177,7 +188,95 @@ mod tests {
         assert_eq!(main["create"], false);
         assert_eq!(main["visible"], false);
         assert!(config["app"].get("trayIcon").is_none(), "the tray is built in Rust");
-        assert!(config.get("plugins").is_none(), "no plugin configuration");
+        assert_eq!(
+            keys(&config["plugins"]),
+            ["updater".to_owned()].into(),
+            "the updater's only"
+        );
+    }
+
+    /// §14.1, SI-H2-15: the plugin refuses an artifact without a signed version and never downgrades; the key and the
+    /// endpoint are compiled in (`update::release`), never taken from this file.
+    #[test]
+    fn the_updater_requires_a_signed_version_and_installs_passively() {
+        let updater = &json(CONFIG)["plugins"]["updater"];
+        assert_eq!(
+            *updater,
+            serde_json::json!({
+                "pubkey": "",
+                "endpoints": [],
+                "requireSignedVersion": true,
+                "windows": {"installMode": "passive"}
+            })
+        );
+    }
+
+    /// §8.7: the uninstaller runs `P2PC.exe --uninstall-cleanup` and stops unless it exits 0; never while a newer
+    /// version is being installed, which would otherwise delete the distro.
+    ///
+    /// Two guards, both needed (read in Tauri's NSIS template, tauri-bundler 2.10.4; **not yet run on Windows**, see
+    /// the PR's risks):
+    /// - `$UpdateMode`: set when the uninstaller gets `/UPDATE`. With `/UPDATE` the new installer does not run the old
+    ///   uninstaller at all, so this guard is a second line.
+    /// - `$EXEDIR != $INSTDIR`: a newer installer run by hand preselects "Uninstall before installing" and runs the old
+    ///   uninstaller without `/UPDATE`, in place (`_?=<install dir>`); an uninstall started from Windows runs from a
+    ///   copy in `%TEMP%`. An in-place run skips the cleanup and keeps the app's data folders.
+    ///
+    /// A flag set by the installer's PREINSTALL hook cannot do this: that hook runs in the install section, after the
+    /// page that runs the old uninstaller.
+    #[test]
+    fn the_uninstaller_runs_the_cleanup_but_never_during_an_update() {
+        let nsis = &json(CONFIG)["bundle"]["windows"]["nsis"];
+        assert_eq!(nsis["installerHooks"], NSIS_HOOKS);
+        let pre = HOOKS
+            .split("!macro NSIS_HOOK_PREUNINSTALL")
+            .nth(1)
+            .and_then(|r| r.split("!macroend").next())
+            .expect("a PREUNINSTALL hook");
+        let guard = pre.find("${If} $UpdateMode <> 1").expect("the update guard");
+        let in_place = pre
+            .find("${AndIf} $EXEDIR != $INSTDIR")
+            .expect("the guard against an uninstaller a newer installer started in place");
+        assert!(guard < in_place);
+        // Nothing of the hook runs outside the two guards.
+        let before_guard: Vec<&str> = pre[..guard].lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        assert!(before_guard.is_empty(), "{before_guard:?}");
+        let close = pre
+            .find("CheckIfAppIsRunning")
+            .expect("the running app is closed first");
+        let run = pre
+            .find(&format!("{}' $0", crate::uninstall::CLEANUP_FLAG))
+            .expect("the cleanup is run and waited for");
+        assert!(in_place < close && close < run);
+        assert!(pre.contains("ExecWait"));
+        assert!(pre.contains("${If} $0 <> 0"), "a non-zero exit stops the uninstall");
+        assert!(pre.contains("Abort"));
+        let post = HOOKS
+            .split("!macro NSIS_HOOK_POSTUNINSTALL")
+            .nth(1)
+            .and_then(|r| r.split("!macroend").next())
+            .expect("a POSTUNINSTALL hook");
+        let post_guard = post.find("${If} $UpdateMode <> 1").expect("the update guard");
+        let post_in_place = post
+            .find("${AndIf} $EXEDIR != $INSTDIR")
+            .expect("the in-place guard: a manual upgrade keeps the app's settings");
+        assert!(post_guard < post_in_place);
+        assert!(post_in_place < post.find("RmDir").expect("the data folders"));
+        assert!(post_in_place < post.find("DeleteRegValue").expect("the RunOnce value"));
+        for line in [
+            "RmDir /r \"$APPDATA\\${BUNDLEID}\"",
+            "RmDir /r \"$LOCALAPPDATA\\${BUNDLEID}\"",
+            "DeleteRegValue HKCU \"Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce\" \"${PRODUCTNAME}\"",
+        ] {
+            assert!(post.contains(line), "{line}");
+        }
+        assert_eq!(crate::autostart::RUN_VALUE_NAME, json(CONFIG)["productName"]);
+        // Never the user's other folders: only the app's own, by its identifier.
+        assert_eq!(json(CONFIG)["identifier"], crate::uninstall::host::APP_IDENTIFIER);
+        assert!(
+            !HOOKS.contains("$LOCALAPPDATA\\P2PC"),
+            "%LOCALAPPDATA%\\P2PC is the cleanup's, with its backup rule"
+        );
     }
 
     #[test]
@@ -189,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn the_only_plugins_are_single_instance_and_opener() {
+    fn the_only_plugins_are_single_instance_opener_and_the_updater() {
         let mut found = BTreeSet::new();
         for line in MANIFEST.lines().map(str::trim).filter(|l| !l.starts_with('#')) {
             let mut rest = line;

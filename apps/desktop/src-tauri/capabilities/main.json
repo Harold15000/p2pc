@@ -18,6 +18,15 @@
     "allow-setup-create-cloud",
     "allow-setup-pair-phone",
     "allow-setup-phone-status",
-    "allow-setup-finish-phone"
+    "allow-setup-finish-phone",
+    "allow-update-status",
+    "allow-update-check",
+    "allow-update-install",
+    "allow-web-verify",
+    "allow-set-update-checks",
+    "allow-distro-upgrade",
+    "allow-uninstall-view",
+    "allow-uninstall-run",
+    "allow-uninstall-finish"
   ]
 }

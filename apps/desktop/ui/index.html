@@ -8,6 +8,7 @@
     <title>P2PC</title>
     <link rel="stylesheet" href="style.css" />
     <script type="module" src="main.js"></script>
+    <script type="module" src="updates.js"></script>
   </head>
   <body>
     <main>
@@ -36,6 +37,26 @@
       <section aria-labelledby="settings-heading">
         <h2 id="settings-heading">Settings</h2>
         <label><input type="checkbox" id="autostart" /> Start P2PC when I sign in</label>
+      </section>
+
+      <!-- Updates (H2 §14, §9.6; T2-45): filled by updates.js. -->
+      <section id="updates" aria-labelledby="updates-heading">
+        <h2 id="updates-heading">Updates</h2>
+        <label
+          ><input type="checkbox" id="update-checks" /> Check for updates and verify the web app automatically</label
+        >
+        <p id="update-last"></p>
+        <p id="update-notice" hidden></p>
+        <p>
+          <button type="button" id="update-check">Check for updates</button>
+          <button type="button" id="update-install" hidden></button>
+          <button type="button" id="web-verify">Verify web app</button>
+        </p>
+        <ul id="web-messages"></ul>
+        <div id="distro" hidden>
+          <p id="distro-text"></p>
+          <p id="distro-buttons"></p>
+        </div>
       </section>
     </main>
   </body>
