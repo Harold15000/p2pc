@@ -13,8 +13,12 @@
 //!   ([`crate::navigation`]) is installed before it loads anything; `window.open` never opens a window.
 //! - **Autostart** (§8.1): the `Run` entry is reconciled with the setting at every start and on every change.
 //! - **Commands** (§8.9): [`crate::commands::COMMANDS`], each validating its arguments in Rust.
+//! - **First run** (§8.2, T2-43): [`crate::setup`]'s flow over the real WSL host (`%LOCALAPPDATA%\P2PC`), the
+//!   DPAPI device key and, until T2-30 lands, the unwired hub API. Its commands run on a blocking thread; the app
+//!   starts in `setup` until `setup.json` says first run has finished.
 
 use std::error::Error;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -30,7 +34,13 @@ use crate::core::{CommandError, ControlError, Core, NodeControl, StatusView, Unw
 use crate::launch::{self, Launch, SecondInstance};
 use crate::navigation::{self, Navigation};
 use crate::settings::{Settings, SettingsFile, Startup, startup};
-use crate::state::Machine;
+use crate::setup::flow::{Setup, SetupView, ShareRequest};
+use crate::setup::host::{SetupHost, UnavailableHost};
+use crate::setup::hub::{NoDevice, OwnerDevice, UnwiredHub};
+use crate::setup::record::RecordFile;
+use crate::setup::starting_machine;
+use crate::setup::wsl_host::{WslHost, WslHostParts, compiled_image_pin};
+use crate::state::{Event, Machine};
 use crate::tray::{self as tray_model, Effect, ICON_SIZE, MenuEntry};
 
 /// The tray icon's id.
@@ -49,6 +59,8 @@ struct Shared {
     /// `None` when the OS gives no config folder: settings then live in memory only.
     settings_file: Option<SettingsFile>,
     node: Arc<dyn NodeControl>,
+    /// First run (§8.2).
+    setup: Arc<Setup>,
 }
 
 impl Shared {
@@ -74,7 +86,23 @@ pub fn run() -> ExitCode {
                 show_main(app);
             }
         }))
-        .invoke_handler(tauri::generate_handler![status, control, settings, set_autostart])
+        .invoke_handler(tauri::generate_handler![
+            status,
+            control,
+            settings,
+            set_autostart,
+            setup_status,
+            setup_welcome,
+            setup_checks,
+            setup_install_wsl,
+            setup_download,
+            setup_prepare_node,
+            setup_share,
+            setup_create_cloud,
+            setup_pair_phone,
+            setup_phone_status,
+            setup_finish_phone
+        ])
         .setup(move |app| setup(app, launch));
     let Ok(app) = builder.build(tauri::generate_context!()) else {
         return ExitCode::FAILURE;
@@ -98,11 +126,18 @@ fn setup(app: &mut tauri::App, launch: Launch) -> Result<(), Box<dyn Error>> {
     if trusted {
         let _ = reconcile_autostart(settings.autostart);
     }
+    let first_run = Arc::new(build_setup());
+    // `setup` until `setup.json` says first run has finished, then `sharing` with the recorded role.
+    let machine = first_run
+        .record()
+        .map(|r| starting_machine(&r))
+        .unwrap_or_else(|_| Machine::new());
     app.manage(Shared {
-        core: Mutex::new(Core::new(Machine::new())),
+        core: Mutex::new(Core::new(machine)),
         settings: Mutex::new(settings),
         settings_file,
         node: Arc::new(Unwired),
+        setup: first_run,
     });
     let window = build_main_window(app.handle())?;
     build_tray(app.handle())?;
@@ -111,6 +146,57 @@ fn setup(app: &mut tauri::App, launch: Launch) -> Result<(), Box<dyn Error>> {
         window.set_focus()?;
     }
     Ok(())
+}
+
+// --- First run ---
+
+/// First run over this PC: the real WSL host under `%LOCALAPPDATA%\P2PC`, or, without it (not Windows) or without an
+/// HTTP client, a host that refuses every action. The hub API is unwired until the device connection (T2-30) lands.
+fn build_setup() -> Setup {
+    let layout = p2pc_wsl::Layout::from_env();
+    let file = layout.as_ref().map(|l| RecordFile::in_dir(l.root()));
+    let device = owner_device(layout.as_ref());
+    let host: Arc<dyn SetupHost> = match (layout, p2pc_wsl::image::HttpFetcher::new()) {
+        (Some(layout), Ok(fetch)) => Arc::new(WslHost::new(WslHostParts {
+            runner: p2pc_wsl::runner::SystemRunner,
+            pause: p2pc_wsl::runner::ThreadPause,
+            fetch: Box::new(fetch),
+            run_once: Box::new(RUN_ONCE_KEY),
+            layout,
+            pin: compiled_image_pin(),
+            exe: std::env::current_exe().ok(),
+            system_root: std::env::var_os("SystemRoot")
+                .filter(|v| !v.is_empty())
+                .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from),
+        })),
+        _ => Arc::new(UnavailableHost),
+    };
+    Setup::load(host, Arc::new(UnwiredHub), device, file)
+}
+
+/// The `HKCU\…\RunOnce` key of this OS (first-run step 2a).
+#[cfg(windows)]
+const RUN_ONCE_KEY: autostart::WindowsRunOnceKey = autostart::WindowsRunOnceKey;
+#[cfg(not(windows))]
+const RUN_ONCE_KEY: autostart::NoRunKey = autostart::NoRunKey;
+
+/// The app's device key, DPAPI-protected in `%LOCALAPPDATA%\P2PC\device.key` (§8.9).
+#[cfg(windows)]
+fn owner_device(layout: Option<&p2pc_wsl::Layout>) -> Arc<dyn OwnerDevice> {
+    use crate::keystore::{DEVICE_KEY_FILE, Dpapi, FileKeyStore};
+    use crate::setup::hub::StoredDevice;
+    match layout {
+        Some(l) => Arc::new(StoredDevice::new(FileKeyStore::new(
+            l.root().join(DEVICE_KEY_FILE),
+            Dpapi,
+        ))),
+        None => Arc::new(NoDevice),
+    }
+}
+
+#[cfg(not(windows))]
+fn owner_device(_: Option<&p2pc_wsl::Layout>) -> Arc<dyn OwnerDevice> {
+    Arc::new(NoDevice)
 }
 
 fn reconcile_autostart(enabled: bool) -> Result<(), AutostartError> {
@@ -319,4 +405,116 @@ fn apply_autostart(app: &AppHandle, enabled: bool) -> Result<Settings, CommandEr
     }
     *current = next.clone();
     Ok(next)
+}
+
+/// Changes one setting and writes the file, under the settings lock (as [`apply_autostart`]).
+fn save_setting(app: &AppHandle, change: impl FnOnce(&mut Settings)) -> Result<Settings, CommandError> {
+    let shared = app.state::<Shared>();
+    let mut current = shared.settings()?;
+    let mut next = current.clone();
+    change(&mut next);
+    if let Some(file) = &shared.settings_file {
+        file.save(&next).map_err(|_| CommandError::Failed)?;
+    }
+    *current = next.clone();
+    Ok(next)
+}
+
+// --- First-run commands (§8.2). Every one but `setup_status` waits for `wsl.exe` or the hub: a blocking thread. ---
+
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, CommandError> + Send + 'static,
+) -> Result<T, CommandError> {
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .unwrap_or(Err(CommandError::Failed))
+}
+
+fn first_run(app: &AppHandle) -> Arc<Setup> {
+    Arc::clone(&app.state::<Shared>().setup)
+}
+
+#[tauri::command]
+fn setup_status(shared: State<'_, Shared>) -> Result<SetupView, CommandError> {
+    shared.setup.view()
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn setup_welcome(app: AppHandle, update_checks: bool) -> Result<SetupView, CommandError> {
+    let s = first_run(&app);
+    let view = blocking(move || s.welcome(update_checks)).await?;
+    // Settings shows the same toggle (§8.2 step 1). `setup.json` already holds the choice; a settings file that
+    // cannot be written keeps it in memory until the next change.
+    let app2 = app.clone();
+    let _ = blocking(move || save_setting(&app2, |s| s.update_checks = Some(update_checks))).await;
+    Ok(view)
+}
+
+#[tauri::command]
+async fn setup_checks(app: AppHandle) -> Result<SetupView, CommandError> {
+    let s = first_run(&app);
+    blocking(move || s.run_checks()).await
+}
+
+#[tauri::command]
+async fn setup_install_wsl(app: AppHandle) -> Result<SetupView, CommandError> {
+    let s = first_run(&app);
+    blocking(move || s.install_wsl()).await
+}
+
+#[tauri::command]
+async fn setup_download(app: AppHandle) -> Result<SetupView, CommandError> {
+    let s = first_run(&app);
+    blocking(move || s.download_image()).await
+}
+
+#[tauri::command]
+async fn setup_prepare_node(app: AppHandle) -> Result<SetupView, CommandError> {
+    let s = first_run(&app);
+    blocking(move || s.prepare_node()).await
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn setup_share(app: AppHandle, request: ShareRequest, keep_awake: bool) -> Result<SetupView, CommandError> {
+    let s = first_run(&app);
+    let view = blocking(move || s.apply_share(request)).await?;
+    if view.error.is_none() {
+        let app2 = app.clone();
+        let _ = blocking(move || save_setting(&app2, |s| s.keep_awake = keep_awake)).await;
+    }
+    Ok(view)
+}
+
+#[tauri::command]
+async fn setup_create_cloud(app: AppHandle) -> Result<SetupView, CommandError> {
+    let s = first_run(&app);
+    blocking(move || s.create_cloud()).await
+}
+
+#[tauri::command]
+async fn setup_pair_phone(app: AppHandle) -> Result<SetupView, CommandError> {
+    let s = first_run(&app);
+    blocking(move || s.pair_phone()).await
+}
+
+#[tauri::command]
+async fn setup_phone_status(app: AppHandle) -> Result<SetupView, CommandError> {
+    let s = first_run(&app);
+    blocking(move || s.phone_status()).await
+}
+
+/// Ends step 5; when first run has finished, the app leaves `setup` for `sharing` (§8.4 "setup done").
+#[tauri::command]
+async fn setup_finish_phone(app: AppHandle) -> Result<SetupView, CommandError> {
+    let s = first_run(&app);
+    let (view, role) = blocking(move || s.finish_phone()).await?;
+    if let Some(role) = role {
+        {
+            let shared = app.state::<Shared>();
+            let mut core = shared.core()?;
+            let _ = core.apply(Event::SetupDone(role));
+        }
+        refresh_tray(&app);
+    }
+    Ok(view)
 }

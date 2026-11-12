@@ -1,6 +1,6 @@
 <!doctype html>
 <!-- SPDX-License-Identifier: Apache-2.0 -->
-<!-- Placeholder window of the desktop app (H2 T2-42) until the web app build (T2-31) replaces it. -->
+<!-- Placeholder window of the desktop app (H2 T2-42, T2-43) until the web app build (T2-31) replaces it. -->
 <html lang="en">
   <head>
     <meta charset="utf-8" />
@@ -12,11 +12,12 @@
   <body>
     <main>
       <h1>P2PC</h1>
-      <p class="note">
-        This is a placeholder window. First run and the full interface come in later versions of the app.
-      </p>
 
-      <section aria-labelledby="status-heading">
+      <!-- First run (H2 §8.2): filled by setup.js while the app is in the state `setup`. -->
+      <section id="setup" aria-live="polite" hidden></section>
+
+      <section id="status-section" aria-labelledby="status-heading" hidden>
+        <p id="ready" class="ready" hidden>Your cloud is ready.</p>
         <h2 id="status-heading">Status</h2>
         <p class="status"><span id="dot" class="dot grey" aria-hidden="true"></span><span id="state">…</span></p>
         <p id="hub-notice" hidden></p>
@@ -27,8 +28,9 @@
           <button type="button" id="confirm-yes"></button>
           <button type="button" id="confirm-no">Cancel</button>
         </div>
-        <p id="error" role="alert" hidden></p>
       </section>
+
+      <p id="error" role="alert" hidden></p>
 
       <section aria-labelledby="settings-heading">
         <h2 id="settings-heading">Settings</h2>

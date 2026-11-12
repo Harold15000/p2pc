@@ -179,6 +179,16 @@ impl<S: DeviceKeyStore + Send + Sync> OwnerDevice for StoredDevice<S> {
     }
 }
 
+/// The device of a build with no key store (not Windows: no DPAPI): it has no NodeId.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoDevice;
+
+impl OwnerDevice for NoDevice {
+    fn node_id(&self) -> Result<String, KeyError> {
+        Err(KeyError::Io(std::io::Error::from(std::io::ErrorKind::Unsupported)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;

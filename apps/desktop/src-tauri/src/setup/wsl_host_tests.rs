@@ -140,6 +140,26 @@ const INVENTORY: &str = r#"{
 // --- Parsing ---
 
 #[test]
+fn the_image_pin_needs_an_https_url_and_a_sha256() {
+    let sha = "ab".repeat(32);
+    let pin = image_pin_from(Some("https://releases.example.invalid/p2pc-node.tar"), Some(&sha)).expect("pin");
+    assert_eq!(pin.url(), "https://releases.example.invalid/p2pc-node.tar");
+    assert_eq!(
+        image_pin_from(Some("http://releases.example.invalid/x.tar"), Some(&sha)),
+        None
+    );
+    assert_eq!(
+        image_pin_from(Some("https://releases.example.invalid/x.tar"), Some("abc")),
+        None
+    );
+    assert_eq!(image_pin_from(None, Some(&sha)), None);
+    assert_eq!(
+        image_pin_from(Some("https://releases.example.invalid/x.tar"), None),
+        None
+    );
+}
+
+#[test]
 fn the_inventory_gives_the_controls_ranges_and_defaults() {
     assert_eq!(
         parse_inventory(INVENTORY),

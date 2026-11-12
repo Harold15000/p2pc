@@ -143,9 +143,85 @@ pub trait SetupHost: Send + Sync {
     fn restart_node(&self) -> Result<(), SetupError>;
 }
 
+/// The host of a PC where first run cannot work (no `%LOCALAPPDATA%`: not Windows): every action is
+/// `not_available`, and nothing runs.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UnavailableHost;
+
+fn unavailable<T>() -> Result<T, SetupError> {
+    Err(SetupError::new(super::errors::SetupErrorCode::NotAvailable))
+}
+
+impl SetupHost for UnavailableHost {
+    fn checks(&self) -> Result<ChecksReport, SetupError> {
+        unavailable()
+    }
+    fn free_bytes(&self) -> Result<u64, SetupError> {
+        unavailable()
+    }
+    fn install_wsl(&self) -> WslInstall {
+        WslInstall::Failed { exit_code: None }
+    }
+    fn reopen_after_reboot(&self) -> Result<(), SetupError> {
+        unavailable()
+    }
+    fn download_image(&self, _: &mut dyn FnMut(Progress) -> ControlFlow<()>) -> Result<(), SetupError> {
+        unavailable()
+    }
+    fn install_distro(&self) -> Result<String, SetupError> {
+        unavailable()
+    }
+    fn node_facts(&self) -> Result<NodeFacts, SetupError> {
+        unavailable()
+    }
+    fn networking_mode(&self) -> NetworkingMode {
+        NetworkingMode::Unknown
+    }
+    fn apply_share(&self, _: &ShareRecord) -> Result<(), SetupError> {
+        unavailable()
+    }
+    fn hub_initialised(&self) -> Result<bool, SetupError> {
+        unavailable()
+    }
+    fn init_hub(&self, _: &str, _: &str) -> Result<HubInit, SetupError> {
+        unavailable()
+    }
+    fn hub_address(&self) -> Result<String, SetupError> {
+        unavailable()
+    }
+    fn set_blobs_quota(&self, _: u64) -> Result<(), SetupError> {
+        unavailable()
+    }
+    fn enable_hub(&self) -> Result<(), SetupError> {
+        unavailable()
+    }
+    fn join_agent(&self, _: &JoinToken) -> JoinResult {
+        JoinResult::Failed { exit_code: None }
+    }
+    fn restart_node(&self) -> Result<(), SetupError> {
+        unavailable()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::setup::errors::SetupErrorCode;
+
+    #[test]
+    fn the_unavailable_host_does_nothing_and_says_so() {
+        let h = UnavailableHost;
+        assert_eq!(
+            h.checks().map(|_| ()),
+            Err(SetupError::new(SetupErrorCode::NotAvailable))
+        );
+        assert_eq!(h.install_wsl(), WslInstall::Failed { exit_code: None });
+        assert_eq!(h.networking_mode(), NetworkingMode::Unknown);
+        assert_eq!(
+            h.join_agent(&JoinToken::new("x".into())),
+            JoinResult::Failed { exit_code: None }
+        );
+    }
 
     #[test]
     fn a_join_token_never_shows_in_debug() {

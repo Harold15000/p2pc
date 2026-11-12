@@ -7,6 +7,17 @@
     "allow-status",
     "allow-control",
     "allow-settings",
-    "allow-set-autostart"
+    "allow-set-autostart",
+    "allow-setup-status",
+    "allow-setup-welcome",
+    "allow-setup-checks",
+    "allow-setup-install-wsl",
+    "allow-setup-download",
+    "allow-setup-prepare-node",
+    "allow-setup-share",
+    "allow-setup-create-cloud",
+    "allow-setup-pair-phone",
+    "allow-setup-phone-status",
+    "allow-setup-finish-phone"
   ]
 }

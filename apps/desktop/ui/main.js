@@ -1,19 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Placeholder UI of the desktop app (H2 T2-42) until the web app build (T2-31) replaces it. It calls only the app's
-// own commands (H2 §8.9) and writes text with `textContent` only, never HTML.
+// Placeholder UI of the desktop app (H2 T2-42, T2-43) until the web app build (T2-31) replaces it. It calls only the
+// app's own commands (H2 §8.9) and writes text with `textContent` only, never HTML. While the app is in the state
+// `setup` it shows first run (setup.js); afterwards, the status and the controls of §8.4.
 
-const { invoke } = window.__TAURI__.core;
-
-// The fixed codes of `CommandError` (src/core.rs).
-const MESSAGES = {
-  invalid_argument: "That is not a valid choice.",
-  not_allowed: "That is not possible right now.",
-  busy: "Another action is still running.",
-  not_available: "This is not available in this version of the app yet.",
-  failed: "That did not work. Try again.",
-  internal: "Something went wrong. Restart P2PC.",
-};
+import { $, invoke, commandMessage } from "./common.js";
+import { refreshSetup, setupView } from "./setup.js";
 
 // What the window says before a control that loses work or takes the cloud offline (H2 §8.4).
 const CONFIRMATIONS = {
@@ -23,10 +15,8 @@ const CONFIRMATIONS = {
     "Turn off your cloud? Your phone and your other PCs lose your cloud until you turn it on again.",
 };
 
-const $ = (id) => document.getElementById(id);
-
 function showError(code) {
-  $("error").textContent = MESSAGES[code] ?? MESSAGES.failed;
+  $("error").textContent = commandMessage(code);
   $("error").hidden = false;
 }
 
@@ -36,6 +26,16 @@ function clearError() {
 }
 
 function render(status) {
+  const inSetup = status.state === "setup";
+  $("setup").hidden = !inSetup;
+  $("status-section").hidden = inSetup;
+  if (inSetup) {
+    refreshSetup();
+    return;
+  }
+  // First run has just finished in this window: say so once (§8.2 "Ready").
+  $("ready").hidden = setupView()?.step !== "ready";
+
   $("dot").className = `dot ${status.tray}`;
   $("state").textContent = status.label;
 

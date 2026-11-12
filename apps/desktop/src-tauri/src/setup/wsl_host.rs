@@ -79,6 +79,21 @@ try {
 }
 "#;
 
+/// The node image this app build is pinned to (§8.3: "URL and SHA-256 compiled into the app build for its matching
+/// image version"), from `P2PC_NODE_IMAGE_URL` and `P2PC_NODE_IMAGE_SHA256` at build time (the release pipeline, T2-52,
+/// sets them). A build without them, or with an unusable pin, has none: the download is then `not_available`.
+pub fn compiled_image_pin() -> Option<ImagePin> {
+    image_pin_from(
+        option_env!("P2PC_NODE_IMAGE_URL"),
+        option_env!("P2PC_NODE_IMAGE_SHA256"),
+    )
+}
+
+/// [`compiled_image_pin`] from its two values.
+pub fn image_pin_from(url: Option<&str>, sha256: Option<&str>) -> Option<ImagePin> {
+    ImagePin::new(url?, sha256?).ok()
+}
+
 /// What `p2pc-agent inventory --json` prints, the fields first run reads.
 #[derive(Debug, Deserialize)]
 struct InventoryReport {
@@ -515,7 +530,10 @@ impl<R: CommandRunner + Send + Sync, P: Pause + Send + Sync> SetupHost for WslHo
             return JoinResult::Failed { exit_code: None };
         }
         // The token goes on stdin (H1 §7), never on the command line; the runner refuses one there anyway.
-        let mut stdin = token.expose().as_bytes().to_vec();
+        // Sized once, so no reallocation leaves an un-wiped copy behind; the runner wipes this buffer when dropped.
+        let secret = token.expose().as_bytes();
+        let mut stdin = Vec::with_capacity(secret.len() + 1);
+        stdin.extend_from_slice(secret);
         stdin.push(b'\n');
         match self.run_in_distro(&[AGENT_BIN, "--config", AGENT_CONFIG, "join", "-"], Some(stdin)) {
             None => JoinResult::Failed { exit_code: None },

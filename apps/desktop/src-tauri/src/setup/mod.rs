@@ -21,6 +21,17 @@
 //!
 //! "Join my cloud" (§5.4) is T2-44 (`invite/`).
 
+use crate::state::{Machine, State};
+
+/// The state the app starts in: `setup` until first run has finished, then `sharing` (§8.4: "Entered by: resume,
+/// setup done"), with the role step 4 chose.
+pub fn starting_machine(record: &record::SetupRecord) -> Machine {
+    record
+        .finished()
+        .and_then(|role| Machine::settled(role, State::Sharing))
+        .unwrap_or_default()
+}
+
 pub mod disk;
 pub mod errors;
 pub mod flow;
@@ -28,3 +39,45 @@ pub mod host;
 pub mod hub;
 pub mod record;
 pub mod wsl_host;
+
+#[cfg(test)]
+mod tests {
+    use super::record::{PhoneOutcome, SetupRecord};
+    use super::*;
+    use crate::state::Role;
+
+    #[test]
+    fn the_app_starts_in_setup_until_first_run_has_finished() {
+        let mut r = SetupRecord {
+            update_checks: Some(true),
+            checks_passed: true,
+            role: Some(Role::Hub),
+            ..SetupRecord::default()
+        };
+        assert_eq!(starting_machine(&r).state(), State::Setup);
+        assert_eq!(starting_machine(&SetupRecord::default()).state(), State::Setup);
+        r = SetupRecord {
+            node: Some(super::record::NodeRecord {
+                image_version: String::new(),
+                cpu_cores: 1,
+                memory_mb: 1024,
+                gpu_offerable: false,
+                default_cpu: 1,
+                default_memory_mb: 1024,
+                networking: super::record::NetworkingMode::Nat,
+            }),
+            share: Some(super::record::ShareRecord {
+                cpu: 1,
+                memory_mb: 1024,
+                gpu: false,
+                share_gib: 1,
+                disk_mb: 512,
+                volumes_mb: 512,
+            }),
+            phone: Some(PhoneOutcome::Skipped),
+            ..r
+        };
+        let m = starting_machine(&r);
+        assert_eq!((m.state(), m.role()), (State::Sharing, Some(Role::Hub)));
+    }
+}
