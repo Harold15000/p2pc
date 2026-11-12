@@ -97,6 +97,9 @@ pub struct ShareRecord {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HubRecord {
+    /// The largest share that leaves the hub its blob quota, after a share was too large (§8.2: step 4 goes back to
+    /// step 3 and asks for a smaller share).
+    pub share_cap_gib: Option<u64>,
     /// The hub's blob quota, computed from the disk arithmetic before anything else runs.
     pub blobs_quota_mb: Option<u64>,
     /// `p2pc-server init --owner-device` ran (or the hub's data dir was already initialised: `found_existing`).
