@@ -190,7 +190,7 @@ fn build(state: AppState, transport: Transport) -> Router {
         .route("/v1/keys", get(list_keys).post(create_key))
         .route("/v1/keys/{key_id}", delete(revoke_key))
         .route("/v1/audit", get(list_audit))
-        .route("/v1/server", get(nodes_api::get_server))
+        .route("/v1/server", get(nodes_api::get_server).patch(nodes_api::patch_server))
         .route(
             "/v1/nodes/join-tokens",
             get(nodes_api::list_join_tokens).post(nodes_api::create_join_token),

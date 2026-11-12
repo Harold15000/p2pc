@@ -30,6 +30,14 @@
 //! never a fit, whatever it offers (SI-H2-19). Both are reported as their own [`Misfit`], so the scheduler can say why
 //! a job waits ([`why_nowhere`]).
 //!
+//! **Volumes on the node** (H2 §11.3). A volume is mounted by one container at a time, and the node's volume share
+//! (`Inventory.volumes_mb`) covers every volume on it. A job with volumes therefore never goes to a node where one of
+//! its volumes is in use ([`Candidate::volumes_in_use`]: held by a lease the hub has not seen end, or reported
+//! `in_use_by` a lease in the node's last `VolumeReport`), and needs `volumes_mb − Σ max_mb of the volumes in use ≥
+//! Σ max_mb of its own volumes`. Both pass with time ([`Misfit::Busy`]). A share that cannot hold the job's volumes
+//! even with none in use makes the node ineligible ([`Misfit::NoVolumeSpace`]). A node that does not report
+//! `volumes_mb` (an agent without `share_update`) is placed without the budget; its agent still enforces it.
+//!
 //! **Volume affinity** ([`affinity`], H2 §7.2). A requeued service with a volume goes back to the node that holds the
 //! volume when that node fits; while that node is eligible but offline or busy, the scheduler waits for it (for a
 //! bounded time, which the caller checks) before it places the job elsewhere.
@@ -73,6 +81,25 @@ pub struct Request {
     pub node_id: Option<NodeId>,
     /// The agent capabilities the job needs (H2 §6.1, see [`needs`]). Empty for an H1 batch job.
     pub needs: Vec<&'static str>,
+    /// Its volumes (H2 §7.1), for the one-holder rule and the volume budget (§11.3). Empty for most jobs.
+    pub volumes: Vec<VolumeNeed>,
+}
+
+/// One volume a job mounts, as placement sees it (H2 §11.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeNeed {
+    /// The volume's name (one holder at a time per name on a node).
+    pub name: String,
+    /// Its `max_mb`, which the node's volume share must hold.
+    pub max_mb: u64,
+}
+
+impl Request {
+    /// The MiB of volume share the job's volumes need: the sum of their `max_mb`.
+    #[must_use]
+    pub fn volumes_mb(&self) -> u64 {
+        self.volumes.iter().fold(0, |sum, v| sum.saturating_add(v.max_mb))
+    }
 }
 
 /// The agent capabilities a job needs (H2 §6.1): `service_jobs` for a service, `volumes` for a job with volumes,
@@ -187,6 +214,9 @@ pub struct Candidate {
     pub features: Vec<String>,
     /// Its held reservations.
     pub held: Held,
+    /// The volumes in use on the node now, by name, with the `max_mb` each counts against the volume share (H2
+    /// §11.3): those of its leases not yet confirmed dead, and those its last `VolumeReport` says a lease holds.
+    pub volumes_in_use: BTreeMap<String, u64>,
     /// When it last got or released work (its enrollment, if never): the tie-break.
     pub idle_since: OffsetDateTime,
 }
@@ -202,6 +232,8 @@ pub enum Misfit {
     MissingCapability(&'static str),
     /// The node offers less than the job asks for, even when idle.
     TooSmall,
+    /// Its volume share (`Inventory.volumes_mb`) cannot hold the job's volumes even with no volume in use (H2 §11.3).
+    NoVolumeSpace,
     /// The node could run the job, but no `admin` has approved it yet (H2 §5.5, SI-H2-19).
     PendingApproval,
     /// Offline, draining or not connected.
@@ -222,6 +254,7 @@ impl Misfit {
                 | Misfit::NoSandbox
                 | Misfit::MissingCapability(_)
                 | Misfit::TooSmall
+                | Misfit::NoVolumeSpace
                 | Misfit::PendingApproval
         )
     }
@@ -252,6 +285,11 @@ pub fn fits(c: &Candidate, req: &Request) -> Result<Option<String>, Misfit> {
     {
         return Err(Misfit::TooSmall);
     }
+    // The volume budget applies only to a job with volumes, on a node that reports its share.
+    let volume_share = c.inventory.volumes_mb.filter(|_| !req.volumes.is_empty());
+    if volume_share.is_some_and(|share| share < req.volumes_mb()) {
+        return Err(Misfit::NoVolumeSpace);
+    }
     // After every other static rule: `PendingApproval` then means "approval is all this node lacks for the job".
     if !c.approved {
         return Err(Misfit::PendingApproval);
@@ -269,6 +307,16 @@ pub fn fits(c: &Candidate, req: &Request) -> Result<Option<String>, Misfit> {
         .is_some_and(|d| d.saturating_sub(c.held.disk_mb) < req.disk_mb);
     if free < req.cpu_milli || free_mem < req.memory_mb || disk_busy {
         return Err(Misfit::Busy);
+    }
+    // One holder at a time: a volume in use on the node cannot be mounted by this job's container too.
+    if req.volumes.iter().any(|v| c.volumes_in_use.contains_key(&v.name)) {
+        return Err(Misfit::Busy);
+    }
+    if let Some(share) = volume_share {
+        let in_use = c.volumes_in_use.values().fold(0u64, |sum, mb| sum.saturating_add(*mb));
+        if share.saturating_sub(in_use) < req.volumes_mb() {
+            return Err(Misfit::Busy);
+        }
     }
     if req.gpu == 0 {
         return Ok(None);
@@ -385,10 +433,10 @@ pub fn affinity(candidates: &[Candidate], req: &Request, holder: NodeId, cooling
     }
 }
 
-/// Why no node will take `req` however long it waits, when that is something the owner can act on (H2 §5.5, §6.1):
-/// [`Misfit::PendingApproval`] when approval is all a node lacks, else [`Misfit::MissingCapability`] when a node
-/// lacks only a capability. `None` when some node is eligible (the job just waits for room, as in H1) or when no node
-/// comes that close.
+/// Why no node will take `req` however long it waits, when that is something the owner can act on (H2 §5.5, §6.1,
+/// §11.3): [`Misfit::PendingApproval`] when approval is all a node lacks, else [`Misfit::MissingCapability`] when a
+/// node lacks only a capability, else [`Misfit::NoVolumeSpace`] when a node's volume share is too small. `None` when
+/// some node is eligible (the job just waits for room, as in H1) or when no node comes that close.
 #[must_use]
 pub fn why_nowhere(candidates: &[Candidate], req: &Request) -> Option<Misfit> {
     let misfits: Vec<Misfit> = candidates.iter().filter_map(|c| fits(c, req).err()).collect();
@@ -399,6 +447,7 @@ pub fn why_nowhere(candidates: &[Candidate], req: &Request) -> Option<Misfit> {
         .iter()
         .find(|m| matches!(m, Misfit::PendingApproval))
         .or_else(|| misfits.iter().find(|m| matches!(m, Misfit::MissingCapability(_))))
+        .or_else(|| misfits.iter().find(|m| matches!(m, Misfit::NoVolumeSpace)))
         .copied()
 }
 
@@ -446,6 +495,7 @@ mod tests {
             approved: true,
             features: Vec::new(),
             held: Held::default(),
+            volumes_in_use: BTreeMap::new(),
             idle_since: T,
         }
     }
@@ -844,6 +894,77 @@ mod tests {
             Affinity::Elsewhere,
             "deleted"
         );
+    }
+
+    fn volume(name: &str, max_mb: u64) -> VolumeNeed {
+        VolumeNeed {
+            name: name.into(),
+            max_mb,
+        }
+    }
+
+    /// H2 §11.3 "Budget": `volumes_mb − Σ max_mb of the volumes in use ≥ Σ max_mb of the job's volumes`; unused
+    /// volumes do not count, and a share too small even when nothing is in use makes the node ineligible.
+    #[test]
+    fn the_volume_share_must_hold_the_volumes_in_use_and_the_jobs_own() {
+        let mut r = req(1.0, 1024, 0);
+        r.volumes = vec![volume("models", 20_480), volume("cache", 1024)];
+        assert_eq!(r.volumes_mb(), 21_504);
+        let mut c = node(4.0, 8192, 0);
+        c.inventory.volumes_mb = Some(21_504);
+        assert_eq!(fits(&c, &r), Ok(None), "exactly enough");
+        c.volumes_in_use.insert("other".into(), 1);
+        assert_eq!(fits(&c, &r), Err(Misfit::Busy), "another lease's volume counts");
+        c.volumes_in_use.clear();
+
+        c.inventory.volumes_mb = Some(21_503);
+        assert_eq!(fits(&c, &r), Err(Misfit::NoVolumeSpace));
+        assert!(Misfit::NoVolumeSpace.is_static(), "ineligible, not busy");
+        assert_eq!(why_nowhere(std::slice::from_ref(&c), &r), Some(Misfit::NoVolumeSpace));
+        // One volume larger than the whole share: the same.
+        c.inventory.volumes_mb = Some(1024);
+        r.volumes = vec![volume("models", 20_480)];
+        assert_eq!(fits(&c, &r), Err(Misfit::NoVolumeSpace));
+        // Ineligible before it is unapproved, offline or busy: the share is what the owner must change.
+        c.approved = false;
+        c.available = false;
+        assert_eq!(fits(&c, &r), Err(Misfit::NoVolumeSpace));
+
+        // A job without volumes ignores the share, even a share of 0.
+        let mut idle = node(4.0, 8192, 0);
+        idle.inventory.volumes_mb = Some(0);
+        assert_eq!(fits(&idle, &req(1.0, 1024, 0)), Ok(None));
+        // A node that does not report its share (no `share_update`) is placed without the budget.
+        idle.inventory.volumes_mb = None;
+        assert_eq!(fits(&idle, &r), Ok(None));
+    }
+
+    /// H2 §11.3 "One holder at a time": a job never goes to a node where one of its volumes is in use; it is busy
+    /// there (it passes with time), so the affinity of a requeued service waits for that node.
+    #[test]
+    fn a_volume_in_use_on_a_node_keeps_its_jobs_off_that_node() {
+        let mut r = req(1.0, 1024, 0);
+        r.volumes = vec![volume("models", 20_480)];
+        let mut holder = node(4.0, 8192, 0);
+        holder.inventory.volumes_mb = Some(102_400);
+        holder.volumes_in_use.insert("models".into(), 20_480);
+        let other = node(4.0, 8192, 0);
+        assert_eq!(fits(&holder, &r), Err(Misfit::Busy));
+        assert_eq!(why_nowhere(std::slice::from_ref(&holder), &r), None, "it just waits");
+        let picked = choose(&[holder.clone(), other.clone()], &r, None).unwrap();
+        assert_eq!(picked.node_id, other.node_id);
+        let never = |_: NodeId| false;
+        assert_eq!(
+            affinity(&[holder.clone(), other.clone()], &r, holder.node_id, &never),
+            Affinity::Wait
+        );
+        // The same name is held on the node whatever share is left; another volume is not.
+        holder.inventory.volumes_mb = None;
+        assert_eq!(fits(&holder, &r), Err(Misfit::Busy));
+        r.volumes = vec![volume("cache", 64)];
+        assert_eq!(fits(&holder, &r), Ok(None));
+        // A job without volumes is not concerned.
+        assert_eq!(fits(&holder, &req(1.0, 1024, 0)), Ok(None));
     }
 
     #[test]

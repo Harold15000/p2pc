@@ -201,13 +201,14 @@ fn cap_reason(why: &str) -> String {
 /// (job, node) pair is not touched, so a re-arm cannot turn into an offer storm: a pair is offered at most once per
 /// 60 s however many leases end.
 ///
-/// Only a lease of an eligible node frees capacity an offer can use (§8): one whose node is draining, offline or
-/// deleted does not re-arm. The node's return or resume does, through [`node_changed`].
+/// Only a lease of an eligible node frees capacity an offer can use (§8): one whose node is draining (or paused by
+/// its owner, H2 §6.1), offline or deleted does not re-arm. The node's return or resume does, through
+/// [`node_changed`].
 async fn rearm_on_lease_end(tx: &mut Conn, lease: &LeaseRow, fx: &mut Effects) -> Result<()> {
     fx.kick = true;
     let offerable = nodes::get(tx, lease.account_id, lease.node_id)
         .await?
-        .is_some_and(|n| n.state == nodes::DbState::Online && !n.draining);
+        .is_some_and(|n| n.state == nodes::DbState::Online && !n.draining && !n.inventory.is_owner_paused());
     if !offerable {
         return Ok(());
     }
@@ -405,6 +406,10 @@ enum Decision {
 /// `Job.reason` of a queued job that only `pending_approval` nodes could run (H2 §5.5).
 pub const REASON_WAITING_FOR_APPROVAL: &str = "waiting for approval on the hub PC";
 
+/// `Job.reason` of a queued job whose volumes no node's volume share can hold (H2 §11.3 "Budget").
+pub const REASON_NO_VOLUME_SPACE: &str = "no node has enough volume space for it: give a node a volume share \
+     (`volumes_mb`) of at least the sum of its volumes' `max_mb`";
+
 /// `Job.reason` of a queued job that no node will take however long it waits, as far as the owner can act on it.
 fn nowhere_reason(why: fit::Misfit) -> Option<String> {
     match why {
@@ -412,6 +417,7 @@ fn nowhere_reason(why: fit::Misfit) -> Option<String> {
         fit::Misfit::MissingCapability(cap) => Some(format!(
             "no node can run it: its agent does not support `{cap}` (update the agent)"
         )),
+        fit::Misfit::NoVolumeSpace => Some(REASON_NO_VOLUME_SPACE.to_string()),
         _ => None,
     }
 }
@@ -1745,10 +1751,13 @@ impl Scheduler {
 
     // --- Placement ------------------------------------------------------------------------------------------------
 
-    /// The candidates of `account_id`: its live nodes, their held reservations and when they were last busy.
+    /// The candidates of `account_id`: its live nodes, their held reservations, the volumes in use on them and when
+    /// they were last busy. A node whose owner paused it (`Inventory.owner_paused`, H2 §6.1, §8.4) is treated as
+    /// draining: not available.
     async fn candidates(&self, conn: &mut Conn, account_id: AccountId) -> Result<Vec<Candidate>> {
         let nodes = nodes::live_of_account(conn, account_id).await?;
         let held = leases::held_for_account(conn, account_id).await?;
+        let mut volumes = crate::store::volumes::in_use_for_account(conn, account_id).await?;
         let activity = leases::last_activity(conn, account_id).await?;
         nodes
             .into_iter()
@@ -1762,7 +1771,11 @@ impl Scheduler {
                     None => n.created_at,
                 };
                 Ok(Candidate {
-                    available: n.state == DbState::Online && !n.draining && self.inner.link.is_connected(n.id),
+                    available: n.state == DbState::Online
+                        && !n.draining
+                        && !n.inventory.is_owner_paused()
+                        && self.inner.link.is_connected(n.id),
+                    volumes_in_use: volumes.remove(&n.id).unwrap_or_default(),
                     approved: n.approval == NodeApproval::Approved,
                     features: n.features,
                     node_id: n.id,
@@ -2029,6 +2042,14 @@ impl Scheduler {
             labels: spec.placement.labels.clone(),
             node_id: spec.placement.node_id,
             needs: fit::needs(spec.kind, !spec.volumes.is_empty(), !spec.inputs.is_empty()),
+            volumes: spec
+                .volumes
+                .iter()
+                .map(|v| fit::VolumeNeed {
+                    name: v.name.clone(),
+                    max_mb: v.max_mb,
+                })
+                .collect(),
         };
         let mut conn = self.inner.db.acquire().await?;
         let mut m = NodeMatch::default();

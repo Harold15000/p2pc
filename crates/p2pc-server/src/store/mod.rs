@@ -8,7 +8,8 @@
 //! - every function that reads or writes tenant data takes the principal's `account_id` and its SQL filters by it
 //!   (SI-7). The exceptions run before there is a REST principal: [`keys::lookup_for_auth`],
 //!   [`join_tokens::find_by_digest`], the device lookups of [`devices`] (`by_id_for_auth`, `live_by_iroh_node_id`,
-//!   `pair`), and the agent-protocol functions of [`nodes`], where the principal is the node authenticated by iroh;
+//!   `pair`), and the agent-protocol functions of [`nodes`], where the principal is the node authenticated by iroh.
+//!   The hub's own settings ([`settings`]) belong to no tenant;
 //! - timestamps are stored as INTEGER Unix seconds (UTC).
 
 pub mod accounts;
@@ -26,6 +27,7 @@ pub mod leases;
 pub mod nodes;
 pub mod outputs;
 pub mod ports;
+pub mod settings;
 pub mod setup;
 pub mod templates;
 pub mod usage;

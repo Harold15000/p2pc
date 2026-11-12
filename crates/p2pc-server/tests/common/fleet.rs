@@ -184,6 +184,12 @@ impl Fleet {
         again
     }
 
+    /// A new connection with `agent`'s key that has sent nothing yet (the old one is closed).
+    pub async fn reconnect_raw(&self, agent: FakeAgent) -> FakeAgent {
+        agent.conn.close(0u32.into(), b"restart");
+        FakeAgent::connect(self.addr(), &agent.key).await
+    }
+
     /// Submits a job with the admin key and returns its ID.
     pub async fn submit(&self, body: Value) -> String {
         let r = self

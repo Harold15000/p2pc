@@ -10,10 +10,12 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use p2pc_proto::api::{
-    AuditKind, CreateJoinToken, JoinTokenInfo, JoinTokenResponse, Node, NodeState, Page, Problem, Scope, ServerInfo,
+    API_VERSION_H2, AuditKind, CreateJoinToken, JoinTokenInfo, JoinTokenResponse, Node, NodeState, Page, Problem,
+    Scope, ServerInfo, UpdateServer,
 };
 use p2pc_proto::auth::{DEFAULT_JOIN_TOKEN_TTL, JoinToken, MAX_JOIN_TOKEN_TTL};
-use p2pc_proto::ids::{JoinTokenId, NodeId};
+use p2pc_proto::ids::{AccountId, JoinTokenId, NodeId};
+use p2pc_proto::pair::PairResponse;
 use p2pc_proto::protocol::{NodeApproved, ServerMsg, capability};
 use p2pc_proto::validate::ErrorCode;
 use p2pc_proto::validate::keys::MAX_RESTRICTED_JOIN_TOKEN_TTL_S;
@@ -30,7 +32,7 @@ use crate::gateway::{OfflineReason, SendError};
 use crate::store::audit::NewEvent;
 use crate::store::join_tokens::{NewJoinToken, Revoke, TokenCursor};
 use crate::store::nodes::NodeCursor;
-use crate::store::{self};
+use crate::store::{self, StoreError};
 
 /// Longest join token label.
 pub const MAX_LABEL_LEN: usize = 256;
@@ -48,18 +50,87 @@ fn no_store(mut resp: Response) -> Response {
     resp
 }
 
-/// The server's iroh NodeId, relays, address (`p2pc_srv_…`) and version.
+/// The body of `GET /v1/server` (H2 §7.3): the endpoint's NodeId, relays, address and version, the H2 API generation,
+/// the hub's name once an `admin` set one, and the largest blob upload. `Paired` (§5.3) reads its name, version and
+/// API generation from here too.
+pub async fn server_info(state: &AppState) -> Result<ServerInfo, StoreError> {
+    let hub_name = {
+        let mut conn = state.db.acquire().await?;
+        store::settings::hub_name(&mut conn).await?
+    };
+    let mut info = state.server.info();
+    info.api_version = API_VERSION_H2;
+    info.hub_name = hub_name;
+    info.max_blob_mb = Some(state.config.blobs.max_blob_mb);
+    Ok(info)
+}
+
+/// Whether `name` is a hub name that `Paired` (H2 §5.3) and `Invite` (§5.4) can carry: the devices check those
+/// messages with the same rule (at most 128 bytes, no control, invisible or bidirectional character), so a name
+/// outside it would make every pairing fail on the device. The check is `Paired`'s own validation.
+fn fits_pairing_messages(name: &str) -> bool {
+    PairResponse::Paired {
+        device_id: "dev_check".to_string(),
+        hub_name: name.to_string(),
+        account_id: AccountId::generate(),
+        scopes: Vec::new(),
+        server_version: env!("CARGO_PKG_VERSION").to_string(),
+        api_version: API_VERSION_H2,
+    }
+    .validate()
+    .is_ok()
+}
+
+/// The server's iroh NodeId, relays, address (`p2pc_srv_…`) and version; the API generation (2), the hub's name and
+/// the largest blob upload (H2 §7.3).
 #[utoipa::path(
     get,
     path = "/v1/server",
     tag = "server",
     responses(
-        (status = 200, description = "How to reach this server over iroh.", body = ServerInfo),
+        (status = 200, description = "How to reach this server over iroh, and what it serves.", body = ServerInfo),
         (status = 401, description = "Missing or invalid key.", content_type = "application/problem+json", body = Problem),
     )
 )]
-pub async fn get_server(State(state): State<AppState>, _key: AnyKey) -> Json<ServerInfo> {
-    Json(state.server.info())
+pub async fn get_server(State(state): State<AppState>, _key: AnyKey) -> Result<Json<ServerInfo>, ApiError> {
+    Ok(Json(server_info(&state).await?))
+}
+
+/// Names the hub (H2 §7.3): `hub_name` is 1-64 printable characters, shown by the apps and sent to devices in
+/// `Paired`. `admin` only. Returns what `GET /v1/server` returns now.
+#[utoipa::path(
+    patch,
+    path = "/v1/server",
+    tag = "server",
+    request_body = UpdateServer,
+    responses(
+        (status = 200, description = "The hub's name is set.", body = ServerInfo),
+        (status = 401, description = "Missing or invalid key (also when the caller was revoked or expired during the request).", content_type = "application/problem+json", body = Problem),
+        (status = 403, description = "The caller lacks the admin scope.", content_type = "application/problem+json", body = Problem),
+        (status = 422, description = "`hub_name` is not 1-64 printable characters.", content_type = "application/problem+json", body = Problem),
+    )
+)]
+pub async fn patch_server(
+    State(state): State<AppState>,
+    Authorized { principal: p, .. }: AdminKey,
+    ApiJson(body): ApiJson<UpdateServer>,
+) -> Result<Json<ServerInfo>, ApiError> {
+    body.validate().map_err(|e| ApiError::validation(&e))?;
+    if !fits_pairing_messages(&body.hub_name) {
+        return Err(ApiError::field(
+            "hub_name",
+            ErrorCode::InvalidFormat,
+            "must be printable: no invisible or bidirectional characters, and at most 128 bytes in UTF-8",
+        ));
+    }
+    let mut tx = store::begin_immediate(&state.db).await?;
+    let now = state.clock.now();
+    // Naming the hub is the owner's decision: the caller must still be live (§5 "Re-checked at the point of use").
+    recheck_caller(&mut tx, &state, &p, now).await?;
+    store::settings::set_hub_name(&mut tx, &body.hub_name, now).await?;
+    tx.commit().await.map_err(StoreError::from)?;
+    tracing::info!(principal = %p.id, "hub name set");
+    Ok(Json(server_info(&state).await?))
 }
 
 /// Who may mint a join token (H2 §5.4, §7.3): an `admin` principal, as in H1, or one with `nodes:join`.
@@ -475,14 +546,32 @@ pub async fn delete_node(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let id = parse_node_id(&id)?;
-    let mut tx = store::begin_immediate(&state.db).await?;
-    let now = state.clock.now();
-    if !store::nodes::soft_delete(&mut tx, p.account_id, id, now).await? {
+    let event = NewEvent::new(AuditKind::NodeDeleted, Some(p.id), Some(id.to_string()), Map::new());
+    if !remove_node(&state, p.account_id, id, &event).await? {
         return Err(ApiError::not_found());
     }
-    let event = NewEvent::new(AuditKind::NodeDeleted, Some(p.id), Some(id.to_string()), Map::new());
-    store::audit::append(&mut tx, p.account_id, &event, now).await?;
-    tx.commit().await.map_err(store::StoreError::from)?;
+    tracing::info!(node_id = %id, "node deleted");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Deletes the live node `id` of `account_id` and appends `event` to the audit log, in one transaction; then closes
+/// the node's connection and has the scheduler requeue its leases, as for a lost node. Whether the node was live.
+///
+/// Used by `DELETE /v1/nodes/{id}` (`node_deleted`) and by the agent's own `Leave` (`node_left`, H2 §6.1), so both
+/// remove a node the same way.
+pub(crate) async fn remove_node(
+    state: &AppState,
+    account_id: AccountId,
+    id: NodeId,
+    event: &NewEvent,
+) -> Result<bool, StoreError> {
+    let mut tx = store::begin_immediate(&state.db).await?;
+    let now = state.clock.now();
+    if !store::nodes::soft_delete(&mut tx, account_id, id, now).await? {
+        return Ok(false);
+    }
+    store::audit::append(&mut tx, account_id, event, now).await?;
+    tx.commit().await?;
     // Ordering, against the gateway's sessions (see `gateway::hub`): `deleted_at` is committed **before** the
     // disconnect. A session that registers after this point re-reads its row and sees the deletion; one registered
     // before is closed here. A reconnect finds no live node and gets `not_enrolled`.
@@ -493,8 +582,7 @@ pub async fn delete_node(
         .node_events()
         .on_node_offline(id, OfflineReason::Deleted)
         .await;
-    tracing::info!(node_id = %id, "node deleted");
-    Ok(StatusCode::NO_CONTENT)
+    Ok(true)
 }
 
 /// Approves a `pending_approval` node (H2 §5.5): from then on the scheduler may offer it leases. Idempotent: approving

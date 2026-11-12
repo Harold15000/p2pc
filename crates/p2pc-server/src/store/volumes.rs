@@ -7,6 +7,8 @@
 //! caller's account through the node (SI-7). `max_mb` is not in a report: it is the limit of the job that mounted the
 //! volume on that node last, read from the stored JobSpec view.
 
+use std::collections::BTreeMap;
+
 use p2pc_proto::ids::{AccountId, JobId, LeaseId, NodeId};
 use p2pc_proto::protocol;
 use time::OffsetDateTime;
@@ -204,4 +206,50 @@ pub async fn held_by_lease(conn: &mut Conn, node_id: NodeId, name: &str) -> Resu
     .fetch_optional(&mut *conn)
     .await?;
     Ok(found.is_some())
+}
+
+/// The volumes in use on each live node of `account_id` (H2 §11.3 "One holder at a time", "Budget"), by node and
+/// name, with the `max_mb` each counts against the node's volume share. A volume is in use when:
+/// - a lease of the node that still holds its execution (not confirmed dead) belongs to a job with that volume: it
+///   is, or is about to be, mounted, whatever the node reported;
+/// - or the node's last `VolumeReport` says a lease holds it (`in_use_by`): the agent keeps the lock until Podman
+///   confirms the container gone, which can outlast the lease.
+///
+/// A reported holder counts with the `max_mb` its job gave that volume, or the measured size when the hub cannot
+/// find it there. A row that cannot be read counts as filling the whole share (fail closed: the node gets no more
+/// volume jobs until it reports again).
+pub async fn in_use_for_account(
+    conn: &mut Conn,
+    account_id: AccountId,
+) -> Result<BTreeMap<NodeId, BTreeMap<String, u64>>, StoreError> {
+    let rows: Vec<(String, Option<String>, Option<i64>)> = sqlx::query_as(
+        "SELECT l.node_id, json_extract(v.value, '$.name'), json_extract(v.value, '$.max_mb') \
+           FROM leases l JOIN nodes n ON n.id = l.node_id JOIN jobs j ON j.job_id = l.job_id, \
+                json_each(j.spec_view, '$.volumes') v \
+          WHERE n.account_id = ?1 AND n.deleted_at IS NULL AND l.confirmed_dead_at IS NULL \
+         UNION ALL \
+         SELECT r.node_id, r.name, \
+                COALESCE((SELECT json_extract(v.value, '$.max_mb') \
+                            FROM leases l JOIN jobs j ON j.job_id = l.job_id, json_each(j.spec_view, '$.volumes') v \
+                           WHERE l.id = r.in_use_by_lease_id AND json_extract(v.value, '$.name') = r.name \
+                           LIMIT 1), r.size_mb) \
+           FROM volume_reports r JOIN nodes n ON n.id = r.node_id \
+          WHERE n.account_id = ?1 AND n.deleted_at IS NULL AND r.in_use_by_lease_id IS NOT NULL",
+    )
+    .bind(account_id.to_string())
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut out: BTreeMap<NodeId, BTreeMap<String, u64>> = BTreeMap::new();
+    for (node, name, max_mb) in rows {
+        let node: NodeId = parse_col(&node, "volumes.node_id")?;
+        let max_mb = max_mb.and_then(|mb| u64::try_from(mb).ok()).unwrap_or(u64::MAX);
+        let Some(name) = name else {
+            // A volume without a name cannot be matched to a job's: count it against the whole share.
+            out.entry(node).or_default().insert(String::new(), u64::MAX);
+            continue;
+        };
+        let slot = out.entry(node).or_default().entry(name).or_insert(0);
+        *slot = (*slot).max(max_mb);
+    }
+    Ok(out)
 }
