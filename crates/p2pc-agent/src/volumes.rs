@@ -6,8 +6,9 @@
 //! as amended by O-16), and this module keeps it inside that exception:
 //!
 //! - **Layout.** `<data_dir>/volumes/<account_id>/<hex(sha256(name))[..32]>/` with `data/` (what is mounted) and
-//!   `meta.json` (name, created, last used, the holder). The agent creates every directory itself, 0700, with
-//!   `mkdirat` under directory descriptors ([`fs`]). A volume's name only ever goes through SHA-256: no name and no
+//!   `meta.json` (name, created, last used, the holder). The agent creates every directory itself with `mkdirat`
+//!   under directory descriptors ([`fs`]): 0700 the levels only it writes, 0755 the mounted `data/`, as H1's
+//!   mounted job directories. A volume's name only ever goes through SHA-256: no name and no
 //!   path from the JobSpec becomes a host path.
 //! - **Who may mount** ([`VolumeStore::reserve`]). Only a lease of the enrolled account whose job is a service or
 //!   carries `template`; a `tpl:` name only for that template. Anything else is `invalid_job`.
@@ -217,6 +218,12 @@ struct Hold {
 impl Hold {
     fn is(&self, lease_id: &LeaseId, epoch: u64) -> bool {
         self.lease_id == *lease_id && self.epoch == epoch
+    }
+
+    /// Whether this is the hold of the run of `(lease_id, epoch)` in this process. An orphaned hold never is: its
+    /// container may still exist, so it is held against everybody, the same lease and epoch included.
+    fn is_run_of(&self, lease_id: &LeaseId, epoch: u64) -> bool {
+        self.is(lease_id, epoch) && self.state != HoldState::Orphaned
     }
 }
 
@@ -434,8 +441,10 @@ impl VolumeStore {
     /// - `not_owner`: the lease is not the enrolled account's.
     /// - `invalid_job`: the job is neither a service nor a template job, or a name, a mount or a size breaks the
     ///   rules of H2 §7.1 (checked again here, whatever the hub validated).
-    /// - `insufficient_capacity`: another lease holds one of the volumes, one is being deleted, or they do not fit
-    ///   in `volumes_mb` next to the volumes other leases hold. The reason is logged.
+    /// - `insufficient_capacity`: another lease holds one of the volumes (or this lease does, but orphaned or under
+    ///   another epoch: every epoch of a lease shares one container name, so a container of it that is not
+    ///   confirmed gone stands in the way of all of them), one is being deleted, or they do not fit in `volumes_mb`
+    ///   next to the volumes other leases hold. The reason is logged.
     pub fn reserve(
         &self,
         lease_id: LeaseId,
@@ -494,19 +503,35 @@ impl VolumeStore {
         }
         let now = self.inner.clock.now();
         let mut state = self.state();
-        // Already this lease's: nothing to take, and nothing to count twice.
+        // A hold of this lease that is orphaned, or under another epoch, on any volume: a container named after the
+        // lease may still exist, and it would be this run's container name too. Nothing is taken until it is gone.
+        if state
+            .volumes
+            .values()
+            .filter_map(|e| e.hold.as_ref())
+            .any(|h| h.lease_id == lease_id && !h.is_run_of(&lease_id, epoch))
+        {
+            tracing::info!(
+                %lease_id,
+                epoch,
+                "an earlier run of this lease still holds a volume: its container is not confirmed gone \
+                 (insufficient_capacity)"
+            );
+            return Err(R::InsufficientCapacity);
+        }
+        // Already this run's: nothing to take, and nothing to count twice.
         if wanted.iter().all(|(key, _)| {
             state
                 .volumes
                 .get(key)
                 .and_then(|e| e.hold.as_ref())
-                .is_some_and(|h| h.is(&lease_id, epoch))
+                .is_some_and(|h| h.is_run_of(&lease_id, epoch))
         }) {
             return Ok(());
         }
         for (key, hold) in &wanted {
             let Some(entry) = state.volumes.get(key) else { continue };
-            if let Some(held) = entry.hold.as_ref().filter(|h| !h.is(&lease_id, epoch)) {
+            if let Some(held) = entry.hold.as_ref().filter(|h| !h.is_run_of(&lease_id, epoch)) {
                 tracing::info!(
                     %lease_id,
                     volume = %hold.name,
@@ -533,7 +558,7 @@ impl VolumeStore {
             .volumes
             .values()
             .filter_map(|e| e.hold.as_ref())
-            .filter(|h| !h.is(&lease_id, epoch))
+            .filter(|h| !h.is_run_of(&lease_id, epoch))
             .fold(0, |sum, h| sum.saturating_add(h.max_mb));
         let own: u64 = wanted.iter().fold(0, |sum, (_, h)| sum.saturating_add(h.max_mb));
         let budget = self.budget_mb();
@@ -601,7 +626,8 @@ impl VolumeStore {
             .volumes
             .iter()
             .filter_map(|(key, entry)| {
-                let hold = entry.hold.as_ref().filter(|h| h.is(lease_id, epoch))?;
+                // Never an orphaned hold: its container may still exist, so nothing of it is walked or mounted.
+                let hold = entry.hold.as_ref().filter(|h| h.is_run_of(lease_id, epoch))?;
                 // A volume whose meta.json was unreadable starts over: its times are not known.
                 let created_at = entry
                     .name
@@ -650,7 +676,7 @@ impl VolumeStore {
                 entry.last_used_at = now;
                 entry.max_mb = hold.max_mb;
                 entry.on_disk = true;
-                if let Some(h) = entry.hold.as_mut().filter(|h| h.is(lease_id, epoch)) {
+                if let Some(h) = entry.hold.as_mut().filter(|h| h.is_run_of(lease_id, epoch)) {
                     h.state = HoldState::Locked;
                 }
             }
@@ -742,16 +768,29 @@ impl VolumeStore {
         write_meta(&chain, &meta)
     }
 
-    /// Frees every volume the lease holds: call it **only** once Podman confirmed that the lease's container is gone
-    /// (`podman rm` succeeded, or `podman container exists` reports it absent; H2 §11.3). Clears the holder in
-    /// `meta.json` and stamps `last_used_at`. Returns whether the lease held anything. Blocking.
-    pub fn release(&self, lease_id: &LeaseId) -> bool {
+    /// Frees the volumes that the run of `(lease_id, epoch)` in this process holds: call it **only** once Podman
+    /// confirmed that the lease's container is gone (`podman rm` succeeded, or `podman container exists` reports it
+    /// absent; H2 §11.3). Clears the holder in `meta.json` and stamps `last_used_at`. It never touches a hold of
+    /// another epoch, nor an orphaned one (the sweep's, [`VolumeStore::release_orphaned`]). Returns whether the run
+    /// held anything. Blocking.
+    pub fn release(&self, lease_id: &LeaseId, epoch: u64) -> bool {
+        self.release_where(lease_id, |hold| hold.is_run_of(lease_id, epoch))
+    }
+
+    /// Frees the volumes the lease holds without a run in this process (its run ended while its container could not
+    /// be removed, or an earlier agent process left the hold): for the sweep, **only** once Podman confirmed that
+    /// container gone. It never touches the hold of a run in progress. Returns whether anything was freed. Blocking.
+    pub fn release_orphaned(&self, lease_id: &LeaseId) -> bool {
+        self.release_where(lease_id, |hold| hold.state == HoldState::Orphaned)
+    }
+
+    fn release_where(&self, lease_id: &LeaseId, mine: impl Fn(&Hold) -> bool) -> bool {
         let held: Vec<(Key, HoldState)> = self
             .state()
             .volumes
             .iter()
             .filter_map(|(key, entry)| {
-                let hold = entry.hold.as_ref().filter(|h| h.lease_id == *lease_id)?;
+                let hold = entry.hold.as_ref().filter(|h| h.lease_id == *lease_id && mine(h))?;
                 Some((key.clone(), hold.state))
             })
             .collect();
@@ -788,14 +827,15 @@ impl VolumeStore {
         true
     }
 
-    /// The lease's run is over but its container could not be confirmed gone: the lock stays, the volume is
-    /// reported `in_use_by` the lease, and the sweep retries the removal ([`VolumeStore::orphaned`]). A hold that
-    /// was never written (no container was created for it) is simply given back.
-    pub fn orphan(&self, lease_id: &LeaseId) {
+    /// The run of `(lease_id, epoch)` is over but its container could not be confirmed gone: the lock stays, the
+    /// volume is reported `in_use_by` the lease, and the sweep retries the removal ([`VolumeStore::orphaned`]). A
+    /// hold that was never written (no container was created for it) is simply given back. Holds of another epoch
+    /// are not touched.
+    pub fn orphan(&self, lease_id: &LeaseId, epoch: u64) {
         {
             let mut state = self.state();
             state.volumes.retain(|_, entry| {
-                let Some(hold) = entry.hold.as_mut().filter(|h| h.lease_id == *lease_id) else {
+                let Some(hold) = entry.hold.as_mut().filter(|h| h.is_run_of(lease_id, epoch)) else {
                     return true;
                 };
                 if hold.state == HoldState::Reserved {
@@ -842,7 +882,12 @@ impl VolumeStore {
 
     /// Evicts unused volumes, least recently used first, until the volumes in use (at their `max_mb`) and the unused
     /// ones (at their size) fit in `volumes_mb` together.
+    ///
+    /// A volume that cannot be deleted does not stop the eviction: it is skipped, and the next one goes. Each unused
+    /// volume whose size is not known is measured once per call; one that cannot be measured counts as full.
     fn make_room(&self) {
+        let mut sizes: BTreeMap<Key, u64> = BTreeMap::new();
+        let mut stuck: Vec<Key> = Vec::new();
         loop {
             let in_use: u64 = self
                 .state()
@@ -853,26 +898,36 @@ impl VolumeStore {
             let unused = self.unused();
             let mut bytes = in_use.saturating_mul(MIB);
             for (key, entry) in &unused {
-                let size = match entry.size {
-                    Some(size) => size,
-                    // Unknown: measure it; if that fails, it counts as full.
-                    None => match self.measure(key) {
-                        Ok(TreeUsage::Bytes(size)) => size,
-                        _ => entry.max_mb.saturating_mul(MIB),
-                    },
+                let size = match (entry.size, sizes.get(key)) {
+                    (Some(size), _) | (None, Some(&size)) => size,
+                    (None, None) => {
+                        let size = match self.measure(key) {
+                            Ok(TreeUsage::Bytes(size)) => size,
+                            _ => entry.max_mb.saturating_mul(MIB),
+                        };
+                        sizes.insert(key.clone(), size);
+                        size
+                    }
                 };
                 bytes = bytes.saturating_add(size);
             }
-            if bytes <= self.budget_mb().saturating_mul(MIB) {
+            let budget = self.budget_mb().saturating_mul(MIB);
+            if bytes <= budget {
                 return;
             }
-            let Some((key, entry)) = unused.into_iter().next() else {
+            let Some((key, entry)) = unused.into_iter().find(|(key, _)| !stuck.contains(key)) else {
+                tracing::warn!(
+                    bytes,
+                    budget,
+                    undeletable = stuck.len(),
+                    "the volumes do not fit in volumes_mb and no unused volume is left to evict"
+                );
                 return;
             };
             tracing::info!(volume = ?entry.name, last_used_at = %entry.last_used_at, "evicting an unused volume to make room");
             if let Err(e) = self.remove(&key) {
-                tracing::warn!(volume = ?entry.name, error = %e, "cannot evict an unused volume");
-                return;
+                tracing::warn!(volume = ?entry.name, error = %e, "cannot evict an unused volume; trying the next one");
+                stuck.push(key);
             }
         }
     }
@@ -972,21 +1027,24 @@ impl VolumeStore {
 
     /// H1's disk floor: evicts unused volumes, least recently used first, while the data disk is below it, so that
     /// no job is killed for space an unused volume holds (H2 §11.3 "Retention"). Returns whether the disk is above
-    /// the floor now; an unreadable disk is not (fail closed). Blocking.
+    /// the floor now; an unreadable disk is not (fail closed). A volume that cannot be deleted is skipped and the
+    /// next one goes: it gives up only when no unused volume is left to try. Blocking.
     pub fn evict_for_floor(&self, free_space: &dyn FreeSpace) -> bool {
         let _one_at_a_time = self.inner.floor.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut stuck: Vec<Key> = Vec::new();
         loop {
             match free_space.space(&self.inner.data_dir) {
                 Ok(space) if !space.below_floor() => return true,
                 Ok(_) => {}
                 Err(_) => return false,
             }
-            let Some((key, entry)) = self.unused().into_iter().next() else {
+            let Some((key, entry)) = self.unused().into_iter().find(|(key, _)| !stuck.contains(key)) else {
                 return false;
             };
             tracing::warn!(volume = ?entry.name, "the data disk is below its floor: evicting an unused volume");
-            if self.remove(&key).is_err() {
-                return false;
+            if let Err(e) = self.remove(&key) {
+                tracing::warn!(volume = ?entry.name, error = %e, "cannot evict an unused volume; trying the next one");
+                stuck.push(key);
             }
         }
     }

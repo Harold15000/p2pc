@@ -378,14 +378,14 @@ async fn cleanup_steps<E: Engine, C: Cgroups>(
     lease: &LeaseId,
     name: &str,
     dir: &JobDir,
-    volumes: Option<&VolumeStore>,
+    volumes: Option<(&VolumeStore, u64)>,
 ) {
     let removed = shared.engine.remove(name).await;
     if let Err(e) = &removed {
         tracing::warn!(lease = %lease, error = %e, "cannot remove the container; the next orphan sweep will");
     }
-    if let Some(store) = volumes {
-        settle_volume_lock(&shared.engine, store, lease, name, removed.is_ok()).await;
+    if let Some((store, epoch)) = volumes {
+        settle_volume_lock(&shared.engine, store, (lease, epoch), name, removed.is_ok()).await;
     }
     if let Err(e) = shared.cgroups.remove(lease).await {
         tracing::warn!(lease = %lease, error = %e, "cannot remove the lease cgroup");
@@ -402,9 +402,16 @@ async fn container_gone<E: Engine>(engine: &E, name: &str, removed: bool) -> boo
     removed || matches!(engine.container_exists(name).await, Ok(false))
 }
 
-/// The end of a lease's run, for its volumes: the lock is freed when Podman confirmed the container gone, and kept
-/// otherwise (the volume is then reported `in_use_by` the lease, and every sweep retries the removal).
-async fn settle_volume_lock<E: Engine>(engine: &E, store: &VolumeStore, lease: &LeaseId, name: &str, removed: bool) {
+/// The end of the run of `(lease, epoch)`, for its volumes: the lock is freed when Podman confirmed the container
+/// gone, and kept otherwise (the volume is then reported `in_use_by` the lease, and every sweep retries the removal).
+/// Only this run's own holds are settled: never those of another epoch, never an orphaned one.
+async fn settle_volume_lock<E: Engine>(
+    engine: &E,
+    store: &VolumeStore,
+    (lease, epoch): (&LeaseId, u64),
+    name: &str,
+    removed: bool,
+) {
     let gone = container_gone(engine, name, removed).await;
     if !gone {
         tracing::warn!(
@@ -416,9 +423,9 @@ async fn settle_volume_lock<E: Engine>(engine: &E, store: &VolumeStore, lease: &
     let (store, lease) = (store.clone(), *lease);
     let settled = blocking(move || {
         if gone {
-            store.release(&lease);
+            store.release(&lease, epoch);
         } else {
-            store.orphan(&lease);
+            store.orphan(&lease, epoch);
         }
     })
     .await;
@@ -503,6 +510,8 @@ struct Guard<E: Engine, C: Cgroups> {
     dir: JobDir,
     /// The store that holds the lease's volumes, if it has any: their lock is settled with the container's removal.
     volumes: Option<VolumeStore>,
+    /// The lease's epoch: only the holds of this run are settled.
+    epoch: u64,
     armed: bool,
 }
 
@@ -516,11 +525,14 @@ impl<E: Engine, C: Cgroups> Drop for Guard<E, C> {
             self.lease,
             self.name.clone(),
             self.dir.clone(),
-            self.volumes.clone(),
+            self.volumes.clone().map(|store| (store, self.epoch)),
         );
         match tokio::runtime::Handle::try_current() {
             Ok(rt) => {
-                let task = rt.spawn(async move { cleanup_steps(&shared, &lease, &name, &dir, volumes.as_ref()).await });
+                let task = rt.spawn(async move {
+                    let volumes = volumes.as_ref().map(|(store, epoch)| (store, *epoch));
+                    cleanup_steps(&shared, &lease, &name, &dir, volumes).await;
+                });
                 self.shared
                     .background
                     .lock()
@@ -834,7 +846,8 @@ impl<E: Engine, C: Cgroups, X: Egress> PodmanDriver<E, C, X> {
                 continue;
             }
             let store = store.clone();
-            if blocking(move || store.release(&lease)).await.unwrap_or(false) {
+            // Only what is orphaned: never the hold of a run in progress.
+            if blocking(move || store.release_orphaned(&lease)).await.unwrap_or(false) {
                 tracing::info!(lease_id = %lease, "the lock of a lease's volumes is free: its container is gone");
                 released.push(lease.to_string());
             }
@@ -1275,6 +1288,7 @@ impl<E: Engine, C: Cgroups, X: Egress> Sandbox for PodmanDriver<E, C, X> {
             name: name.clone(),
             dir: dir.clone(),
             volumes: volume_store.clone(),
+            epoch,
             armed: true,
         };
         // The guard settles the volumes from here on: with the container's removal, as every other path does.
@@ -1683,7 +1697,7 @@ impl<E: Engine, C: Cgroups, X: Egress> Sandbox for PodmanDriver<E, C, X> {
             &job.lease_id,
             &job.name,
             &job.dir,
-            job.guard.volumes.as_ref(),
+            job.guard.volumes.as_ref().map(|store| (store, job.epoch)),
         )
         .await;
     }

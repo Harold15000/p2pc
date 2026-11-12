@@ -94,7 +94,7 @@ impl Fx {
     fn used_once(&self, store: &VolumeStore, name: &str, max_mb: u64) -> PathBuf {
         let lease = LeaseId::generate();
         mount(store, lease, &self.owner, &service(&[(name, "/volumes/v", max_mb)])).unwrap();
-        assert!(store.release(&lease));
+        assert!(store.release(&lease, 1));
         self.data_of(name)
     }
 
@@ -257,16 +257,17 @@ fn the_agent_creates_the_chain_0700_and_records_the_holder_before_the_mount() {
             .join("8edcc26c0f6c7256a71a8ede6b954ad9")
             .join("data")
     );
-    // 0700 at every level whatever the umask, `meta.json` 0600.
+    // 0700 at every level only the agent writes, whatever the umask; `data/`, which is mounted, 0755 like H1's
+    // mounted job directories; `meta.json` 0600.
     for dir in [
         fx.data.path().join("volumes"),
         fx.account_dir(),
         fx.volume_dir("models"),
-        fx.data_of("models"),
     ] {
         assert!(fs::symlink_metadata(&dir).unwrap().is_dir());
         assert_eq!(mode(&dir), 0o700, "{}", dir.display());
     }
+    assert_eq!(mode(&fx.data_of("models")), 0o755);
     assert_eq!(mode(&fx.volume_dir("models").join(META_FILE)), 0o600);
     // `meta.json`: name, created, last used, and the holder (lease id and container name).
     let meta = fx.meta("models");
@@ -442,7 +443,7 @@ fn a_volume_has_one_holder_until_its_container_is_confirmed_gone() {
     assert_eq!(store.reserve(second, 1, &fx.owner, &job), Err(R::InsufficientCapacity));
 
     // The lease ended while `podman rm` failed: the lock stays, and the volume is reported in use by that lease.
-    store.orphan(&first);
+    store.orphan(&first, 1);
     assert_eq!(store.orphaned(), [first]);
     assert_eq!(store.reserve(second, 1, &fx.owner, &job), Err(R::InsufficientCapacity));
     assert_eq!(store.report_now().volumes[0].in_use_by, Some(first));
@@ -450,12 +451,12 @@ fn a_volume_has_one_holder_until_its_container_is_confirmed_gone() {
 
     // Podman confirmed the container gone.
     fx.clock.advance(time::Duration::hours(2));
-    assert!(store.release(&first));
+    assert!(store.release_orphaned(&first));
     assert!(store.orphaned().is_empty());
     assert_eq!(fx.meta("models").get("holder"), None);
     assert_eq!(fx.meta("models")["last_used_at"], "2027-01-15T10:00:00Z");
     assert_eq!(store.report_now().volumes[0].in_use_by, None);
-    assert!(!store.release(&first), "nothing left to release");
+    assert!(!store.release_orphaned(&first), "nothing left to release");
     mount(&store, second, &fx.owner, &job).unwrap();
     assert_eq!(fx.meta("models")["holder"]["lease_id"], second.to_string());
     assert_eq!(fx.meta("models")["created_at"], "2027-01-15T08:00:00Z");
@@ -472,10 +473,10 @@ fn a_reservation_that_was_never_written_is_given_back() {
     store.cancel_reservation(&first, 1);
     assert_eq!(store.reserve(second, 1, &fx.owner, &job), Ok(()));
     // Or its run ended before the lock: no container was created for it, so there is nothing to confirm.
-    store.orphan(&second);
+    store.orphan(&second, 1);
     assert!(store.orphaned().is_empty());
     assert_eq!(store.reserve(first, 1, &fx.owner, &job), Ok(()));
-    assert!(store.release(&first));
+    assert!(store.release(&first, 1));
     assert!(
         !fx.account_dir().exists(),
         "a volume that was never locked leaves nothing on disk"
@@ -525,11 +526,101 @@ fn the_lock_survives_an_agent_restart() {
     assert_eq!(again.orphaned(), [held_by]);
     // The sweep removed the container and Podman reports it absent: only now is the volume free, and only now is
     // it walked (and refused, for the link).
-    assert!(again.release(&held_by));
+    assert!(again.release_orphaned(&held_by));
     assert_eq!(fx.meta("models").get("holder"), None);
     let err = mount(&again, next, &fx.owner, &job).unwrap_err();
     assert!(err.contains("a symbolic link"), "{err}");
     assert!(fx.store().orphaned().contains(&next), "the new lock is on disk too");
+}
+
+/// Defence in depth for the one-holder lock. An orphaned hold is held against everybody, its own lease and epoch
+/// included: its container may still exist, and every epoch of a lease shares the container's name. The run's own
+/// `release` and `orphan` touch only that run's holds, and the sweep's release only what is orphaned.
+#[test]
+fn an_orphaned_hold_is_held_against_its_own_lease_and_only_the_sweep_frees_it() {
+    let fx = Fx::new();
+    let store = fx.store();
+    let models = service(&[("models", "/volumes/models", 64)]);
+    let other = service(&[("other", "/volumes/other", 64)]);
+    let holder = |name: &str| {
+        let report = store.report_now();
+        report.volumes.iter().find(|v| v.name == name).and_then(|v| v.in_use_by)
+    };
+    let lease = LeaseId::generate();
+    mount(&store, lease, &fx.owner, &models).unwrap();
+    // Its run ended while `podman rm` failed.
+    store.orphan(&lease, 1);
+    // What the container can still do; a walk would find it.
+    symlink("/etc", fx.data_of("models").join("planted")).unwrap();
+
+    // The same lease and epoch offered again (the executor no longer remembers its answer): rejected, and nothing
+    // of the volume is walked, measured or mounted.
+    assert_eq!(
+        store.reserve(lease, 1, &fx.owner, &models),
+        Err(R::InsufficientCapacity)
+    );
+    assert!(matches!(store.lock_and_check(&lease, 1), Err(VolumeError::NotReserved)));
+    assert!(store.usage(&lease, 1).is_empty());
+    // Nor may the lease take another volume, under this epoch or a new one: its container would have the orphan's
+    // name.
+    for epoch in [1, 2] {
+        assert_eq!(
+            store.reserve(lease, epoch, &fx.owner, &other),
+            Err(R::InsufficientCapacity),
+            "epoch {epoch}"
+        );
+    }
+    assert_eq!(holder("other"), None, "nothing was taken");
+    // Nothing a run does for itself frees or changes an orphaned hold, whatever epoch it names.
+    assert!(!store.release(&lease, 1));
+    assert!(!store.release(&lease, 2));
+    store.orphan(&lease, 2);
+    store.cancel_reservation(&lease, 1);
+    assert_eq!(store.orphaned(), [lease]);
+    assert_eq!(holder("models"), Some(lease));
+    assert_eq!(fx.meta("models")["holder"]["lease_id"], lease.to_string());
+
+    // Another lease runs meanwhile. The sweep's release is for orphans only: it never frees a run in progress.
+    let running = LeaseId::generate();
+    mount(&store, running, &fx.owner, &other).unwrap();
+    assert!(!store.release_orphaned(&running));
+    assert_eq!(holder("other"), Some(running));
+    assert_eq!(fx.meta("other")["holder"]["lease_id"], running.to_string());
+    // And a run's release is for its own epoch only.
+    assert!(!store.release(&running, 2));
+    store.orphan(&running, 2);
+    assert_eq!(store.orphaned(), [lease], "another epoch's orphan() changed nothing");
+    assert_eq!(holder("other"), Some(running));
+
+    // Podman confirmed the orphan's container gone: the sweep frees it, and only it.
+    assert!(store.release_orphaned(&lease));
+    assert!(store.orphaned().is_empty());
+    assert_eq!(holder("models"), None);
+    assert_eq!(holder("other"), Some(running));
+    assert!(store.release(&running, 1));
+    assert_eq!(holder("other"), None);
+    // Now the lease id is free to take a volume again, and the volume is walked.
+    let err = mount(&store, lease, &fx.owner, &models).unwrap_err();
+    assert!(err.contains("a symbolic link"), "{err}");
+}
+
+/// While one epoch of a lease holds a volume, another epoch of it takes none, on any volume: the two would share
+/// one container name, so "the container is gone" could not be told for either.
+#[test]
+fn a_lease_holds_volumes_under_one_epoch_at_a_time() {
+    let fx = Fx::new();
+    let store = fx.store();
+    let lease = LeaseId::generate();
+    mount(&store, lease, &fx.owner, &service(&[("a", "/volumes/a", 64)])).unwrap();
+    let b = service(&[("b", "/volumes/b", 64)]);
+    assert_eq!(store.reserve(lease, 2, &fx.owner, &b), Err(R::InsufficientCapacity));
+    // The same epoch may: it is the same run (a job's volumes are taken together; this is the idempotent path).
+    assert_eq!(
+        store.reserve(lease, 1, &fx.owner, &service(&[("a", "/volumes/a", 64)])),
+        Ok(())
+    );
+    assert!(store.release(&lease, 1));
+    assert_eq!(store.reserve(lease, 2, &fx.owner, &b), Ok(()));
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -553,7 +644,7 @@ fn refused_for(plant: impl FnOnce(&Fx, &Path)) -> (Fx, VolumeStore, String) {
         store.reserve(LeaseId::generate(), 1, &fx.owner, &job),
         Err(R::InsufficientCapacity)
     );
-    assert!(store.release(&lease));
+    assert!(store.release(&lease, 1));
     (fx, store, err.to_string())
 }
 
@@ -668,7 +759,7 @@ fn a_tree_over_the_entry_budget_or_too_deep_refuses_the_mount() {
         1,
         "10 entries fit"
     );
-    assert!(store.release(&lease));
+    assert!(store.release(&lease, 1));
     fs::write(data.join("one-more"), b"").unwrap();
     let err = mount(&store, LeaseId::generate(), &fx.owner, &job).unwrap_err();
     assert!(err.contains("more than 10 entries"), "{err}");
@@ -757,9 +848,45 @@ fn a_missing_chain_is_recreated_and_an_open_one_is_tightened() {
     fs::set_permissions(fx.account_dir(), fs::Permissions::from_mode(0o777)).unwrap();
     let job = service(&[("models", "/volumes/models", 64)]);
     mount(&store, LeaseId::generate(), &fx.owner, &job).unwrap();
-    assert_eq!(mode(&data), 0o700);
+    assert_eq!(mode(&data), 0o755, "the mounted directory, made again");
     assert_eq!(mode(&fx.volume_dir("models")), 0o700);
     assert_eq!(mode(&fx.account_dir()), 0o700);
+}
+
+/// `data/` is what is mounted, and `:U` gives it to the image's user. With rootless Podman and an image that does
+/// not run as root, that user is one of the agent's subordinate UIDs, not the agent. So `data/` is 0755, as H1's
+/// mounted job directories are: the agent can still open it to measure the volume and to check it before the next
+/// mount. The 0700 levels above it keep every other user out.
+#[test]
+fn the_mounted_directory_is_0755_under_private_parents() {
+    assert_eq!(super::fs::DATA_MODE, crate::sandbox::jobdir::SUBDIR_MODE);
+    assert_eq!(super::fs::DIR_MODE, 0o700);
+    let fx = Fx::new();
+    // A tight umask must not take the bits away, as a loose one must not add any to the parents.
+    let store = crate::identity::with_umask(0o077, || fx.store());
+    let lease = LeaseId::generate();
+    let job = service(&[("models", "/volumes/models", 64)]);
+    crate::identity::with_umask(0o077, || mount(&store, lease, &fx.owner, &job)).unwrap();
+    let data = fx.data_of("models");
+    assert_eq!(mode(&data), 0o755);
+    for private in [
+        fx.volume_dir("models"),
+        fx.account_dir(),
+        fx.data.path().join(VOLUMES_DIR),
+    ] {
+        assert_eq!(mode(&private), 0o700, "{}", private.display());
+    }
+    // What the agent needs of a `data/` that is not its own is to read it. With no write permission at all, as on
+    // a directory of another UID, the volume is still measured while it is mounted and checked before the next mount.
+    fs::write(data.join("weights"), vec![1u8; 4096]).unwrap();
+    fs::set_permissions(&data, fs::Permissions::from_mode(0o555)).unwrap();
+    assert!(matches!(store.usage(&lease, 1)[0].used, Ok(TreeUsage::Bytes(bytes)) if bytes >= 4096));
+    assert!(store.release(&lease, 1));
+    let next = LeaseId::generate();
+    mount(&store, next, &fx.owner, &job).unwrap();
+    assert!(matches!(store.usage(&next, 1)[0].used, Ok(TreeUsage::Bytes(_))));
+    // So that the temporary directory can be removed.
+    fs::set_permissions(&data, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 #[test]
@@ -848,15 +975,15 @@ fn the_budget_counts_the_volumes_other_leases_hold() {
     );
     // The lease's own volumes count together.
     let c = LeaseId::generate();
-    assert!(store.release(&b));
+    assert!(store.release(&b, 1));
     let two = service(&[("c1", "/volumes/c1", 300), ("c2", "/volumes/c2", 300)]);
     assert_eq!(store.reserve(c, 1, &fx.owner, &two), Err(R::InsufficientCapacity));
     let two = service(&[("c1", "/volumes/c1", 200), ("c2", "/volumes/c2", 200)]);
     assert_eq!(store.reserve(c, 1, &fx.owner, &two), Ok(()));
     // A volume larger than `volumes_mb` never fits.
     let d = LeaseId::generate();
-    assert!(store.release(&a));
-    assert!(store.release(&c));
+    assert!(store.release(&a, 1));
+    assert!(store.release(&c, 1));
     assert_eq!(
         store.reserve(d, 1, &fx.owner, &service(&[("d", "/volumes/d", 1001)])),
         Err(R::InsufficientCapacity)
@@ -895,7 +1022,7 @@ fn unused_volumes_are_evicted_least_recently_used_first_when_a_mount_needs_room(
             .unwrap()
             .set_len(100 * MIB)
             .unwrap();
-        assert!(store.release(&lease));
+        assert!(store.release(&lease, 1));
         fx.clock.advance(time::Duration::hours(1));
     }
     assert_eq!(store.report_now().volumes.len(), 3);
@@ -915,8 +1042,8 @@ fn unused_volumes_are_evicted_least_recently_used_first_when_a_mount_needs_room(
     assert!(!fx.volume_dir("new").exists(), "the last unused volume went");
     assert!(fx.data_of("fresh").exists());
     assert!(fx.data_of("more").exists());
-    assert!(store.release(&lease));
-    assert!(store.release(&other));
+    assert!(store.release(&lease, 1));
+    assert!(store.release(&other, 1));
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1013,7 +1140,7 @@ fn volume_delete_refuses_bad_names_and_volumes_in_use() {
         Err(DeleteError::InUse(Some(l))) if l == lease
     ));
     assert!(fx.data_of("tpl:transcribe/models").exists());
-    assert!(store.release(&lease));
+    assert!(store.release(&lease, 1));
     // A `tpl:` name is a name like any other here: the hub decides who may delete.
     store.delete("tpl:transcribe/models").unwrap();
     assert!(!fx.volume_dir("tpl:transcribe/models").exists());
@@ -1152,6 +1279,107 @@ fn under_the_disk_floor_unused_volumes_are_evicted_first() {
     fx.used_once(&store, "spare", 64);
     assert!(!store.evict_for_floor(&Unreadable));
     assert!(fx.volume_dir("spare").exists());
+}
+
+/// A volume the agent cannot delete, as one written by a non-root image user is with rootless Podman: a file in a
+/// `data/` the agent may read but not write. Dropping it gives the permission back (and lets the test clean up).
+struct Undeletable(PathBuf);
+
+impl Undeletable {
+    /// `None` as root, who can delete anything: the tests that need it are skipped then.
+    fn make(data: PathBuf) -> Option<Self> {
+        if rustix::process::geteuid().is_root() {
+            eprintln!("SKIPPED: root can delete anything");
+            return None;
+        }
+        fs::write(data.join("kept-by-permissions"), b"x").unwrap();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o555)).unwrap();
+        Some(Self(data))
+    }
+}
+
+impl Drop for Undeletable {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// One volume that cannot be deleted must not stop the eviction: it is skipped, and the next unused volume goes.
+#[test]
+fn a_volume_that_cannot_be_deleted_does_not_stop_the_eviction_for_room() {
+    let fx = Fx::new();
+    {
+        let store = VolumeStore::open(fx.config(512)).unwrap();
+        // Three volumes of 100 MiB each, last used in this order: stuck, mid, new.
+        for name in ["stuck", "mid", "new"] {
+            let lease = LeaseId::generate();
+            mount(&store, lease, &fx.owner, &service(&[(name, "/volumes/v", 128)])).unwrap();
+            fs::File::create(fx.data_of(name).join("blob"))
+                .unwrap()
+                .set_len(100 * MIB)
+                .unwrap();
+            assert!(store.release(&lease, 1));
+            fx.clock.advance(time::Duration::hours(1));
+        }
+    }
+    let Some(stuck) = Undeletable::make(fx.data_of("stuck")) else {
+        return;
+    };
+    // A restart: the sizes are not known and are measured for the eviction.
+    let store = VolumeStore::open(fx.config(512)).unwrap();
+    // 400 in use + 300 unused do not fit in 512. `stuck` is the least recently used and cannot go: `mid` goes
+    // (600), then `new` (500, with `stuck` still counted), and the mount goes ahead.
+    let lease = LeaseId::generate();
+    mount(&store, lease, &fx.owner, &service(&[("fresh", "/volumes/fresh", 400)])).unwrap();
+    assert!(fx.data_of("stuck").join("blob").exists());
+    assert!(!fx.volume_dir("mid").exists());
+    assert!(!fx.volume_dir("new").exists());
+    // The one that could not go says on disk that it is being deleted, is never mounted again, and goes at a later
+    // collection, once it can.
+    assert_eq!(fx.meta("stuck")["deleting"], true);
+    let again = service(&[("stuck", "/volumes/stuck", 64)]);
+    assert_eq!(
+        store.reserve(LeaseId::generate(), 1, &fx.owner, &again),
+        Err(R::InsufficientCapacity)
+    );
+    assert_eq!(store.collect_garbage(), 0, "still not deletable");
+    drop(stuck);
+    assert_eq!(store.collect_garbage(), 1);
+    assert!(!fx.volume_dir("stuck").exists());
+}
+
+/// H2 §11.3: "Under the H1 disk floor the agent evicts unused volumes before it kills jobs". A volume that cannot be
+/// deleted is skipped; the eviction gives up only when no unused volume is left to try.
+#[test]
+fn under_the_disk_floor_a_volume_that_cannot_be_deleted_is_skipped() {
+    let fx = Fx::new();
+    let store = fx.store();
+    for name in ["stuck", "next", "last"] {
+        fx.used_once(&store, name, 64);
+        fx.clock.advance(time::Duration::hours(1));
+    }
+    let Some(stuck) = Undeletable::make(fx.data_of("stuck")) else {
+        return;
+    };
+    // Below the floor until `next` is gone. The least recently used volume cannot be deleted: the next one goes,
+    // and the disk is above the floor again.
+    let disk = FullWhile(vec![fx.volume_dir("next")]);
+    assert!(store.evict_for_floor(&disk));
+    assert!(fx.volume_dir("stuck").exists());
+    assert!(!fx.volume_dir("next").exists());
+    assert!(fx.volume_dir("last").exists(), "no more than it takes");
+    // Called again, as every 2 s while a job runs: the same volume fails again and is skipped again.
+    let disk = FullWhile(vec![fx.volume_dir("last")]);
+    assert!(store.evict_for_floor(&disk));
+    assert!(!fx.volume_dir("last").exists());
+    // Only when everything that can go is gone does it give up, and it ends: it does not try the same volume for
+    // ever.
+    let disk = FullWhile(vec![fx.volume_dir("stuck")]);
+    assert!(!store.evict_for_floor(&disk));
+    assert!(fx.volume_dir("stuck").exists());
+    drop(stuck);
+    assert!(store.evict_for_floor(&disk), "once it can be deleted, it goes");
+    assert!(!fx.volume_dir("stuck").exists());
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1319,7 +1547,7 @@ async fn a_session_reports_at_once_every_interval_on_changes_and_after_a_delete(
         names(sent.recv().await),
         [("cache".to_string(), None), ("models".to_string(), Some(lease))]
     );
-    assert!(store.release(&lease));
+    assert!(store.release(&lease, 1));
     assert_eq!(
         names(sent.recv().await),
         [("cache".to_string(), None), ("models".to_string(), None)]

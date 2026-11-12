@@ -1495,7 +1495,7 @@ fn used_volume(store: &VolumeStore, owner: &AccountId, extra: Value, name: &str)
     let lease = LeaseId::generate();
     store.reserve(lease, 1, owner, &job).unwrap();
     store.lock_and_check(&lease, 1).unwrap();
-    assert!(store.release(&lease));
+    assert!(store.release(&lease, 1));
 }
 
 /// A job with one volume called `name`; `extra` says what kind of job it is.
@@ -1515,19 +1515,43 @@ fn volume_job(extra: Value, name: &str) -> Value {
     job
 }
 
+/// Longest (virtual) wait of [`ServerEnd::recv_acking`] and [`answer_of`]: well over the 10 minutes between two
+/// volume reports, and short enough that a test waiting for a message that never comes fails at once instead of
+/// acknowledging heartbeats for ever under the paused clock.
+const RECV_DEADLINE: Duration = Duration::from_secs(30 * 60);
+
 impl ServerEnd {
     /// The next agent message that is not a heartbeat, acknowledging the heartbeats on the way (a server that
-    /// stays silent is dropped).
+    /// stays silent is dropped). Panics after [`RECV_DEADLINE`] of virtual time without one.
     async fn recv_acking(&mut self) -> Value {
-        loop {
-            let m = self.recv().await.unwrap();
-            if m["type"] != "heartbeat" {
-                return m;
+        let next = async {
+            loop {
+                let m = self.recv().await.expect("the agent closed the connection");
+                if m["type"] != "heartbeat" {
+                    return m;
+                }
+                let seq = m["seq"].clone();
+                self.send(json!({"type": "heartbeat_ack", "seq": seq})).await;
             }
-            let seq = m["seq"].clone();
-            self.send(json!({"type": "heartbeat_ack", "seq": seq})).await;
-        }
+        };
+        tokio::time::timeout(RECV_DEADLINE, next)
+            .await
+            .expect("no message but heartbeats before the deadline")
     }
+}
+
+/// The helper gives up: with nothing but heartbeats coming, it fails after its deadline of virtual time instead of
+/// spinning until something outside kills the test.
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "no message but heartbeats before the deadline")]
+async fn recv_acking_gives_up_after_its_deadline() {
+    let mut w = start(Options::default());
+    let mut s = w.next_connection().await;
+    let _ = s.handshake(w.owner).await;
+    let started = Instant::now();
+    // The whole test is bounded in real time too, in case the bound itself is what broke.
+    let _ = tokio::time::timeout(RECV_DEADLINE * 2, s.recv_acking()).await;
+    unreachable!("recv_acking returned after {:?}", started.elapsed());
 }
 
 /// H2 §6.1: an agent with volume space declares `volumes` and takes leases whose job has volumes; one without is as
@@ -1605,14 +1629,20 @@ async fn volumes_is_declared_and_leases_with_volumes_are_taken_only_with_a_volum
     }
 }
 
-/// The next answer to a lease, skipping the session's volume reports.
+/// The next answer to a lease, skipping the session's volume reports. Bounded like [`ServerEnd::recv_acking`]: the
+/// reports alone would keep it going.
 async fn answer_of(s: &mut ServerEnd) -> Value {
-    loop {
-        let m = s.recv_acking().await;
-        if m["type"] != "volume_report" {
-            return m;
+    let answer = async {
+        loop {
+            let m = s.recv_acking().await;
+            if m["type"] != "volume_report" {
+                return m;
+            }
         }
-    }
+    };
+    tokio::time::timeout(RECV_DEADLINE, answer)
+        .await
+        .expect("no answer to the lease before the deadline")
 }
 
 /// H2 §6.1: `VolumeReport` after `Hello` (once welcomed), every 10 minutes, and in answer to `VolumeDelete`, which
@@ -1682,7 +1712,7 @@ async fn volume_reports_follow_the_welcome_and_answer_volume_delete() {
     assert!(volume_dir("cache").exists());
 
     // The lease ended and Podman confirmed its container gone: a report at once.
-    assert!(store.release(&held));
+    assert!(store.release(&held, 1));
     let after = names(&s.recv_acking().await);
     assert_eq!(after[1], ("held".to_string(), Value::Null));
     assert_eq!(

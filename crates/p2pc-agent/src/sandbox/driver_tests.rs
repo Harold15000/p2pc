@@ -3573,6 +3573,34 @@ fn the_sweep_leaves_the_volumes_of_active_leases_alone() {
     });
 }
 
+/// The upkeep, which runs every minute beside the jobs, is for orphaned holds only: it neither removes the
+/// container of a run in progress nor frees its volume.
+#[test]
+fn the_upkeep_leaves_a_run_in_progress_alone() {
+    guarded(Clock::Paused, || async {
+        let fx = Fx::new();
+        let store = fx.volume_store(1024);
+        let engine = MockEngine::default();
+        let d = fx.volume_driver(&store, engine.clone());
+        let mut lease = fx.models_lease();
+        lease.job.timeout_s = 3600;
+        let id = lease.lease_id;
+        let cancel = CancelHandle::new();
+        let mut job = prepare_and_start(&d, &fx, lease, cancel.clone()).await;
+        d.maintain_volumes().await;
+        d.sweep_orphans(&HashSet::from([id])).await;
+        assert_eq!(engine.count("rm "), 0, "{:?}", engine.calls());
+        assert_eq!(in_use_by(&store, "models"), Some(id));
+        assert_eq!(volume_meta(&fx, "models")["holder"]["lease_id"], id.to_string());
+        assert_eq!(store.usage(&id, 1).len(), 1, "still locked for the run");
+        cancel.cancel();
+        engine.exit(143);
+        d.wait(&mut job).await.unwrap();
+        d.cleanup(job).await;
+        assert_eq!(in_use_by(&store, "models"), None);
+    });
+}
+
 /// H2 §11.3 "Size": a volume over its `max_mb` stops the lease with `volume_limit`, measured every 2 s like the
 /// disk, and it fails closed like the disk: over the entry budget, or unmeasurable three times in a row.
 #[test]

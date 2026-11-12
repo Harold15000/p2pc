@@ -5,7 +5,7 @@
 //! Nothing in this file follows a symbolic link, and nothing in it takes a path from a job:
 //!
 //! - **The chain** `volumes/<account_id>/<hash>/data` is entered one name at a time with
-//!   `openat(O_NOFOLLOW | O_DIRECTORY)`, and created with `mkdirat` (0700) under the parent's descriptor when it is
+//!   `openat(O_NOFOLLOW | O_DIRECTORY)`, and created with `mkdirat` (0700; `data/` 0755) under the parent's descriptor when it is
 //!   missing. A symbolic link, or anything that is not a directory, at any level is an error, never followed.
 //! - **The check before a mount** ([`check_tree`]) walks `data/` with `openat(O_NOFOLLOW | O_DIRECTORY)` for
 //!   directories and an `lstat` (`fstatat(AT_SYMLINK_NOFOLLOW)`) for every entry. It refuses a symbolic link, an entry
@@ -27,8 +27,14 @@ use rustix::io::Errno;
 use super::{DATA_DIR, META_FILE, VOLUMES_DIR};
 use crate::sandbox::disk::TreeUsage;
 
-/// Mode of every directory of the chain, as the agent creates it.
+/// Mode of the directories of the chain that only the agent writes (`volumes/`, `<account_id>/`, `<hash>/`), as it
+/// creates them. They are what keeps every other user of the host out of a volume.
 pub const DIR_MODE: u32 = 0o700;
+/// Mode of `data/`, the directory that is mounted, as the agent creates it: the same as H1's mounted job
+/// directories ([`crate::sandbox::jobdir::SUBDIR_MODE`]), and for the same reason. `:U` gives `data/` to the image's
+/// user; with rootless Podman that is one of the agent's subordinate UIDs when the image does not run as root, and
+/// the agent must still be able to open the directory to measure it and to check it before the next mount.
+pub const DATA_MODE: u32 = 0o755;
 /// Mode of `meta.json`.
 pub const META_MODE: u32 = 0o600;
 /// Deepest nesting the check and the measurement walk: each level holds a descriptor. Deeper is refused (the check)
@@ -121,10 +127,10 @@ fn is_component(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\0'])
 }
 
-/// Enters the directory `name` under `at`: created 0700 with `mkdirat` when `create` is set and it is missing,
-/// opened with `O_NOFOLLOW | O_DIRECTORY` either way, and verified. `owned` levels are the ones only the agent
-/// writes: they must belong to the agent, and their mode is tightened to 0700. `data/` is not one of them: `:U` gives
-/// it to the container's user.
+/// Enters the directory `name` under `at`: created with `mkdirat` when `create` is set and it is missing, opened
+/// with `O_NOFOLLOW | O_DIRECTORY` either way, and verified. `owned` levels are the ones only the agent writes: they
+/// are created 0700 ([`DIR_MODE`]), must belong to the agent, and their mode is tightened to 0700. `data/` is not one
+/// of them: it is created 0755 ([`DATA_MODE`]), and `:U` gives it to the container's user.
 pub fn enter(
     at: BorrowedFd<'_>,
     name: &str,
@@ -139,9 +145,10 @@ pub fn enter(
     if !is_component(name) {
         return Err(ChainError::BadName { what });
     }
+    let mode = if owned { DIR_MODE } else { DATA_MODE };
     let mut created = false;
     if create {
-        match rustix::fs::mkdirat(at, name, Mode::from_raw_mode(DIR_MODE)) {
+        match rustix::fs::mkdirat(at, name, Mode::from_raw_mode(mode)) {
             Ok(()) => created = true,
             Err(Errno::EXIST) => {}
             Err(e) => return Err(io(e)),
@@ -160,7 +167,7 @@ pub fn enter(
     }
     if created {
         // `mkdirat` honours the umask: make the mode exact.
-        rustix::fs::fchmod(&fd, Mode::from_raw_mode(DIR_MODE)).map_err(io)?;
+        rustix::fs::fchmod(&fd, Mode::from_raw_mode(mode)).map_err(io)?;
     } else if owned {
         let euid = rustix::process::geteuid().as_raw();
         if stat.st_uid != euid {
