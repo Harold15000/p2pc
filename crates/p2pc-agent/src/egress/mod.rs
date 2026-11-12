@@ -657,9 +657,12 @@ fn bind_in(dir: &OwnedFd, name: &str) -> io::Result<StdUnixListener> {
 /// in a fresh 0700 staging directory, sets it to 0600, hard-links it into place and `chown`s it. The staging
 /// directory is gone on return, on success or not.
 ///
+///
+/// The ingress bridge makes its socket with this same function (H2 §11.2: "exactly like the egress socket").
+///
 /// # Errors
 /// [`StartError`].
-fn create_socket(socket_path: &Path, options: SocketOptions) -> Result<StdUnixListener, StartError> {
+pub(crate) fn create_socket(socket_path: &Path, options: SocketOptions) -> Result<StdUnixListener, StartError> {
     static STAGING_SEQ: AtomicU32 = AtomicU32::new(0);
     let dir = socket_path
         .parent()
