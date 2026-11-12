@@ -298,7 +298,9 @@ fn join_reads_the_token_from_stdin_never_from_argv() {
 /// The binary, isolated from the developer's own config and home.
 fn agent(home: &Path) -> Command {
     let mut cmd = cargo_bin_cmd!("p2pc-agent");
-    cmd.env("HOME", home).env_remove("P2PC_AGENT_CONFIG");
+    cmd.env("HOME", home)
+        .env_remove("P2PC_AGENT_CONFIG")
+        .timeout(std::time::Duration::from_secs(120));
     cmd
 }
 
@@ -449,4 +451,204 @@ fn real_machine_smoke() {
         .arg(&config)
         .assert()
         .stdout(contains("Result: "));
+}
+
+/// The binary with an empty `PATH`: `podman` and `nvidia-smi` are missing to it, so a detection reads only `/proc`.
+fn agent_without_tools(home: &Path) -> Command {
+    let empty_path = home.join("empty-path");
+    fs::create_dir_all(&empty_path).unwrap();
+    let mut cmd = agent(home);
+    cmd.env("PATH", &empty_path);
+    cmd
+}
+
+/// H2 §5.4 step 2: `status --json` gives this node's iroh NodeId (the same as `identity`) and its node phrase before
+/// any `join`, creating the key on first use.
+#[test]
+fn status_json_gives_the_node_id_and_phrase_before_joining() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(dir.path(), "");
+    let out = agent(dir.path())
+        .args(["status", "--json", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(status["enrolled"], false);
+    assert_eq!(status["owner_paused"], false);
+    assert_eq!(status["agent_running"], false);
+    assert!(status["connection"].is_null());
+    let id = status["iroh_node_id"].as_str().unwrap().to_string();
+    assert_eq!(id.len(), 64);
+    assert_eq!(status["node_phrase"].as_str().unwrap().split(' ').count(), 6);
+    // The same key as `identity`, and the same answer next time.
+    agent(dir.path())
+        .args(["identity", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(format!("{id}\n"));
+    // The plain text shows the phrase too.
+    agent(dir.path())
+        .args(["status", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(contains(format!(
+            "Node phrase:   {}",
+            status["node_phrase"].as_str().unwrap()
+        )))
+        .stdout(contains("Sharing:       on"));
+}
+
+/// H2 §8.4: `share set` checks the change against this machine, writes only what it names, and `status` shows the
+/// pause.
+#[test]
+fn share_set_pauses_and_refuses_what_the_machine_does_not_have() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(dir.path(), "# mine\n[labels]\nzone = \"home\"\n");
+    agent_without_tools(dir.path())
+        .args(["share", "set", "--paused", "true", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(contains("Sharing paused"));
+    let text = fs::read_to_string(&config).unwrap();
+    assert!(text.contains("# mine") && text.contains("zone = \"home\""), "{text}");
+    assert!(text.contains("paused = true"), "{text}");
+    agent(dir.path())
+        .args(["status", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(contains("Sharing:       paused by the owner"));
+    // More cores than the machine has: refused, and the file is unchanged.
+    agent_without_tools(dir.path())
+        .args(["share", "set", "--cpu", "100000", "--config"])
+        .arg(&config)
+        .assert()
+        .code(1)
+        .stderr(contains("share.cpu_cores"));
+    assert_eq!(fs::read_to_string(&config).unwrap(), text);
+    // Nothing to change.
+    agent_without_tools(dir.path())
+        .args(["share", "set", "--config"])
+        .arg(&config)
+        .assert()
+        .code(1)
+        .stderr(contains("nothing to change"));
+    // Resume.
+    agent_without_tools(dir.path())
+        .args(["share", "set", "--paused", "false", "--config"])
+        .arg(&config)
+        .assert()
+        .success();
+    assert!(fs::read_to_string(&config).unwrap().contains("paused = false"));
+    // Review of T2-23, round 2: what a running agent takes up only after a restart is said, not left to be found out.
+    agent_without_tools(dir.path())
+        .args(["share", "set", "--gpu", "none", "--volumes-mb", "0", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(contains("a GPU added to the share is offered once the agent restarts"))
+        .stdout(contains("it offers volumes once it restarts"));
+    // A change that needs no restart says nothing of one.
+    agent_without_tools(dir.path())
+        .args(["share", "set", "--cpu", "1", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(contains("restart").not());
+}
+
+/// `leave` needs an enrollment: before `join` it exits 8, like `run`, and dials nothing.
+#[test]
+fn leave_before_joining() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(dir.path(), "");
+    agent(dir.path())
+        .args(["leave", "--config"])
+        .arg(&config)
+        .assert()
+        .code(8)
+        .stderr(contains("not enrolled"));
+}
+
+/// Review P3 of T2-23: pausing is a safety control and offers less, so it is never refused because the share in force
+/// no longer matches the machine; a change of a limit still is.
+#[test]
+fn share_set_pauses_even_when_the_share_in_force_does_not_fit_the_machine() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(dir.path(), "[share]\ncpu_cores = 100000.0\n");
+    agent_without_tools(dir.path())
+        .args(["share", "set", "--paused", "true", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(contains("Sharing paused"));
+    assert!(fs::read_to_string(&config).unwrap().contains("paused = true"));
+    agent_without_tools(dir.path())
+        .args(["share", "set", "--paused", "false", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(contains("Sharing resumed"));
+    // A limit, even a smaller one, is checked against the machine as a whole.
+    agent_without_tools(dir.path())
+        .args(["share", "set", "--memory-mb", "1", "--config"])
+        .arg(&config)
+        .assert()
+        .code(1)
+        .stderr(contains("share.cpu_cores"));
+}
+
+/// Review P3 of T2-23: on an enrolled node, `status --json` never creates a key in place of a lost one; it reports
+/// `null`, and exits 0.
+#[test]
+fn status_json_never_replaces_the_key_of_an_enrolled_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        dir.path(),
+        &format!(
+            "[server]\nnode_id = \"{SERVER_ID}\"\naccount_id = \"acc_01JBQ6Z5E8Y1V8Y6Y3C8V9N2W4\"\n\
+             agent_node_id = \"node_01JBQ6Z5E8Y1V8Y6Y3C8V9N2W4\"\n"
+        ),
+    );
+    let out = agent(dir.path())
+        .args(["status", "--json", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(status["enrolled"], true);
+    assert!(status["iroh_node_id"].is_null(), "{status}");
+    assert!(status["node_phrase"].is_null(), "{status}");
+    assert!(
+        !dir.path().join("data/identity.key").exists(),
+        "no new key for an enrolled node"
+    );
+    // A key that cannot be used (here: readable by others, refused as H1 refuses it) is `null` too, with exit 0, and is
+    // left as it is.
+    fs::create_dir_all(dir.path().join("data")).unwrap();
+    let key = dir.path().join("data/identity.key");
+    fs::write(&key, [7u8; 32]).unwrap();
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
+    let out = agent(dir.path())
+        .args(["status", "--json", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .stderr(contains("cannot read this node's identity"))
+        .get_output()
+        .stdout
+        .clone();
+    let status: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert!(status["iroh_node_id"].is_null(), "{status}");
+    assert_eq!(fs::read(&key).unwrap(), [7u8; 32]);
 }

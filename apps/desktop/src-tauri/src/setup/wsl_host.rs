@@ -222,6 +222,12 @@ pub fn with_blobs_quota(server_toml: &str, quota_mb: u64) -> Option<String> {
     Some(table.to_string())
 }
 
+/// The value of `p2pc-agent share set --gpu` for the Share step's on/off switch. The agent takes `all`, `none` or a
+/// list of GPU UUIDs (`GpuShare`), not a boolean: "on" offers every GPU the node can serve, "off" none.
+pub fn gpu_share_arg(gpu: bool) -> &'static str {
+    if gpu { "all" } else { "none" }
+}
+
 /// `p2pc-agent share set …` (§8.4) for a share.
 pub fn share_set_command(share: &ShareRecord) -> Vec<String> {
     [
@@ -235,7 +241,7 @@ pub fn share_set_command(share: &ShareRecord) -> Vec<String> {
         "--memory-mb",
         &share.memory_mb.to_string(),
         "--gpu",
-        if share.gpu { "true" } else { "false" },
+        gpu_share_arg(share.gpu),
         "--disk-mb",
         &share.disk_mb.to_string(),
         "--volumes-mb",

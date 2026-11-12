@@ -37,6 +37,16 @@
 //! answered with a fresh report ([`crate::volumes::serve_session`], on its own task, so a slow deletion never stalls
 //! the connection's reads). Without a store, a lease with volumes is `invalid_job` and `VolumeDelete` is ignored.
 //!
+//! **The owner's share and the node's approval** (H2 §5.5, §6.1, §8.4). A session with [`NodeControls`]
+//! ([`Shared::node`]) declares `leave` and `approval`:
+//! - `Welcome.pending_approval` and `NodeApproved` are recorded in [`Approval`], which `p2pc-agent status` shows.
+//!   Informative only: the scheduler enforces approval, the agent gates nothing on it;
+//! - while the owner paused sharing (`share.paused`, `owner_paused`), every new lease is refused with `draining`,
+//!   after the owner check; running leases continue, and the H1 drain of the server stays separate;
+//! - a share change re-detects the inventory at once, so a new offer goes out as `InventoryUpdate` in seconds.
+//!
+//! [`leave`] is `p2pc-agent leave`'s own short connection: `Hello`, `Welcome`, `Leave`, and the hub's close.
+//!
 //! **Control frames first** (T10a review, P2-1). Job messages (`JobStarted`, `LogChunk`, `JobFinished`) have their
 //! own queue of [`JOB_QUEUE`] frames, and the writer always takes a waiting control frame (heartbeat, lease answer,
 //! inventory update) before the next job frame: a job logging at full speed delays a heartbeat by at most the frame
@@ -73,6 +83,7 @@ use super::streams::{self, PortOpener, StreamAcceptor};
 use super::transport::{Link, StreamOpener};
 use super::uplink::{Acks, JOB_QUEUE, JobFrame, Port, Uplink};
 use super::watchdog::Watchdog;
+use crate::config::Share;
 use crate::inventory::AGENT_VERSION;
 use crate::volumes::{self, VolumeStore};
 
@@ -134,14 +145,73 @@ pub struct Shared {
     /// Opens the service ports the server asks for with `PortOpen` streams (H2 §6.1): the node's ingress bridge.
     /// `None` is an H1 agent: it declares no `service_jobs`, takes no service lease and accepts no stream.
     pub ports: Option<Arc<dyn PortOpener>>,
+    /// The owner's share and the node's approval (H2 §5.5, §6.1, §8.4). `None` is an H1 agent: it declares neither
+    /// `leave` nor `approval`, and ignores `NodeApproved`.
+    pub node: Option<NodeControls>,
     /// The node's persistent volumes (H2 §11.3), when the owner gave them a share of the disk. `None`: the agent
     /// declares no `volumes`, takes no lease with volumes, and sends no `VolumeReport`.
     pub volumes: Option<VolumeStore>,
 }
 
+/// What an H2 node adds to a session (H2 §5.5, §6.1, §8.4).
+#[derive(Debug, Clone)]
+pub struct NodeControls {
+    /// The owner's share in force (`p2pc-agent share set`, [`crate::config::ShareWatcher`]). While `paused` is set,
+    /// every new lease is refused with `draining` (`owner_paused`); a change re-detects the inventory at once, so a
+    /// changed offer reaches the server as `InventoryUpdate` without waiting for the 10-minute tick.
+    pub share: watch::Receiver<Share>,
+    /// Where the session reports the node's approval.
+    pub approval: Approval,
+}
+
+/// The node's approval as the hub last told it (H2 §5.5): `Welcome.pending_approval`, then `NodeApproved`. Unknown
+/// (`None`) until the first `Welcome` of this run. Informative only: approval is enforced by the scheduler, never by
+/// the agent, so nothing here gates a lease. Clones share the value.
+#[derive(Debug, Clone)]
+pub struct Approval(Arc<watch::Sender<Option<bool>>>);
+
+impl Default for Approval {
+    fn default() -> Self {
+        Self(Arc::new(watch::channel(None).0))
+    }
+}
+
+impl Approval {
+    /// Unknown.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether the node waits for approval, as last heard; `None` before the first `Welcome`.
+    #[must_use]
+    pub fn pending(&self) -> Option<bool> {
+        *self.0.borrow()
+    }
+
+    /// Records what the hub said.
+    pub fn set_pending(&self, pending: bool) {
+        self.0.send_if_modified(|p| {
+            let changed = *p != Some(pending);
+            *p = Some(pending);
+            changed
+        });
+    }
+
+    /// Follows the changes.
+    #[must_use]
+    pub fn subscribe(&self) -> watch::Receiver<Option<bool>> {
+        self.0.subscribe()
+    }
+}
+
 impl Shared {
-    /// `Hello.features`: `service_jobs` exactly when this node can serve the ports of a service, `volumes` exactly
-    /// when it mounts persistent volumes.
+    /// `Hello.features`, in the order of the spec's table (H2 §6.1): `service_jobs` exactly when this node can serve
+    /// the ports of a service, `volumes` exactly when it mounts persistent volumes, and `leave` and `approval` for an H2
+    /// node ([`Shared::node`]).
+    ///
+    /// `share_update` is not declared: it promises `Inventory.volumes_mb` and `owner_paused`, which the wire inventory
+    /// does not carry yet. The share is still applied live, and a paused node refuses every lease with `draining`.
     #[must_use]
     pub fn features(&self) -> Vec<String> {
         let mut features = Vec::new();
@@ -151,7 +221,16 @@ impl Shared {
         if self.volumes.is_some() {
             features.push(capability::VOLUMES.to_string());
         }
+        if self.node.is_some() {
+            features.push(capability::LEAVE.to_string());
+            features.push(capability::APPROVAL.to_string());
+        }
         features
+    }
+
+    /// Whether the owner paused sharing (`owner_paused`).
+    fn owner_paused(&self) -> bool {
+        self.node.as_ref().is_some_and(|n| n.share.borrow().paused)
     }
 
     /// The limits a lease's job is parsed with: the agent's, with service jobs and volumes understood exactly when
@@ -187,6 +266,10 @@ pub struct Welcomed {
     pub agent_lease_ttl: Duration,
     /// The heartbeat interval in force.
     pub heartbeat_interval: Duration,
+    /// The hub's version (`Welcome.server_version`), for `p2pc-agent status --json` (H2 §14.2).
+    pub server_version: String,
+    /// `Welcome.pending_approval` (H2 §5.5).
+    pub pending_approval: bool,
 }
 
 /// How a session ended.
@@ -198,6 +281,9 @@ pub enum SessionEnd {
     AddressesChanged(Vec<SelectedAddr>),
     /// The connector asked for a new endpoint with the same addresses (T10l): re-bind and reconnect at once.
     Rebind,
+    /// The owner resumed sharing after a pause (H2 §8.4): reconnect at once, so the new `Hello` makes the hub offer
+    /// the jobs it stopped offering during the pause.
+    Resumed,
     /// The connection dropped, the server went silent, or a frame was bad. `welcomed` tells whether the
     /// `Welcome` had arrived (the backoff starts again from 1 s then).
     Lost {
@@ -501,6 +587,8 @@ async fn drive(
 ) -> SessionEnd {
     // 1. Hello at once, with the inventory detected just before the dial.
     let mut last_inventory = normalized(&inventory);
+    // Whether the owner had paused sharing when this `Hello` went out: a resume after it ends the session (below).
+    let mut paused = shared.owner_paused();
     let hello = AgentMsg::Hello {
         agent_version: AGENT_VERSION.to_string(),
         inventory,
@@ -534,8 +622,7 @@ async fn drive(
                     account_id,
                     heartbeat_interval_s,
                     lease_ttl_s,
-                    // `pending_approval` (H2 §5.5) is not used yet (T2-23).
-                    ..
+                    pending_approval,
                 } => {
                     if account_id != shared.owner {
                         tracing::error!(
@@ -570,8 +657,19 @@ async fn drive(
                     let w = Welcomed {
                         agent_lease_ttl: ttl,
                         heartbeat_interval: asked.min(most),
+                        server_version: server_version.clone(),
+                        pending_approval,
                     };
-                    tracing::info!(%node_id, %server_version, "connected to the server");
+                    tracing::info!(%node_id, %server_version, pending_approval, "connected to the server");
+                    if let Some(node) = &shared.node {
+                        if pending_approval {
+                            tracing::warn!(
+                                "this node waits for approval on the hub PC: it gets no work until an admin approves \
+                                 it (compare the node phrase of `p2pc-agent status`)"
+                            );
+                        }
+                        node.approval.set_pending(pending_approval);
+                    }
                     on_welcome(&w);
                     io.port = Some(shared.uplink.connect(Port::new(&io.jobs, io.streams.clone())));
                     // Only now, and only with a bridge: before the Welcome no stream of the server is accepted.
@@ -617,6 +715,12 @@ async fn drive(
     let mut redetect = tokio::time::interval_at(Instant::now() + every, every);
     redetect.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut detection: Option<JoinHandle<Result<Inventory, String>>> = None;
+    // A share change that came while a detection was running: detect again once it ends, with the new share.
+    let mut detect_again = false;
+    // The owner's share (H2 §8.4). The clone has not seen any change since the agent started, on purpose: `Hello`'s
+    // inventory may predate a change (it was detected before the dial, and may be reused for a minute), so once a share
+    // was changed, every session re-detects once after its `Welcome`. That costs a detection; it never misses a change.
+    let mut share = shared.node.as_ref().map(|n| n.share.clone());
     let mut seq: u64 = 0;
     let mut last_heard = Instant::now();
     loop {
@@ -654,8 +758,34 @@ async fn drive(
                 }
             }
             _ = redetect.tick(), if detection.is_none() => {
-                let source = shared.inventory.clone();
-                detection = Some(tokio::spawn(async move { source.detect().await }));
+                detection = Some(spawn_detection(shared));
+            }
+            // The owner changed the share (`share set`): detect now, so the new offer goes out as `InventoryUpdate`
+            // within seconds (H2 §8.4: 10 s).
+            changed = async {
+                match share.as_mut() {
+                    Some(rx) => rx.changed().await,
+                    None => std::future::pending().await,
+                }
+            }, if share.is_some() => {
+                if changed.is_err() {
+                    // The watcher is gone: the share in force stays.
+                    share = None;
+                    continue;
+                }
+                // A resume. The hub counted every `draining` refusal of the pause against its per-job offer cap, and
+                // only a node change re-arms it; a pause changes nothing on the wire, so a new `Hello` is the one that
+                // does. Reconnect at once (review P2 of T2-23).
+                let now_paused = shared.owner_paused();
+                if std::mem::replace(&mut paused, now_paused) && !now_paused {
+                    tracing::info!("the owner resumed sharing; reconnecting so the hub offers work again");
+                    return SessionEnd::Resumed;
+                }
+                if detection.is_none() {
+                    detection = Some(spawn_detection(shared));
+                } else {
+                    detect_again = true;
+                }
             }
             result = async {
                 match detection.as_mut() {
@@ -663,7 +793,7 @@ async fn drive(
                     None => std::future::pending().await,
                 }
             }, if detection.is_some() => {
-                detection = None;
+                detection = std::mem::take(&mut detect_again).then(|| spawn_detection(shared));
                 match result {
                     Ok(Ok(inventory)) => {
                         let now = normalized(&inventory);
@@ -681,6 +811,12 @@ async fn drive(
             }
         }
     }
+}
+
+/// Starts one inventory detection on its own task.
+fn spawn_detection(shared: &Shared) -> JoinHandle<Result<Inventory, String>> {
+    let source = shared.inventory.clone();
+    tokio::spawn(async move { source.detect().await })
 }
 
 /// Queues the next `Heartbeat`, numbered after the last one, with the load now and the leases that still hold resources
@@ -723,6 +859,11 @@ async fn route(shared: &Shared, io: &Io, decisions: &mut JoinSet<()>, msg: Serve
             if account_id != shared.owner {
                 tracing::warn!(%lease_id, %account_id, "lease for another account refused (not_owner, SI-1)");
                 return queue(io, reject(LeaseRejectReason::NotOwner));
+            }
+            // H2 §6.1: while the owner paused sharing, no new lease; running ones continue.
+            if shared.owner_paused() {
+                tracing::info!(%lease_id, "lease refused: the owner paused sharing (draining)");
+                return queue(io, reject(LeaseRejectReason::Draining));
             }
             // §6 "must understand": strict parse; a failure is a rejected offer, never a closed connection.
             let job = match parse_lease_job(&job, &shared.lease_limits()) {
@@ -774,6 +915,16 @@ async fn route(shared: &Shared, io: &Io, decisions: &mut JoinSet<()>, msg: Serve
         ServerMsg::Error { code, message } => tracing::warn!(%code, %message, "error from the server"),
         ServerMsg::Welcome { .. } => tracing::warn!("a second Welcome on one connection; ignored"),
         ServerMsg::Unknown => tracing::debug!("a message type this agent does not know; ignored"),
+        // H2 §5.5: an admin approved this node. Informative: the scheduler enforces approval.
+        ServerMsg::NodeApproved(_) => match &shared.node {
+            Some(node) => {
+                if node.approval.pending() != Some(false) {
+                    tracing::info!("this node was approved on the hub PC");
+                }
+                node.approval.set_pending(false);
+            }
+            None => tracing::debug!("NodeApproved for an agent that did not declare `approval`; ignored"),
+        },
         // H2 §6.1: delete a node-local volume that no lease uses, and answer with a fresh `VolumeReport`. The
         // deletion runs on the session's volume task: never on this one, which must go back to reading.
         ServerMsg::VolumeDelete(delete) => match &io.volumes {
@@ -784,10 +935,6 @@ async fn route(shared: &Shared, io: &Io, decisions: &mut JoinSet<()>, msg: Serve
             }
             None => tracing::debug!("VolumeDelete for an agent that declared no volumes; ignored"),
         },
-        // H2 §6.1: sent only to agents that declared `approval`, which this one does not yet.
-        msg @ ServerMsg::NodeApproved(_) => {
-            tracing::debug!(kind = msg.kind(), "a message this agent does not use yet; ignored");
-        }
     }
     None
 }
@@ -814,6 +961,225 @@ fn queue(io: &Io, msg: AgentMsg) -> Option<SessionEnd> {
             None
         }
         Err(mpsc::error::TrySendError::Closed(_)) => Some(SessionEnd::Lost { welcomed: true }),
+    }
+}
+
+/// How `p2pc-agent leave` ended ([`leave`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaveEnd {
+    /// From [`leave`]: `Leave` was written and the hub closed the connection, as it does after it deletes the node
+    /// (H2 §6.1). From [`leave_node`]: that, and a second connection confirmed it with `not_enrolled`.
+    Left,
+    /// The hub says this machine is not enrolled: it is already gone.
+    NotEnrolled,
+    /// The hub does not know `Leave` (`Error{unsupported_message}`): the node was not removed.
+    Unsupported,
+    /// The `Welcome` named another account than the owner (SI-1): nothing was sent to it.
+    WrongOwner,
+    /// The hub refuses this agent version.
+    AgentTooOld,
+    /// The hub answered with another error, with its code.
+    Refused(String),
+    /// The connection ended before `Leave` was written.
+    Lost,
+    /// No end within the deadline.
+    TimedOut,
+    /// `Leave` was written and the connection closed, but a second connection could not confirm the removal within the
+    /// deadline ([`leave_node`]): the hub may not have processed it.
+    Unconfirmed,
+    /// Nothing reached the hub: the inventory could not be detected, or the hub could not be dialled.
+    Failed(String),
+}
+
+/// Most connections [`leave_node`] opens: the `Leave`, the confirmation, and one more `Leave` if the confirmation
+/// found the node still enrolled.
+pub const MAX_LEAVE_CONNECTIONS: usize = 3;
+
+/// What `p2pc-agent leave` asks for (H2 §6.1).
+#[derive(Debug, Clone)]
+pub struct LeaveRequest {
+    /// The enrolled owner (SI-1).
+    pub owner: AccountId,
+    /// The leases a running agent still holds, for `Hello.running`.
+    pub running: Vec<p2pc_proto::protocol::RunningLease>,
+    /// The message.
+    pub leave: p2pc_proto::protocol::Leave,
+}
+
+/// The whole of `p2pc-agent leave` (H2 §6.1, §8.7), bounded by `deadline` from start to end (the app gives it 10 s):
+/// the inventory detection for `Hello`, each dial, and each exchange take what is left of it.
+///
+/// The hub answers `Leave` with nothing, so a close after `Leave` cannot tell "removed" from "the network dropped" or
+/// "another connection of this node replaced this one". So after [`LeaveEnd::Left`] it dials once more: `not_enrolled`
+/// confirms the removal ([`LeaveEnd::Left`]); a `Welcome` means the node is still there, and `Leave` is sent again; and
+/// a confirmation that cannot be had within the deadline is [`LeaveEnd::Unconfirmed`]. At most
+/// [`MAX_LEAVE_CONNECTIONS`] connections.
+pub async fn leave_node(
+    connector: &dyn super::Connector,
+    detect: impl std::future::Future<Output = Result<Inventory, String>>,
+    request: LeaveRequest,
+    deadline: Duration,
+) -> LeaveEnd {
+    let started = Instant::now();
+    let left = || deadline.saturating_sub(started.elapsed());
+    let inventory = match tokio::time::timeout(left(), detect).await {
+        Ok(Ok(inventory)) => inventory,
+        Ok(Err(e)) => return LeaveEnd::Failed(format!("cannot detect the inventory for Hello: {e}")),
+        Err(_) => return LeaveEnd::TimedOut,
+    };
+    let mut sent = false;
+    for _ in 0..MAX_LEAVE_CONNECTIONS {
+        let link = match tokio::time::timeout(left(), connector.connect()).await {
+            Ok(Ok(link)) => link,
+            Ok(Err(e)) if !sent => return LeaveEnd::Failed(format!("cannot connect to the hub: {e}")),
+            Ok(Err(_)) | Err(_) if sent => return LeaveEnd::Unconfirmed,
+            Ok(Err(_)) | Err(_) => return LeaveEnd::TimedOut,
+        };
+        let end = leave(
+            link,
+            request.owner,
+            inventory.clone(),
+            request.running.clone(),
+            request.leave.clone(),
+            left(),
+        )
+        .await;
+        match end {
+            // Sent: dial again to confirm (or to send it again).
+            LeaveEnd::Left => sent = true,
+            // Gone: confirmed after a `Leave`, or already gone before.
+            LeaveEnd::NotEnrolled if sent => return LeaveEnd::Left,
+            other if sent => {
+                tracing::warn!(?other, "the removal of this node could not be confirmed");
+                return LeaveEnd::Unconfirmed;
+            }
+            other => return other,
+        }
+    }
+    LeaveEnd::Unconfirmed
+}
+
+/// `p2pc-agent leave` (H2 §6.1, §8.7): on its own connection, `Hello` (with `features: ["leave"]`, `inventory` and the
+/// leases the node still runs, so the hub's reconciliation keeps them), the `Welcome`, which must name the owner
+/// (SI-1), then `Leave{reason}`, and wait for the hub to close the connection. A lease offered meanwhile is refused with
+/// `draining`. Everything is bounded by `deadline`.
+///
+/// The hub answers `Leave` with nothing: it deletes the node and closes. A close counts as [`LeaveEnd::Left`] only
+/// once `Leave` was written.
+pub async fn leave(
+    link: Link,
+    owner: AccountId,
+    inventory: Inventory,
+    running: Vec<p2pc_proto::protocol::RunningLease>,
+    leave: p2pc_proto::protocol::Leave,
+    deadline: Duration,
+) -> LeaveEnd {
+    let mut io = Io::new(link);
+    let end = tokio::time::timeout(deadline, drive_leave(&mut io, owner, inventory, running, leave))
+        .await
+        .unwrap_or(LeaveEnd::TimedOut);
+    io.finish().await;
+    end
+}
+
+async fn drive_leave(
+    io: &mut Io,
+    owner: AccountId,
+    inventory: Inventory,
+    running: Vec<p2pc_proto::protocol::RunningLease>,
+    leave: p2pc_proto::protocol::Leave,
+) -> LeaveEnd {
+    let hello = AgentMsg::Hello {
+        agent_version: AGENT_VERSION.to_string(),
+        inventory,
+        running,
+        features: vec![capability::LEAVE.to_string()],
+    };
+    if io.outbox.send(hello).await.is_err() {
+        return LeaveEnd::Lost;
+    }
+    match io.inbound.recv().await {
+        None => return LeaveEnd::Lost,
+        Some(ServerMsg::Welcome { account_id, .. }) if account_id != owner => {
+            tracing::error!(
+                welcome_account = %account_id,
+                %owner,
+                "the server's Welcome names another account than this node's owner: not leaving through it (SI-1)"
+            );
+            return LeaveEnd::WrongOwner;
+        }
+        Some(ServerMsg::Welcome { .. }) => {}
+        Some(ServerMsg::Error { code, .. }) if code == error_code::NOT_ENROLLED => return LeaveEnd::NotEnrolled,
+        Some(ServerMsg::Error { code, .. }) if code == error_code::AGENT_TOO_OLD => return LeaveEnd::AgentTooOld,
+        Some(ServerMsg::Error { code, .. }) => return LeaveEnd::Refused(code),
+        Some(other) => {
+            tracing::warn!(
+                kind = other.kind(),
+                "the server answered Hello with something else than Welcome"
+            );
+            return LeaveEnd::Refused("no_welcome".into());
+        }
+    }
+    // Through the job queue, which says when the frame is written: only then does a close mean the node was removed.
+    let (frame, written) = JobFrame::new(AgentMsg::Leave(leave), None).signalled();
+    if io.jobs.send(frame).await.is_err() {
+        return LeaveEnd::Lost;
+    }
+    let mut pending_write = Some(written);
+    loop {
+        tokio::select! {
+            biased;
+            r = async {
+                match pending_write.as_mut() {
+                    Some(w) => w.await,
+                    None => std::future::pending().await,
+                }
+            }, if pending_write.is_some() => {
+                pending_write = None;
+                if r.is_err() {
+                    // Dropped unwritten: the connection ended first.
+                    return LeaveEnd::Lost;
+                }
+            }
+            msg = io.inbound.recv() => {
+                let Some(msg) = msg else {
+                    // The hub closed. That is the answer to `Leave` only if `Leave` went out: the writer has already
+                    // either written it (signalled) or dropped it with the connection (an error), so this wait is short.
+                    return match pending_write.take() {
+                        None => LeaveEnd::Left,
+                        Some(w) => match w.await {
+                            Ok(()) => LeaveEnd::Left,
+                            Err(_) => LeaveEnd::Lost,
+                        },
+                    };
+                };
+                if let Some(end) = leave_route(io, msg) {
+                    return end;
+                }
+            }
+        }
+    }
+}
+
+/// One message on a leave connection. `Some` ends it.
+fn leave_route(io: &Io, msg: ServerMsg) -> Option<LeaveEnd> {
+    match msg {
+        ServerMsg::Error { code, .. } if code == error_code::UNSUPPORTED_MESSAGE => Some(LeaveEnd::Unsupported),
+        // The node is already gone (another `leave`, or `DELETE /v1/nodes/{id}` meanwhile).
+        ServerMsg::Error { code, .. } if code == error_code::NOT_ENROLLED => Some(LeaveEnd::Left),
+        ServerMsg::Error { code, .. } => Some(LeaveEnd::Refused(code)),
+        ServerMsg::Lease { lease_id, epoch, .. } => {
+            let _ = queue(
+                io,
+                AgentMsg::LeaseRejected {
+                    lease_id,
+                    epoch,
+                    reason: LeaseRejectReason::Draining,
+                },
+            );
+            None
+        }
+        _ => None,
     }
 }
 

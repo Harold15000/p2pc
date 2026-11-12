@@ -229,6 +229,7 @@ where
             decisions: Arc::new(Semaphore::new(MAX_PENDING_DECISIONS)),
             uplink,
             ports: None,
+            node: None,
             volumes: None,
         },
         connector: Arc::new(IrohConnector::new(
