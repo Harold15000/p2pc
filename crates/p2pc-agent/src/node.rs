@@ -43,6 +43,7 @@ use crate::inventory::{self, Report};
 use crate::runner::SystemRunner;
 use crate::sandbox::cgroup::{FsCgroups, HostCgroups, SystemdCgroups, user_service_cgroup};
 use crate::sandbox::engine::{PULL_TIMEOUT, PodmanEngine};
+use crate::sandbox::ingress::IngressBridge;
 use crate::sandbox::{DriverConfig, KnownPublicAddrs, PodmanDriver, ProxyEgress};
 
 /// The lock file inside the data dir.
@@ -228,6 +229,9 @@ pub struct Node {
     pub executor: Executor<NodeDriver>,
     /// For [`crate::connection::DetectInventory`]: the offers, and the driver's limits the inventory reports.
     pub offers: OfferFeed,
+    /// The ingress bridge (H2 §11.2), shared with the driver: the session opens service ports through it
+    /// ([`crate::connection::session::Shared::ports`]).
+    pub ingress: IngressBridge,
 }
 
 /// Builds the driver and the executor from `facts`. `public_addrs` is the live source of the node's public addresses
@@ -280,6 +284,11 @@ pub fn build(
     cfg.offerable_gpus = gpus.clone();
     cfg.public_addrs = public_addrs;
     cfg.egress_ready = egress_ready;
+    // One bridge for the three things that reach a service's ports: the driver attaches each service lease to it
+    // and checks its health through it, and the session opens the hub's port streams through it (H2 §11.2).
+    let ingress = IngressBridge::new();
+    cfg.health_probe = Some(Arc::new(ingress.clone()));
+    cfg.ingress = Some(ingress.clone());
     let driver = PodmanDriver::new(
         cfg,
         PodmanEngine::system("podman", PULL_TIMEOUT),
@@ -294,6 +303,7 @@ pub fn build(
     Node {
         executor: Executor::new(driver, owner, uplink, rx, clock),
         offers: OfferFeed { tx, driver: limits },
+        ingress,
     }
 }
 

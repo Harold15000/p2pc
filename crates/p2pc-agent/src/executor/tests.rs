@@ -1473,6 +1473,7 @@ mod through_the_session {
                 inventory_interval: INVENTORY_INTERVAL,
                 decisions: Arc::new(Semaphore::new(MAX_PENDING_DECISIONS)),
                 uplink: w.uplink.clone(),
+                ports: None,
             },
             connector: Arc::new(Pipes {
                 accepted: tx,

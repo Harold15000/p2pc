@@ -404,6 +404,7 @@ async fn status_after_join_force_to_the_same_server_is_a_fresh_enrollment() {
             inventory_interval: INVENTORY_INTERVAL,
             decisions: Arc::new(Semaphore::new(MAX_PENDING_DECISIONS)),
             uplink: p2pc_agent::connection::Uplink::new(),
+            ports: None,
         },
         connector: Arc::new(agent_connector(addr.clone())),
         backoff_seed: 1,
@@ -528,6 +529,7 @@ async fn run_says_hello_heartbeats_and_routes_over_iroh() {
         inventory_interval: INVENTORY_INTERVAL,
         decisions: Arc::new(Semaphore::new(MAX_PENDING_DECISIONS)),
         uplink: p2pc_agent::connection::Uplink::new(),
+        ports: None,
     };
     let connector = Arc::new(agent_connector(addr));
     let daemon = Daemon {
@@ -577,6 +579,122 @@ async fn run_says_hello_heartbeats_and_routes_over_iroh() {
         Some("drain")
     );
     // Shutdown closes the connection cleanly.
+    stop.send(true).unwrap();
+    assert_eq!(
+        tokio::time::timeout(WAIT, running).await.unwrap().unwrap(),
+        DaemonExit::Shutdown
+    );
+    tokio::time::timeout(WAIT, conn.closed()).await.unwrap();
+    server.close().await;
+}
+
+/// A port opener that connects every port of epoch 1 to an echo and refuses any other epoch as stale.
+#[derive(Debug)]
+struct EchoPorts;
+
+impl p2pc_agent::connection::streams::PortOpener for EchoPorts {
+    fn open<'a>(
+        &'a self,
+        open: &'a p2pc_proto::protocol::PortOpen,
+    ) -> BoxFuture<'a, Result<Box<dyn p2pc_agent::connection::streams::PortIo>, &'static str>> {
+        Box::pin(async move {
+            if open.epoch != 1 {
+                return Err(p2pc_proto::protocol::port_open_reason::STALE_LEASE);
+            }
+            let (agent, service) = tokio::io::duplex(64 * 1024);
+            tokio::spawn(async move {
+                let (mut r, mut w) = tokio::io::split(service);
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+            Ok(Box::new(agent) as Box<dyn p2pc_agent::connection::streams::PortIo>)
+        })
+    }
+}
+
+/// H2 §6.1 over real iroh: an agent with a port opener declares `service_jobs`; the server opens streams on the
+/// agent's own connection; a `PortOpen` is acked and carries bytes both ways with a clean end; a refused one gets
+/// its reason; a stream of an unknown type is reset with `unsupported_stream` (3) and the connection goes on.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_server_opens_port_streams_on_the_agents_connection_over_iroh() {
+    use iroh::endpoint::{ReadError, ReadToEndError, VarInt};
+    use p2pc_proto::protocol::STREAM_RESET_UNSUPPORTED_STREAM;
+
+    let _ = capture();
+    let (server, addr) = fake_server().await;
+    let owner = AccountId::generate();
+    let (tx, mut supervised) = mpsc::unbounded_channel();
+    let ttl = Duration::from_secs(45);
+    let shared = Shared {
+        owner,
+        agent_lease_ttl: ttl,
+        watchdog: Watchdog::new(ttl),
+        supervisor: Arc::new(Drains(tx)),
+        handler: Arc::new(NotReady),
+        inventory: Arc::new(FixedInventory),
+        load: Arc::new(ZeroLoad),
+        inventory_interval: INVENTORY_INTERVAL,
+        decisions: Arc::new(Semaphore::new(MAX_PENDING_DECISIONS)),
+        uplink: p2pc_agent::connection::Uplink::new(),
+        ports: Some(Arc::new(EchoPorts)),
+    };
+    let daemon = Daemon {
+        shared,
+        connector: Arc::new(agent_connector(addr)),
+        backoff_seed: 1,
+        state_file: None,
+        server_node_id: server.id().to_string(),
+        agent_node_id: NodeId::generate().to_string(),
+    };
+    let (stop, stop_rx) = watch::channel(false);
+    let (_net_tx, net_rx) = mpsc::channel(1);
+    let running = tokio::spawn(daemon.run(stop_rx, net_rx));
+
+    let (conn, mut w, mut r) = accept(&server).await;
+    let hello = recv(&mut r).await.unwrap();
+    assert_eq!(hello["features"], json!(["service_jobs"]));
+    send(&mut w, welcome(NodeId::generate(), owner)).await;
+    let lease_id = p2pc_proto::ids::LeaseId::generate();
+    let port_open =
+        |epoch: u64| json!({"type": "port_open", "lease_id": lease_id, "epoch": epoch, "port": 11434, "conn_id": 1});
+
+    // A port stream: the agent's ack is its first frame, then the bytes of the port, then a clean end.
+    let (mut ps, mut pr) = tokio::time::timeout(WAIT, conn.open_bi()).await.unwrap().unwrap();
+    send(&mut ps, port_open(1)).await;
+    assert_eq!(recv(&mut pr).await.unwrap(), json!({"ok": true}));
+    ps.write_all(b"ping").await.unwrap();
+    ps.finish().unwrap();
+    let echoed = tokio::time::timeout(WAIT, pr.read_to_end(64)).await.unwrap().unwrap();
+    assert_eq!(echoed, b"ping", "a finish, after the echoed bytes");
+
+    // A refused one: the reason, then a clean end.
+    let (mut ps, mut pr) = tokio::time::timeout(WAIT, conn.open_bi()).await.unwrap().unwrap();
+    send(&mut ps, port_open(2)).await;
+    assert_eq!(
+        recv(&mut pr).await.unwrap(),
+        json!({"ok": false, "reason": "stale_lease"})
+    );
+    let rest = tokio::time::timeout(WAIT, pr.read_to_end(64)).await.unwrap().unwrap();
+    assert!(rest.is_empty());
+
+    // A stream of a type this agent does not know: reset with `unsupported_stream`, in both directions.
+    let (mut us, mut ur) = tokio::time::timeout(WAIT, conn.open_bi()).await.unwrap().unwrap();
+    send(&mut us, json!({"type": "log_follow", "lease_id": lease_id})).await;
+    let end = tokio::time::timeout(WAIT, ur.read_to_end(64)).await.unwrap();
+    let unsupported = VarInt::from_u32(STREAM_RESET_UNSUPPORTED_STREAM);
+    assert!(
+        matches!(end, Err(ReadToEndError::Read(ReadError::Reset(code))) if code == unsupported),
+        "{end:?}"
+    );
+    let stopped = tokio::time::timeout(WAIT, us.stopped()).await.unwrap().unwrap();
+    assert_eq!(stopped, Some(unsupported));
+
+    // Never the connection: the control stream still routes.
+    send(&mut w, json!({"type": "drain"})).await;
+    assert_eq!(
+        tokio::time::timeout(WAIT, supervised.recv()).await.unwrap(),
+        Some("drain")
+    );
+    assert!(conn.close_reason().is_none());
     stop.send(true).unwrap();
     assert_eq!(
         tokio::time::timeout(WAIT, running).await.unwrap().unwrap(),
@@ -642,6 +760,7 @@ async fn a_route_move_ends_in_a_rebind_and_the_new_endpoint_opens_the_gate() {
             inventory_interval: INVENTORY_INTERVAL,
             decisions: Arc::new(Semaphore::new(MAX_PENDING_DECISIONS)),
             uplink: p2pc_agent::connection::Uplink::new(),
+            ports: None,
         },
         connector: connector.clone(),
         backoff_seed: 1,
