@@ -23,6 +23,14 @@
 #     in Podman), and a trap inside a job that is at its PID limit cannot fork to report anything
 #   - GPU (only with an NVIDIA GPU: /dev/dxg plus libcuda; Intel/AMD GPU-PV, no libcuda, is SKIP; libcuda with a
 #     failing nvidia-smi -L is a FAIL): CDI lists nvidia.com/gpu=all and nvidia-smi -L inside a CUDA image lists one GPU
+#   - the runner and the hub (H2 spec §8.5): /usr/local/sbin/p2pc-run, the old path p2pc-node-run as a symlink to it,
+#     and /usr/local/bin/p2pc-server are in the image
+#   - listeners (hard rule 4, H2 §8.5 and §10.5): no process of this distro listens on a TCP address that is not
+#     loopback (from /proc/net/tcp and tcp6, each socket matched to its process by inode). A listener that no process of
+#     this distro holds belongs to another distro of the user: all WSL2 distros share the VM's network namespace (H1
+#     §9.0, E1), so it is INFO, not a verdict. With /var/lib/p2pc-server/hub.enabled the hub (p2pc-server) must listen
+#     on TCP, and only on loopback (its REST listener, 127.0.0.1:7477 by default; it waits up to 30 s for the hub to
+#     start); without it, no p2pc-server may run at all
 #
 # It needs the internet ONLY to pull two small images (cached afterwards) and for one skopeo registry lookup (INFO
 # when there is no network). Images are pinned by digest: the digests are the constants below, which already hold the
@@ -68,6 +76,9 @@ unset _bs
 
 # Where the cgroup v2 hierarchy is mounted (overridable only for the unit tests).
 CGROUP_ROOT="${P2PC_TEST_CGROUP_ROOT:-/sys/fs/cgroup}"
+# /proc, for the listener checks, and the hub's data directory (H2 §8.5); overridable only for the unit tests.
+PROC_ROOT="${P2PC_TEST_PROC:-/proc}"
+HUB_DIR="${P2PC_TEST_HUB_DIR:-/var/lib/p2pc-server}"
 
 JSON=0
 RESULTS=()
@@ -362,6 +373,92 @@ skopeo_failure_is_network() {
     "$t" == *"tls handshake timeout"* || "$t" == *"no route to host"* ]]
 }
 
+# --- TCP listeners (hard rule 4, H2 §8.5) ---------------------------------------------------------------------------
+# tcp_endpoint <hex address:hex port of /proc/net/tcp or tcp6>: prints "<loopback|exposed> <address:port>". The kernel
+# writes an IPv4 address as one 32-bit word and an IPv6 address as four, each in host (little-endian) byte order.
+# Loopback is 127.0.0.0/8, ::1 and the IPv4-mapped ::ffff:127.0.0.0/104; everything else, the wildcards included, is
+# exposed. Fails on anything it cannot read.
+tcp_endpoint() {
+  local hex="${1%:*}" port="${1##*:}" w i b=() groups=() scope=exposed
+  [[ "$1" == *:* && "$port" =~ ^[0-9A-Fa-f]{4}$ ]] || return 1
+  port=$((16#$port))
+  if [[ "$hex" =~ ^[0-9A-Fa-f]{8}$ ]]; then
+    b=("${hex:6:2}" "${hex:4:2}" "${hex:2:2}" "${hex:0:2}")
+    [[ "${b[0],,}" == 7f ]] && scope=loopback
+    printf '%s %d.%d.%d.%d:%d\n' "$scope" "$((16#${b[0]}))" "$((16#${b[1]}))" "$((16#${b[2]}))" "$((16#${b[3]}))" "$port"
+    return 0
+  fi
+  [[ "$hex" =~ ^[0-9A-Fa-f]{32}$ ]] || return 1
+  for ((w = 0; w < 4; w++)); do
+    i="${hex:w*8:8}"
+    b+=("${i:6:2}" "${i:4:2}" "${i:2:2}" "${i:0:2}")
+  done
+  local flat="${b[*]}"
+  flat="${flat// /}"
+  flat="${flat,,}"
+  if [[ "$flat" == 00000000000000000000000000000001 || "$flat" == 00000000000000000000ffff7f* ]]; then
+    scope=loopback
+  fi
+  for ((i = 0; i < 16; i += 2)); do
+    groups+=("$(printf '%x' "$((16#${b[i]}${b[i + 1]}))")")
+  done
+  local IFS=:
+  printf '%s [%s]:%d\n' "$scope" "${groups[*]}" "$port"
+}
+
+# tcp_listeners <proc root>: one line per listening TCP socket (state 0A) of this network namespace, from net/tcp and
+# net/tcp6: "<inode> <loopback|exposed> <address:port>".
+tcp_listeners() {
+  local f local_addr state inode ep
+  for f in "$1/net/tcp" "$1/net/tcp6"; do
+    [[ -r "$f" ]] || continue
+    while read -r _ local_addr _ state _ _ _ _ _ inode _; do
+      [[ "$state" == 0A && "$inode" =~ ^[0-9]+$ ]] || continue
+      ep="$(tcp_endpoint "$local_addr")" || continue
+      printf '%s %s\n' "$inode" "$ep"
+    done < <(tail -n +2 "$f")
+  done
+}
+
+# socket_inode_owners <proc root>: "<inode> <pid> <command name>" for every socket descriptor of every process this
+# distro can see (/proc/<pid>/fd/<n> -> socket:[<inode>]).
+socket_inode_owners() {
+  local d pid fd target comm
+  for d in "$1"/[0-9]*; do
+    pid="${d##*/}"
+    [[ "$pid" =~ ^[0-9]+$ && -d "$d/fd" ]] || continue
+    comm="$(head -n 1 "$d/comm" 2>/dev/null)"
+    for fd in "$d"/fd/*; do
+      target="$(readlink "$fd" 2>/dev/null)" || continue
+      [[ "$target" =~ ^socket:\[([0-9]+)\]$ ]] || continue
+      printf '%s %s %s\n' "${BASH_REMATCH[1]}" "$pid" "${comm:-?}"
+    done
+  done
+}
+
+# tcp_listener_report <proc root>: "<loopback|exposed> <address:port> <owners>" per listening TCP socket, where owners is
+# "comm[pid]" for every process of this distro that holds it (comma separated), or "-" for none.
+tcp_listener_report() {
+  local listeners owners inode scope addr who
+  listeners="$(tcp_listeners "$1")"
+  owners="$(socket_inode_owners "$1")"
+  while read -r inode scope addr; do
+    [[ -n "$inode" ]] || continue
+    who="$(awk -v i="$inode" '$1 == i { printf "%s%s[%s]", (n++ ? "," : ""), $3, $2 }' <<<"$owners")"
+    printf '%s %s %s\n' "$scope" "$addr" "${who:--}"
+  done <<<"$listeners"
+}
+
+# hub_processes <proc root>: the pids whose command name is p2pc-server.
+hub_processes() {
+  local d
+  for d in "$1"/[0-9]*; do
+    [[ "${d##*/}" =~ ^[0-9]+$ ]] || continue
+    [[ "$(head -n 1 "$d/comm" 2>/dev/null)" == p2pc-server ]] && printf '%s\n' "${d##*/}"
+  done
+  return 0
+}
+
 # --- result bookkeeping ---------------------------------------------------------------------------------------------
 # record <PASS|FAIL|SKIP|INFO> <name> [detail]
 record() {
@@ -558,6 +655,86 @@ check_state_files() {
     fi
   else
     record PASS cfg.boot_status "$(one_line "$(cat /var/lib/p2pc/boot-status.json)")"
+  fi
+}
+
+# The runner and the hub binary (H2 §8.5): p2pc-run replaces p2pc-node-run, whose path stays as a symlink to it for one
+# release (an existing Scheduled Task still runs that path), and the image carries p2pc-server.
+check_runner_files() {
+  local link
+  if [[ -x /usr/local/sbin/p2pc-run ]]; then record PASS cfg.runner; else record FAIL cfg.runner "/usr/local/sbin/p2pc-run missing or not executable"; fi
+  link="$(readlink /usr/local/sbin/p2pc-node-run 2>/dev/null || true)"
+  if [[ -L /usr/local/sbin/p2pc-node-run && "$link" == p2pc-run ]]; then
+    record PASS cfg.runner_old_path "/usr/local/sbin/p2pc-node-run -> p2pc-run"
+  else
+    record FAIL cfg.runner_old_path "/usr/local/sbin/p2pc-node-run is not a symlink to p2pc-run (got '${link:-not a symlink}'): a task registered by an older install.ps1 runs that path"
+  fi
+  if [[ -x /usr/local/bin/p2pc-server ]]; then
+    record PASS cfg.hub_binary
+  else
+    record FAIL cfg.hub_binary "/usr/local/bin/p2pc-server missing or not executable: this image cannot be a hub (build it with --agent-from)"
+  fi
+}
+
+# Nothing of this distro listens on a TCP address that is not loopback (hard rule 4; H2 §8.5: beyond the hub's own iroh
+# endpoint, UDP, only the loopback REST listener). All WSL2 distros share one network namespace, so /proc/net/tcp also
+# shows the other distros' listeners: a socket that no process of this distro holds is reported as INFO, not judged.
+check_tcp_listeners() {
+  local report scope addr who bad="" foreign="" local_ok=""
+  report="$(tcp_listener_report "$PROC_ROOT")"
+  while read -r scope addr who; do
+    [[ -n "$scope" ]] || continue
+    if [[ "$scope" == loopback ]]; then
+      local_ok+="${local_ok:+, }$addr ($who)"
+    elif [[ "$who" == - ]]; then
+      foreign+="${foreign:+, }$addr"
+    else
+      bad+="${bad:+, }$addr ($who)"
+    fi
+  done <<<"$report"
+  if [[ -n "$bad" ]]; then
+    record FAIL net.no_lan_tcp_listener "processes of this distro listen on TCP addresses that are not loopback: $bad"
+  else
+    record PASS net.no_lan_tcp_listener "every TCP listener of this distro is on loopback: ${local_ok:-none}"
+  fi
+  if [[ -n "$foreign" ]]; then
+    record INFO net.foreign_tcp_listeners "TCP listeners that no process of this distro holds (another WSL2 distro: they all share the VM's network namespace): $foreign"
+  fi
+}
+
+HUB_WAIT_S=30
+# The hub (H2 §8.5): with hub.enabled, p2pc-server must hold at least one TCP listener and every one of them must be on
+# loopback (its REST listener; its iroh endpoint is UDP). It may still be starting: wait up to HUB_WAIT_S, polling once a
+# second. Without hub.enabled, no p2pc-server may run (p2pc-run starts it only while the flag exists).
+check_hub() {
+  local i pids report lines="" scope addr who bad="" good=""
+  if [[ ! -e "$HUB_DIR/hub.enabled" ]]; then
+    pids="$(hub_processes "$PROC_ROOT" | paste -sd' ' -)"
+    if [[ -n "$pids" ]]; then
+      record FAIL hub.only_when_enabled "p2pc-server runs (pid $pids) but $HUB_DIR/hub.enabled does not exist"
+    else
+      record PASS hub.only_when_enabled "no hub.enabled, and no p2pc-server runs"
+    fi
+    record SKIP hub.rest_loopback "the hub is not enabled on this PC ($HUB_DIR/hub.enabled does not exist)"
+    return 0
+  fi
+  for ((i = 0; i <= HUB_WAIT_S; i++)); do
+    report="$(tcp_listener_report "$PROC_ROOT")"
+    lines="$(grep -E ' p2pc-server\[|,p2pc-server\[' <<<"$report" || true)"
+    [[ -n "$lines" ]] && break
+    ((i < HUB_WAIT_S)) && poll_sleep 1
+  done
+  if [[ -z "$lines" ]]; then
+    record FAIL hub.rest_loopback "$HUB_DIR/hub.enabled exists but p2pc-server holds no TCP listener after ${HUB_WAIT_S} s (is p2pc-run running? see /var/log/p2pc/hub.log)"
+    return 1
+  fi
+  while read -r scope addr who; do
+    if [[ "$scope" == loopback ]]; then good+="${good:+, }$addr"; else bad+="${bad:+, }$addr"; fi
+  done <<<"$lines"
+  if [[ -n "$bad" ]]; then
+    record FAIL hub.rest_loopback "the hub listens on TCP addresses that are not loopback: $bad (hard rule 4: its REST listener binds loopback only)"
+  else
+    record PASS hub.rest_loopback "the hub's TCP listeners are all loopback: $good"
   fi
 }
 
@@ -864,6 +1041,9 @@ main() {
   check_no_oobe_user
   check_subids
   check_state_files
+  check_runner_files
+  check_hub
+  check_tcp_listeners
   check_file_caps
   check_skopeo
   if check_podman_config; then

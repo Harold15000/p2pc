@@ -268,7 +268,7 @@ printf '%s\n' "$old_json" >"$status_file"
 P2PC_PROC="$SCRATCH/proc-empty" wait_boot_status "$status_file"
 assert_eq "0" "$?" "without the init's identity an existing status is accepted"
 unset P2PC_PROC
-poll_sleep() { sleep "$1"; }
+# (poll_sleep stays the scripted one: the hub check below polls too, and nothing in this file may really sleep.)
 
 # --- boot_status_ok: what each GPU situation requires of p2pc-boot's status ----------------------------------------------
 ok_json='{"time":"T","cdi":"fresh","cdi_regenerated":false,"errors":[]}'
@@ -291,6 +291,120 @@ assert_false "no NVIDIA GPU (code 1), but the status says fresh" boot_status_ok 
 # wget would then "connect" to the proxy: a blocked network could look reachable, or the other way round.
 assert_contains " ${JOB_FLAGS[*]} " " --http-proxy=false " "every test container runs with --http-proxy=false (spec 9)"
 assert_contains "$NET_SCRIPT" "wget -Y off" "the probe's wget never uses a proxy"
+
+# --- TCP listeners (H2 §8.5, hard rule 4): /proc/net/tcp{,6} and the processes that own the sockets --------------------
+# tcp_endpoint: the kernel writes each IPv4 address as one little-endian 32-bit word, and each IPv6 address as four.
+assert_eq "loopback 127.0.0.1:7477" "$(tcp_endpoint 0100007F:1D35)" "IPv4 loopback"
+assert_eq "loopback 127.0.0.2:9000" "$(tcp_endpoint 0200007F:2328)" "all of 127.0.0.0/8 is loopback"
+assert_eq "exposed 0.0.0.0:22" "$(tcp_endpoint 00000000:0016)" "the IPv4 wildcard is exposed"
+assert_eq "exposed 192.0.2.10:8080" "$(tcp_endpoint 0A0200C0:1F90)" "an address of the host is exposed"
+assert_eq "loopback [0:0:0:0:0:0:0:1]:7477" "$(tcp_endpoint 00000000000000000000000001000000:1D35)" "IPv6 loopback"
+assert_eq "loopback [0:0:0:0:0:ffff:7f00:1]:8080" "$(tcp_endpoint 0000000000000000FFFF00000100007F:1F90)" "IPv4-mapped loopback"
+assert_eq "exposed [0:0:0:0:0:0:0:0]:80" "$(tcp_endpoint 00000000000000000000000000000000:0050)" "the IPv6 wildcard is exposed"
+assert_eq "exposed [2001:db8:0:0:0:0:0:1]:443" "$(tcp_endpoint B80D0120000000000000000001000000:01BB)" "a global IPv6 address is exposed"
+assert_eq "exposed [0:0:0:0:0:ffff:c000:20a]:80" "$(tcp_endpoint 0000000000000000FFFF00000A0200C0:0050)" "an IPv4-mapped host address is exposed"
+assert_false "a malformed address is refused" tcp_endpoint 0100007F
+assert_false "a malformed IPv6 address is refused" tcp_endpoint 0000:1D35
+# make_proc <dir>: a /proc fixture. p2pc-server (pid 100) listens on 127.0.0.1:7477 and [::1]:7477 and has a UDP-like
+# socket that is not a TCP listener; the agent (pid 200) has an established connection only; nothing owns a listener on
+# 0.0.0.0:22 (another distro of the WSL VM, which shares the network namespace).
+tcp_header='  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode'
+tcp_line() { # tcp_line <local> <state> <inode>
+  printf '   0: %s 00000000:0000 %s 00000000:00000000 00:00000000 00000000     0        0 %s 1 0000000000000000 100 0 0 10 0\n' "$1" "$2" "$3"
+}
+make_proc() {
+  local p="$1"
+  mkdir -p "$p/net" "$p/100/fd" "$p/200/fd" "$p/self"
+  {
+    printf '%s\n' "$tcp_header"
+    tcp_line 0100007F:1D35 0A 1001
+    tcp_line 00000000:0016 0A 1002
+    tcp_line 0100007F:1D35 01 1003
+  } >"$p/net/tcp"
+  {
+    printf '%s\n' "$tcp_header"
+    tcp_line 00000000000000000000000001000000:1D35 0A 2001
+  } >"$p/net/tcp6"
+  printf 'p2pc-server\n' >"$p/100/comm"
+  ln -s 'socket:[1001]' "$p/100/fd/3"
+  ln -s 'socket:[2001]' "$p/100/fd/4"
+  ln -s 'socket:[5555]' "$p/100/fd/5"
+  ln -s /dev/null "$p/100/fd/0"
+  printf 'p2pc-agent\n' >"$p/200/comm"
+  ln -s 'socket:[1003]' "$p/200/fd/3"
+}
+proc="$SCRATCH/proc-net"
+make_proc "$proc"
+listeners="$(tcp_listeners "$proc")"
+assert_eq "3" "$(grep -c . <<<"$listeners")" "three listening sockets (the established connection is not one)"
+assert_contains "$listeners" "1001 loopback 127.0.0.1:7477" "the hub's IPv4 listener"
+assert_contains "$listeners" "2001 loopback [0:0:0:0:0:0:0:1]:7477" "the hub's IPv6 listener"
+assert_contains "$listeners" "1002 exposed 0.0.0.0:22" "the foreign wildcard listener"
+owners="$(socket_inode_owners "$proc")"
+assert_contains "$owners" "1001 100 p2pc-server" "the owner of a socket, by inode"
+assert_contains "$owners" "1003 200 p2pc-agent" "every process is scanned"
+assert_false "a descriptor that is not a socket is not listed" grep -q '^ ' <<<"$owners"
+report="$(tcp_listener_report "$proc")"
+assert_contains "$report" "loopback 127.0.0.1:7477 p2pc-server[100]" "the report names each listener's owner"
+assert_contains "$report" "exposed 0.0.0.0:22 -" "and '-' for a socket no process of this distro holds"
+# check_tcp_listeners: a listener of this distro on a non-loopback address is a FAIL; one that no process here holds is
+# another distro's (they share the WSL VM's network namespace) and only INFO.
+JSON=0
+PROC_ROOT="$proc"
+out="$(check_tcp_listeners)"
+assert_contains "$out" "PASS net.no_lan_tcp_listener" "no process of this distro listens on a non-loopback TCP address"
+assert_contains "$out" "INFO net.foreign_tcp_listeners" "a listener nobody here holds is reported"
+assert_contains "$out" "0.0.0.0:22" "with its address"
+ln -s 'socket:[1002]' "$proc/200/fd/6"
+out="$(check_tcp_listeners)"
+assert_contains "$out" "FAIL net.no_lan_tcp_listener" "a process of this distro on 0.0.0.0 is a FAIL"
+assert_contains "$out" "p2pc-agent[200]" "naming it"
+rm "$proc/200/fd/6"
+# check_hub: the hub's REST listener is loopback only while it runs, and nothing of the hub runs while it is disabled.
+HUB_DIR="$SCRATCH/hub"
+mkdir -p "$HUB_DIR"
+SLEEPS=0
+ON_SLEEP=""
+out="$(check_hub)"
+assert_contains "$out" "FAIL hub.only_when_enabled" "a running p2pc-server without hub.enabled is a FAIL"
+mv "$proc/100" "$proc/100.off"
+out="$(check_hub)"
+assert_contains "$out" "PASS hub.only_when_enabled" "no hub.enabled and no p2pc-server: PASS"
+assert_contains "$out" "SKIP hub.rest_loopback" "and the REST check is skipped"
+mv "$proc/100.off" "$proc/100"
+touch "$HUB_DIR/hub.enabled"
+out="$(check_hub)"
+assert_contains "$out" "PASS hub.rest_loopback" "hub.enabled: the hub's TCP listeners are all loopback"
+assert_contains "$out" "127.0.0.1:7477" "the detail names them"
+# The hub on a LAN address: FAIL.
+sed -i 's/0100007F:1D35 00000000:0000 0A/00000000:1D35 00000000:0000 0A/' "$proc/net/tcp"
+out="$(check_hub)"
+assert_contains "$out" "FAIL hub.rest_loopback" "a hub listening on 0.0.0.0:7477 is a FAIL"
+assert_contains "$out" "0.0.0.0:7477" "naming the address"
+sed -i 's/00000000:1D35 00000000:0000 0A/0100007F:1D35 00000000:0000 0A/' "$proc/net/tcp"
+# hub.enabled, but the hub does not listen (yet): it waits up to HUB_WAIT_S, polling once a second, then FAILs.
+mv "$proc/100" "$proc/100.off"
+SLEEPS=0
+out="$(check_hub)"
+assert_contains "$out" "FAIL hub.rest_loopback" "hub.enabled but no hub listener: FAIL"
+assert_contains "$out" "no TCP listener" "saying the hub does not listen"
+SLEEPS=0
+check_hub >/dev/null
+assert_eq "$HUB_WAIT_S" "$SLEEPS" "it polled once a second for HUB_WAIT_S"
+hub_back() { ((SLEEPS == 3)) && mv "$proc/100.off" "$proc/100"; return 0; }
+SLEEPS=0
+ON_SLEEP=hub_back
+out="$(check_hub)"
+assert_contains "$out" "PASS hub.rest_loopback" "a hub that starts listening within the wait passes"
+ON_SLEEP=""
+rm -f "$HUB_DIR/hub.enabled"
+unset PROC_ROOT HUB_DIR
+# The runner and the hub binary the image must carry (H2 §8.5).
+assert_contains "$(declare -f check_runner_files)" "/usr/local/sbin/p2pc-run" "the runner is checked"
+assert_contains "$(declare -f check_runner_files)" "/usr/local/sbin/p2pc-node-run" "and the old path, a symlink to it"
+assert_contains "$(declare -f check_runner_files)" "/usr/local/bin/p2pc-server" "and the hub binary"
+assert_contains "$(declare -f main)" "check_tcp_listeners" "main runs the listener check"
+assert_contains "$(declare -f main)" "check_hub" "and the hub check"
 
 # --- json output ----------------------------------------------------------------------------------------------------
 assert_eq 'say \"hi\"\n' "$(json_escape $'say "hi"\n')" "json_escape"
