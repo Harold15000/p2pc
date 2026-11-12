@@ -18,6 +18,11 @@
 //!   There is no total deadline: a 2 GiB blob over a relay takes about half an hour (H2 §7.5), and a stream that
 //!   keeps moving is allowed to finish.
 //!
+//! - **Job start** ([`BlobInputs`]). The sandbox driver fetches each blob input of a lease through the welcomed
+//!   session of the moment ([`Uplink`]), waiting for one if the agent is reconnecting. A transport failure (the
+//!   connection went away, a stall) is tried again from an empty destination, at most [`MAX_FETCH_ATTEMPTS`] times in
+//!   all; a refusal or a digest mismatch is the hub's answer and is never tried again.
+//!
 //! Errors never quote the hub's bytes beyond a cleaned, bounded refusal reason.
 
 use std::sync::Arc;
@@ -33,6 +38,8 @@ use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::Semaphore;
 
+use crate::connection::BoxFuture;
+use crate::connection::Uplink;
 use crate::connection::transport::StreamOpener;
 
 /// The job error of a blob whose bytes do not hash to its digest (H2 §6.1).
@@ -47,6 +54,8 @@ pub const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_REASON_CHARS: usize = 200;
 /// How much is read at a time.
 const CHUNK: usize = 256 * 1024;
+/// Most attempts of one blob input at job start: a transport failure is tried again, on the session of the moment.
+pub const MAX_FETCH_ATTEMPTS: u32 = 3;
 
 /// Why the hub refused a fetch (`BlobFetchAck.reason`, H2 §6.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,6 +187,80 @@ impl BlobFetcher {
     }
 }
 
+/// Where a blob input is written: emptied before an attempt that follows a failed one.
+pub trait BlobSink: AsyncWrite + Send + Unpin {
+    /// Drops everything written so far, so the next attempt starts from an empty destination.
+    fn reset(&mut self) -> BoxFuture<'_, std::io::Result<()>>;
+}
+
+impl BlobSink for tokio::fs::File {
+    fn reset(&mut self) -> BoxFuture<'_, std::io::Result<()>> {
+        Box::pin(async move {
+            use tokio::io::AsyncSeekExt as _;
+            self.set_len(0).await?;
+            self.rewind().await.map(|_| ())
+        })
+    }
+}
+
+impl BlobSink for Vec<u8> {
+    fn reset(&mut self) -> BoxFuture<'_, std::io::Result<()>> {
+        self.clear();
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// The blob inputs of leases (H2 §7.5): fetched over the agent's connection of the moment, within the fetcher's bound.
+/// Clones share the bound and the connection.
+#[derive(Debug, Clone)]
+pub struct BlobInputs {
+    fetcher: BlobFetcher,
+    uplink: Uplink,
+}
+
+impl BlobInputs {
+    /// Fetches through the sessions `uplink` publishes.
+    #[must_use]
+    pub fn new(uplink: Uplink) -> Self {
+        Self {
+            fetcher: BlobFetcher::new(),
+            uplink,
+        }
+    }
+
+    /// Fetches `request` into `dest`, refusing a blob of more than `max_bytes`, and returns its size once it is
+    /// written and verified. Waits for a welcomed session when there is none (the caller bounds that wait with the
+    /// lease's cancel). A [`FetchError::Transport`] is tried again, after `dest` is emptied, at most
+    /// [`MAX_FETCH_ATTEMPTS`] times in all; every other error is final.
+    ///
+    /// # Errors
+    /// The last attempt's [`FetchError`]. What `dest` holds then must be discarded by the caller.
+    pub async fn fetch(
+        &self,
+        request: BlobRequest,
+        max_bytes: u64,
+        dest: &mut dyn BlobSink,
+    ) -> Result<u64, FetchError> {
+        let mut attempt = 1;
+        loop {
+            let port = self.uplink.connected().await;
+            match self.fetcher.fetch(&**port.streams(), request, max_bytes, dest).await {
+                Err(FetchError::Transport(e)) if attempt < MAX_FETCH_ATTEMPTS => {
+                    tracing::info!(
+                        lease = %request.lease_id,
+                        attempt,
+                        error = %e,
+                        "a blob fetch failed on the way; trying again"
+                    );
+                    attempt += 1;
+                    dest.reset().await.map_err(|e| FetchError::Write(e.to_string()))?;
+                }
+                other => return other,
+            }
+        }
+    }
+}
+
 /// A hub's refusal reason, safe to log: no control characters, bounded.
 fn clean_reason(reason: Option<&str>) -> String {
     reason
@@ -287,8 +370,8 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
-    use crate::connection::BoxFuture;
     use crate::connection::transport::{BoxRead, BoxWrite, ConnectError};
+    use crate::connection::{BoxFuture, Port};
 
     /// The hub's end of one stream the agent opened.
     struct HubEnd {
@@ -312,11 +395,13 @@ mod tests {
         }
     }
 
-    /// Opens in-memory streams and hands their hub end to the test.
+    /// Opens in-memory streams and hands their hub end to the test. The first `refuse` opens fail, as on a
+    /// connection that went away.
     #[derive(Debug)]
     struct Pipes {
         hub: mpsc::UnboundedSender<HubEnd>,
         opened: AtomicUsize,
+        refuse: AtomicUsize,
     }
 
     impl std::fmt::Debug for HubEnd {
@@ -329,6 +414,10 @@ mod tests {
         fn open_bi(&self) -> BoxFuture<'_, Result<(BoxWrite, BoxRead), ConnectError>> {
             Box::pin(async move {
                 self.opened.fetch_add(1, Ordering::SeqCst);
+                if self.refuse.load(Ordering::SeqCst) > 0 {
+                    self.refuse.fetch_sub(1, Ordering::SeqCst);
+                    return Err(ConnectError("the connection is gone".into()));
+                }
                 let (agent, hub) = tokio::io::duplex(1024 * 1024);
                 let (ar, aw) = tokio::io::split(agent);
                 let (hr, hw) = tokio::io::split(hub);
@@ -344,6 +433,7 @@ mod tests {
             Arc::new(Pipes {
                 hub: tx,
                 opened: AtomicUsize::new(0),
+                refuse: AtomicUsize::new(0),
             }),
             rx,
         )
@@ -563,6 +653,137 @@ mod tests {
         );
         for f in fetches {
             f.abort();
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------------------------
+    // BlobInputs: the fetch of a lease's input over the session of the moment.
+
+    /// A welcomed session whose streams are `streams`; keep the returned sender alive as long as the session.
+    fn session(uplink: &Uplink, streams: Arc<Pipes>) -> mpsc::Sender<crate::connection::uplink::JobFrame> {
+        let (jobs, _rx) = mpsc::channel(4);
+        uplink.connect(Port::new(&jobs, streams));
+        jobs
+    }
+
+    /// Serves every stream with `data`, answering each header.
+    fn serve_all(mut ends: mpsc::UnboundedReceiver<HubEnd>, data: Vec<u8>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            while let Some(mut hub) = ends.recv().await {
+                let body = data.clone();
+                tokio::spawn(async move {
+                    let _ = hub.header().await;
+                    hub.ack(json!({"ok": true, "size": body.len()})).await;
+                    hub.bytes(&body).await;
+                    std::future::pending::<()>().await;
+                });
+            }
+        })
+    }
+
+    /// There is no session yet: the fetch waits for one, then goes through it.
+    #[tokio::test]
+    async fn an_input_waits_for_a_welcomed_session() {
+        let data = b"the blob".to_vec();
+        let (streams, ends) = pipes();
+        let server = serve_all(ends, data.clone());
+        let uplink = Uplink::new();
+        let inputs = BlobInputs::new(uplink.clone());
+        let req = request(&data);
+        let fetch = tokio::spawn(async move {
+            let mut out = Vec::new();
+            let r = inputs.fetch(req, 1 << 20, &mut out).await;
+            (r, out)
+        });
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!fetch.is_finished(), "no session: it waits");
+        assert_eq!(streams.opened.load(Ordering::SeqCst), 0);
+        let _session = session(&uplink, streams.clone());
+        let (r, out) = fetch.await.unwrap();
+        assert_eq!(r, Ok(data.len() as u64));
+        assert_eq!(out, data);
+        server.abort();
+    }
+
+    /// A transport failure (the connection went away) is tried again, from an empty destination, at most
+    /// [`MAX_FETCH_ATTEMPTS`] times in all.
+    #[tokio::test(start_paused = true)]
+    async fn a_transport_failure_is_tried_again_from_scratch_a_bounded_number_of_times() {
+        let data = b"0123456789".to_vec();
+        // First a stream that cannot open, then one that stalls half-way (the stall timeout), then a good one.
+        let (streams, mut ends) = pipes();
+        streams.refuse.store(1, Ordering::SeqCst);
+        let body = data.clone();
+        let server = tokio::spawn(async move {
+            let mut stalled = ends.recv().await.unwrap();
+            let _ = stalled.header().await;
+            stalled.ack(json!({"ok": true, "size": 10})).await;
+            stalled.bytes(b"01234").await;
+            let mut good = ends.recv().await.unwrap();
+            let _ = good.header().await;
+            good.ack(json!({"ok": true, "size": 10})).await;
+            good.bytes(&body).await;
+            let _keep = (stalled, good);
+            std::future::pending::<()>().await;
+        });
+        let uplink = Uplink::new();
+        let _session = session(&uplink, streams.clone());
+        let mut out = Vec::new();
+        let r = BlobInputs::new(uplink.clone())
+            .fetch(request(&data), 1 << 20, &mut out)
+            .await;
+        assert_eq!(r, Ok(10));
+        assert_eq!(out, data, "what the stalled attempt wrote is gone");
+        assert_eq!(streams.opened.load(Ordering::SeqCst), 3);
+        server.abort();
+
+        // A connection that never comes back: three attempts, then the transport error.
+        let (streams, _ends) = pipes();
+        streams.refuse.store(usize::MAX, Ordering::SeqCst);
+        let uplink = Uplink::new();
+        let _session = session(&uplink, streams.clone());
+        let mut out = Vec::new();
+        let r = BlobInputs::new(uplink).fetch(request(&data), 1 << 20, &mut out).await;
+        assert!(matches!(r, Err(FetchError::Transport(_))), "{r:?}");
+        assert_eq!(
+            streams.opened.load(Ordering::SeqCst),
+            usize::try_from(MAX_FETCH_ATTEMPTS).unwrap()
+        );
+    }
+
+    /// The hub's refusals and a digest mismatch are answers, not accidents: never tried again.
+    #[tokio::test]
+    async fn refusals_and_integrity_failures_are_not_tried_again() {
+        let data = b"the real blob".to_vec();
+        for forged in [false, true] {
+            let (streams, mut ends) = pipes();
+            let server = tokio::spawn(async move {
+                while let Some(mut hub) = ends.recv().await {
+                    let _ = hub.header().await;
+                    if forged {
+                        hub.ack(json!({"ok": true, "size": 13})).await;
+                        hub.bytes(b"a forged blob").await;
+                    } else {
+                        hub.ack(json!({"ok": false, "reason": "gone"})).await;
+                    }
+                    let _keep = hub;
+                    std::future::pending::<()>().await;
+                }
+            });
+            let uplink = Uplink::new();
+            let _session = session(&uplink, streams.clone());
+            let mut out = Vec::new();
+            let r = BlobInputs::new(uplink).fetch(request(&data), 1 << 20, &mut out).await;
+            let expected = if forged {
+                FetchError::Integrity
+            } else {
+                FetchError::Refused(Refusal::Gone)
+            };
+            assert_eq!(r, Err(expected));
+            assert_eq!(streams.opened.load(Ordering::SeqCst), 1, "forged = {forged}");
+            server.abort();
         }
     }
 }
