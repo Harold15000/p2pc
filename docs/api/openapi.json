@@ -3016,11 +3016,11 @@
         "tags": [
           "server"
         ],
-        "summary": "The server's iroh NodeId, relays, address (`p2pc_srv_…`) and version.",
+        "summary": "The server's iroh NodeId, relays, address (`p2pc_srv_…`) and version; the API generation (2), the hub's name and\nthe largest blob upload (H2 §7.3).",
         "operationId": "get_server",
         "responses": {
           "200": {
-            "description": "How to reach this server over iroh.",
+            "description": "How to reach this server over iroh, and what it serves.",
             "content": {
               "application/json": {
                 "schema": {
@@ -3031,6 +3031,65 @@
           },
           "401": {
             "description": "Missing or invalid key.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "server"
+        ],
+        "summary": "Names the hub (H2 §7.3): `hub_name` is 1-64 printable characters, shown by the apps and sent to devices in\n`Paired`. `admin` only. Returns what `GET /v1/server` returns now.",
+        "operationId": "patch_server",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateServer"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The hub's name is set.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerInfo"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid key (also when the caller was revoked or expired during the request).",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller lacks the admin scope.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`hub_name` is not 1-64 printable characters.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -7810,6 +7869,20 @@
         "format": "int64",
         "description": "An amount of compute, in milli-units (1 unit = 1 000 milli-units = 1 vCPU-hour reserved).\n\nSerialized as a JSON integer of milli-units.",
         "minimum": 0
+      },
+      "UpdateServer": {
+        "type": "object",
+        "description": "Body of `PATCH /v1/server` (H2 §7.3), `admin` only. Validate with [`UpdateServer::validate`].",
+        "required": [
+          "hub_name"
+        ],
+        "properties": {
+          "hub_name": {
+            "type": "string",
+            "description": "The hub's display name: 1-64 printable characters."
+          }
+        },
+        "additionalProperties": false
       },
       "UsageGroupBy": {
         "type": "string",

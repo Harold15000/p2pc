@@ -223,7 +223,7 @@ async fn pair(
         return None;
     };
     match redeem(inner, iroh_id, ticket, label, platform).await {
-        Ok(Some(device)) => Some(paired(inner, &device)),
+        Ok(Some(device)) => Some(paired(inner, &device).await),
         Ok(None) => failed(inner, iroh_id, Some(ticket.hash_prefix()), now).then_some(INVALID_TICKET),
         Err(e) => {
             tracing::warn!(error = %e, "pairing failed on a storage error");
@@ -287,8 +287,19 @@ async fn redeem(
 }
 
 /// The `Paired` answer for `device`. The hub's name, version and API generation are what `GET /v1/server` says.
-fn paired(inner: &Inner, device: &DeviceRow) -> PairResponse {
-    let info = inner.state.server.info();
+///
+/// The device is paired already, so a name that cannot be read (a storage error) never costs it its answer: it gets
+/// an empty name (what a hub nobody named sends) and reads the name later from `GET /v1/server`.
+async fn paired(inner: &Inner, device: &DeviceRow) -> PairResponse {
+    let info = match crate::nodes_api::server_info(&inner.state).await {
+        Ok(info) => info,
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot read the hub name for a Paired answer");
+            let mut info = inner.state.server.info();
+            info.api_version = p2pc_proto::api::API_VERSION_H2;
+            info
+        }
+    };
     PairResponse::Paired {
         device_id: device.device_id.to_string(),
         hub_name: info.hub_name.unwrap_or_default(),
