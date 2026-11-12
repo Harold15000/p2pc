@@ -45,6 +45,13 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // `lease_ttl_s`, is then never later than the gateway's restart grace. It answers the estimates too.
     let scheduler = Scheduler::new(&state, Arc::new(state.hub.clone()));
     state.nodes = Arc::new(scheduler.clone());
+    // H2 §12: the slices of the midnights missed while the hub was down, and today's cap reservations, before any
+    // request or agent is served and before the listener binds. A hub that cannot catch up does not start: its caps
+    // would not count the services that are running.
+    scheduler
+        .catch_up()
+        .await
+        .map_err(|e| anyhow::anyhow!("cannot start: {e}"))?;
     let listener = TcpListener::bind(bind)
         .await
         .map_err(|e| anyhow::anyhow!("cannot listen on {bind}: {e}"))?;

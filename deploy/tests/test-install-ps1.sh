@@ -54,19 +54,61 @@ P2PC_PS1="$ps1" P2PC_README="$here/../README.md" pwsh -NoProfile -NonInteractive
   Check "unknown value"            "unknown" (Get-StateProbe -ExitCode 0 -Output "P2PC_STATE=maybe")
   Check "wrong case"               "unknown" (Get-StateProbe -ExitCode 0 -Output "p2pc_state=absent")
   Check "marker inside a longer line" "unknown" (Get-StateProbe -ExitCode 0 -Output "xP2PC_STATE=absent")
-  # --- the listing filter ---------------------------------------------------------------------------------------------
-  Check "ignores tmp"              $true  (Test-StateListingIgnored "700:0:0:d:tmp")
-  Check "ignores tmp content"      $true  (Test-StateListingIgnored "600:0:0:f:tmp/nvidia-cdi.abc.yaml")
-  Check "ignores boot-status"      $true  (Test-StateListingIgnored "600:0:0:f:boot-status.json")
-  Check "keeps the identity key"   $false (Test-StateListingIgnored "600:0:0:f:identity.key")
-  Check "keeps a nested tmp name"  $false (Test-StateListingIgnored "700:0:0:d:jobs/tmp")
-  Check "keeps the root entry"     $false (Test-StateListingIgnored "700:0:0:d:")
-  Check "ignores a socket"         $true  (Test-StateListingIgnored "755:0:0:s:run/agent.sock")
-  Check "ignores a FIFO"           $true  (Test-StateListingIgnored "600:0:0:p:jobs/ctl.fifo")
-  Check "ignores a nested socket"  $true  (Test-StateListingIgnored "600:0:0:s:a/b/c.sock")
-  Check "keeps a file named like a type" $false (Test-StateListingIgnored "600:0:0:f:s")
-  Check "keeps a directory"        $false (Test-StateListingIgnored "700:0:0:d:jobs")
-  Check "keeps a symlink"          $false (Test-StateListingIgnored "777:0:0:l:link")
+  # H2 8.3: the hub data (/var/lib/p2pc-server) without the agent state is its own answer, never "absent"
+  Check "hub data only"            "hub-only" (Get-StateProbe -ExitCode 0 -Output "P2PC_STATE=hub-only`n")
+  Check "hub data only, wrong case" "unknown" (Get-StateProbe -ExitCode 0 -Output "P2PC_STATE=HUB-ONLY")
+  # --- Get-StateSize: the answer of $StateSizeScript (du -sk), read strictly -----------------------------------------------
+  $sz = Get-StateSize -ExitCode 0 -Output "12`t/var/lib/p2pc`n"
+  Check "size: the agent state alone" "12||12" ("{0}|{1}|{2}" -f $sz.AgentKB, $sz.HubKB, $sz.TotalKB)
+  $sz = Get-StateSize -ExitCode 0 -Output "12`t/var/lib/p2pc`r`n1000`t/var/lib/p2pc-server`r`n"
+  Check "size: with the hub data" "12|1000|1012" ("{0}|{1}|{2}" -f $sz.AgentKB, $sz.HubKB, $sz.TotalKB)
+  Check "size: a failed du is unknown" $true ($null -eq (Get-StateSize -ExitCode 1 -Output "12`t/var/lib/p2pc"))
+  Check "size: no agent line is unknown" $true ($null -eq (Get-StateSize -ExitCode 0 -Output "1000`t/var/lib/p2pc-server"))
+  Check "size: garbage is unknown" $true ($null -eq (Get-StateSize -ExitCode 0 -Output "du: cannot access"))
+  Check "size: two agent lines are unknown" $true ($null -eq (Get-StateSize -ExitCode 0 -Output "1`t/var/lib/p2pc`n2`t/var/lib/p2pc"))
+  Check "size: another directory is unknown" $true ($null -eq (Get-StateSize -ExitCode 0 -Output "1`t/var/lib/p2pc`n2`t/var/lib/p2pc-serverx"))
+  # --- Get-UpgradeSpaceNeeds: per volume, the archive staged in the distro and restored again, plus -MinFreeGB, and the
+  # backup copy on the backup volume (H2 8.3, review P2): one volume needs about 2x the archive plus -MinFreeGB.
+  $realGetVolumeRoot = ${function:Get-VolumeRoot}
+  function Get-VolumeRoot { param([string]$Path) if ($Path.StartsWith("D:")) { return "D:\" } else { return "C:\" } }
+  $spaceNeeds = Get-UpgradeSpaceNeeds -StateBytes 1000 -DistroDir "C:\distro" -BackupDir "C:\backups" -MinFree 50
+  Check "space: one volume" "C:\" ((@($spaceNeeds.Keys)) -join ",")
+  Check "space: one volume needs 2x the archive plus the minimum" 2050 $spaceNeeds["C:\"]
+  $spaceNeeds = Get-UpgradeSpaceNeeds -StateBytes 1000 -DistroDir "D:\distro" -BackupDir "C:\backups" -MinFree 50
+  Check "space: two volumes: the distro volume" 1050 $spaceNeeds["D:\"]
+  Check "space: two volumes: the backup volume" 1000 $spaceNeeds["C:\"]
+  Set-Item -Path function:local:Get-VolumeRoot -Value $realGetVolumeRoot
+  # --- the listing filter (paths are relative to /var/lib: p2pc/... and, on the hub PC, p2pc-server/...) ---------------
+  Check "ignores tmp"              $true  (Test-StateListingIgnored "700:0:0:d:p2pc/tmp")
+  Check "ignores tmp content"      $true  (Test-StateListingIgnored "600:0:0:f:p2pc/tmp/nvidia-cdi.abc.yaml")
+  Check "ignores boot-status"      $true  (Test-StateListingIgnored "600:0:0:f:p2pc/boot-status.json")
+  Check "ignores a boot-status temp" $true (Test-StateListingIgnored "600:0:0:f:p2pc/.boot-status.AbC123")
+  Check "keeps the identity key"   $false (Test-StateListingIgnored "600:0:0:f:p2pc/identity.key")
+  Check "keeps a nested tmp name"  $false (Test-StateListingIgnored "700:0:0:d:p2pc/jobs/tmp")
+  Check "keeps the root entry"     $false (Test-StateListingIgnored "700:0:0:d:p2pc")
+  Check "keeps the hub root entry" $false (Test-StateListingIgnored "700:0:0:d:p2pc-server")
+  Check "keeps the hub database"   $false (Test-StateListingIgnored "600:0:0:f:p2pc-server/p2pc.db")
+  Check "keeps the hub tmp (only p2pc-boot files of p2pc/ are skipped)" $false (Test-StateListingIgnored "700:0:0:d:p2pc-server/tmp")
+  Check "keeps a hub boot-status name" $false (Test-StateListingIgnored "600:0:0:f:p2pc-server/boot-status.json")
+  Check "ignores a socket"         $true  (Test-StateListingIgnored "755:0:0:s:p2pc/run/agent.sock")
+  Check "ignores a FIFO"           $true  (Test-StateListingIgnored "600:0:0:p:p2pc/jobs/ctl.fifo")
+  Check "ignores a nested socket"  $true  (Test-StateListingIgnored "600:0:0:s:p2pc/a/b/c.sock")
+  Check "ignores a hub socket"     $true  (Test-StateListingIgnored "600:0:0:s:p2pc-server/x.sock")
+  Check "keeps a file named like a type" $false (Test-StateListingIgnored "600:0:0:f:p2pc/s")
+  Check "keeps a directory"        $false (Test-StateListingIgnored "700:0:0:d:p2pc/jobs")
+  Check "keeps a symlink"          $false (Test-StateListingIgnored "777:0:0:l:p2pc/link")
+  # --- Get-StateListing: one find over /var/lib that lists p2pc and p2pc-server only, paths relative to /var/lib --------
+  function Invoke-InDistro { param([string[]]$Command) $script:listingArgs = $Command; return (New-Object psobject -Property @{ ExitCode = 0; Output = "700:0:0:d:p2pc`n600:0:0:f:p2pc/identity.key`n600:0:0:f:p2pc/boot-status.json`n700:0:0:d:p2pc-server`n600:0:0:f:p2pc-server/p2pc.db`n" }) }
+  $listing = Get-StateListing
+  Set-Item -Path function:local:Invoke-InDistro -Value $realInvokeInDistro
+  Check "listing: 26 arguments" 26 $script:listingArgs.Count
+  Check "listing: one find from /var/lib" "/usr/bin/find /var/lib -mindepth 1" (($script:listingArgs[0..3]) -join " ")
+  Check "listing: everything but p2pc and p2pc-server is pruned" "! -path /var/lib/p2pc ! -path /var/lib/p2pc/* ! -path /var/lib/p2pc-server ! -path /var/lib/p2pc-server/* -prune -o" (($script:listingArgs[4..17]) -join " ")
+  Check "listing: paths relative to /var/lib, no sockets or FIFOs" "! -type s ! -type p -printf %m:%U:%G:%y:%P\n" (($script:listingArgs[18..25]) -join " ")
+  Check "listing: four entries (the boot status file is not compared)" 4 @($listing).Count
+  foreach ($e in @("700:0:0:d:p2pc", "600:0:0:f:p2pc/identity.key", "700:0:0:d:p2pc-server", "600:0:0:f:p2pc-server/p2pc.db")) {
+      Check ("listing: compares " + $e) $true ($listing -ccontains $e)
+  }
   # --- Get-BackupsToPrune: keep the newest 3 COMPLETED backups, never touch a failed one ------------------------------
   $ok = @("p2pc-state-20261101120000.ok.tar","p2pc-state-20261102120000.ok.tar","p2pc-state-20261103120000.ok.tar","p2pc-state-20261104120000.ok.tar","p2pc-state-20261105120000.ok.tar")
   Check "keeps the newest 3, prunes the 2 oldest" "p2pc-state-20261102120000.ok.tar,p2pc-state-20261101120000.ok.tar" ((Get-BackupsToPrune -Names $ok -Keep 3) -join ",")
@@ -266,7 +308,7 @@ P2PC_PS1="$ps1" P2PC_README="$here/../README.md" pwsh -NoProfile -NonInteractive
   $stateBytes = [byte[]](1..250)
   $sha = [System.Security.Cryptography.SHA256]::Create()
   $stateHash = ([BitConverter]::ToString($sha.ComputeHash($stateBytes)) -replace "-", "").ToLowerInvariant()
-  $script:listBefore = @("700:0:0:d:", "600:0:0:f:identity.key")
+  $script:listBefore = @("700:0:0:d:p2pc", "600:0:0:f:p2pc/identity.key", "700:0:0:d:p2pc-server", "600:0:0:f:p2pc-server/p2pc.db")
   $script:listAfter = $script:listBefore
   $script:listCalls = 0
   $script:probeAnswer = "P2PC_STATE=present"
@@ -301,6 +343,9 @@ P2PC_PS1="$ps1" P2PC_README="$here/../README.md" pwsh -NoProfile -NonInteractive
           $script:oldVarConfig = "empty"
           return (& $ok "P2PC_CONFIG=created")
       }
+      if ($Command[0] -eq "/bin/sh" -and $Command[2] -eq $StateSizeScript) {
+          return (New-Object psobject -Property @{ ExitCode = $script:sizeExit; Output = $script:sizeAnswer })
+      }
       if ($Command[0] -eq "/bin/sh") { return (& $ok $script:probeAnswer) }
       if ($Command[0] -eq "/bin/grep" -and $Command[-1] -eq "/var/lib/p2pc/agent.toml") {
           $cfg = $script:oldVarConfig
@@ -328,7 +373,10 @@ P2PC_PS1="$ps1" P2PC_README="$here/../README.md" pwsh -NoProfile -NonInteractive
       $script:hashBackOverride = $null; $script:probeAnswer = "P2PC_STATE=present"; $script:unregExit = 0
       $script:oldVarConfig = "server"; $script:oldEtcConfig = $null; $script:newVarConfig = "empty"; $script:archived = $null
       $script:imported = $false; $script:migrationFails = $false; $script:restoreDropsConfig = $false; $script:nodeRunStatus = ""
+      $script:sizeExit = 0; $script:sizeAnswer = "16`t/var/lib/p2pc"; $script:freeBytes = [long]1TB; $script:freeAsked = @()
   }
+  # The free space of a volume, stubbed (no real drive is measured), and which volumes were asked about.
+  function Get-FreeBytes { param([string]$Root) $script:freeAsked += $Root; return $script:freeBytes }
   function Invoke-UpgradeSafely { try { Invoke-UpgradeAction (Join-Path $env:LOCALAPPDATA "distro") } catch { if ($_.Exception.Message -ne $script:FailMarker) { throw } } }
   # The task state and the agent status around the upgrade, stubbed (no Task Scheduler, no WSL, no real sleeps).
   $script:upgradeTaskState = "Running"
@@ -443,6 +491,63 @@ P2PC_PS1="$ps1" P2PC_README="$here/../README.md" pwsh -NoProfile -NonInteractive
   Invoke-UpgradeSafely
   Check "fail 23: exit code" 23 $script:ExitCode
   Check "fail 23: the old distro is untouched, so its task is started again" $true (($script:wslCalls -join "|").EndsWith("task:register-disabled|task:enable|task:start"))
+  # H2 8.3: the hub data without the agent state is never dropped, not even with -Force (it holds the whole cloud)
+  Reset-Upgrade
+  $script:probeAnswer = "P2PC_STATE=hub-only"
+  $Force = [switch]$true
+  Invoke-UpgradeSafely
+  $Force = [switch]$false
+  Check "hub data only: exit 23, even with -Force" 23 $script:ExitCode
+  Check "hub data only: nothing unregistered" 0 @($script:wslCalls | Where-Object { $_ -like "--unregister*" }).Count
+  Check "hub data only: nothing archived" 0 @($script:inDistro | Where-Object { $_ -like "/bin/bash -c *" }).Count
+  Check "hub data only: the message names the hub data" 1 @($script:logged | Where-Object { $_.Contains("/var/lib/p2pc-server") -and $_.Contains("NOT touched") }).Count
+  # review P2: the carried state is measured in the old distro first, and the upgrade refuses (23, nothing touched) when a
+  # volume cannot hold it: here 50 GB of hub data, 60 GB free, so 2 x 50 GB + 20 GB (-MinFreeGB) does not fit.
+  Reset-Upgrade
+  $script:sizeAnswer = "16`t/var/lib/p2pc`n52428800`t/var/lib/p2pc-server"
+  $script:freeBytes = [long]60GB
+  Invoke-UpgradeSafely
+  Check "no space: exit 23" 23 $script:ExitCode
+  Check "no space: nothing unregistered" 0 @($script:wslCalls | Where-Object { $_ -like "--unregister*" }).Count
+  Check "no space: nothing archived" 0 @($script:inDistro | Where-Object { $_ -like "/bin/bash -c *" }).Count
+  Check "no space: the config migration did not run either" 0 @($script:inDistro | Where-Object { $_.Contains("P2PC_CONFIG") }).Count
+  Check "no space: no backup file" 0 @(Get-StateBackupFiles $bd "Unfinished").Count
+  # 2 x (50 GB + 16 KB) + 20 GB, rounded up to whole GB
+  Check "no space: the message gives the sizes and says the old distro is untouched" 1 @($script:logged | Where-Object { $_.Contains("51200 MB") -and $_.Contains("121 GB needed") -and $_.Contains("60 GB free") -and $_.Contains("NOT touched") }).Count
+  Check "no space: the old distro is untouched, so its task is started again" $true (($script:wslCalls -join "|").EndsWith("task:enable|task:start"))
+  # ... and the same state fits with enough room (2 x 50 GB + 20 GB = 120 GB)
+  Reset-Upgrade
+  $script:sizeAnswer = "16`t/var/lib/p2pc`n52428800`t/var/lib/p2pc-server"
+  $script:freeBytes = [long]121GB
+  Invoke-UpgradeSafely
+  Check "room: the upgrade goes on" 0 $script:ExitCode
+  # the size cannot be measured: refused like the probe, nothing touched
+  Reset-Upgrade
+  $script:sizeExit = 1
+  $script:sizeAnswer = "du: cannot read"
+  Invoke-UpgradeSafely
+  Check "size unknown: exit 23" 23 $script:ExitCode
+  Check "size unknown: nothing unregistered" 0 @($script:wslCalls | Where-Object { $_ -like "--unregister*" }).Count
+  # with the hub data in the archive only ONE verified backup is kept (it can be as large as the cloud), and its size is
+  # printed; without it the newest 3 stay (the "upgrade ok" case above)
+  Reset-Upgrade
+  $script:sizeAnswer = "16`t/var/lib/p2pc`n2048`t/var/lib/p2pc-server"
+  foreach ($nm in @("p2pc-state-20261101000000.ok.tar", "p2pc-state-20261102000000.ok.tar", "p2pc-state-20260101000000.tar")) {
+      Set-Content -LiteralPath (Join-Path $bd $nm) -Value "old"
+  }
+  Invoke-UpgradeSafely
+  $okNames = @(Get-ChildItem -LiteralPath $bd -Filter "p2pc-state-*.ok.tar" -File | ForEach-Object { $_.Name })
+  Check "hub upgrade: exit 0" 0 $script:ExitCode
+  Check "hub upgrade: one verified backup kept" 1 $okNames.Count
+  Check "hub upgrade: it is the new one" $false ($okNames -contains "p2pc-state-20261102000000.ok.tar")
+  Check "hub upgrade: the failed backup is never pruned" $true (Test-Path -LiteralPath (Join-Path $bd "p2pc-state-20260101000000.tar"))
+  Check "hub upgrade: the log gives the state size" 1 @($script:logged | Where-Object { $_.Contains("State to carry: 2 MB") -and $_.Contains("/var/lib/p2pc-server 2 MB") }).Count
+  Check "hub upgrade: the log gives the backup size and says only it is kept" 1 @($script:logged | Where-Object { $_.Contains("Backup of the state (") -and $_.Contains(" MB") -and $_.Contains("only this verified backup is kept") }).Count
+  # the upgrade archives both directories (one archive, one listing)
+  Reset-Upgrade
+  Invoke-UpgradeSafely
+  Check "upgrade ok: the archive script carries /var/lib/p2pc-server too" 1 @($script:inDistro | Where-Object { $_ -like "/bin/bash -c *./p2pc-server*" }).Count
+  Check "upgrade ok: the log names both directories" 1 @($script:logged | Where-Object { $_.Contains("Exported /var/lib/p2pc and /var/lib/p2pc-server") }).Count
   # no task registered: the upgrade neither stops nor starts one
   Reset-Upgrade
   $script:taskRegistered = $false

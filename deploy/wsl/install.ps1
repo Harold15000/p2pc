@@ -50,11 +50,17 @@
 
   -Upgrade keeps the agent's identity AND its enrollment: all mutable node state lives in /var/lib/p2pc, the agent's
   config included (/var/lib/p2pc/agent.toml, named by P2PC_AGENT_CONFIG; images up to 0.2.1 kept it in
-  /etc/p2pc/agent.toml, and -Upgrade copies it over first). /var/lib/p2pc is exported from the old distro to a backup file under
+  /etc/p2pc/agent.toml, and -Upgrade copies it over first). On the PC that hosts the hub it also keeps the hub's data,
+  /var/lib/p2pc-server (H2 spec 8.3: the cloud's database, keys, blobs and hub.enabled). Both directories are exported
+  from the old distro to one backup file under
   %LOCALAPPDATA%\P2PC\backups (not %TEMP%, where Windows Storage Sense deletes old files), the old distro is
-  unregistered, the new image is imported, /var/lib/p2pc is restored with the same modes and owners, and the result
-  is verified. After a successful upgrade the backup is renamed to p2pc-state-<time>.ok.tar and only the newest 3 of
-  those are kept. The backup of an upgrade that failed is never deleted, and its path is printed.
+  unregistered, the new image is imported, both are restored with the same modes and owners, and the result
+  is verified. Before anything is touched it measures both directories in the old distro (du) and stops (23) unless
+  the Windows drives can hold the archive: the distro's drive about once more plus -MinFreeGB, the backup drive once
+  (twice plus -MinFreeGB when they are the same drive). After a successful upgrade the backup is renamed to
+  p2pc-state-<time>.ok.tar and only the newest 3 of those are kept, or only that one when it holds the hub's data (it
+  can be as large as the cloud's blobs); its size is printed. The backup of an upgrade that failed is never deleted,
+  and its path is printed.
 
   Exit codes
      0  success
@@ -74,10 +80,12 @@
     20  wsl --import failed
     21  verification of the new distro failed
     22  -Upgrade: p2pc-node is not installed
-    23  -Upgrade: exporting /var/lib/p2pc failed, or it could not be determined whether it exists, or it does
-        not exist and -Force was not given (the old distro is never touched in these cases)
+    23  -Upgrade: exporting /var/lib/p2pc (and /var/lib/p2pc-server) failed, or it could not be determined whether
+        /var/lib/p2pc exists, or it does not exist and -Force was not given, or /var/lib/p2pc-server exists without
+        it (with or without -Force), or their size cannot be measured, or the Windows drives have no room for the
+        archive (the old distro is never touched in these cases)
     24  -Upgrade: unregistering the old distro failed
-    25  -Upgrade: restoring /var/lib/p2pc failed
+    25  -Upgrade: restoring /var/lib/p2pc (and /var/lib/p2pc-server) failed
     26  -Upgrade: verification after restore failed (the exported state file is kept)
     27  -Uninstall: p2pc-node is not installed
     29  -Uninstall: wsl --unregister failed
@@ -166,17 +174,26 @@ $TaskName = 'P2PC node'
 # How long -Join waits for the agent to say "connected" once the task runs.
 $ConnectWaitSeconds = 60
 
+# What -Upgrade carries over (H2 spec 8.3): /var/lib/p2pc (the agent's identity, enrollment and state) and, on the PC
+# that hosts the hub, /var/lib/p2pc-server (the hub's database, keys, blobs and hub.enabled). Nothing else of /var/lib.
 # The probe for "does the agent state exist?": prints exactly one marker. Absent is only believed on a positive answer.
-$StateProbeScript = 'if [ -d /var/lib/p2pc ]; then echo P2PC_STATE=present; else echo P2PC_STATE=absent; fi'
+# The hub's data without the agent state is its own answer (hub-only): -Upgrade refuses it, with or without -Force.
+$StateProbeScript = 'if [ -d /var/lib/p2pc ]; then echo P2PC_STATE=present; elif [ -e /var/lib/p2pc-server ]; then echo P2PC_STATE=hub-only; else echo P2PC_STATE=absent; fi'
+# How much -Upgrade will carry, measured in the old distro before anything is touched (du -sk: KiB per directory, the
+# hub's line only when it exists). See Get-StateSize and Test-UpgradeSpace.
+$StateSizeScript = 'set -e; du -sk /var/lib/p2pc; if [ -e /var/lib/p2pc-server ]; then du -sk /var/lib/p2pc-server; fi'
 # The state archive, as a bash script run inside the distro. It WRITES the archive to a file inside the distro (@OUT@,
 # replaced by Get-StateArchiveScript with a validated path, mode 0600 through umask) and prints its SHA-256 there:
 # binary data is never streamed through PowerShell, which cannot be trusted to keep bytes (see Invoke-WslCopyOut). It
 # lists the files with find and hands the list to tar, because tar cannot exclude by file type: sockets and FIFOs are
 # left out (a socket cannot be archived, a FIFO would be re-created, and neither is identity; one of them would
-# otherwise make the before/after listing differ and fail every upgrade, exit 26). The boot step's own files (tmp/,
-# boot-status.json, .boot-status.*) are left out too: they are not identity and change at every start.
+# otherwise make the before/after listing differ and fail every upgrade, exit 26). The boot step's own files in p2pc
+# (tmp/, boot-status.json, .boot-status.*) are left out too: they are not identity and change at every start.
+# find starts at /var/lib and prunes every entry that is neither p2pc nor p2pc-server, so a node without the hub
+# directory archives p2pc alone (naming p2pc-server as a start point would fail there); %P keeps the member names
+# relative to /var/lib (p2pc/..., p2pc-server/...), as before.
 # One line, no double quote, no dollar sign, no backtick, no && (tests/test-install-archive.sh checks all of it).
-$StateArchiveScript = "set -e; set -o pipefail; umask 077; cd /var/lib; find p2pc -type s -prune -o -type p -prune -o -path p2pc/tmp -prune -o -path p2pc/boot-status.json -prune -o -path 'p2pc/.boot-status.*' -prune -o -print0 | tar --numeric-owner --no-recursion --null -T - -cpf @OUT@; sha256sum @OUT@"
+$StateArchiveScript = "set -e; set -o pipefail; umask 077; cd /var/lib; find . -mindepth 1 ! -path ./p2pc ! -path './p2pc/*' ! -path ./p2pc-server ! -path './p2pc-server/*' -prune -o -type s -prune -o -type p -prune -o -path ./p2pc/tmp -prune -o -path ./p2pc/boot-status.json -prune -o -path './p2pc/.boot-status.*' -prune -o -printf '%P\0' | tar --numeric-owner --no-recursion --null -T - -cpf @OUT@; sha256sum @OUT@"
 
 # Before the old distro is archived: when /var/lib/p2pc/agent.toml does not exist yet (an image up to 0.2.1), it is
 # created there, as a copy of /etc/p2pc/agent.toml (which holds [server] on a joined node) or empty, mode 0600, so the
@@ -732,10 +749,10 @@ function Test-NewDistro {
     return $first
 }
 
-# Parses the answer of the state probe (see $StateProbeScript). Returns 'present', 'absent' or 'unknown'.
+# Parses the answer of the state probe (see $StateProbeScript). Returns 'present', 'absent', 'hub-only' or 'unknown'.
 # 'absent' is a POSITIVE answer: the command exited 0 and printed exactly one marker line, and it was the absent one.
 # A transient error (the distro would not start, wsl.exe hiccuped, empty or garbled output) is 'unknown', which must
-# never be treated as "there is no agent identity to save".
+# never be treated as "there is no agent identity to save". 'hub-only': /var/lib/p2pc-server exists without /var/lib/p2pc.
 function Get-StateProbe {
     param([int]$ExitCode, [string]$Output)
     if ($ExitCode -ne 0) { return 'unknown' }
@@ -747,7 +764,71 @@ function Get-StateProbe {
     if ($markers.Count -ne 1) { return 'unknown' }
     if ($markers[0] -ceq 'P2PC_STATE=present') { return 'present' }
     if ($markers[0] -ceq 'P2PC_STATE=absent') { return 'absent' }
+    if ($markers[0] -ceq 'P2PC_STATE=hub-only') { return 'hub-only' }
     return 'unknown'
+}
+
+# Get-StateSize: the answer of $StateSizeScript as { AgentKB, HubKB ($null without the hub's data), TotalKB }, or $null
+# when the command failed or answered anything but one /var/lib/p2pc line and at most one /var/lib/p2pc-server line.
+# An unknown size is never "small enough": the caller refuses the upgrade.
+function Get-StateSize {
+    param([int]$ExitCode, [string]$Output)
+    if ($ExitCode -ne 0) { return $null }
+    $agent = @(); $hub = @()
+    foreach ($line in ($Output -split "`r?`n")) {
+        $t = $line.Trim()
+        if (-not $t) { continue }
+        $m = [regex]::Match($t, '^([0-9]+)\s+(/var/lib/p2pc|/var/lib/p2pc-server)$')
+        if (-not $m.Success) { return $null }
+        if ($m.Groups[2].Value -ceq '/var/lib/p2pc') { $agent += [long]$m.Groups[1].Value } else { $hub += [long]$m.Groups[1].Value }
+    }
+    if ($agent.Count -ne 1 -or $hub.Count -gt 1) { return $null }
+    $hubKB = $null
+    $total = $agent[0]
+    if ($hub.Count -eq 1) { $hubKB = $hub[0]; $total += $hubKB }
+    return New-Object psobject -Property @{ AgentKB = $agent[0]; HubKB = $hubKB; TotalKB = $total }
+}
+
+# Get-VolumeRoot <path>: the root of the volume that holds <path> (C:\ ...).
+function Get-VolumeRoot {
+    param([string]$Path)
+    return [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($Path))
+}
+
+# Get-FreeBytes <volume root>: the bytes this user may still write there.
+function Get-FreeBytes {
+    param([string]$Root)
+    return (New-Object System.IO.DriveInfo($Root)).AvailableFreeSpace
+}
+
+# Get-UpgradeSpaceNeeds: the bytes -Upgrade needs on each Windows volume, as root -> bytes. The archive is staged in the
+# old distro (whose virtual disk is on the distro's volume) and later restored into the new one there, and its copy goes
+# to the backup volume; the distro's volume also keeps -MinFreeGB for what runs afterwards (images, job data). On one
+# volume that is about twice the archive plus -MinFreeGB (review P2).
+function Get-UpgradeSpaceNeeds {
+    param([long]$StateBytes, [string]$DistroDir, [string]$BackupDir, [long]$MinFree)
+    $needs = [ordered]@{}
+    $d = Get-VolumeRoot $DistroDir
+    $b = Get-VolumeRoot $BackupDir
+    $needs[$d] = $StateBytes + $MinFree
+    if ($needs.Contains($b)) { $needs[$b] += $StateBytes } else { $needs[$b] = $StateBytes }
+    return $needs
+}
+
+# Test-UpgradeSpace: refuses the upgrade (23; nothing was touched yet) when a volume cannot hold what it needs.
+function Test-UpgradeSpace {
+    param($Size, [string]$DistroDir, [string]$BackupDir)
+    $stateBytes = [long]$Size.TotalKB * 1KB
+    $stateMB = [math]::Round($Size.TotalKB / 1024)
+    $needs = Get-UpgradeSpaceNeeds -StateBytes $stateBytes -DistroDir $DistroDir -BackupDir $BackupDir -MinFree ([long]$MinFreeGB * 1GB)
+    foreach ($root in @($needs.Keys)) {
+        $free = [long](Get-FreeBytes $root)
+        if ($free -lt $needs[$root]) {
+            Fail 23 ("Not enough free space on {0} for the upgrade: the state to carry is {1} MB (the agent state, and on the hub PC the hub's database and blobs). The drive of the distro holds the archive while it is made and restored, plus -MinFreeGB ({2} GB); the drive of %LOCALAPPDATA%\P2PC\backups holds its backup copy. {0}: {3} GB needed, {4} GB free. The old distro was NOT touched." -f $root, $stateMB, $MinFreeGB, [math]::Ceiling($needs[$root] / 1GB), [math]::Floor($free / 1GB)) @(
+                'Free some space on that drive, then run the upgrade again.')
+        }
+        Write-Log ("Free space on {0} for the upgrade: {1} GB, {2} GB needed: OK" -f $root, [math]::Floor($free / 1GB), [math]::Ceiling($needs[$root] / 1GB)) 'OK'
+    }
 }
 
 # Get-ConfigMigrationResult: the answer of $ConfigMigrationScript: 'present', 'moved' or 'created', or $null when the
@@ -765,12 +846,13 @@ function Get-ConfigMigrationResult {
     return $null
 }
 
-# What the state listing ignores: p2pc-boot rewrites boot-status.json and uses tmp/ at every distro start, and sockets
-# and FIFOs (type s and p) are not archived, so they must not be compared either (see $StateArchiveScript).
+# What the state listing ignores: p2pc-boot rewrites p2pc/boot-status.json and uses p2pc/tmp/ at every distro start,
+# and sockets and FIFOs (type s and p) are not archived, so they must not be compared either (see $StateArchiveScript).
+# Paths are relative to /var/lib; nothing of p2pc-server is ignored but its sockets and FIFOs.
 function Test-StateListingIgnored {
     param([string]$Line)
     if ($Line -match '^[0-9]+:[0-9]+:[0-9]+:[sp]:') { return $true }
-    return ($Line -match ':(tmp|tmp/.*|boot-status\.json|\.boot-status\..*)$')
+    return ($Line -match ':p2pc/(tmp|tmp/.*|boot-status\.json|\.boot-status\..*)$')
 }
 
 # Where the upgrade keeps the export of /var/lib/p2pc.
@@ -788,10 +870,12 @@ function Get-BackupsToPrune {
     return @($done | Select-Object -Skip $Keep)
 }
 
-# One line per entry: mode:uid:gid:type:path, sorted, so before/after can be compared exactly.
+# One line per entry: mode:uid:gid:type:path, sorted, so before/after can be compared exactly. It lists what the upgrade
+# carries: /var/lib/p2pc and, when it exists, /var/lib/p2pc-server (every other entry of /var/lib is pruned, as in
+# $StateArchiveScript), with paths relative to /var/lib (p2pc, p2pc/agent.toml, p2pc-server/...).
 function Get-StateListing {
     # Sockets and FIFOs are not archived (see $StateArchiveScript), so they are not listed.
-    $r = Invoke-InDistro @('/usr/bin/find', '/var/lib/p2pc', '!', '-type', 's', '!', '-type', 'p', '-printf', '%m:%U:%G:%y:%P\n')
+    $r = Invoke-InDistro @('/usr/bin/find', '/var/lib', '-mindepth', '1', '!', '-path', '/var/lib/p2pc', '!', '-path', '/var/lib/p2pc/*', '!', '-path', '/var/lib/p2pc-server', '!', '-path', '/var/lib/p2pc-server/*', '-prune', '-o', '!', '-type', 's', '!', '-type', 'p', '-printf', '%m:%U:%G:%y:%P\n')
     if ($r.ExitCode -ne 0) { return $null }
     # p2pc-boot rewrites boot-status.json and uses tmp/ every time the distro starts (including the start that runs
     # the verification), so those are not part of the identity and are left out of the before/after comparison.
@@ -846,7 +930,7 @@ function Invoke-UpgradeAction {
     $tarPath = Test-Image
     if ($CheckOnly) { return }
 
-    Confirm-Action ("This stops {0} (running jobs are lost and retried elsewhere), replaces its filesystem with the new image and restores /var/lib/p2pc (the agent identity)." -f $DistroName)
+    Confirm-Action ("This stops {0} (running jobs are lost and retried elsewhere), replaces its filesystem with the new image and restores /var/lib/p2pc (the agent identity) and, on the hub PC, /var/lib/p2pc-server (the hub's data)." -f $DistroName)
 
     # The Scheduled Task is disabled and stopped for the upgrade (so its 5-minute trigger cannot start the old or the
     # half-imported distro meanwhile), and enabled and started again when the node is back with its identity, or when
@@ -926,8 +1010,11 @@ function Invoke-UpgradeSteps {
     param([string]$TarPath, [string]$Dir)
     $tarPath = $TarPath
     $dir = $Dir
+    # Whether the archive holds /var/lib/p2pc-server (decides how many verified backups are kept).
+    $script:UpgradeCarriesHub = $false
 
-    # 1. Archive /var/lib/p2pc INSIDE the distro, hash it there, copy it out byte-exact (see the BINARY DATA RULE).
+    # 1. Archive /var/lib/p2pc (and /var/lib/p2pc-server, the hub's data, when it exists) INSIDE the distro, hash it
+    #    there, copy it out byte-exact (see the BINARY DATA RULE).
     $null = Invoke-Wsl @('--terminate', $DistroName)
     $inDistroTar = '/tmp/p2pc-state.tar'
     $backupDir = Get-BackupDir
@@ -942,6 +1029,11 @@ function Invoke-UpgradeSteps {
         Fail 23 'Could not tell whether /var/lib/p2pc exists in the old distro (the probe failed or answered nothing sensible). The old distro was NOT touched.' @(
             ("probe exit code {0}, output: {1}" -f $probe.ExitCode, $probe.Output), 'Check that the distro starts (wsl -d p2pc-node -u root --exec /bin/true), then run the upgrade again.')
     }
+    if ($probeResult -eq 'hub-only') {
+        # The hub's data is the whole cloud (its database, keys and blobs): never dropped, not even with -Force.
+        Fail 23 '/var/lib/p2pc-server (the hub data: the database, keys and blobs of your cloud) exists, but /var/lib/p2pc (the agent state) does not. This installer carries them only together. The old distro was NOT touched.' @(
+            'Back up /var/lib/p2pc-server by hand before you replace this distro (see deploy/README.md, "Recovering from a failed upgrade").')
+    }
     $hasState = ($probeResult -eq 'present')
     $before = $null
     $hashOutside = $null
@@ -953,6 +1045,19 @@ function Invoke-UpgradeSteps {
         }
         Write-Log '/var/lib/p2pc does not exist in the old distro (confirmed by the probe) and -Force was given: continuing without restoring anything. The node will have to re-enrol after the upgrade.' 'WARN'
     } else {
+        # Before anything is written: how much will be carried, and whether the Windows drives can hold it (review P2:
+        # on the hub PC the archive holds the cloud's blobs too). An unknown size or too little room stops here (23).
+        $sizeRun = Invoke-InDistro @('/bin/sh', '-c', $StateSizeScript)
+        $size = Get-StateSize -ExitCode $sizeRun.ExitCode -Output $sizeRun.Output
+        if ($null -eq $size) {
+            Fail 23 'Could not measure /var/lib/p2pc and /var/lib/p2pc-server in the old distro (du failed or answered nothing sensible). The old distro was NOT touched.' @(
+                ("exit code {0}, output: {1}" -f $sizeRun.ExitCode, $sizeRun.Output))
+        }
+        $hubText = ''
+        if ($null -ne $size.HubKB) { $hubText = (", /var/lib/p2pc-server {0} MB" -f [math]::Round($size.HubKB / 1024)) }
+        Write-Log ("State to carry: {0} MB (/var/lib/p2pc {1} MB{2})" -f [math]::Round($size.TotalKB / 1024), [math]::Round($size.AgentKB / 1024), $hubText) 'INFO'
+        Test-UpgradeSpace -Size $size -DistroDir $dir -BackupDir $backupDir
+        $script:UpgradeCarriesHub = ($null -ne $size.HubKB)
         # The agent's config (and [server], the enrollment) into /var/lib/p2pc first, so that the archive carries it.
         $mig = Invoke-InDistro @('/bin/sh', '-c', $ConfigMigrationScript)
         $migResult = Get-ConfigMigrationResult -ExitCode $mig.ExitCode -Output $mig.Output
@@ -962,14 +1067,14 @@ function Invoke-UpgradeSteps {
         if ($migResult -eq 'moved') { Write-Log ('Copied /etc/p2pc/agent.toml (the enrollment of an image up to 0.2.1) to {0}, so the upgrade carries it.' -f $AgentConfigPath) 'OK' }
         $script:UpgradeWasEnrolled = (Test-ServerSection)
         $before = Get-StateListing
-        if ($null -eq $before) { Fail 23 'Could not list /var/lib/p2pc in the old distro.' }
+        if ($null -eq $before) { Fail 23 'Could not list /var/lib/p2pc and /var/lib/p2pc-server in the old distro.' }
         New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
         try {
             # The archive (mode 0600, umask 077) is made and hashed inside the distro; nothing binary reaches PowerShell.
             $a = Invoke-InDistro @('/bin/bash', '-c', (Get-StateArchiveScript $inDistroBackup))
             $m = [regex]::Match($a.Output, '(?m)^([0-9a-f]{64})  ' + [regex]::Escape($inDistroBackup) + '\s*$')
             if ($a.ExitCode -ne 0 -or -not $m.Success) {
-                Fail 23 'Could not archive /var/lib/p2pc inside the old distro. The old distro was NOT touched.' @($a.Output)
+                Fail 23 'Could not archive /var/lib/p2pc and /var/lib/p2pc-server inside the old distro. The old distro was NOT touched.' @($a.Output)
             }
             $hashInside = $m.Groups[1].Value
             $x = Invoke-WslCopyOut -LinuxPath $inDistroBackup -WinPath $stateFile
@@ -987,7 +1092,7 @@ function Invoke-UpgradeSteps {
             # On every path: the archive holds the identity key and must not stay in the old distro's /var/tmp.
             $null = Invoke-InDistro @('/bin/rm', '-f', $inDistroBackup)
         }
-        Write-Log ("Exported /var/lib/p2pc to {0}, SHA-256 {1} (this file holds the agent's identity key: it is kept until the upgrade is verified, and the newest {2} verified backups are kept after that)" -f $stateFile, $hashOutside, $BackupKeep) 'OK'
+        Write-Log ("Exported /var/lib/p2pc and /var/lib/p2pc-server (when this PC hosts the hub) to {0}, SHA-256 {1} (this file holds the agent's identity key, and on the hub PC the cloud's database and keys: it is kept until the upgrade is verified, and the newest {2} verified backups are kept after that)" -f $stateFile, $hashOutside, $BackupKeep) 'OK'
         # From here on the file is the only copy of the identity once the old distro is gone: Main prints its path if the run does not end well.
         $script:StateBackup = $stateFile
     }
@@ -1009,8 +1114,8 @@ function Invoke-UpgradeSteps {
     # A new image: whether it keeps the config in /var/lib/p2pc is asked again.
     $script:NewConfigLayout = $null
 
-    # 3. Restore /var/lib/p2pc with the same modes and owners: stream the file into the new distro, check its hash
-    #    there, then extract it.
+    # 3. Restore /var/lib/p2pc (and /var/lib/p2pc-server) with the same modes and owners: stream the file into the new
+    #    distro, check its hash there, then extract it.
     if ($hasState) {
         try {
             # Create the file first, mode 0600 (it is the agent identity), then stream into it: dd truncates and keeps the mode.
@@ -1021,7 +1126,7 @@ function Invoke-UpgradeSteps {
             $hashBack = Get-DistroFileHash $inDistroTar
             if ($hashBack -ne $hashOutside) { Fail 25 'The state file was corrupted on its way into the new distro.' @(("State file kept: {0}" -f $stateFile)) }
             $r = Invoke-InDistro @('/bin/tar', '--numeric-owner', '-C', '/var/lib', '-xpf', $inDistroTar)
-            if ($r.ExitCode -ne 0) { Fail 25 'Could not restore /var/lib/p2pc.' @($r.Output, ("State file kept: {0}" -f $stateFile)) }
+            if ($r.ExitCode -ne 0) { Fail 25 'Could not restore /var/lib/p2pc and /var/lib/p2pc-server.' @($r.Output, ("State file kept: {0}" -f $stateFile)) }
         } finally {
             # On every path (success, any Fail, any exception): the copy of the identity must not stay in the new distro's /tmp.
             $null = Invoke-InDistro @('/bin/rm', '-f', $inDistroTar)
@@ -1045,23 +1150,31 @@ function Invoke-UpgradeSteps {
     }
     $after = Get-StateListing
     if ($null -eq $after -or (($before -join "`n") -ne ($after -join "`n"))) {
-        Fail 26 '/var/lib/p2pc after the restore differs from before (names, modes or owners).' @(("State file kept: {0}" -f $stateFile))
+        Fail 26 '/var/lib/p2pc or /var/lib/p2pc-server after the restore differs from before (names, modes or owners).' @(("State file kept: {0}" -f $stateFile))
     }
     # The enrollment must have come along: a node that was joined must still hold [server] where the new agent reads it.
     if ($script:UpgradeWasEnrolled -and -not (Test-ServerSection)) {
         Fail 38 ('The node was enrolled, but after the upgrade {0} holds no [server]: the agent would stop with exit 8.' -f $AgentConfigPath) @(
             ("State file kept: {0}" -f $stateFile), 'Enroll it again with a new token from p2pc join-token create:   .\install.ps1 -Join -Force')
     }
-    # Verified: mark the backup as completed (the only kind that is ever pruned) and keep the newest $BackupKeep of them.
+    # Verified: mark the backup as completed (the only kind that is ever pruned) and keep the newest $BackupKeep of them,
+    # or only this one when it holds the hub's data (it can be as large as the cloud's blobs; review P2).
     $doneFile = $stateFile -replace '\.tar$', '.ok.tar'
     Move-Item -LiteralPath $stateFile -Destination $doneFile -Force
     $script:StateBackup = $null
-    $names = @(Get-ChildItem -LiteralPath $backupDir -Filter 'p2pc-state-*.ok.tar' -File -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
-    foreach ($old in @(Get-BackupsToPrune -Names $names -Keep $BackupKeep)) {
-        Remove-Item -LiteralPath (Join-Path $backupDir $old) -Force -ErrorAction SilentlyContinue
-        Write-Log ("Removed the old state backup {0} (only the newest {1} are kept)." -f $old, $BackupKeep) 'DEBUG'
+    $keep = $BackupKeep
+    $keptText = ("the newest {0} verified backups are kept" -f $BackupKeep)
+    if ($script:UpgradeCarriesHub) {
+        $keep = 1
+        $keptText = 'it holds the hub data, so only this verified backup is kept'
     }
-    Write-Log ("Upgrade complete; /var/lib/p2pc restored identically ({0} entries). Backup of the agent state (holds the identity key): {1}" -f $after.Count, $doneFile) 'OK'
+    $names = @(Get-ChildItem -LiteralPath $backupDir -Filter 'p2pc-state-*.ok.tar' -File -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+    foreach ($old in @(Get-BackupsToPrune -Names $names -Keep $keep)) {
+        Remove-Item -LiteralPath (Join-Path $backupDir $old) -Force -ErrorAction SilentlyContinue
+        Write-Log ("Removed the old state backup {0} (only the newest {1} are kept)." -f $old, $keep) 'DEBUG'
+    }
+    $backupMB = [math]::Round((Get-Item -LiteralPath $doneFile).Length / 1MB)
+    Write-Log ("Upgrade complete; /var/lib/p2pc (and /var/lib/p2pc-server, if any) restored identically ({0} entries). Backup of the state ({1} MB; holds the identity key, and the hub's data on the hub PC; {2}): {3}" -f $after.Count, $backupMB, $keptText, $doneFile) 'OK'
     $script:UpgradeDone = $true
     Show-BootStatus
 }
