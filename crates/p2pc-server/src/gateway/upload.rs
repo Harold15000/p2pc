@@ -1,8 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Upload streams of `p2pc/agent/1` (spec §6 "Uploads"): every bidirectional stream an enrolled, connected agent
-//! opens after its control stream carries one output file.
+//! Agent-opened streams of `p2pc/agent/1`: every bidirectional stream an enrolled, connected agent opens after its
+//! control stream. Its first frame is a header (H2 §6.1 "New streams on an agent connection"), dispatched here:
 //!
+//! - **without a `type`**: an H1 `UploadHeader`, one output file (spec §6 "Uploads"), unchanged, below;
+//! - **`blob_fetch`**: a `BlobFetch`, served by [`super::blob_fetch`], at most
+//!   [`MAX_BLOB_FETCHES_PER_CONNECTION`] at once per connection;
+//! - **any other `type`**: the stream is reset with `unsupported_stream`
+//!   ([`STREAM_RESET_UNSUPPORTED_STREAM`]), never the connection.
+//!
+//! **Uploads.**
 //! The stream starts with an `UploadHeader` frame (at most 1 MiB, decoded under the global decode cap), then exactly
 //! `size` raw bytes, then the end of the agent's side. The server answers one `UploadAck` frame and finishes its
 //! side. What is checked, and where the bytes go, is [`crate::outputs`]. A stale epoch also gets `Cancel` on the
@@ -13,26 +20,29 @@ use std::sync::Arc;
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
 use p2pc_proto::ids::NodeId;
 use p2pc_proto::protocol::{
-    MAX_FRAME_LEN, ServerMsg, UploadAck, UploadHeader, read_frame_bytes, upload_reason, write_frame,
+    AgentStreamHeader, MAX_BLOB_FETCHES_PER_CONNECTION, MAX_FRAME_LEN, STREAM_RESET_UNSUPPORTED_STREAM, ServerMsg,
+    UploadAck, UploadHeader, decode_agent_stream_header, read_frame_bytes, upload_reason, write_frame,
 };
 
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::Inner;
 use crate::outputs::{self, Begun};
 use crate::scheduler::code;
 
-/// Accepts upload streams on `conn` until it closes; each is handled in its own task.
+/// Accepts agent-opened streams on `conn` until it closes; each is handled in its own task.
 ///
 /// A node may have at most `headers_per_node` streams (across its connections) whose header is still being read
 /// (review P3): each such read may buffer up to 1 MiB for up to 30 s. A stream beyond that is answered
 /// `too_many_uploads` at once, with nothing read from it.
 pub(super) async fn accept(inner: Arc<Inner>, conn: Connection, node_id: NodeId) {
     let headers = inner.upload_headers(node_id);
+    // H2 §6.1 "Limits": the blob fetches of this connection.
+    let fetches = Arc::new(Semaphore::new(MAX_BLOB_FETCHES_PER_CONNECTION));
     while let Ok((send, recv)) = conn.accept_bi().await {
         match headers.clone().try_acquire_owned() {
             Ok(permit) => {
-                tokio::spawn(handle(inner.clone(), node_id, send, recv, permit));
+                tokio::spawn(handle(inner.clone(), node_id, send, recv, permit, fetches.clone()));
             }
             Err(_) => {
                 let idle = inner.limits.uploads.idle;
@@ -50,22 +60,37 @@ pub(super) async fn accept(inner: Arc<Inner>, conn: Connection, node_id: NodeId)
 async fn handle(
     inner: Arc<Inner>,
     node_id: NodeId,
-    send: SendStream,
+    mut send: SendStream,
     mut recv: RecvStream,
     header_slot: OwnedSemaphorePermit,
+    fetches: Arc<Semaphore>,
 ) {
     let limits = inner.limits.uploads;
     let header = match tokio::time::timeout(limits.idle, read_frame_bytes(&mut recv, MAX_FRAME_LEN)).await {
-        Ok(Ok(Some(body))) => match inner.decodes.decode::<UploadHeader>(&body).await {
-            Some(Ok(h)) => Some(h),
-            _ => None,
-        },
+        Ok(Ok(Some(body))) => inner
+            .decodes
+            .decode_with(|| decode_agent_stream_header(&body))
+            .await
+            .and_then(Result::ok),
         _ => None,
     };
-    // The header is read: the slot goes to the next stream (the body is bounded by the upload slots).
+    // The header is read: the slot goes to the next stream (the body is bounded by the upload slots, a fetch by the
+    // connection's fetch slots).
     drop(header_slot);
     let ack = match header {
-        Some(h) => upload(&inner, node_id, &h, &mut recv).await,
+        Some(AgentStreamHeader::Upload(h)) => upload(&inner, node_id, &h, &mut recv).await,
+        Some(AgentStreamHeader::BlobFetch(fetch)) => {
+            super::blob_fetch::serve(&inner, node_id, &fetch, send, recv, &fetches).await;
+            return;
+        }
+        Some(AgentStreamHeader::Unknown) => {
+            // H2 §6.1: the stream, never the connection.
+            let code = VarInt::from_u32(STREAM_RESET_UNSUPPORTED_STREAM);
+            let _ = send.reset(code);
+            let _ = recv.stop(code);
+            return;
+        }
+        // Unreadable, or not a header (H1: an upload with an invalid header).
         None => UploadAck::refused(upload_reason::INVALID_HEADER),
     };
     answer(send, recv, ack, limits.idle).await;

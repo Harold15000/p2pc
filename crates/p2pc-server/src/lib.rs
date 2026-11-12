@@ -23,6 +23,8 @@ pub mod app;
 pub mod artifacts_api;
 pub mod audit_queue;
 pub mod auth;
+pub mod blobs;
+pub mod blobs_api;
 pub mod clock;
 pub mod config;
 mod conn;

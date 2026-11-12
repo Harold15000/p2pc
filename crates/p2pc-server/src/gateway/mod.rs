@@ -24,6 +24,7 @@
 //! Later tasks plug in through [`LeaseReconciler`] (T06) and [`NodeEvents`] (T06, T10).
 
 mod agent;
+mod blob_fetch;
 pub mod device;
 pub mod endpoint;
 pub mod hub;
@@ -577,7 +578,11 @@ async fn accept_on(inner: &Arc<Inner>, ep: &Endpoint) {
 }
 
 async fn sweep_loop(inner: Arc<Inner>) {
-    let mut tick = tokio::time::interval(inner.limits.sweep_interval);
+    // The first sweep one interval after the start, not at once: `interval`'s immediate first tick ran it at an
+    // arbitrary moment after `Gateway::start`, which raced with tests that set the interval out of reach and call the
+    // sweep themselves.
+    let every = inner.limits.sweep_interval;
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
