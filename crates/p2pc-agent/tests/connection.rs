@@ -22,6 +22,8 @@ use p2pc_agent::connection::streams::{HubRecv, HubSend, HubStream, PortIo, PortO
 use p2pc_agent::connection::transport::{ConnectError, Connector, Link};
 use p2pc_agent::connection::watchdog::Watchdog;
 use p2pc_agent::connection::{BoxFuture, Uplink, exit};
+use p2pc_agent::executor::SystemClock;
+use p2pc_agent::volumes::{StoreConfig, VolumeStore, dir_name};
 use p2pc_proto::api::Inventory;
 use p2pc_proto::ids::{AccountId, LeaseId, NodeId};
 use p2pc_proto::net::{AddressChange, SelectedAddr};
@@ -282,6 +284,10 @@ struct Options {
     ports: Option<Arc<dyn PortOpener>>,
     /// Where the streams the fake server opens arrive.
     incoming: Option<Arc<dyn StreamAcceptor>>,
+    /// The node's owner, when the test needs it before the daemon starts (to open its volumes).
+    owner: Option<AccountId>,
+    /// The node's volumes (H2 §11.3); `None` is an agent that declares no `volumes`.
+    volumes: Option<VolumeStore>,
 }
 
 impl Default for Options {
@@ -293,12 +299,14 @@ impl Default for Options {
             earlier_state: None,
             ports: None,
             incoming: None,
+            owner: None,
+            volumes: None,
         }
     }
 }
 
 fn start(opts: Options) -> World {
-    let owner = AccountId::generate();
+    let owner = opts.owner.unwrap_or_else(AccountId::generate);
     let (acc_tx, accepted) = mpsc::unbounded_channel();
     let connector = Arc::new(PipeConnector {
         accepted: acc_tx,
@@ -341,6 +349,7 @@ fn start(opts: Options) -> World {
         decisions: Arc::new(Semaphore::new(MAX_PENDING_DECISIONS)),
         uplink: Uplink::new(),
         ports: opts.ports,
+        volumes: opts.volumes,
     };
     let daemon = Daemon {
         shared,
@@ -888,8 +897,8 @@ async fn drain_and_resume_reach_the_supervisor_and_unknown_messages_are_ignored(
     w.shutdown().await;
 }
 
-/// H2 §6.1 before the agent uses them: `VolumeDelete` and `NodeApproved` are ignored, like an unknown type, and
-/// nothing closes.
+/// H2 §6.1: `NodeApproved` is not used yet, and `VolumeDelete` is for agents that declared `volumes`: an agent
+/// that did not ignores both, like an unknown type, and nothing closes.
 #[tokio::test(start_paused = true)]
 async fn h2_server_messages_are_ignored_for_now() {
     let mut w = start(Options::default());
@@ -1460,6 +1469,257 @@ async fn the_servers_streams_are_served_only_after_the_welcome_and_end_with_the_
     write_frame(&mut again.to_agent, &port_open).await.unwrap();
     let ack: Value = read_frame(&mut again.from_agent, MAX_FRAME_LEN).await.unwrap().unwrap();
     assert_eq!(ack, json!({"ok": true}));
+    let (_task, _rx) = s.serve(true);
+    assert_eq!(w.shutdown().await, DaemonExit::Shutdown);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Volumes (H2 §6.1, §11.3)
+
+/// The node's volumes in `dir`, for `owner`, with `budget_mb` of volume space.
+fn volume_store(dir: &std::path::Path, owner: AccountId, budget_mb: u64) -> VolumeStore {
+    VolumeStore::open(StoreConfig {
+        data_dir: dir.to_path_buf(),
+        owner,
+        budget_mb,
+        retention_days: 30,
+        entry_budget: 1000,
+        clock: Arc::new(SystemClock),
+    })
+    .unwrap()
+}
+
+/// A volume that a lease used and left: on disk, unused. `extra` says what kind of job the lease had.
+fn used_volume(store: &VolumeStore, owner: &AccountId, extra: Value, name: &str) {
+    let job = serde_json::from_value(volume_job(extra, name)).unwrap();
+    let lease = LeaseId::generate();
+    store.reserve(lease, 1, owner, &job).unwrap();
+    store.lock_and_check(&lease, 1).unwrap();
+    assert!(store.release(&lease, 1));
+}
+
+/// A job with one volume called `name`; `extra` says what kind of job it is.
+fn volume_job(extra: Value, name: &str) -> Value {
+    let mut job = json!({
+        "image": "docker.io/library/python:3.12-slim",
+        "command": ["python", "-m", "http.server", "8080"],
+        "resources": {"cpu": 1, "memory_mb": 512},
+        "volumes": [{"name": name, "mount": "/volumes/models", "max_mb": 64}],
+    });
+    if extra["kind"] == "service" {
+        job["service"] = json!({"ports": [{"port": 8080, "name": "web"}]});
+    }
+    for (key, value) in extra.as_object().unwrap() {
+        job[key] = value.clone();
+    }
+    job
+}
+
+/// Longest (virtual) wait of [`ServerEnd::recv_acking`] and [`answer_of`]: well over the 10 minutes between two
+/// volume reports, and short enough that a test waiting for a message that never comes fails at once instead of
+/// acknowledging heartbeats for ever under the paused clock.
+const RECV_DEADLINE: Duration = Duration::from_secs(30 * 60);
+
+impl ServerEnd {
+    /// The next agent message that is not a heartbeat, acknowledging the heartbeats on the way (a server that
+    /// stays silent is dropped). Panics after [`RECV_DEADLINE`] of virtual time without one.
+    async fn recv_acking(&mut self) -> Value {
+        let next = async {
+            loop {
+                let m = self.recv().await.expect("the agent closed the connection");
+                if m["type"] != "heartbeat" {
+                    return m;
+                }
+                let seq = m["seq"].clone();
+                self.send(json!({"type": "heartbeat_ack", "seq": seq})).await;
+            }
+        };
+        tokio::time::timeout(RECV_DEADLINE, next)
+            .await
+            .expect("no message but heartbeats before the deadline")
+    }
+}
+
+/// The helper gives up: with nothing but heartbeats coming, it fails after its deadline of virtual time instead of
+/// spinning until something outside kills the test.
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "no message but heartbeats before the deadline")]
+async fn recv_acking_gives_up_after_its_deadline() {
+    let mut w = start(Options::default());
+    let mut s = w.next_connection().await;
+    let _ = s.handshake(w.owner).await;
+    let started = Instant::now();
+    // The whole test is bounded in real time too, in case the bound itself is what broke.
+    let _ = tokio::time::timeout(RECV_DEADLINE * 2, s.recv_acking()).await;
+    unreachable!("recv_acking returned after {:?}", started.elapsed());
+}
+
+/// H2 §6.1: an agent with volume space declares `volumes` and takes leases whose job has volumes; one without is as
+/// before: no capability, and such a lease is `invalid_job` before any handler sees it. With or without, a batch job
+/// that is not a template job never gets a volume (SI-H2-9), and a template's volume only goes to that template.
+#[tokio::test(start_paused = true)]
+async fn volumes_is_declared_and_leases_with_volumes_are_taken_only_with_a_volume_store() {
+    for with_volumes in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = AccountId::generate();
+        let recorder = Arc::new(Recorder::default());
+        let mut w = start(Options {
+            handler: recorder.clone(),
+            ports: Some(Arc::new(EchoPorts::default()) as Arc<dyn PortOpener>),
+            owner: Some(owner),
+            volumes: with_volumes.then(|| volume_store(dir.path(), owner, 1024)),
+            ..Options::default()
+        });
+        let mut s = w.next_connection().await;
+        let hello = s.handshake(owner).await;
+        let expected = if with_volumes {
+            json!(["service_jobs", "volumes"])
+        } else {
+            json!(["service_jobs"])
+        };
+        assert_eq!(hello["features"], expected, "with_volumes = {with_volumes}");
+        let rejected =
+            |id: LeaseId| json!({"type": "lease_rejected", "lease_id": id, "epoch": 1, "reason": "invalid_job"});
+        let accepted = |id: LeaseId| json!({"type": "lease_accepted", "lease_id": id, "epoch": 1});
+
+        // A service with a volume, and the batch job of a template with that template's volume.
+        let service = volume_job(json!({"kind": "service"}), "models");
+        let template = volume_job(
+            json!({"template": {"id": "transcribe", "version": 1}}),
+            "tpl:transcribe/models",
+        );
+        let mut taken = Vec::new();
+        for job in [service, template] {
+            let (id, lease) = lease_msg(owner, job);
+            s.send(lease).await;
+            let answer = answer_of(&mut s).await;
+            if with_volumes {
+                assert_eq!(answer, accepted(id));
+                taken.push(id);
+            } else {
+                assert_eq!(answer, rejected(id));
+            }
+        }
+        assert_eq!(*recorder.offers.lock().unwrap(), taken);
+
+        // Never, whatever the agent has: a batch job that is not a template job, a template's volume on a plain
+        // service or on another template's job, and a name that is a path.
+        let refused = [
+            volume_job(json!({}), "data"),
+            volume_job(json!({"kind": "service"}), "tpl:transcribe/models"),
+            volume_job(
+                json!({"template": {"id": "private-chat", "version": 1}}),
+                "tpl:transcribe/models",
+            ),
+            volume_job(json!({"kind": "service"}), "../../etc"),
+            volume_job(json!({"kind": "service"}), "a/b"),
+        ];
+        for job in refused {
+            let (id, lease) = lease_msg(owner, job.clone());
+            s.send(lease).await;
+            assert_eq!(answer_of(&mut s).await, rejected(id), "{job}");
+        }
+        assert_eq!(
+            *recorder.offers.lock().unwrap(),
+            taken,
+            "no handler saw a refused lease"
+        );
+        let (_task, _rx) = s.serve(true);
+        assert_eq!(w.shutdown().await, DaemonExit::Shutdown);
+    }
+}
+
+/// The next answer to a lease, skipping the session's volume reports. Bounded like [`ServerEnd::recv_acking`]: the
+/// reports alone would keep it going.
+async fn answer_of(s: &mut ServerEnd) -> Value {
+    let answer = async {
+        loop {
+            let m = s.recv_acking().await;
+            if m["type"] != "volume_report" {
+                return m;
+            }
+        }
+    };
+    tokio::time::timeout(RECV_DEADLINE, answer)
+        .await
+        .expect("no answer to the lease before the deadline")
+}
+
+/// H2 §6.1: `VolumeReport` after `Hello` (once welcomed), every 10 minutes, and in answer to `VolumeDelete`, which
+/// deletes a volume no lease uses. Nothing of it before the `Welcome`.
+#[tokio::test(start_paused = true)]
+async fn volume_reports_follow_the_welcome_and_answer_volume_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let owner = AccountId::generate();
+    let store = volume_store(dir.path(), owner, 1024);
+    used_volume(&store, &owner, json!({"kind": "service"}), "cache");
+    // A template's volume, left by a service of that template.
+    let chat = json!({"kind": "service", "template": {"id": "private-chat", "version": 1}});
+    used_volume(&store, &owner, chat, "tpl:private-chat/models");
+    let held = LeaseId::generate();
+    let job = serde_json::from_value(volume_job(json!({"kind": "service"}), "held")).unwrap();
+    store.reserve(held, 1, &owner, &job).unwrap();
+    store.lock_and_check(&held, 1).unwrap();
+    let volume_dir = |name: &str| dir.path().join("volumes").join(owner.to_string()).join(dir_name(name));
+
+    let mut w = start(Options {
+        owner: Some(owner),
+        volumes: Some(store.clone()),
+        ..Options::default()
+    });
+    let mut s = w.next_connection().await;
+    // `Hello` first; no report before the `Welcome`.
+    assert_eq!(s.recv().await.unwrap()["type"], "hello");
+    s.welcome(owner, 60).await;
+    let names = |report: &Value| -> Vec<(String, Value)> {
+        assert_eq!(report["type"], "volume_report", "{report}");
+        report["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| (v["name"].as_str().unwrap().to_string(), v["in_use_by"].clone()))
+            .collect()
+    };
+    let all = [
+        ("cache".to_string(), Value::Null),
+        ("held".to_string(), json!(held)),
+        ("tpl:private-chat/models".to_string(), Value::Null),
+    ];
+    let first = s.recv_acking().await;
+    assert_eq!(names(&first), all);
+    assert!(first["volumes"][0]["size_mb"].is_u64() && first["volumes"][0]["last_used_at"].is_string());
+
+    // Every 10 minutes.
+    let before = Instant::now();
+    assert_eq!(names(&s.recv_acking().await), all);
+    let waited = before.elapsed();
+    assert!(
+        (Duration::from_secs(590)..=Duration::from_secs(630)).contains(&waited),
+        "{waited:?}"
+    );
+
+    // `VolumeDelete` of a `tpl:` volume that no lease uses: it goes, and a fresh report answers.
+    s.send(json!({"type": "volume_delete", "name": "tpl:private-chat/models"}))
+        .await;
+    assert_eq!(names(&s.recv_acking().await), all[..2]);
+    assert!(!volume_dir("tpl:private-chat/models").exists());
+    // A volume in use is never deleted, and a name that is a path deletes nothing; both are answered.
+    for name in ["held", "../../etc", "unknown"] {
+        s.send(json!({"type": "volume_delete", "name": name})).await;
+        assert_eq!(names(&s.recv_acking().await), all[..2], "{name}");
+    }
+    assert!(volume_dir("held").join("data").exists());
+    assert!(volume_dir("cache").exists());
+
+    // The lease ended and Podman confirmed its container gone: a report at once.
+    assert!(store.release(&held, 1));
+    let after = names(&s.recv_acking().await);
+    assert_eq!(after[1], ("held".to_string(), Value::Null));
+    assert_eq!(
+        w.connector.attempts.lock().unwrap().len(),
+        1,
+        "one connection all along"
+    );
     let (_task, _rx) = s.serve(true);
     assert_eq!(w.shutdown().await, DaemonExit::Shutdown);
 }

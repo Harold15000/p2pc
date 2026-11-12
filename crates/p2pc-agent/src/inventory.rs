@@ -12,6 +12,11 @@
 //! 2. [`Probe::report`] applies the owner's share limits ([`crate::config::Share::resolve`]), builds the wire
 //!    [`Inventory`] and validates it with `p2pc-proto`, exactly as the server will.
 //!
+//! **The volume share** (H2 §8.2, §11.3). `share.volumes_mb` is resolved with the rest of the share and kept in
+//! [`LocalDetails::share`]: it is the budget of the node's volume store ([`crate::node::build`]), and
+//! `p2pc-agent inventory --json` shows it. It is not in the wire [`Inventory`]: `Inventory.volumes_mb` comes with the
+//! `share_update` capability (H2 §6.1), which this agent does not declare.
+//!
 //! The agent never installs or changes anything here.
 
 use std::collections::BTreeSet;
@@ -667,10 +672,20 @@ impl Probe {
                     memory_mb: 0,
                     gpus: Vec::new(),
                     disk_mb: 0,
+                    volumes_mb: 0,
                     warnings: vec!["nothing is offered: the RAM size is unknown".into()],
                 },
             ),
         };
+        // H2 §11.3: a volume share below the smallest volume mounts nothing, so the node declares no `volumes`.
+        // Say so here, where the owner looks (`p2pc-agent inventory`, `doctor`), instead of leaving it to be guessed.
+        let smallest = *crate::volumes::VOLUME_MB_RANGE.start();
+        if (1..smallest).contains(&share.volumes_mb) {
+            share.warnings.push(format!(
+                "volumes are not mounted: share.volumes_mb is {} MiB, less than the smallest volume ({smallest} MiB)",
+                share.volumes_mb
+            ));
+        }
         let gpu_status = self.gpu_status();
         // Podman reaches a GPU only through a CDI spec: without one, offering it would only make GPU jobs fail.
         if gpu_status.status == GpuStatusKind::CdiMissing && !share.gpus.is_empty() {

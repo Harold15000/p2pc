@@ -1,0 +1,8 @@
+# The bundle's own fields (H2 spec §7.6 "Bundle"). `scripts/templates-bundle` compiles the templates in this directory
+# into `templates.json` with these two values.
+#
+# Raise `bundle_version` in every change to a template (a new digest included): the hub refuses a bundle below the
+# highest one it has loaded. `min_hub_version` is the oldest hub that may load the bundle: raise it only when a
+# template needs something older hubs do not have.
+bundle_version = 1
+min_hub_version = "0.1.0"

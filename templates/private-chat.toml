@@ -1,0 +1,135 @@
+# Private AI chat: Ollama as a service (H2 spec §7.6 "Templates shipped with the beta").
+#
+# The image and the egress hosts were checked on a test node (plain Podman 4.9.3, through a logging CONNECT proxy, the
+# HTTPS_PROXY path): Ollama 0.40.16 (5.10 GB on disk) pulled a model through `registry.ollama.ai`, `ollama.com` and the
+# object-storage host below, and no other. A 16 GB GPU ran `qwen3:4b` (2.4 GB) at 163 tokens/s with 5.0 GB of VRAM, and
+# `qwen3:4b-instruct` (Apache-2.0, 2.4 GB) at 178 tokens/s.
+#
+# Ollama images must be pinned by digest: an old tag can no longer pull current models. To move the digest, take the
+# new one from the registry (`skopeo inspect` or `crane digest docker.io/ollama/ollama:<tag>`), run it on a test node,
+# raise `bundle_version` in `bundle.toml` and run `templates-bundle check --release`.
+#
+# THINKING. `qwen3:4b` answers with a reasoning block first, and `"think": false` in the request did not stop it. The
+# default is therefore `qwen3:4b-instruct`, which does not. A template cannot pass Ollama request options (the hub
+# forwards the chat request as the client sent it, §7.4) and Ollama has no environment setting for this. `qwen3:1.7b`
+# is the same family as `qwen3:4b`, so the chat UI (T2-32) should still strip a leading reasoning block.
+#
+# VOLUME. Ollama 0.40.16 writes a relative symlink into its store (`models/manifests-v2/ollama.com/library/<model>/
+# <tag>` points to `../../../../blobs/sha256-…`), and a volume that holds a symlink is refused (`volume_unsafe`) at the
+# next mount (§11.3). Only the blobs are worth keeping, so the volume is mounted at `/volumes/models/blobs`, below
+# `OLLAMA_MODELS=/volumes/models` (a mount must be under `/volumes/`, §7.1): the manifests and their link are written to
+# the container's own directory and go with it, and the volume holds regular files and one directory. Checked on the
+# test node with plain Podman (container root under `--userns=auto`): the first pull of `qwen3:1.7b` took 15 s, a
+# re-pull on a new container with the blobs kept took 1 s, a chat answered, and the volume held 6 regular files and
+# 1 directory with no link. The hub's pull per attempt (§7.6) is what restores the manifest after a restart.
+# `OLLAMA_NOPRUNE=1` is a guard: Ollama 0.40.16 did not prune the blobs, but another version may remove blobs that no
+# manifest names, and the manifests do not survive a restart.
+
+id = "private-chat"
+version = 1
+title = "Private AI chat"
+description = "Chat with an open language model that runs on your own computers. Nothing you type leaves your cloud; the model is downloaded once and kept."
+kind = "service"
+ui = "chat"
+singleton = true
+# Shown in the UI before launch: the image, then the models.
+licenses = [
+  "Ollama: MIT",
+  "Qwen3 models (qwen3:4b-instruct, qwen3:1.7b): Apache-2.0",
+]
+# The 5.10 GB image (its size on disk, so an upper bound for the download, about 4865 MiB) plus the 2.4 GB default
+# model (about 2290 MiB): about 7150 MiB, rounded up.
+download_mb = 7200
+
+[requirements]
+gpu = "preferred"
+# The reference PC's floor (§7.6, §16): the default used 5,020 MiB of VRAM after one chat, so a card with less would
+# have almost no headroom and Ollama would move layers to the CPU.
+min_vram_mb = 6144
+
+# The model the hub downloads at launch (the `pull` target). The default is at most about 4 B parameters, Apache-2.0,
+# a 2.4 GB download that does not think out loud (checked on a test node). `qwen3:1.7b` is the smaller choice for a
+# computer with little memory.
+[[params]]
+name = "model"
+label = "Model"
+type = "enum"
+values = ["qwen3:4b-instruct", "qwen3:1.7b"]
+default = "qwen3:4b-instruct"
+target = "pull"
+
+# Stop the chat after this many idle seconds (900 s to 24 h).
+[[params]]
+name = "idle_timeout_s"
+label = "Stop after idle seconds"
+type = "int"
+min = 900
+max = 86400
+default = 3600
+target = "field:service.idle_timeout_s"
+
+[spec]
+kind = "service"
+name = "Private AI chat"
+# Ollama 0.40.16.
+image = "docker.io/ollama/ollama@sha256:910d0d8107b538fb0894e63163eb195de0cc7aefcbc666dc62d3b18f71124592"
+command = ["/bin/ollama", "serve"]
+# The longest a service may run: 30 days. After it the chat UI offers "Restart".
+timeout_s = 2592000
+
+[spec.env]
+OLLAMA_HOST = "127.0.0.1:11434"
+OLLAMA_MODELS = "/volumes/models"
+OLLAMA_NOPRUNE = "1"
+
+[spec.resources]
+cpu = 4
+memory_mb = 8192
+gpu = 1
+disk_mb = 2048
+
+# Fixed by the template: the hosts a model pull reached on the test node. `ollama.com` is needed too, not only the
+# registry; the blobs come from the object-storage host.
+[spec.egress]
+allow = [
+  "registry.ollama.ai",
+  "ollama.com",
+  "dd20bb891979d25aebc8bec07b2b3bbc.r2.cloudflarestorage.com",
+]
+
+[spec.retry]
+max_attempts = 3
+
+[spec.service]
+idle_timeout_s = 3600
+restart = "on_node_loss"
+
+[[spec.service.ports]]
+port = 11434
+name = "api"
+
+[spec.service.health]
+http_get = "/api/version"
+port = 11434
+interval_s = 10
+timeout_s = 3
+start_period_s = 600
+failure_threshold = 3
+
+[[spec.volumes]]
+name = "tpl:private-chat/models"
+mount = "/volumes/models/blobs"
+max_mb = 20480
+
+# What a non-admin principal may send to the service (§7.4): the chat and the model list, nothing else. No route pulls,
+# creates, copies, pushes or deletes a model: only the hub downloads models, and only an admin's raw connection can
+# write one.
+[[allowed_routes]]
+port = 11434
+method = "POST"
+path = "/api/chat"
+
+[[allowed_routes]]
+port = 11434
+method = "GET"
+path = "/api/tags"

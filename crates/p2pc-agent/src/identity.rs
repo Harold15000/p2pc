@@ -219,7 +219,8 @@ fn check_owner(path: &Path, meta: &fs::Metadata) -> Result<(), IdentityError> {
 
 /// Whether a directory entry is one of the agent's own: everything the agent itself puts in its data dir.
 ///
-/// - the key, the lock file, the connection state, the lease status and the `jobs/` directory by name;
+/// - the key, the lock file, the connection state, the lease status and the `jobs/` and `volumes/` directories by
+///   name;
 /// - the temporary file of the atomic install of the key and of each of those files (`.<name>.<hex>.tmp`, see
 ///   `connection::state::write_atomic`).
 ///
@@ -231,8 +232,9 @@ fn is_agent_file(name: &str) -> bool {
     use crate::executor::status::LEASES_FILE;
     use crate::node::LOCK_FILE;
     use crate::sandbox::jobdir::JOBS_DIR;
+    use crate::volumes::VOLUMES_DIR;
 
-    let by_name = [IDENTITY_FILE, LOCK_FILE, STATE_FILE, LEASES_FILE, JOBS_DIR];
+    let by_name = [IDENTITY_FILE, LOCK_FILE, STATE_FILE, LEASES_FILE, JOBS_DIR, VOLUMES_DIR];
     let atomic = [IDENTITY_FILE, STATE_FILE, LEASES_FILE];
     by_name.contains(&name)
         || atomic.iter().any(|own| {

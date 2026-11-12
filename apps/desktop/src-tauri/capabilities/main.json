@@ -1,0 +1,12 @@
+{
+  "identifier": "main",
+  "description": "The main window may call the app's own commands and nothing else: no core plugin, no shell, filesystem, HTTP or opener permission (H2 §8.9). src/capabilities.rs tests this file.",
+  "local": true,
+  "windows": ["main"],
+  "permissions": [
+    "allow-status",
+    "allow-control",
+    "allow-settings",
+    "allow-set-autostart"
+  ]
+}
