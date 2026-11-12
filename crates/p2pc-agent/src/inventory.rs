@@ -14,8 +14,9 @@
 //!
 //! **The volume share** (H2 §8.2, §11.3). `share.volumes_mb` is resolved with the rest of the share and kept in
 //! [`LocalDetails::share`]: it is the budget of the node's volume store ([`crate::node::build`]), and
-//! `p2pc-agent inventory --json` shows it. It is not in the wire [`Inventory`]: `Inventory.volumes_mb` comes with the
-//! `share_update` capability (H2 §6.1), which this agent does not declare.
+//! `p2pc-agent inventory --json` shows it. The detection leaves `Inventory.volumes_mb` and `owner_paused` out: they
+//! come with the `share_update` capability (H2 §6.1), so the running agent's connection adds them
+//! ([`crate::connection::DetectInventory`], [`crate::connection::session::Shared::share_fields`]).
 //!
 //! The agent never installs or changes anything here.
 
@@ -771,6 +772,9 @@ impl Probe {
             },
             disk_total_mb: self.disk_mb,
             agent_version: AGENT_VERSION.into(),
+            // `share_update` (H2 §6.1): the session adds them when it declares the capability.
+            volumes_mb: None,
+            owner_paused: None,
         };
         validate_inventory(&inventory)?;
         Ok(Report {

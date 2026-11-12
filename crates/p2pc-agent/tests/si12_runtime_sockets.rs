@@ -163,6 +163,7 @@ async fn si12_runtime_the_running_agent_opens_only_its_iroh_udp_sockets() {
             ports: None,
             node: None,
             volumes: None,
+            blob_inputs: false,
         },
         connector: connector.clone(),
         backoff_seed: 1,

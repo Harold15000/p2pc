@@ -2,7 +2,7 @@
 
 //! The per-job scratch directory (spec §9): `<data_dir>/jobs/<lease_id>/`, mode 0700, with
 //!
-//! - `inputs/`: the job's decoded `files`, mounted read-only at `/inputs`;
+//! - `inputs/`: the job's decoded `files` and its blob `inputs` (H2 §7.5), mounted read-only at `/inputs`;
 //! - `outputs/`: mounted read-write at `/outputs`, collected after exit (SI-9, [`super::outputs`]);
 //! - `p2pc/`: a copy of the shim and, with egress, the proxy's socket; mounted read-only at `/.p2pc`;
 //! - `env`: the 0600 `--env-file`, deleted as soon as Podman has read it.
@@ -195,6 +195,34 @@ impl JobDir {
         Ok(())
     }
 
+    /// Creates the empty file of a blob input at `path` (under `/inputs/`), with its parents, by the same rules as
+    /// [`JobDir::write_inputs`]: a validated path, walked one segment at a time without following links, the file new
+    /// (`O_EXCL`), 0644. The caller writes the blob into it (H2 §7.5).
+    ///
+    /// # Errors
+    /// [`InputError`]: an invalid path, a symlink or an existing entry on the way, or an I/O error.
+    pub fn create_input_file(&self, path: &str) -> Result<fs::File, InputError> {
+        validate_input_path(path).map_err(|_| InputError::InvalidPath { path: path.into() })?;
+        let rel = path
+            .strip_prefix(INPUTS_DIR)
+            .and_then(|r| r.strip_prefix('/'))
+            .ok_or_else(|| InputError::InvalidPath { path: path.into() })?;
+        let inputs = open_dir(rustix::fs::CWD, &self.inputs()).map_err(|e| InputError::Io {
+            path: INPUTS_DIR.into(),
+            source: e.into(),
+        })?;
+        create_relative(&inputs, rel).map(fs::File::from).map_err(|e| match e {
+            WriteError::Refused(reason) => InputError::Refused {
+                path: path.into(),
+                reason,
+            },
+            WriteError::Io(source) => InputError::Io {
+                path: path.into(),
+                source,
+            },
+        })
+    }
+
     /// Writes the env file (0600, `O_EXCL | O_NOFOLLOW`) with `content` (from [`super::argv::env_file`]).
     ///
     /// # Errors
@@ -284,6 +312,13 @@ fn open_dir<Fd: std::os::fd::AsFd>(at: Fd, name: &Path) -> Result<OwnedFd, Errno
 
 /// Writes `content` at `rel` (validated: no `..`, `.` or empty segments) below the directory `base`.
 fn write_relative(base: &OwnedFd, rel: &str, content: &[u8]) -> Result<(), WriteError> {
+    let mut f = fs::File::from(create_relative(base, rel)?);
+    f.write_all(content).map_err(WriteError::Io)
+}
+
+/// Creates the new file `rel` (validated: no `..`, `.` or empty segments) below the directory `base`, with its
+/// parents, never following a link, and returns it open for writing.
+fn create_relative(base: &OwnedFd, rel: &str) -> Result<OwnedFd, WriteError> {
     let segments: Vec<&str> = rel.split('/').collect();
     let Some((name, parents)) = segments.split_last() else {
         return Err(WriteError::Refused("empty path"));
@@ -308,9 +343,7 @@ fn write_relative(base: &OwnedFd, rel: &str, content: &[u8]) -> Result<(), Write
         Mode::from_raw_mode(INPUT_FILE_MODE),
     )?;
     rustix::fs::fchmod(&fd, Mode::from_raw_mode(INPUT_FILE_MODE)).map_err(WriteError::from)?;
-    let mut f = fs::File::from(fd);
-    f.write_all(content).map_err(WriteError::Io)?;
-    Ok(())
+    Ok(fd)
 }
 
 #[cfg(test)]
@@ -453,6 +486,43 @@ mod tests {
             .write_inputs(&[file("/inputs/b", &half), file("/inputs/c", &half)])
             .unwrap_err();
         assert!(matches!(e, InputError::InvalidContent { .. }), "{e}");
+    }
+
+    /// H2 §7.5: a blob input is delivered into `inputs/` like an inline file: created there with its parents, by the
+    /// same `O_NOFOLLOW`/`O_EXCL` walk, never outside it.
+    #[test]
+    fn creates_a_blob_input_file_with_the_inline_file_rules() {
+        use std::io::Write as _;
+        let data = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let dir = JobDir::create(data.path(), &lease()).unwrap();
+        let mut f = dir.create_input_file("/inputs/models/audio.wav").unwrap();
+        f.write_all(b"RIFF").unwrap();
+        drop(f);
+        assert_eq!(fs::read(dir.inputs().join("models/audio.wav")).unwrap(), b"RIFF");
+        assert_eq!(mode(&dir.inputs().join("models")), 0o755);
+        assert_eq!(mode(&dir.inputs().join("models/audio.wav")), 0o644);
+
+        for path in ["/inputs/../escape", "/etc/passwd", "/inputs/", "/inputs//x"] {
+            let e = dir.create_input_file(path).unwrap_err();
+            assert!(matches!(e, InputError::InvalidPath { .. }), "{path}: {e}");
+        }
+        symlink(outside.path(), dir.inputs().join("link")).unwrap();
+        let e = dir.create_input_file("/inputs/link/x").unwrap_err();
+        assert!(matches!(e, InputError::Refused { .. }), "{e}");
+        let e = dir.create_input_file("/inputs/models/audio.wav").unwrap_err();
+        assert!(
+            matches!(
+                e,
+                InputError::Refused {
+                    reason: "already exists",
+                    ..
+                }
+            ),
+            "{e}"
+        );
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0, "nothing escaped");
+        assert_eq!(fs::read(dir.inputs().join("models/audio.wav")).unwrap(), b"RIFF");
     }
 
     #[test]

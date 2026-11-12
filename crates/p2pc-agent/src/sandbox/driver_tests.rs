@@ -6,7 +6,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -2569,7 +2569,8 @@ fn a_check_that_hangs_fails_at_its_timeout() {
 }
 
 /// Without a `health` block the service is healthy at its first successful connection to its first port, then not
-/// checked again and never stopped for its health: here it runs to its wall-clock limit (H1's enforcement).
+/// checked again and never stopped for its health: here it runs to its wall-clock limit (H1's enforcement), well past
+/// its start period.
 #[test]
 fn a_service_without_a_health_block_is_healthy_at_its_first_connection() {
     guarded(Clock::Paused, || async {
@@ -2587,6 +2588,34 @@ fn a_service_without_a_health_block_is_healthy_at_its_first_connection() {
         assert_eq!(kills(&engine), ["kill Term at 600s", "kill Kill at 610s"]);
         let (health, _) = service_events(&mut rx);
         assert_eq!(states(&health), [HealthState::Starting, HealthState::Healthy]);
+        d.cleanup(job).await;
+    });
+}
+
+/// H2 §7.2: a service without a `health` block is `starting` for at most the default start period (300 s, §7.1).
+/// One whose first port never takes a connection is stopped then with `health_check_failed`; it no longer stays
+/// `starting` until its `timeout_s`, which the hub's idle timeout (counted from the first `healthy`) never ends.
+#[test]
+fn a_service_without_a_health_block_that_never_connects_is_stopped_after_the_start_period() {
+    guarded(Clock::Paused, || async {
+        let fx = Fx::new();
+        let engine = MockEngine::default(); // ignores SIGTERM
+        let probe = FakeProbe::new([], Probe::Fail);
+        let d = fx.service_driver(Arc::clone(&probe), engine.clone());
+        mark_t0();
+        let lease = service_lease(&fx, None, 3600);
+        let (mut job, mut rx) = start_collecting(&d, &fx, lease, CancelHandle::new()).await;
+        let f = d.wait(&mut job).await.unwrap();
+        assert_eq!(
+            (f.outcome, f.exit_code, f.error.as_deref()),
+            (Outcome::Error, None, Some(error_code::HEALTH_CHECK_FAILED))
+        );
+        let times = probe.times();
+        assert_eq!(times.len(), 30, "one check every 10 s up to 300 s: {times:?}");
+        assert_eq!(times.last(), Some(&300));
+        assert_eq!(kills(&engine), ["kill Term at 300s", "kill Kill at 310s"]);
+        let (health, _) = service_events(&mut rx);
+        assert_eq!(states(&health), [HealthState::Starting], "it never became healthy");
         d.cleanup(job).await;
     });
 }
@@ -3784,5 +3813,361 @@ fn the_upkeep_expires_unused_volumes() {
         d.cleanup(job).await;
         // A driver without volumes has nothing to keep.
         fx.driver(MockEngine::default()).maintain_volumes().await;
+    });
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Blob inputs (H2 §6.1, §7.5): fetched at job start over `BlobFetch` streams, verified, placed under `inputs/`.
+
+/// How the fake hub answers a `BlobFetch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HubAnswer {
+    /// The blob's bytes.
+    Serve,
+    /// As many bytes, not the blob's.
+    Forge,
+    /// `ok: false`, `gone`.
+    Gone,
+    /// No stream opens: the connection to the hub is gone.
+    Unreachable,
+}
+
+/// The hub end of the agent connection: serves the blobs it holds on every stream the agent opens, and records each
+/// header.
+#[derive(Debug)]
+struct BlobHub {
+    blobs: Mutex<HashMap<String, Vec<u8>>>,
+    headers: Mutex<Vec<serde_json::Value>>,
+    answer: HubAnswer,
+}
+
+impl BlobHub {
+    fn new(answer: HubAnswer) -> Arc<Self> {
+        Arc::new(Self {
+            blobs: Mutex::new(HashMap::new()),
+            headers: Mutex::new(Vec::new()),
+            answer,
+        })
+    }
+
+    /// Holds `data`; returns its reference.
+    fn hold(&self, data: &[u8]) -> p2pc_proto::api::BlobRef {
+        use sha2::Digest as _;
+        let digest = p2pc_proto::api::Sha256Digest(sha2::Sha256::digest(data).into());
+        self.blobs.lock().unwrap().insert(digest.to_string(), data.to_vec());
+        p2pc_proto::api::BlobRef(digest)
+    }
+
+    fn headers(&self) -> Vec<serde_json::Value> {
+        self.headers.lock().unwrap().clone()
+    }
+}
+
+/// The hub's side of one stream.
+async fn serve_blob(
+    hub: Arc<BlobHub>,
+    mut r: impl tokio::io::AsyncRead + Unpin,
+    mut w: impl tokio::io::AsyncWrite + Unpin,
+) {
+    use tokio::io::AsyncWriteExt as _;
+    let Ok(Some(body)) = p2pc_proto::protocol::read_frame_bytes(&mut r, 4096).await else {
+        return;
+    };
+    let header: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let digest = header["sha256"].as_str().unwrap_or_default().to_string();
+    hub.headers.lock().unwrap().push(header);
+    let data = hub.blobs.lock().unwrap().get(&digest).cloned();
+    match (hub.answer, data) {
+        (HubAnswer::Gone, _) | (_, None) => {
+            let ack = serde_json::json!({"ok": false, "reason": "gone"});
+            p2pc_proto::protocol::write_frame(&mut w, &ack).await.unwrap();
+        }
+        (answer, Some(mut data)) => {
+            let ack = serde_json::json!({"ok": true, "size": data.len()});
+            p2pc_proto::protocol::write_frame(&mut w, &ack).await.unwrap();
+            if answer == HubAnswer::Forge {
+                for b in &mut data {
+                    *b ^= 0xff;
+                }
+            }
+            let _ = w.write_all(&data).await;
+        }
+    }
+    // The hub keeps its side open: the agent reads exactly `size` bytes.
+    std::future::pending::<()>().await;
+}
+
+impl crate::connection::StreamOpener for BlobHubStreams {
+    fn open_bi(
+        &self,
+    ) -> crate::connection::BoxFuture<
+        '_,
+        Result<
+            (
+                crate::connection::transport::BoxWrite,
+                crate::connection::transport::BoxRead,
+            ),
+            crate::connection::transport::ConnectError,
+        >,
+    > {
+        let hub = Arc::clone(&self.0);
+        Box::pin(async move {
+            if hub.answer == HubAnswer::Unreachable {
+                return Err(crate::connection::transport::ConnectError(
+                    "the connection is gone".into(),
+                ));
+            }
+            let (agent, far) = tokio::io::duplex(1 << 20);
+            let (ar, aw) = tokio::io::split(agent);
+            let (fr, fw) = tokio::io::split(far);
+            tokio::spawn(serve_blob(hub, fr, fw));
+            Ok((
+                Box::new(aw) as crate::connection::transport::BoxWrite,
+                Box::new(ar) as crate::connection::transport::BoxRead,
+            ))
+        })
+    }
+}
+
+#[derive(Debug)]
+struct BlobHubStreams(Arc<BlobHub>);
+
+/// A driver whose blob inputs go through `hub`, over a welcomed session (keep the returned sender alive).
+fn blob_driver(
+    fx: &Fx,
+    hub: &Arc<BlobHub>,
+    engine: MockEngine,
+) -> (
+    PodmanDriver<MockEngine, FsCgroups>,
+    mpsc::Sender<crate::connection::uplink::JobFrame>,
+) {
+    let uplink = crate::connection::Uplink::new();
+    let (jobs, _rx) = mpsc::channel(4);
+    uplink.connect(crate::connection::Port::new(
+        &jobs,
+        Arc::new(BlobHubStreams(Arc::clone(hub))),
+    ));
+    let mut cfg = fx.cfg(Platform::Wsl2);
+    cfg.blobs = Some(crate::blobs::BlobInputs::new(uplink));
+    (fx.driver_with(cfg, engine), jobs)
+}
+
+/// A batch lease with the fixture's inline file and one blob input at `/inputs/audio`, with `disk_mb` of disk.
+fn blob_lease(fx: &Fx, blob: p2pc_proto::api::BlobRef, disk_mb: u64) -> LeaseContext {
+    let mut lease = fx.lease();
+    lease.epoch = 7;
+    lease.job.resources.disk_mb = disk_mb;
+    lease.job.inputs = vec![p2pc_proto::api::BlobInput {
+        path: "/inputs/audio".into(),
+        blob,
+    }];
+    lease
+}
+
+/// H2 §6.1, §7.5: each blob input is asked for with its lease and epoch (fencing, SI-H2-6), verified, and written
+/// under `inputs/` like an inline file (0644, read-only in the container with the rest of `/inputs`), before the
+/// container is created.
+#[test]
+fn blob_inputs_are_fetched_with_the_lease_verified_and_placed_under_inputs() {
+    guarded(Clock::Real, || async {
+        let fx = Fx::new();
+        let hub = BlobHub::new(HubAnswer::Serve);
+        let audio = b"RIFF fake audio".repeat(1000);
+        let blob = hub.hold(&audio);
+        let engine = MockEngine::default();
+        let (d, _session) = blob_driver(&fx, &hub, engine.clone());
+        let lease = blob_lease(&fx, blob, 128);
+        let id = lease.lease_id;
+        let (tx, _rx) = events();
+        let job = d.prepare(&fx.owner, lease, tx, CancelHandle::new()).await.unwrap();
+        let inputs = fx.jobs_dir().join(id.to_string()).join("inputs");
+        assert_eq!(fs::read(inputs.join("audio")).unwrap(), audio);
+        assert_eq!(
+            fs::read(inputs.join("data.csv")).unwrap(),
+            b"a,b\n1,2\n",
+            "inline files too"
+        );
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            fs::metadata(inputs.join("audio")).unwrap().permissions().mode() & 0o7777,
+            0o644
+        );
+        assert_eq!(
+            hub.headers(),
+            [serde_json::json!({"type": "blob_fetch", "lease_id": id, "epoch": 7, "sha256": blob.0.to_string()})]
+        );
+        assert_eq!(engine.count("create"), 1);
+        d.cleanup(job).await;
+    });
+}
+
+/// H2 §6.1 "Blob integrity": bytes that do not hash to the digest fail the lease with `input_integrity`, a
+/// `start_failed`-class error: no container, and the job directory (with what was written) is removed.
+#[test]
+fn a_blob_that_does_not_match_its_digest_fails_with_input_integrity() {
+    guarded(Clock::Real, || async {
+        let fx = Fx::new();
+        let hub = BlobHub::new(HubAnswer::Forge);
+        let blob = hub.hold(b"the real audio");
+        let engine = MockEngine::default();
+        let (d, _session) = blob_driver(&fx, &hub, engine.clone());
+        let lease = blob_lease(&fx, blob, 128);
+        let id = lease.lease_id;
+        let f = finished(run(&d, &fx, lease).await.0);
+        assert_eq!(
+            (f.outcome, f.error.as_deref()),
+            (Outcome::Error, Some(error_code::INPUT_INTEGRITY))
+        );
+        assert_eq!(engine.count("create"), 0, "{:?}", engine.calls());
+        d.drain_background().await;
+        assert!(!fx.jobs_dir().join(id.to_string()).exists());
+    });
+}
+
+/// H2 §7.1, §7.5: blob inputs and inline files fit in `resources.disk_mb` minus 64 MiB. A blob that would go over is
+/// refused before any of its bytes is read (`invalid_input`); one that fits exactly is taken. A refusal of the hub
+/// (`gone`) fails the lease the same way.
+#[test]
+fn blob_inputs_are_bounded_by_the_disk_minus_64_mib() {
+    guarded(Clock::Real, || async {
+        const MIB: usize = 1024 * 1024;
+        // 65 MiB of disk: 1 MiB for inputs, minus the 8 bytes of the inline file.
+        let room = MIB - b"a,b\n1,2\n".len();
+        for (size, fits) in [(room, true), (room + 1, false)] {
+            let fx = Fx::new();
+            let hub = BlobHub::new(HubAnswer::Serve);
+            let blob = hub.hold(&vec![7u8; size]);
+            let engine = MockEngine::with(|s| s.exit_now = Some(0));
+            let (d, _session) = blob_driver(&fx, &hub, engine.clone());
+            let f = finished(run(&d, &fx, blob_lease(&fx, blob, 65)).await.0);
+            if fits {
+                assert_eq!((f.outcome, f.error), (Outcome::Exited, None), "{size}");
+            } else {
+                assert_eq!(
+                    (f.outcome, f.error.as_deref()),
+                    (Outcome::Error, Some(error_code::INVALID_INPUT)),
+                    "{size}"
+                );
+                assert_eq!(engine.count("create"), 0);
+            }
+        }
+        let fx = Fx::new();
+        let hub = BlobHub::new(HubAnswer::Gone);
+        let blob = hub.hold(b"deleted meanwhile");
+        let engine = MockEngine::default();
+        let (d, _session) = blob_driver(&fx, &hub, engine.clone());
+        let f = finished(run(&d, &fx, blob_lease(&fx, blob, 128)).await.0);
+        assert_eq!(
+            (f.outcome, f.error.as_deref()),
+            (Outcome::Error, Some(error_code::INVALID_INPUT))
+        );
+        assert_eq!(engine.count("create"), 0);
+    });
+}
+
+/// H2 §6.1 "must understand": a node without the `BlobFetch` client refuses a lease with blob inputs as an invalid
+/// job, before anything exists.
+#[test]
+fn without_a_blob_client_a_lease_with_blob_inputs_is_an_invalid_job() {
+    guarded(Clock::Real, || async {
+        let fx = Fx::new();
+        let hub = BlobHub::new(HubAnswer::Serve);
+        let blob = hub.hold(b"x");
+        let engine = MockEngine::default();
+        let d = fx.driver(engine.clone());
+        assert_eq!(
+            run(&d, &fx, blob_lease(&fx, blob, 128)).await.0,
+            LeaseReport::Rejected(LeaseRejectReason::InvalidJob)
+        );
+        assert!(engine.calls().is_empty());
+        assert!(fx.data_entries().is_empty());
+    });
+}
+
+/// While the agent is reconnecting the fetch waits for a session; a cancel ends that wait (the lease timer or the
+/// hub's `Cancel` bound it), before any pull.
+#[test]
+fn a_cancel_ends_a_blob_fetch_waiting_for_a_session() {
+    guarded(Clock::Paused, || async {
+        let fx = Fx::new();
+        let engine = MockEngine::default();
+        let mut cfg = fx.cfg(Platform::Wsl2);
+        cfg.blobs = Some(crate::blobs::BlobInputs::new(crate::connection::Uplink::new()));
+        let d = fx.driver_with(cfg, engine.clone());
+        let hub = BlobHub::new(HubAnswer::Serve);
+        let lease = blob_lease(&fx, hub.hold(b"x"), 128);
+        let id = lease.lease_id;
+        let cancel = CancelHandle::new();
+        let canceller = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                cancel.cancel();
+            })
+        };
+        let (tx, _rx) = events();
+        let r = run_lease(&d, &fx.owner, lease, tx, cancel).await;
+        canceller.await.unwrap();
+        assert_eq!(finished(r).outcome, Outcome::Cancelled);
+        assert_eq!(engine.count("pull"), 0, "{:?}", engine.calls());
+        d.drain_background().await;
+        assert!(!fx.jobs_dir().join(id.to_string()).exists());
+    });
+}
+
+/// Review P3 of T2-24: a fetch that failed on the way every time is the link's failure, not the job's input: it is
+/// reported as `sandbox_setup`, never as `invalid_input`.
+#[test]
+fn a_blob_fetch_that_keeps_failing_on_the_way_is_sandbox_setup_not_invalid_input() {
+    guarded(Clock::Paused, || async {
+        let fx = Fx::new();
+        let hub = BlobHub::new(HubAnswer::Unreachable);
+        let blob = hub.hold(b"never delivered");
+        let engine = MockEngine::default();
+        let (d, _session) = blob_driver(&fx, &hub, engine.clone());
+        let f = finished(run(&d, &fx, blob_lease(&fx, blob, 128)).await.0);
+        assert_eq!(
+            (f.outcome, f.error.as_deref()),
+            (Outcome::Error, Some(error_code::SANDBOX_SETUP))
+        );
+        assert_eq!(engine.count("create"), 0, "{:?}", engine.calls());
+    });
+}
+
+/// Review P3 of T2-24: the blob inputs sit in `inputs/`, outside the running disk measurement (the writable layer
+/// and `outputs/`), so what they take comes off the job's disk limit: inputs and what the job writes stay within
+/// `resources.disk_mb` together (H2 §7.1 leaves the job at least 64 MiB).
+#[test]
+fn delivered_blob_inputs_count_against_the_disk_limit() {
+    guarded(Clock::Paused, || async {
+        const MIB: u64 = 1024 * 1024;
+        let fx = Fx::new();
+        let hub = BlobHub::new(HubAnswer::Serve);
+        let blob = hub.hold(&vec![7u8; 1024 * 1024]);
+        // disk_mb = 66 with a 1 MiB blob: the job may write 65 MiB. Its writable layer grows to 65.5 MiB.
+        let engine = MockEngine::with(|s| s.sizes = VecDeque::from([0, 65 * MIB + MIB / 2]));
+        let (d, _session) = blob_driver(&fx, &hub, engine.clone());
+        let mut lease = blob_lease(&fx, blob, 66);
+        lease.job.timeout_s = 3600;
+        mark_t0();
+        let mut job = prepare_and_start(&d, &fx, lease, CancelHandle::new()).await;
+        let f = d.wait(&mut job).await.unwrap();
+        assert_eq!(
+            (f.outcome, f.error.as_deref()),
+            (Outcome::Error, Some(error_code::DISK_LIMIT))
+        );
+        assert_eq!(kills(&engine), ["kill Kill at 4s"]);
+        d.cleanup(job).await;
+
+        // The same growth without a blob input is within `disk_mb`: H1's rule, unchanged.
+        let engine = MockEngine::with(|s| s.sizes = VecDeque::from([0, 65 * MIB + MIB / 2]));
+        let d = fx.driver(engine.clone());
+        let mut lease = fx.lease();
+        lease.job.resources.disk_mb = 66;
+        lease.job.timeout_s = 60;
+        let mut job = prepare_and_start(&d, &fx, lease, CancelHandle::new()).await;
+        let f = d.wait(&mut job).await.unwrap();
+        assert_eq!((f.outcome, f.error), (Outcome::TimedOut, None));
+        d.cleanup(job).await;
     });
 }

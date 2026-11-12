@@ -1107,6 +1107,18 @@ pub fn validate_inventory(inv: &Inventory) -> Result<(), ProtocolViolation> {
             ));
         }
     }
+    // The volume share (H2 §6.1, §11.3) is disk too, apart from `offered.disk_mb`: bounded the same way.
+    if let Some(volumes) = inv.volumes_mb {
+        if volumes > MAX_NODE_DISK_MB {
+            return Err(violation("inventory.volumes_mb", "must be at most 64 PiB"));
+        }
+        if inv.disk_total_mb.is_some_and(|total| volumes > total) {
+            return Err(violation(
+                "inventory.volumes_mb",
+                "must not exceed the filesystem (disk_total_mb)",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1720,6 +1732,8 @@ pub(crate) mod tests {
             },
             disk_total_mb: Some(512_000),
             agent_version: "0.1.0".into(),
+            volumes_mb: None,
+            owner_paused: None,
         }
     }
 
@@ -2908,6 +2922,65 @@ pub(crate) mod tests {
         assert_eq!(
             with(&|i| i.disk_total_mb = Some(MAX_NODE_DISK_MB + 1)),
             Err("inventory.disk_total_mb")
+        );
+    }
+
+    /// H2 §6.1: `volumes_mb` and `owner_paused` come with `share_update`. An agent without it sends neither: both are
+    /// left out of the wire form and read as `None`, and such a node is not paused.
+    #[test]
+    fn the_share_update_fields_are_left_out_without_the_capability() {
+        let h1 = inventory();
+        assert_eq!((h1.volumes_mb, h1.owner_paused), (None, None));
+        assert!(!h1.is_owner_paused());
+        let json = serde_json::to_value(&h1).unwrap();
+        assert!(json.get("volumes_mb").is_none(), "{json}");
+        assert!(json.get("owner_paused").is_none(), "{json}");
+        let back: Inventory = serde_json::from_value(json).unwrap();
+        assert_eq!(back, h1);
+
+        let mut h2 = inventory();
+        h2.volumes_mb = Some(20_480);
+        h2.owner_paused = Some(false);
+        let json = serde_json::to_value(&h2).unwrap();
+        assert_eq!(json["volumes_mb"], 20_480);
+        assert_eq!(
+            json["owner_paused"], false,
+            "sent even when false: it comes with the capability"
+        );
+        assert_eq!(serde_json::from_value::<Inventory>(json).unwrap(), h2);
+        assert!(!h2.is_owner_paused());
+        h2.owner_paused = Some(true);
+        assert!(h2.is_owner_paused());
+        assert_eq!(validate_inventory(&h2), Ok(()));
+    }
+
+    /// `volumes_mb` is a share of the disk, apart from `offered.disk_mb` (H2 §11.3): never more than the filesystem
+    /// the agent reports, nor than the absolute ceiling.
+    #[test]
+    fn volumes_mb_cannot_exceed_the_filesystem() {
+        let with = |f: &dyn Fn(&mut Inventory)| {
+            let mut inv = inventory();
+            f(&mut inv);
+            validate_inventory(&inv).map_err(|v| v.field)
+        };
+        // The fixture's filesystem is 512 000 MiB.
+        assert_eq!(with(&|i| i.volumes_mb = Some(0)), Ok(()));
+        assert_eq!(with(&|i| i.volumes_mb = Some(512_000)), Ok(()));
+        assert_eq!(with(&|i| i.volumes_mb = Some(512_001)), Err("inventory.volumes_mb"));
+        assert_eq!(
+            with(&|i| {
+                i.disk_total_mb = None;
+                i.volumes_mb = Some(MAX_NODE_DISK_MB);
+            }),
+            Ok(()),
+            "unknown filesystem: the ceiling only"
+        );
+        assert_eq!(
+            with(&|i| {
+                i.disk_total_mb = None;
+                i.volumes_mb = Some(MAX_NODE_DISK_MB + 1);
+            }),
+            Err("inventory.volumes_mb")
         );
     }
 
