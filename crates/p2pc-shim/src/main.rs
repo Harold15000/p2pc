@@ -12,11 +12,17 @@
 //!    `127.0.0.1:3128` inside the container and copies each connection to and from the socket, one thread per
 //!    direction. It then sets `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, `https_proxy` and
 //!    `NO_PROXY=localhost,127.0.0.1` for the child. With no socket file, nothing listens and no proxy is set.
-//! 2. **PID 1 duties.** It becomes a child subreaper (a no-op as PID 1, where it already is the reaper), spawns
+//! 2. **Ingress bridge** (H2 §11.2, [`ingress`]). If `/.p2pc/ports.json` exists (the agent writes it for a service),
+//!    it keeps 4 idle connections open to the agent's `/.p2pc/ingress.sock` and forwards each request the agent
+//!    sends on one to `127.0.0.1:<port>` inside the container, for the listed ports only. It listens on nothing:
+//!    the container keeps `--network=none`. With no ports file, nothing is dialed.
+//! 3. **PID 1 duties.** It becomes a child subreaper (a no-op as PID 1, where it already is the reaper), spawns
 //!    the job's command, forwards SIGTERM, SIGINT and SIGHUP to it, and reaps every child that exits, including
 //!    orphans re-parented to it.
-//! 3. **Exit.** It exits with the child's code, or `128 + signal` if a signal killed it. Its own failures: 2 for
+//! 4. **Exit.** It exits with the child's code, or `128 + signal` if a signal killed it. Its own failures: 2 for
 //!    usage errors, 126 if the command cannot be executed, 127 if it does not exist.
+
+mod ingress;
 
 use std::ffi::OsString;
 use std::io;
@@ -51,7 +57,8 @@ const EXIT_CANNOT_EXECUTE: u8 = 126;
 /// Exit code when the command does not exist (as in POSIX shells).
 const EXIT_NOT_FOUND: u8 = 127;
 
-const USAGE: &str = "usage: p2pc-shim [--egress-socket <path>] [--listen <loopback addr>] -- <command> [args...]";
+const USAGE: &str = "usage: p2pc-shim [--egress-socket <path>] [--listen <loopback addr>] [--ports-file <path>] \
+                     [--ingress-socket <path>] -- <command> [args...]";
 
 /// What the command line asks for.
 #[derive(Debug, PartialEq, Eq)]
@@ -69,6 +76,10 @@ enum Invocation {
 struct Run {
     egress_socket: PathBuf,
     listen: SocketAddr,
+    /// The ports the ingress bridge may forward; the bridge runs only when this file exists.
+    ports_file: PathBuf,
+    /// The agent's ingress socket.
+    ingress_socket: PathBuf,
     argv: Vec<OsString>,
 }
 
@@ -76,6 +87,8 @@ struct Run {
 fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
     let mut egress_socket = PathBuf::from(EGRESS_SOCKET);
     let mut listen: SocketAddr = LISTEN.parse().map_err(|_| "bad built-in listen address".to_string())?;
+    let mut ports_file = PathBuf::from(ingress::PORTS_FILE);
+    let mut ingress_socket = PathBuf::from(ingress::INGRESS_SOCKET);
     loop {
         let Some(arg) = args.next() else {
             return Err(format!("missing `--` before the command\n{USAGE}"));
@@ -89,6 +102,14 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Invocation, String>
                     .next()
                     .ok_or_else(|| format!("--egress-socket needs a value\n{USAGE}"))?;
                 egress_socket = PathBuf::from(value);
+            }
+            Some(flag @ ("--ports-file" | "--ingress-socket")) => {
+                let value = args.next().ok_or_else(|| format!("{flag} needs a value\n{USAGE}"))?;
+                if flag == "--ports-file" {
+                    ports_file = PathBuf::from(value);
+                } else {
+                    ingress_socket = PathBuf::from(value);
+                }
             }
             Some("--listen") => {
                 let value = args.next().ok_or_else(|| format!("--listen needs a value\n{USAGE}"))?;
@@ -114,6 +135,8 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Invocation, String>
     Ok(Invocation::Run(Run {
         egress_socket,
         listen,
+        ports_file,
+        ingress_socket,
         argv,
     }))
 }
@@ -122,6 +145,8 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Invocation, String>
 trait Duplex: io::Read + io::Write + Send + Sized + 'static {
     fn split(&self) -> io::Result<Self>;
     fn close_write(&self);
+    /// Closes both directions, for every handle of the stream: a broken connection is torn down at once.
+    fn close_both(&self);
 }
 
 impl Duplex for TcpStream {
@@ -131,6 +156,9 @@ impl Duplex for TcpStream {
     fn close_write(&self) {
         let _ = self.shutdown(Shutdown::Write);
     }
+    fn close_both(&self) {
+        let _ = self.shutdown(Shutdown::Both);
+    }
 }
 
 impl Duplex for UnixStream {
@@ -139,6 +167,9 @@ impl Duplex for UnixStream {
     }
     fn close_write(&self) {
         let _ = self.shutdown(Shutdown::Write);
+    }
+    fn close_both(&self) {
+        let _ = self.shutdown(Shutdown::Both);
     }
 }
 
@@ -233,6 +264,22 @@ fn run(job: Run) -> ExitCode {
         }
     }
 
+    // The ingress bridge of a service (H2 §11.2): only with a ports file, and before the job starts, so that its
+    // idle connections are there when the service comes up. Fail closed and loudly, as for the egress bridge.
+    match ingress::load_ports(&job.ports_file) {
+        Ok(None) => {}
+        Ok(Some(ports)) => {
+            if let Err(e) = ingress::start(&job.ingress_socket, ports) {
+                eprintln!("p2pc-shim: cannot start the ingress bridge: {e}");
+                return ExitCode::from(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("p2pc-shim: cannot read {}: {e}", job.ports_file.display());
+            return ExitCode::from(1);
+        }
+    }
+
     let child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
@@ -307,6 +354,8 @@ mod tests {
         assert_eq!(run.argv, ["--help", "--", "-x"]);
         assert_eq!(run.egress_socket, Path::new(EGRESS_SOCKET));
         assert_eq!(run.listen, LISTEN.parse().unwrap());
+        assert_eq!(run.ports_file, Path::new("/.p2pc/ports.json"));
+        assert_eq!(run.ingress_socket, Path::new("/.p2pc/ingress.sock"));
     }
 
     #[test]
@@ -318,6 +367,11 @@ mod tests {
         };
         assert_eq!(run.listen, "[::1]:1".parse().unwrap());
         assert_eq!(run.egress_socket, Path::new("/s"));
+        let Ok(Invocation::Run(run)) = parse(args(&["--ports-file", "/p", "--ingress-socket", "/i", "--", "x"])) else {
+            panic!("expected a run");
+        };
+        assert_eq!(run.ports_file, Path::new("/p"));
+        assert_eq!(run.ingress_socket, Path::new("/i"));
     }
 
     /// The copy logic of the bridge, with a loopback TCP upstream standing in for the unix socket (some sandboxes
@@ -368,6 +422,8 @@ mod tests {
             &["x"],
             &["--"],
             &["--listen"],
+            &["--ports-file"],
+            &["--ingress-socket"],
             &["--listen", "nope", "--", "x"],
             &["--listen", "0.0.0.0:3128", "--", "x"],
             &["--listen", "198.51.100.7:3128", "--", "x"],

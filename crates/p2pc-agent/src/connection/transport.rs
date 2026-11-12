@@ -9,6 +9,10 @@
 //! A connection also opens more bidirectional streams after the control stream: one per output upload (§6
 //! "Uploads", T10a). A [`Link`] carries a [`StreamOpener`] for them; a transport without extra streams uses
 //! [`NoStreams`].
+//!
+//! H2 adds streams in the other direction: the server opens them on the same connection (H2 §6.1, port streams). A
+//! [`Link`] may carry a [`StreamAcceptor`] for those; a transport without them has none, and nothing is ever
+//! accepted.
 
 use std::fmt;
 use std::sync::Arc;
@@ -18,6 +22,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Notify;
 
 use super::BoxFuture;
+use super::streams::StreamAcceptor;
 
 /// The sending half of a stream.
 pub type BoxWrite = Box<dyn AsyncWrite + Send + Unpin>;
@@ -50,6 +55,8 @@ pub struct Link {
     pub close: Box<dyn FnOnce() + Send + Sync>,
     /// Opens the upload streams of this connection.
     pub streams: Arc<dyn StreamOpener>,
+    /// Where the streams the server opens on this connection arrive (H2 §6.1), if the transport has them.
+    pub incoming: Option<Arc<dyn StreamAcceptor>>,
 }
 
 impl fmt::Debug for Link {
@@ -67,6 +74,7 @@ impl Link {
             recv,
             close,
             streams: Arc::new(NoStreams),
+            incoming: None,
         }
     }
 
@@ -74,6 +82,13 @@ impl Link {
     #[must_use]
     pub fn with_streams(mut self, streams: Arc<dyn StreamOpener>) -> Self {
         self.streams = streams;
+        self
+    }
+
+    /// The same link, with the streams the server opens arriving at `incoming`.
+    #[must_use]
+    pub fn with_incoming(mut self, incoming: Arc<dyn StreamAcceptor>) -> Self {
+        self.incoming = Some(incoming);
         self
     }
 

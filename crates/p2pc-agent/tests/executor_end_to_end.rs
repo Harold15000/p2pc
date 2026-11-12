@@ -228,6 +228,7 @@ where
             inventory_interval: INVENTORY_INTERVAL,
             decisions: Arc::new(Semaphore::new(MAX_PENDING_DECISIONS)),
             uplink,
+            ports: None,
         },
         connector: Arc::new(IrohConnector::new(
             SecretKey::generate(),
