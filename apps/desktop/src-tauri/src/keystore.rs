@@ -16,6 +16,7 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use zeroize::Zeroizing;
 
@@ -151,11 +152,27 @@ impl<P: Protector> FileKeyStore<P> {
         &self.path
     }
 
-    fn temp_path(&self) -> PathBuf {
+    /// A temporary name next to the key, unique to this process and call (`device.key.<pid>-<n>.tmp`), so that two
+    /// writers never share one.
+    fn new_temp_path(&self) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let mut name = self.path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
-        name.push(".tmp");
+        name.push(format!(".{}-{n}.tmp", std::process::id()));
         self.path.with_file_name(name)
     }
+}
+
+/// Gives the finished temporary file its final name only if that name is free, then removes the temporary name.
+///
+/// `rename` would replace an existing file (on Windows and on Unix); a hard link fails with `AlreadyExists` instead,
+/// atomically, so a key that another writer stored in the meantime is never replaced. `%LOCALAPPDATA%` is on NTFS,
+/// which has hard links.
+fn publish_new(temp: &Path, path: &Path) -> io::Result<()> {
+    fs::hard_link(temp, path)?;
+    // The key is in place; a temporary name left behind is only clutter.
+    let _ = fs::remove_file(temp);
+    Ok(())
 }
 
 impl<P: Protector> DeviceKeyStore for FileKeyStore<P> {
@@ -186,23 +203,26 @@ impl<P: Protector> DeviceKeyStore for FileKeyStore<P> {
         if let Some(dir) = self.path.parent() {
             fs::create_dir_all(dir)?;
         }
-        // Write a temporary file, flush it to disk, then rename: a crash leaves either no key or a whole one.
-        let temp = self.temp_path();
+        // Write a temporary file of our own, flush it to disk, then give it the final name without ever replacing an
+        // existing key (see `publish_new`): a crash leaves either no key or a whole one.
+        let temp = self.new_temp_path();
         let written = (|| -> io::Result<()> {
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&temp)?;
+            let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
             file.write_all(HEADER)?;
             file.write_all(&blob)?;
             file.sync_all()
         })();
-        if let Err(e) = written.and_then(|()| fs::rename(&temp, &self.path)) {
-            let _ = fs::remove_file(&temp);
-            return Err(e.into());
+        match written.and_then(|()| publish_new(&temp, &self.path)) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = fs::remove_file(&temp);
+                if e.kind() == io::ErrorKind::AlreadyExists {
+                    Err(KeyError::AlreadyExists)
+                } else {
+                    Err(e.into())
+                }
+            }
         }
-        Ok(())
     }
 }
 
@@ -334,7 +354,8 @@ mod dpapi {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::sync::atomic::AtomicU32;
+    use std::sync::{Arc, Barrier};
 
     use super::*;
 
@@ -342,14 +363,14 @@ mod tests {
     /// (as DPAPI refuses another user's blob).
     #[derive(Debug, Default)]
     struct FakeProtector {
-        protects: Cell<u32>,
+        protects: AtomicU32,
     }
 
     const MARK: &[u8] = b"FAKE";
 
     impl Protector for FakeProtector {
         fn protect(&self, plain: &[u8]) -> Result<Vec<u8>, ProtectError> {
-            self.protects.set(self.protects.get() + 1);
+            self.protects.fetch_add(1, Ordering::Relaxed);
             let mut out = MARK.to_vec();
             out.extend(plain.iter().map(|b| b ^ 0x5a));
             Ok(out)
@@ -406,7 +427,7 @@ mod tests {
         let s = store(&dir);
         s.store_new(&key(9)).expect("store");
         assert_eq!(bytes(s.load().expect("load")), Some([9; DEVICE_KEY_LEN]));
-        assert!(!s.temp_path().exists(), "temporary file left behind");
+        assert_only_the_key_is_left(&s);
     }
 
     #[test]
@@ -441,7 +462,67 @@ mod tests {
         assert_eq!(first.as_bytes(), &[3; DEVICE_KEY_LEN]);
         let again = load_or_create(&s, || panic!("must not generate a second key")).expect("load");
         assert_eq!(again.as_bytes(), &[3; DEVICE_KEY_LEN]);
-        assert_eq!(s.protector.protects.get(), 1);
+        assert_eq!(s.protector.protects.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn publishing_never_replaces_an_existing_file() {
+        // The window between "no key yet" and the final rename: another writer got there first.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(DEVICE_KEY_FILE);
+        let temp = dir.path().join("device.key.1-0.tmp");
+        fs::write(&path, b"the existing key").expect("write");
+        fs::write(&temp, b"a new key").expect("write");
+        let err = publish_new(&temp, &path).expect_err("must not replace");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&path).expect("read"), b"the existing key");
+    }
+
+    #[test]
+    fn concurrent_creations_store_exactly_one_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let s = Arc::new(store(&dir));
+        let start = Arc::new(Barrier::new(8));
+        let handles: Vec<_> = (0..8u8)
+            .map(|i| {
+                let (s, start) = (Arc::clone(&s), Arc::clone(&start));
+                std::thread::spawn(move || {
+                    start.wait();
+                    s.store_new(&key(i)).map(|()| i)
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().expect("thread")).collect();
+        let winners: Vec<u8> = results.iter().filter_map(|r| r.as_ref().ok().copied()).collect();
+        assert_eq!(winners.len(), 1, "{results:?}");
+        assert!(
+            results
+                .iter()
+                .all(|r| matches!(r, Ok(_) | Err(KeyError::AlreadyExists))),
+            "{results:?}"
+        );
+        assert_eq!(bytes(s.load().expect("load")), Some([winners[0]; DEVICE_KEY_LEN]));
+        assert_only_the_key_is_left(&s);
+    }
+
+    #[test]
+    fn temporary_names_are_unique() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let s = store(&dir);
+        assert_ne!(s.new_temp_path(), s.new_temp_path());
+    }
+
+    fn assert_only_the_key_is_left(s: &FileKeyStore<FakeProtector>) {
+        let dir = s.path().parent().expect("parent");
+        let names: Vec<_> = fs::read_dir(dir)
+            .expect("read dir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(
+            names,
+            vec![std::ffi::OsString::from(DEVICE_KEY_FILE)],
+            "temporary file left behind"
+        );
     }
 
     #[test]
@@ -494,7 +575,8 @@ mod tests {
         let s = FileKeyStore::new(device_key_path(dir.path()), BrokenProtector);
         assert!(matches!(s.store_new(&key(4)), Err(KeyError::Protect(_))));
         assert!(!s.path().exists());
-        assert!(!s.temp_path().exists());
+        // Protection fails before anything is written: no temporary file, not even the folder.
+        assert!(!dir.path().join("P2PC").exists());
     }
 
     #[test]
