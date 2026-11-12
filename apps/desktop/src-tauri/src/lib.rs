@@ -27,6 +27,7 @@ pub mod keystore;
 pub mod launch;
 pub mod navigation;
 pub mod settings;
+pub mod setup;
 pub mod state;
 pub mod tray;
 
