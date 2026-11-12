@@ -260,7 +260,89 @@ fn an_argv_target_may_not_be_the_script_of_a_shell_dash_c() {
     let with_target = format!(
         "{text}\n[[params]]\nname = \"extra\"\ntype = \"enum\"\nvalues = [\"a\", \"b\"]\ndefault = \"a\"\ntarget = \"argv:2\"\n"
     );
-    assert_refused(&with_target, "shell");
+    assert_refused(&with_target, "inline code");
+}
+
+/// The batch fixture with `command` replaced and one enum parameter that targets `argv:<index>`.
+fn with_command_and_argv_target(command: &[&str], index: usize) -> String {
+    let list = command.iter().map(|a| format!("{a:?}")).collect::<Vec<_>>().join(", ");
+    let text = batch_toml().replace(
+        "command = [\"/bin/sh\", \"/inputs/.template/run.sh\", \"fixed\"]",
+        &format!("command = [{list}]"),
+    );
+    format!(
+        "{text}\n[[params]]\nname = \"extra\"\ntype = \"enum\"\nvalues = [\"a\", \"b\"]\ndefault = \"a\"\ntarget = \"argv:{index}\"\n"
+    )
+}
+
+#[test]
+fn an_argv_target_may_not_be_inline_code_of_any_common_interpreter() {
+    // (command, the argv index a parameter would replace). Each index is the code (or a slot after the flag).
+    let refused: &[(&[&str], usize)] = &[
+        (&["/bin/sh", "-c", "echo x"], 2),
+        (&["/bin/bash", "-ec", "echo x"], 2),
+        (&["/bin/dash", "-c", "echo x", "name"], 3),
+        // Wrappers: `env` (with options, assignments and options that take a value) and `busybox`.
+        (&["/usr/bin/env", "sh", "-c", "echo x"], 3),
+        (&["/usr/bin/env", "-i", "FOO=1", "bash", "-c", "echo x"], 5),
+        (&["/usr/bin/env", "-u", "FOO", "sh", "-c", "echo x"], 5),
+        (&["/usr/bin/env", "-iu", "FOO", "sh", "-c", "echo x"], 5),
+        (&["/usr/bin/env", "--unset=FOO", "sh", "-c", "echo x"], 4),
+        (&["/usr/bin/env", "--", "sh", "-c", "echo x"], 4),
+        (&["/bin/busybox", "sh", "-c", "echo x"], 3),
+        (&["/usr/bin/env", "busybox", "sh", "-c", "echo x"], 4),
+        (&["/usr/bin/env", "FOO=1", "/bin/busybox", "ash", "-c", "echo x"], 5),
+        // `env -S` splits one string into a command line: nothing after it can be told apart from code.
+        (&["/usr/bin/env", "-S", "sh -c", "x"], 3),
+        (&["/usr/bin/env", "--split-string=sh -c", "x"], 2),
+        // Other interpreters' inline-code flags.
+        (&["/usr/bin/python3", "-c", "print(1)"], 2),
+        (&["/usr/bin/python3.12", "-c", "print(1)"], 2),
+        (&["/usr/bin/python", "-Ic", "print(1)"], 2),
+        (&["/usr/bin/env", "python3", "-c", "print(1)"], 3),
+        (&["/usr/bin/node", "-e", "1"], 2),
+        (&["/usr/bin/node", "-p", "1"], 2),
+        (&["/usr/bin/node", "--eval", "1"], 2),
+        (&["/usr/bin/node", "--print", "1"], 2),
+        (&["/usr/bin/nodejs", "-e", "1"], 2),
+        (&["/usr/bin/perl", "-e", "1"], 2),
+        (&["/usr/bin/perl", "-E", "say 1"], 2),
+        (&["/usr/bin/perl", "-w", "-e", "1"], 3),
+        (&["/usr/bin/ruby", "-e", "1"], 2),
+    ];
+    for (command, index) in refused {
+        let found = problems(&with_command_and_argv_target(command, *index), Mode::Dev);
+        assert!(
+            found.iter().any(|p| p.contains("inline code")),
+            "{command:?} argv:{index} was not refused as inline code: {found:#?}"
+        );
+    }
+}
+
+#[test]
+fn an_argv_target_that_is_a_script_argument_is_fine() {
+    // The same interpreters running a script file: a parameter there is data for the script, not code.
+    let accepted: &[(&[&str], usize)] = &[
+        (&["/bin/sh", "/inputs/.template/run.sh", "fixed"], 2),
+        (&["/usr/bin/python3", "/inputs/.template/run.py", "fixed"], 2),
+        (&["/usr/bin/python3", "-u", "/inputs/.template/run.py", "fixed"], 3),
+        (
+            &["/usr/bin/env", "FOO=1", "python3", "/inputs/.template/run.py", "fixed"],
+            4,
+        ),
+        (&["/usr/bin/node", "/inputs/.template/run.js", "fixed"], 2),
+        (&["/usr/bin/perl", "/inputs/.template/run.pl", "fixed"], 2),
+        (&["/usr/bin/ruby", "/inputs/.template/run.rb", "fixed"], 2),
+        (&["/bin/busybox", "sh", "/inputs/.template/run.sh", "fixed"], 3),
+        (&["/usr/bin/env", "-u", "FOO", "/bin/cat", "/inputs/audio", "fixed"], 5),
+    ];
+    for (command, index) in accepted {
+        let found = problems(&with_command_and_argv_target(command, *index), Mode::Dev);
+        assert!(
+            !found.iter().any(|p| p.contains("inline code")),
+            "{command:?} argv:{index} was refused: {found:#?}"
+        );
+    }
 }
 
 #[test]

@@ -60,7 +60,7 @@ impl fmt::Display for Problem {
 
 /// Wildcard routes (a final `*` segment, §7.4) that a reviewer accepted: `(template id, path)`. Empty in the beta
 /// (§7.4: "the beta templates do not"). Adding a line here is a reviewed change, like the template that needs it.
-const WILDCARD_ROUTES: &[(&str, &str)] = &[];
+pub const WILDCARD_ROUTES: &[(&str, &str)] = &[];
 
 /// The most templates in a bundle, parameters in a template, routes in a template and values in an enum.
 const MAX_TEMPLATES: usize = 32;
@@ -93,9 +93,6 @@ const FORBIDDEN_ENV: &[&str] = &[
 
 /// Ollama's model-writing endpoints (the second segment after `/api/`).
 const MODEL_WRITE_SEGMENTS: &[&str] = &["pull", "create", "copy", "push", "delete", "blobs"];
-
-/// Shells whose `-c` argument is a script.
-const SHELLS: &[&str] = &["sh", "bash", "dash", "ash", "zsh", "ksh"];
 
 struct Ctx<'a> {
     id: &'a str,
@@ -445,9 +442,9 @@ fn check_param_target(t: &Template, p: &TemplateParam, c: &mut Ctx<'_>) {
                 c.say(format!("argv:{index} is outside the command ({len} elements)"));
             } else if i == 0 {
                 c.say("argv:0 would replace the program itself");
-            } else if is_shell_script_slot(&spec.command, i) {
+            } else if is_inline_code_slot(&spec.command, i) {
                 c.say(format!(
-                    "argv:{index} is the script of a shell `-c`: a parameter must never become shell code"
+                    "argv:{index} is inline code for an interpreter (`sh -c`, `python3 -c`, `node -e`, `perl -e`, `ruby -e`, also through `env` or `busybox`): a parameter must never become code"
                 ));
             }
         }
@@ -497,18 +494,88 @@ fn check_param_target(t: &Template, p: &TemplateParam, c: &mut Ctx<'_>) {
     }
 }
 
-/// Whether `command[i]` is the script argument of a shell invoked with `-c`.
-fn is_shell_script_slot(command: &[String], i: usize) -> bool {
-    let Some(program) = command.first() else { return false };
-    let base = program.rsplit('/').next().unwrap_or(program);
-    SHELLS.contains(&base)
-        && i >= 1
-        && command.get(..i).is_some_and(|before| {
-            before
-                .iter()
-                .skip(1)
-                .any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('c'))
-        })
+/// The last path component of a program name.
+fn base_name(program: &str) -> &str {
+    program.rsplit('/').next().unwrap_or(program)
+}
+
+/// A bundle of short options such as `-c` or `-ec`: one dash, then ASCII letters only.
+fn short_options(arg: &str) -> Option<&str> {
+    let rest = arg.strip_prefix('-')?;
+    (!rest.is_empty() && rest.bytes().all(|b| b.is_ascii_alphabetic())).then_some(rest)
+}
+
+/// Where the interpreter starts, after the wrappers that run another program: `env` (its options, `NAME=value`
+/// assignments and the options that take a value) and `busybox` (the applet is the next word).
+enum Start {
+    /// The program that really runs is at this index.
+    At(usize),
+    /// `env -S` splits one string into a command line: from this index on, nothing can be told apart from code.
+    SplitString(usize),
+}
+
+fn program_start(command: &[String]) -> Start {
+    let mut idx = 0;
+    while let Some(program) = command.get(idx) {
+        match base_name(program) {
+            "busybox" => idx += 1,
+            "env" => {
+                idx += 1;
+                while let Some(arg) = command.get(idx) {
+                    if arg == "--" {
+                        idx += 1;
+                        break;
+                    }
+                    if arg.starts_with("--split-string") || short_options(arg).is_some_and(|o| o.contains('S')) {
+                        return Start::SplitString(idx);
+                    }
+                    if arg == "--unset"
+                        || arg == "--chdir"
+                        || short_options(arg).is_some_and(|o| o.ends_with(['u', 'C']))
+                    {
+                        idx += 2; // the option and its value
+                    } else if arg.starts_with('-') || arg.contains('=') {
+                        idx += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    Start::At(idx)
+}
+
+/// Whether `arg` makes `interpreter` run the next argument as code: `sh -c`, `python3 -c`, `node -e`, `perl -e`,
+/// `ruby -e`. A short-option bundle counts (`-ec`, `-Ic`). It is deliberately broad: a false positive only makes the
+/// author pass the value another way, a miss would let a parameter become code.
+fn is_inline_code_flag(interpreter: &str, arg: &str) -> bool {
+    let has = |letters: &[char]| short_options(arg).is_some_and(|o| o.contains(letters));
+    match interpreter {
+        "sh" | "bash" | "dash" | "ash" | "zsh" | "ksh" => has(&['c']),
+        i if i.starts_with("python") => has(&['c']),
+        "node" | "nodejs" => has(&['e', 'p']) || arg == "--eval" || arg == "--print" || arg.starts_with("--eval="),
+        "perl" => has(&['e', 'E']),
+        "ruby" => has(&['e']),
+        _ => false,
+    }
+}
+
+/// Whether `command[i]` comes after an inline-code flag of the interpreter the command runs: the code itself, or
+/// what follows it. Looks through `env` and `busybox`.
+fn is_inline_code_slot(command: &[String], i: usize) -> bool {
+    match program_start(command) {
+        Start::SplitString(at) => i > at,
+        Start::At(at) => {
+            let Some(program) = command.get(at) else { return false };
+            let interpreter = base_name(program);
+            i > at
+                && command
+                    .get(at + 1..i)
+                    .is_some_and(|before| before.iter().any(|a| is_inline_code_flag(interpreter, a)))
+        }
+    }
 }
 
 // ---- routes ----------------------------------------------------------------------------------------------------
@@ -542,15 +609,20 @@ fn check_routes(t: &Template, c: &mut Ctx<'_>) {
         if r.method != "GET" && r.method != "POST" {
             c.say(format!("route {shown}: the method must be exactly GET or POST"));
         }
-        if let Some(why) = route_path_problem(&t.info.id, &r.path) {
+        if let Some(why) = route_path_problem(&t.info.id, &r.path, WILDCARD_ROUTES) {
             c.say(format!("route {shown}: {why}"));
         }
     }
 }
 
-/// Why `path` is not an acceptable route path, or `None`. The hub matches the request target byte for byte (§7.4),
-/// so a path with a query, an escape or a dot segment could never match what the author meant.
-fn route_path_problem(template_id: &str, path: &str) -> Option<String> {
+/// Why `path` is not an acceptable route path of template `template_id`, or `None`. The hub matches the request
+/// target byte for byte (§7.4), so a path with a query, an escape or a dot segment could never match what the author
+/// meant.
+///
+/// `reviewed_wildcards` is the list of `(template id, path)` wildcard routes a reviewer accepted
+/// ([`WILDCARD_ROUTES`] in a real check). It is a parameter so that the expansion of a reviewed wildcard into the
+/// model-writing words can be tested while the beta list is empty.
+pub fn route_path_problem(template_id: &str, path: &str, reviewed_wildcards: &[(&str, &str)]) -> Option<String> {
     if !path.starts_with('/') {
         return Some("the path must be absolute".to_string());
     }
@@ -575,7 +647,7 @@ fn route_path_problem(template_id: &str, path: &str) -> Option<String> {
         if !wildcard_ok {
             return Some("a wildcard is only a whole final `*` segment".to_string());
         }
-        if !WILDCARD_ROUTES.contains(&(template_id, path)) {
+        if !reviewed_wildcards.contains(&(template_id, path)) {
             return Some(
                 "a wildcard route needs a reviewed entry in WILDCARD_ROUTES (the beta templates have none)".to_string(),
             );

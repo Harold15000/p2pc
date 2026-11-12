@@ -58,6 +58,12 @@ fi
 
 mkdir -p "$out" "$models"
 
+# A run killed by its timeout or by the loss of its node cannot run the `trap` below, and the volume outlives the job.
+# So clear what an earlier run left behind: its scratch directories and its half-written downloads. A volume has one
+# job at a time (spec §11.3), so nothing here belongs to a run that is still going. Finished models stay.
+rm -rf "$models"/.work.*
+rm -f "$models"/ggml-*.bin.part
+
 # The converted audio is scratch: keep it out of the outputs and remove it on every exit.
 work="$(mktemp -d "$models/.work.XXXXXX")"
 trap 'rm -rf "$work"' EXIT

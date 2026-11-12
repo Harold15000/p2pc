@@ -149,6 +149,37 @@ fn it_leaves_no_working_file_in_outputs() {
 }
 
 #[test]
+fn it_removes_what_a_killed_run_left_in_the_models_volume() {
+    // A job killed by its timeout or a node loss cannot run its `trap`, so the next run on the same volume must clear
+    // the scratch directory and the half-written downloads it left, or the 5 GiB volume fills up with them.
+    let sb = sandbox(true);
+    let models = sb.root.join("volumes/models");
+    fs::create_dir_all(models.join(".work.old")).expect("mkdir");
+    fs::write(models.join(".work.old/audio.wav"), vec![b'x'; 4096]).expect("stale wav");
+    fs::create_dir_all(models.join(".work.AbC123")).expect("mkdir");
+    fs::write(models.join("ggml-base.bin.part"), b"half").expect("stale part");
+    fs::write(models.join("ggml-medium.bin.part"), b"half").expect("stale part");
+    // A finished model of another size is the volume's content and must stay.
+    fs::write(models.join("ggml-medium.bin"), b"a finished model").expect("model");
+    // Something that is not ours must stay too.
+    fs::write(models.join("README"), b"keep").expect("other");
+
+    let out = run(&sb, "auto", "small");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let mut left: Vec<String> = fs::read_dir(&models)
+        .expect("models")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        ["README", "ggml-medium.bin", "ggml-small.bin"],
+        "stale .work.* and *.part are gone, the finished models and unrelated files stay"
+    );
+}
+
+#[test]
 fn it_refuses_a_language_or_model_that_is_not_a_plain_listed_word() {
     for (language, model) in [
         ("en; touch pwned", "small"),
