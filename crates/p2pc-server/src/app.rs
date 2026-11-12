@@ -76,9 +76,13 @@ pub struct AppState {
     /// The open port connections of every service (H2 §7.4): counted by the port relay (T2-13), read by the
     /// scheduler's idle cancel and by `GET /v1/jobs/{id}`.
     pub connections: crate::scheduler::OpenConnections,
-    /// Which templates are `singleton` (H2 §7.6), for the template view of the job routes (§5.5). Until the template
-    /// bundle is loaded (T2-15) it is [`jobs_api::NoTemplates`]: no template, so no singleton instance.
+    /// Which templates are `singleton` (H2 §7.6), for the template view of the job routes (§5.5), and their
+    /// `allowed_routes`, for the filter of their service ports (§7.4). Until the template bundle is loaded (T2-15) it
+    /// is [`jobs_api::NoTemplates`]: no template, so no singleton instance and no allowed route.
     pub templates: Arc<dyn jobs_api::TemplateCatalog>,
+    /// The port relay (H2 §7.4): the limits and the accounting of the service port connections. It counts them in
+    /// `connections`.
+    pub ports: crate::gateway::ports::PortRelay,
 }
 
 impl AppState {
@@ -100,6 +104,8 @@ impl AppState {
         let mut conn = db.acquire().await.map_err(StoreError::from)?;
         let owner_account = store::accounts::owner(&mut conn).await?;
         drop(conn);
+        let connections = crate::scheduler::OpenConnections::default();
+        let ports = crate::gateway::ports::PortRelay::new(&config, connections.clone());
         let logs = crate::logs::LogStore::new(&config.data_dir);
         let outputs = crate::outputs::OutputStore::new(&config.data_dir, db.clone(), clock.clone(), logs.clone());
         Ok(Self {
@@ -116,7 +122,8 @@ impl AppState {
             nodes: Arc::new(EmptyNodeDirectory),
             kick: crate::scheduler::Kick::default(),
             devices: crate::devices_api::DeviceSessions::default(),
-            connections: crate::scheduler::OpenConnections::default(),
+            connections,
+            ports,
             templates: Arc::new(jobs_api::NoTemplates),
         })
     }
@@ -217,12 +224,15 @@ fn build(state: AppState, transport: Transport) -> Router {
     // Streaming routes opt out of the whole-request limit by being added here instead of to `bounded`. Each bounds
     // itself with an idle limit (`http.keepalive_idle_ms`): no data taken or sent for that long ends the stream
     // (§10, see `artifacts_api`). Logs in both modes (a 64 MiB page can outlast 30 s on a slow link) and downloads.
+    // A service port connection (H2 §7.4) leaves the limit too: `?wait_ready=true` and the node's answer bound what
+    // comes before its upgrade, and `port_idle_s` what comes after.
     let streaming: Router<AppState> = Router::new()
         .route("/v1/jobs/{id}/logs", get(crate::artifacts_api::get_logs))
         .route(
             "/v1/jobs/{id}/outputs/{*path}",
             get(crate::artifacts_api::download_output),
-        );
+        )
+        .route("/v1/jobs/{id}/ports/{port}/connect", post(crate::ports_api::connect));
     let (authenticated, streaming) = match transport {
         Transport::Keys => (
             authenticated.route_layer(middleware::from_fn_with_state(state.clone(), require_api_key)),

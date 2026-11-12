@@ -179,6 +179,14 @@ impl ApiError {
         Self::new(StatusCode::SERVICE_UNAVAILABLE, code, "Service Unavailable", detail)
     }
 
+    /// A problem with a given status and code, titled with the status's reason phrase: for the H2 codes whose
+    /// status has no constructor of its own (`403 route_not_allowed`, `431 headers_too_large`, `502 node_unreachable`,
+    /// H2 §7.7).
+    #[must_use]
+    pub fn with_status(status: StatusCode, code: &str, detail: impl Into<String>) -> Self {
+        Self::new(status, code, status.canonical_reason().unwrap_or("Error"), detail)
+    }
+
     /// `415 unsupported_media_type`.
     #[must_use]
     pub fn unsupported_media_type() -> Self {
