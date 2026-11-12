@@ -2718,3 +2718,161 @@ fn a_service_logs_past_the_batch_cap() {
         }
     });
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// The ingress bridge of a service (H2 §11.2): its ports file and its socket, from `prepare` to `cleanup`
+
+use crate::sandbox::ingress::{IngressBridge, OpenError, PORTS_FILE, SOCKET_NAME};
+use std::os::unix::fs::MetadataExt as _;
+
+impl Fx {
+    /// A driver for services with `bridge` as its ingress bridge (and a scripted probe for the checks).
+    fn bridged_driver(&self, bridge: &IngressBridge, engine: MockEngine) -> PodmanDriver<MockEngine, FsCgroups> {
+        let mut cfg = self.service_cfg(FakeProbe::new([], Probe::Pass));
+        cfg.ingress = Some(bridge.clone());
+        self.driver_with(cfg, engine)
+    }
+
+    fn p2pc_dir(&self, lease: &LeaseId) -> PathBuf {
+        self.jobs_dir().join(lease.to_string()).join("p2pc")
+    }
+}
+
+/// A service gets `ports.json` with its ports and a place on the bridge for its `(lease_id, epoch)` before its
+/// container is created; a cancel closes the bridge to new streams at once; `cleanup` takes the place away.
+#[test]
+fn a_service_is_attached_to_the_ingress_bridge_from_prepare_to_cleanup() {
+    guarded(Clock::Real, || async {
+        let fx = Fx::new();
+        let bridge = IngressBridge::without_sockets();
+        let engine = MockEngine::default();
+        let d = fx.bridged_driver(&bridge, engine.clone());
+        let mut lease = service_lease(&fx, None, 600);
+        lease.epoch = 7;
+        lease.job.service = Some(
+            serde_json::from_value(
+                serde_json::json!({"ports": [{"port": 11434, "name": "api"}, {"port": 8080, "name": "web"}]}),
+            )
+            .unwrap(),
+        );
+        let id = lease.lease_id;
+        let (tx, _rx) = events();
+        let cancel = CancelHandle::new();
+        let job = d.prepare(&fx.owner, lease, tx, cancel.clone()).await.unwrap();
+
+        // The ports the shim may forward, in the directory the container sees read-only as `/.p2pc`.
+        let ports_file = fx.p2pc_dir(&id).join(PORTS_FILE);
+        assert_eq!(fs::read_to_string(&ports_file).unwrap(), r#"{"ports":[11434,8080]}"#);
+        assert_eq!(fs::metadata(&ports_file).unwrap().mode() & 0o7777, 0o644);
+        assert_eq!(bridge.attached(&id), Some((7, vec![11434, 8080])));
+        assert!(
+            engine.calls().iter().any(|c| c.starts_with("create")),
+            "{:?}",
+            engine.calls()
+        );
+
+        // SI-H2-10: the container has no network and publishes nothing; the bridge needs no new argument.
+        let argv = engine.0.lock().unwrap().create_argv.clone().unwrap();
+        assert!(argv.contains(&"--network=none".to_string()), "{argv:?}");
+        for arg in &argv {
+            assert!(
+                !(arg == "-p"
+                    || arg == "-P"
+                    || arg.starts_with("--publish")
+                    || arg.starts_with("--expose")
+                    || arg.starts_with("--network=") && arg != "--network=none"
+                    || arg.contains(SOCKET_NAME)
+                    || arg.contains(PORTS_FILE)),
+                "{arg}"
+            );
+        }
+        let mounts: Vec<&String> = argv.iter().filter(|a| a.contains(":/.p2pc:")).collect();
+        assert_eq!(mounts.len(), 1, "{argv:?}");
+        assert!(
+            mounts[0].ends_with(":/.p2pc:ro,U"),
+            "the bridge's files are in the read-only mount"
+        );
+
+        // The lease's cancel reaches the bridge: no new port stream for it (SI-H2-6).
+        cancel.cancel();
+        let refused = bridge.open_port(id, 7, 11434).await.err();
+        assert_eq!(refused, Some(OpenError::StaleLease));
+
+        d.cleanup(job).await;
+        assert_eq!(bridge.attached(&id), None, "detached at cleanup");
+        assert!(!fx.jobs_dir().join(id.to_string()).exists());
+    });
+}
+
+/// A batch job has no ports file and no place on the bridge, on a node that runs services too.
+#[test]
+fn a_batch_job_is_not_attached_to_the_ingress_bridge() {
+    guarded(Clock::Real, || async {
+        let fx = Fx::new();
+        let bridge = IngressBridge::without_sockets();
+        let d = fx.bridged_driver(&bridge, MockEngine::default());
+        let lease = fx.lease();
+        let id = lease.lease_id;
+        let (tx, _rx) = events();
+        let job = d.prepare(&fx.owner, lease, tx, CancelHandle::new()).await.unwrap();
+        assert!(!fx.p2pc_dir(&id).join(PORTS_FILE).exists());
+        assert!(!fx.p2pc_dir(&id).join(SOCKET_NAME).exists());
+        assert_eq!(bridge.attached(&id), None);
+        d.cleanup(job).await;
+    });
+}
+
+/// A `prepare` that fails after the lease was attached (here `podman create`) leaves nothing on the bridge.
+#[test]
+fn a_failed_prepare_detaches_the_service_from_the_ingress_bridge() {
+    guarded(Clock::Real, || async {
+        let fx = Fx::new();
+        let bridge = IngressBridge::without_sockets();
+        let engine = MockEngine::with(|s| s.fail_create = true);
+        let d = fx.bridged_driver(&bridge, engine);
+        let lease = service_lease(&fx, None, 600);
+        let id = lease.lease_id;
+        let (tx, _rx) = events();
+        let failed = d.prepare(&fx.owner, lease, tx, CancelHandle::new()).await.err();
+        assert!(
+            matches!(failed, Some(SandboxError::Failed { code, .. }) if code == error_code::CREATE_FAILED),
+            "{failed:?}"
+        );
+        assert_eq!(bridge.attached(&id), None);
+        d.drain_background().await;
+        assert!(!fx.jobs_dir().join(id.to_string()).exists());
+    });
+}
+
+/// With the real bridge the socket is the agent's own file, 0600, next to the shim and the ports file, and it is
+/// gone after `cleanup`. Skipped, loudly, where the environment forbids unix sockets.
+#[test]
+fn a_service_gets_its_ingress_socket_in_the_read_only_mount() {
+    guarded(Clock::Real, || async {
+        let forbidden = std::os::unix::net::UnixListener::bind("/nonexistent.invalid/probe")
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
+        if forbidden {
+            eprintln!("SKIPPED: this environment forbids unix sockets");
+            return;
+        }
+        let fx = Fx::new();
+        let bridge = IngressBridge::new();
+        let d = fx.bridged_driver(&bridge, MockEngine::default());
+        let lease = service_lease(&fx, None, 600);
+        let id = lease.lease_id;
+        let (tx, _rx) = events();
+        let job = d.prepare(&fx.owner, lease, tx, CancelHandle::new()).await.unwrap();
+        let socket = fx.p2pc_dir(&id).join(SOCKET_NAME);
+        let meta = fs::symlink_metadata(&socket).unwrap();
+        assert!(std::os::unix::fs::FileTypeExt::is_socket(&meta.file_type()));
+        assert_eq!(meta.mode() & 0o7777, 0o600);
+        let mut entries: Vec<String> = fs::read_dir(fx.p2pc_dir(&id))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        assert_eq!(entries, [SOCKET_NAME, PORTS_FILE, "shim"]);
+        d.cleanup(job).await;
+        assert!(fs::symlink_metadata(&socket).is_err());
+    });
+}

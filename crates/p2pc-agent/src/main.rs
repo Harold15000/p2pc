@@ -318,7 +318,11 @@ fn run_cmd(cli: &Cli, env: &Env) -> anyhow::Result<ExitCode> {
         // leftovers of an earlier process swept before the first Hello (no checkpointing in v0.1, §9).
         let uplink = Uplink::new();
         let facts = NodeFacts::detect(&host, &config).await;
-        let Node { executor, offers } = node::build(
+        let Node {
+            executor,
+            offers,
+            ingress,
+        } = node::build(
             &config,
             facts,
             server.account_id,
@@ -345,6 +349,8 @@ fn run_cmd(cli: &Cli, env: &Env) -> anyhow::Result<ExitCode> {
             inventory_interval: INVENTORY_INTERVAL,
             decisions: Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_DECISIONS)),
             uplink,
+            // The hub's port streams go through the driver's ingress bridge (H2 §6.1, §11.2).
+            ports: Some(Arc::new(ingress)),
         };
         let daemon = Daemon {
             shared,
