@@ -16,10 +16,17 @@
 //!   arguments or environment values look like a join token or an API key is refused before anything starts
 //!   ([`RunError::SecretInArguments`]). Secrets go on stdin ([`Invocation::stdin`]), which is wiped when dropped and
 //!   never shown by `Debug`.
+//! - **Byte-exact files.** Large binary data (the state archive of an upgrade, H2 §8.3; a template bundle, §14.1) goes
+//!   through files: [`Invocation::stdin_file`] streams a file to the child's stdin and [`Invocation::stdout_file`]
+//!   streams the child's stdout to a file, raw bytes, never decoded and never capped. This is what `install.ps1` had
+//!   to work around with `cmd.exe` redirections and .NET streams, because PowerShell 5.1 re-encodes piped bytes.
 
 use std::fmt;
+use std::fs::File;
 use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -55,6 +62,8 @@ pub struct Invocation {
     args: Vec<String>,
     env: Vec<(String, String)>,
     stdin: Option<Zeroizing<Vec<u8>>>,
+    stdin_file: Option<PathBuf>,
+    stdout_file: Option<PathBuf>,
     timeout: Option<Duration>,
 }
 
@@ -66,6 +75,8 @@ impl Invocation {
             args: Vec::new(),
             env: Vec::new(),
             stdin: None,
+            stdin_file: None,
+            stdout_file: None,
             timeout: None,
         }
     }
@@ -95,6 +106,21 @@ impl Invocation {
     /// Bytes written to the child's stdin, then EOF. They are wiped when the invocation is dropped and never shown.
     pub fn stdin(mut self, bytes: Vec<u8>) -> Self {
         self.stdin = Some(Zeroizing::new(bytes));
+        self.stdin_file = None;
+        self
+    }
+
+    /// A file whose bytes are streamed, unchanged, to the child's stdin, then EOF. Replaces [`Invocation::stdin`].
+    pub fn stdin_file(mut self, path: impl AsRef<Path>) -> Self {
+        self.stdin_file = Some(path.as_ref().to_owned());
+        self.stdin = None;
+        self
+    }
+
+    /// A file the child's stdout is streamed to, unchanged and uncapped (created or truncated). [`Output::stdout`] is
+    /// then empty.
+    pub fn stdout_file(mut self, path: impl AsRef<Path>) -> Self {
+        self.stdout_file = Some(path.as_ref().to_owned());
         self
     }
 
@@ -122,6 +148,16 @@ impl Invocation {
     /// The stdin bytes, if any.
     pub fn stdin_bytes(&self) -> Option<&[u8]> {
         self.stdin.as_ref().map(|b| b.as_slice())
+    }
+
+    /// The file streamed to stdin, if any.
+    pub fn stdin_path(&self) -> Option<&Path> {
+        self.stdin_file.as_deref()
+    }
+
+    /// The file stdout is streamed to, if any.
+    pub fn stdout_path(&self) -> Option<&Path> {
+        self.stdout_file.as_deref()
     }
 
     /// The time limit, if any.
@@ -153,6 +189,8 @@ impl fmt::Debug for Invocation {
             .field("args", &self.args)
             .field("env", &self.env.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>())
             .field("stdin", &self.stdin.as_ref().map(|b| format!("<{} bytes>", b.len())))
+            .field("stdin_file", &self.stdin_file)
+            .field("stdout_file", &self.stdout_file)
             .field("timeout", &self.timeout)
             .finish()
     }
@@ -221,6 +259,9 @@ pub enum RunError {
     /// Waiting for the program failed.
     #[error("{program}: {message}")]
     Wait { program: String, message: String },
+    /// A file of [`Invocation::stdin_file`] or [`Invocation::stdout_file`] could not be opened, read or written.
+    #[error("{program}: {message}")]
+    File { program: String, message: String },
     /// An argument or an environment value looks like a secret: nothing was started (the value is not shown).
     #[error(
         "refused to run {program}: an argument looks like a secret (not shown); secrets go on stdin, never on a command line"
@@ -245,6 +286,13 @@ pub trait CommandRunner {
 pub trait Pause {
     /// Waits this long.
     fn sleep(&self, duration: Duration);
+
+    /// A monotonic clock (time since an arbitrary start), for deadlines: the wall clock can jump after the host slept.
+    /// The fake advances it by the pauses it records.
+    fn now(&self) -> Duration {
+        static START: OnceLock<Instant> = OnceLock::new();
+        START.get_or_init(Instant::now).elapsed()
+    }
 }
 
 /// The real [`Pause`]: `std::thread::sleep`.
@@ -306,9 +354,22 @@ impl CommandRunner for SystemRunner {
     fn run(&self, inv: &Invocation) -> Result<Output, RunError> {
         inv.check_no_secret()?;
         let program = inv.program.clone();
+        let file_err = |what: &str, path: &Path, e: io::Error| RunError::File {
+            program: program.clone(),
+            message: format!("{what} {}: {e}", path.display()),
+        };
+        // Both files are opened before the child starts: a missing input starts nothing.
+        let stdin_file = match &inv.stdin_file {
+            Some(p) => Some(File::open(p).map_err(|e| file_err("cannot read", p, e))?),
+            None => None,
+        };
+        let stdout_file = match &inv.stdout_file {
+            Some(p) => Some(File::create(p).map_err(|e| file_err("cannot write", p, e))?),
+            None => None,
+        };
         let mut cmd = Command::new(resolve_program(&inv.program));
         cmd.args(&inv.args)
-            .stdin(if inv.stdin.is_some() {
+            .stdin(if inv.stdin.is_some() || stdin_file.is_some() {
                 Stdio::piped()
             } else {
                 Stdio::null()
@@ -331,10 +392,13 @@ impl CommandRunner for SystemRunner {
             kind: e.kind(),
             message: e.to_string(),
         })?;
-        let out = drain(child.stdout.take());
+        let (out, to_file) = match stdout_file {
+            Some(file) => (None, Some(copy_to_file(child.stdout.take(), file))),
+            None => (Some(drain(child.stdout.take())), None),
+        };
         let err = drain(child.stderr.take());
-        let feeder = match (child.stdin.take(), &inv.stdin) {
-            (Some(mut pipe), Some(bytes)) => {
+        let feeder = match (child.stdin.take(), &inv.stdin, stdin_file) {
+            (Some(mut pipe), Some(bytes), _) => {
                 let bytes = bytes.clone();
                 // A child that never reads its stdin must not block us: the write runs on its own thread, and
                 // dropping the pipe is the child's EOF.
@@ -342,6 +406,10 @@ impl CommandRunner for SystemRunner {
                     let _ = pipe.write_all(&bytes);
                 }))
             }
+            (Some(mut pipe), None, Some(mut file)) => Some(thread::spawn(move || {
+                // Raw bytes from the file to the pipe; a child that stops reading ends the copy with an error.
+                let _ = io::copy(&mut file, &mut pipe);
+            })),
             _ => None,
         };
         let status = match inv.timeout {
@@ -374,14 +442,37 @@ impl CommandRunner for SystemRunner {
         if let Some(f) = feeder {
             let _ = f.join();
         }
-        let stdout = out.join().unwrap_or_default();
+        let stdout = out.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
         let stderr = err.join().unwrap_or_default();
+        if let (Some(handle), Some(path)) = (to_file, &inv.stdout_file) {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(file_err("cannot write", path, e)),
+                Err(_) => {
+                    return Err(file_err(
+                        "cannot write",
+                        path,
+                        io::Error::other("the copy thread panicked"),
+                    ));
+                }
+            }
+        }
         Ok(Output {
             code: status.code(),
             stdout,
             stderr,
         })
     }
+}
+
+/// Streams a child's stdout to a file, uncapped, and flushes it to disk.
+fn copy_to_file<R: Read + Send + 'static>(stream: Option<R>, mut file: File) -> thread::JoinHandle<io::Result<()>> {
+    thread::spawn(move || {
+        if let Some(mut s) = stream {
+            io::copy(&mut s, &mut file)?;
+        }
+        file.sync_all()
+    })
 }
 
 /// Decodes the output of a Windows program: UTF-16LE when it looks like it (a BOM, or NULs in the odd bytes, which is
@@ -529,10 +620,12 @@ pub(crate) mod fake {
     use super::*;
 
     type Matcher = Box<dyn Fn(&Invocation) -> bool>;
+    type Handler = Box<dyn Fn(&Invocation) -> Result<Output, RunError>>;
 
     struct Rule {
         matcher: Matcher,
         replies: VecDeque<Result<Output, RunError>>,
+        handler: Option<Handler>,
     }
 
     /// Answers each invocation with the first rule that matches it. A rule's replies are used in order and its last
@@ -562,6 +655,22 @@ pub(crate) mod fake {
             self.rules.borrow_mut().push(Rule {
                 matcher: Box::new(matcher),
                 replies: replies.into(),
+                handler: None,
+            });
+            self
+        }
+
+        /// A rule whose reply is computed (and which may read `stdin_file` or write `stdout_file`, as a real child
+        /// would).
+        pub(crate) fn on_fn(
+            &self,
+            matcher: impl Fn(&Invocation) -> bool + 'static,
+            handler: impl Fn(&Invocation) -> Result<Output, RunError> + 'static,
+        ) -> &Self {
+            self.rules.borrow_mut().push(Rule {
+                matcher: Box::new(matcher),
+                replies: VecDeque::new(),
+                handler: Some(Box::new(handler)),
             });
             self
         }
@@ -586,6 +695,9 @@ pub(crate) mod fake {
             let mut rules = self.rules.borrow_mut();
             for rule in rules.iter_mut() {
                 if (rule.matcher)(inv) {
+                    if let Some(handler) = &rule.handler {
+                        return handler(inv);
+                    }
                     return if rule.replies.len() > 1 {
                         rule.replies.pop_front().unwrap_or_else(|| Ok(Output::default()))
                     } else {
@@ -601,7 +713,7 @@ pub(crate) mod fake {
         }
     }
 
-    /// Records the pauses instead of sleeping.
+    /// Records the pauses instead of sleeping; its clock moves only by them.
     #[derive(Default)]
     pub(crate) struct FakePause {
         slept: RefCell<Vec<Duration>>,
@@ -616,6 +728,10 @@ pub(crate) mod fake {
     impl Pause for FakePause {
         fn sleep(&self, duration: Duration) {
             self.slept.borrow_mut().push(duration);
+        }
+
+        fn now(&self) -> Duration {
+            self.slept.borrow().iter().sum()
         }
     }
 
@@ -797,6 +913,55 @@ mod tests {
         assert_eq!(out.code, Some(3));
         assert_eq!(out.stdout_text(), "a b|v|from stdin");
         assert_eq!(out.stderr_text(), "err");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_pipes_are_byte_exact_and_not_capped() {
+        // Every byte value, CRLFs and NULs included, and more than the capture cap: the state archive of an upgrade
+        // (H2 §8.3) and a template bundle (§14.1) go through these pipes and must arrive unchanged.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.bin");
+        let dst = dir.path().join("out.bin");
+        let mut bytes: Vec<u8> = (0..=255u8).cycle().take(MAX_CAPTURED_BYTES + 4099).collect();
+        bytes.extend_from_slice(b"\r\n\0\xff\xfe");
+        std::fs::write(&src, &bytes).unwrap();
+        let inv = Invocation::new("/bin/cat").stdin_file(&src).stdout_file(&dst);
+        let out = SystemRunner.run(&inv).unwrap();
+        assert!(out.success());
+        assert!(out.stdout.is_empty(), "stdout went to the file");
+        assert_eq!(std::fs::read(&dst).unwrap(), bytes);
+        let shown = format!("{inv:?}");
+        assert!(shown.contains("in.bin") && shown.contains("out.bin"), "{shown}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_stdin_file_is_an_error_before_anything_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let inv = Invocation::new("/bin/cat").stdin_file(dir.path().join("missing"));
+        let err = SystemRunner.run(&inv).unwrap_err();
+        assert!(matches!(err, RunError::File { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn stdin_bytes_and_a_stdin_file_replace_each_other() {
+        let inv = Invocation::new("x").stdin(b"a".to_vec()).stdin_file("f");
+        assert_eq!(inv.stdin_bytes(), None);
+        assert_eq!(inv.stdin_path(), Some(std::path::Path::new("f")));
+        let inv = inv.stdin(b"b".to_vec());
+        assert_eq!(inv.stdin_path(), None);
+        assert_eq!(inv.stdin_bytes(), Some(&b"b"[..]));
+    }
+
+    #[test]
+    fn the_fake_pause_is_a_monotonic_clock() {
+        let pause = FakePause::default();
+        let t0 = pause.now();
+        pause.sleep(Duration::from_secs(2));
+        assert_eq!(pause.now() - t0, Duration::from_secs(2));
+        let real = ThreadPause;
+        assert!(real.now() <= real.now());
     }
 
     #[cfg(unix)]
