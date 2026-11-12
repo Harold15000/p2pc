@@ -14,17 +14,25 @@
 //! 5. every lost lease (hence every requeue) happened at least `lease_ttl_s` after its node's last contact (and
 //!    after the server's boot), or was explicit: absent from a `Hello`, or the node was deleted; and every requeue
 //!    in `job_events` has one of those reasons;
-//! 6. `usage_records` has exactly one row per finished attempt: reported by its node, or estimated by the server when
-//!    the attempt ended with no report (the server ended it, or it was lost);
+//! 6. `usage_records` has exactly one row per finished **slice** (H2 §12): the rows of each attempt tile
+//!    `[started_at, ended_at]` with no gap and no overlap, cut only at 00:00 UTC and only for services; a finished
+//!    attempt has exactly one `last_slice = 1` row (reported by its node, or estimated by the server when the attempt
+//!    ended with no report: the server ended it, or it was lost) and a running one has none; after a pass, a running
+//!    service attempt has one row for each midnight it crossed and none for its current slice. The clock is driven
+//!    across midnights, and `spent(P, D)` equals the reference sum of H2 §12 for every day it touched;
 //! 7. no lease ever reaches a `pending_approval` node (H2 §5.5, SI-H2-19). One node starts pending, and nodes are
 //!    approved and (as no API does) turned pending again at random: no `Lease` is ever sent to a node that is pending,
 //!    no offer is accepted from one, no lease on one was offered or accepted after it turned pending, and after a
 //!    scheduling pass no active lease is left on one.
 //!
+//! A second property test (SI-H2-20, [`the_ledger_and_the_caps_stay_exact`]) drives well-behaved agents over batch
+//! and service jobs of key and device principals with daily caps, across midnights.
+//!
 //! 256 cases run by default. More locally: `PROPTEST_CASES=5000 cargo test -p p2pc-server --lib scheduler::tests::props`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use p2pc_proto::api::Principal;
 use proptest::prelude::*;
 
 use super::*;
@@ -36,6 +44,13 @@ enum Op {
         gpu: bool,
         attempts: u8,
     },
+    /// A service (H2 §7.1) of 1 vCPU, with a long or a short `timeout_s`.
+    CreateService {
+        long: bool,
+        attempts: u8,
+    },
+    /// The clock jumps to the next 00:00 UTC, one second before it, or one second after it.
+    Midnight(u8),
     Cancel(u8),
     Accept(u8),
     Reject(u8),
@@ -64,6 +79,20 @@ enum Op {
 }
 
 fn op() -> impl Strategy<Value = Op> {
+    op_with(1)
+}
+
+/// The steps: H1's, then services and midnight jumps, `services` each against H1's 44.
+fn op_with(services: u32) -> impl Strategy<Value = Op> {
+    prop_oneof![
+        44 => h1_op(),
+        services => (prop::bool::weighted(0.7), 1u8..=3).prop_map(|(long, attempts)| Op::CreateService { long, attempts }),
+        services => any::<u8>().prop_map(Op::Midnight),
+    ]
+}
+
+/// The steps of H1's property test, with H1's weights.
+fn h1_op() -> impl Strategy<Value = Op> {
     prop_oneof![
         4 => (any::<u8>(), prop::bool::weighted(0.2), 1u8..=3).prop_map(|(size, gpu, attempts)| Op::Create { size, gpu, attempts }),
         1 => any::<u8>().prop_map(Op::Cancel),
@@ -138,6 +167,22 @@ async fn step(fx: &Fx, m: &mut Model, op: &Op) {
                 }))
                 .await;
             m.jobs.push(job);
+        }
+        Op::CreateService { long, attempts } => {
+            let job = fx
+                .job_with(serde_json::json!({
+                    "kind": "service", "image": "docker.io/library/nginx:1.27", "command": ["nginx"],
+                    "resources": {"cpu": 1, "memory_mb": 256},
+                    "timeout_s": if long { 30 * 86_400 } else { 5 }, "retry": {"max_attempts": attempts},
+                    "service": {"ports": [{"port": 8080, "name": "http"}]},
+                }))
+                .await;
+            m.jobs.push(job);
+        }
+        Op::Midnight(k) => {
+            let next = crate::units::day_of(now.unix_timestamp()) + crate::units::DAY_S;
+            let target = next + i64::from(k % 3) - 1;
+            fx.advance((target - now.unix_timestamp()).max(0));
         }
         Op::Cancel(i) => {
             if m.jobs.is_empty() {
@@ -422,7 +467,7 @@ async fn check_no_lease_on_pending_nodes(fx: &Fx, m: &Model, ticked: bool) {
     }
 }
 
-async fn check_invariants(fx: &Fx, m: &mut Model) {
+async fn check_invariants(fx: &Fx, m: &mut Model, op: &Op) {
     let now = fx.now();
     let mut conn = fx.db.acquire().await.unwrap();
     // 1. Capacity, counting every held reservation.
@@ -545,24 +590,193 @@ async fn check_invariants(fx: &Fx, m: &mut Model) {
             "requeued for {r}"
         );
     }
-    // 6. One usage record per finished attempt, and only for those: an attempt whose node reported its end, or one
-    //    that ended with no report (accepted, then revoked by the server or lost: an estimate).
-    let (finished, records, matched): (i64, i64, i64) = sqlx::query_as(
-        "SELECT (SELECT COUNT(*) FROM leases WHERE state IN ('finished', 'lost') \
-                 OR (state = 'revoked' AND accepted_at IS NOT NULL)), \
-                (SELECT COUNT(*) FROM usage_records), \
-                (SELECT COUNT(*) FROM usage_records u JOIN leases l ON l.id = u.lease_id \
-                 WHERE (l.state = 'finished' AND u.estimated = 0) \
-                    OR (l.state IN ('revoked', 'lost') AND l.accepted_at IS NOT NULL AND u.estimated = 1))",
+    drop(conn);
+    // 6. One row per finished slice (H2 §12).
+    check_slices(fx, matches!(op, Op::Tick)).await;
+    // `spent(P, D)` is the reference sum of H2 §12, for every day the sequence touched.
+    for day in days_until(now) {
+        check_spent(fx, fx.account, Principal::Key(fx.key), day).await;
+    }
+}
+
+/// The UTC days from the fixture's first one to the one after `now`.
+fn days_until(now: OffsetDateTime) -> impl Iterator<Item = i64> {
+    let first = crate::units::day_of(T0.unix_timestamp());
+    let last = crate::units::day_of(now.unix_timestamp()) + crate::units::DAY_S;
+    (first..=last).step_by(86_400)
+}
+
+/// Invariant 6 (H2 §12): one row per finished slice. `ticked`: a scheduling pass just ran, so every midnight a running
+/// service attempt crossed has its row.
+async fn check_slices(fx: &Fx, ticked: bool) {
+    let now = fx.now().unix_timestamp();
+    type Slice = (String, i64, String, String, i64, i64, i64, bool, bool);
+    let rows: Vec<Slice> = sqlx::query_as(
+        "SELECT u.job_id, u.attempt, u.lease_id, u.kind, u.started_at, u.slice_start, u.slice_end, u.last_slice, \
+                u.estimated FROM usage_records u ORDER BY u.job_id, u.attempt, u.slice_start",
     )
-    .fetch_one(&mut *conn)
+    .fetch_all(&fx.db)
     .await
     .unwrap();
-    assert_eq!(
-        (records, matched),
-        (finished, finished),
-        "usage records vs finished attempts"
+    let mut attempts: BTreeMap<(String, i64), Vec<Slice>> = BTreeMap::new();
+    for r in rows {
+        attempts.entry((r.0.clone(), r.1)).or_default().push(r);
+    }
+    // The tiling of each attempt's rows.
+    for ((job, attempt), slices) in &attempts {
+        let first = &slices[0];
+        assert_eq!(
+            first.5, first.4,
+            "{job}/{attempt}: the first slice starts at the attempt's start"
+        );
+        for w in slices.windows(2) {
+            assert_eq!(w[1].5, w[0].6, "{job}/{attempt}: a gap or an overlap between slices");
+        }
+        for (k, sl) in slices.iter().enumerate() {
+            assert_eq!(sl.4, first.4, "{job}/{attempt}: one start for the attempt");
+            assert!(sl.5 <= sl.6, "{job}/{attempt}: a slice ends before it starts");
+            assert_eq!(sl.2, first.2, "{job}/{attempt}: every slice names the attempt's lease");
+            let is_final = k + 1 == slices.len();
+            if !is_final || !sl.7 {
+                assert!(!sl.7, "{job}/{attempt}: a last slice before the end");
+                assert_eq!(sl.6 % 86_400, 0, "{job}/{attempt}: a cut that is not at 00:00 UTC");
+                assert_eq!(sl.3, "service", "{job}/{attempt}: a batch attempt was cut");
+            }
+        }
+    }
+    // Finished attempts have their last slice, with the right estimate flag; running ones have none.
+    /// `id, job_id, attempt, state, accepted_at, started_at, kind`.
+    type LeaseCols = (String, String, i64, String, Option<i64>, Option<i64>, String);
+    let leases: Vec<LeaseCols> = sqlx::query_as(
+        "SELECT l.id, l.job_id, l.attempt, l.state, l.accepted_at, l.started_at, j.kind FROM leases l \
+         JOIN jobs j ON j.job_id = l.job_id",
+    )
+    .fetch_all(&fx.db)
+    .await
+    .unwrap();
+    let mut finished = 0;
+    for (id, job, attempt, state, accepted, started, kind) in &leases {
+        let slices = attempts.get(&(job.clone(), *attempt));
+        let last = slices.and_then(|s| s.iter().find(|r| r.7));
+        match state.as_str() {
+            "finished" | "lost" => {}
+            "revoked" if accepted.is_some() => {}
+            "accepted" | "running" => {
+                assert!(last.is_none(), "running attempt {job}/{attempt} has a last slice");
+                if let Some(sl) = slices {
+                    assert!(
+                        sl.iter().all(|r| r.2 == *id),
+                        "rows of {job}/{attempt} name another lease"
+                    );
+                }
+                let start = slices
+                    .map(|s| s[0].4)
+                    .or(*started)
+                    .or(*accepted)
+                    .expect("an accepted lease has a start");
+                // A batch attempt is never cut.
+                let crossed = if kind == "service" {
+                    crate::units::midnights(start, now).count()
+                } else {
+                    0
+                };
+                let cut = slices.map_or(0, Vec::len);
+                assert!(
+                    cut <= crossed,
+                    "{job}/{attempt}: a row for a midnight it has not crossed"
+                );
+                if ticked {
+                    assert_eq!(cut, crossed, "{job}/{attempt}: a pass left a midnight uncut");
+                }
+                continue;
+            }
+            _ => {
+                assert!(
+                    slices.is_none_or(|s| s.iter().all(|r| r.2 != *id)),
+                    "lease {id} never ran an attempt but has rows"
+                );
+                continue;
+            }
+        }
+        finished += 1;
+        let last = last.unwrap_or_else(|| panic!("finished attempt {job}/{attempt} ({state}) has no last slice"));
+        assert_eq!(last.2, *id, "the last slice of {job}/{attempt} names another lease");
+        assert_eq!(
+            last.8,
+            state != "finished",
+            "{job}/{attempt} ({state}): estimated is {}",
+            last.8
+        );
+    }
+    let last_slices = attempts.values().flatten().filter(|r| r.7).count();
+    assert_eq!(last_slices, finished, "last slices vs finished attempts");
+}
+
+/// `spent(P, D)` against the reference sum of H2 §12, computed here from the raw tables.
+pub(crate) async fn check_spent(fx: &Fx, account: AccountId, principal: Principal, day: i64) -> u64 {
+    let (col_key, col_dev) = match principal {
+        Principal::Key(k) => (Some(k.to_string()), None),
+        Principal::Device(d) => (None, Some(d.to_string())),
+    };
+    let mine = |key: &Option<String>, dev: &Option<String>| -> bool {
+        (col_key.is_some() && *key == col_key) || (col_dev.is_some() && *dev == col_dev)
+    };
+    /// `job_id, key_id, device_id, charge_day, units`.
+    type RowCols = (String, Option<String>, Option<String>, i64, i64);
+    let rows: Vec<RowCols> = sqlx::query_as("SELECT job_id, key_id, device_id, charge_day, units FROM usage_records")
+        .fetch_all(&fx.db)
+        .await
+        .unwrap();
+    type JobCols = (
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        String,
+        i64,
+        i64,
+        bool,
+        Option<i64>,
+        Option<i64>,
     );
+    let jobs: Vec<JobCols> = sqlx::query_as(
+        "SELECT j.job_id, j.key_id, j.device_id, j.kind, j.status, j.units_reserved, j.created_at, \
+                EXISTS (SELECT 1 FROM job_events e WHERE e.job_id = j.job_id AND e.to_status = 'running'), \
+                s.cap_day, s.cap_reserved_units \
+         FROM jobs j LEFT JOIN service_state s ON s.job_id = j.job_id",
+    )
+    .fetch_all(&fx.db)
+    .await
+    .unwrap();
+    let terminal = |s: &str| ["succeeded", "failed", "timed_out", "cancelled", "lost"].contains(&s);
+    let mut reference: i64 = rows
+        .iter()
+        .filter(|r| mine(&r.1, &r.2) && r.3 == day)
+        .map(|r| r.4)
+        .sum();
+    for (job, key, dev, kind, status, reserved, created, ran, cap_day, cap_reserved) in &jobs {
+        if !mine(key, dev) {
+            continue;
+        }
+        let has_rows = rows.iter().any(|r| r.0 == *job);
+        if kind == "batch" && crate::units::day_of(*created) == day {
+            reference += if !terminal(status) {
+                *reserved
+            } else if has_rows || (status == "cancelled" && !ran) {
+                0
+            } else {
+                *reserved
+            };
+        }
+        if kind == "service" && !terminal(status) && *cap_day == Some(day) {
+            let on_day: i64 = rows.iter().filter(|r| r.0 == *job && r.3 == day).map(|r| r.4).sum();
+            reference += (cap_reserved.unwrap_or(0) - on_day).max(0);
+        }
+    }
+    let mut conn = fx.db.acquire().await.unwrap();
+    let got = leases::spent(&mut conn, account, principal, day).await.unwrap();
+    assert_eq!(i64::try_from(got).unwrap(), reference, "spent({principal:?}, {day})");
+    got
 }
 
 /// How many leases ended each way (`state:end_reason`), and how many requeues: what one sequence reached.
@@ -585,6 +799,12 @@ async fn coverage(fx: &Fx) -> Coverage {
     .await
     .unwrap();
     out.insert("requeue".into(), requeues);
+    // H2 §12: service attempts cut at a midnight.
+    let midnight_slices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_records WHERE last_slice = 0")
+        .fetch_one(&fx.db)
+        .await
+        .unwrap();
+    out.insert("midnight_slice".into(), midnight_slices);
     out
 }
 
@@ -597,6 +817,15 @@ async fn run(ops: Vec<Op>) -> Coverage {
         let uuids = (0..gpus).map(|i| format!("GPU-{id}-{i}")).collect();
         offered.insert(id, (fit::cpu_milli(cpu), mem, uuids));
         ids.push(id);
+    }
+    // Two nodes run services too (H2 §6.1 `service_jobs`).
+    for &id in &[ids[0], ids[2]] {
+        sqlx::query("UPDATE nodes SET features = ? WHERE id = ?")
+            .bind(serde_json::json!([p2pc_proto::protocol::capability::SERVICE_JOBS]).to_string())
+            .bind(id.to_string())
+            .execute(&fx.db)
+            .await
+            .unwrap();
     }
     // The last node, the largest, enrolled with a token of a non-`admin` principal: it waits for approval.
     let waiting = ids[3];
@@ -617,7 +846,7 @@ async fn run(ops: Vec<Op>) -> Coverage {
     };
     for op in &ops {
         step(&fx, &mut m, op).await;
-        check_invariants(&fx, &mut m).await;
+        check_invariants(&fx, &mut m, op).await;
         check_no_lease_on_pending_nodes(&fx, &m, matches!(op, Op::Tick)).await;
     }
     coverage(&fx).await
@@ -657,11 +886,19 @@ fn the_generated_sequences_reach_every_lease_outcome() {
         .build()
         .unwrap();
     let mut total = Coverage::new();
-    for _ in 0..128 {
-        let ops = prop::collection::vec(op(), 40..48)
-            .new_tree(&mut runner)
-            .unwrap()
-            .current();
+    // H1's sequences, then sequences rich in services and midnights (H2 §12).
+    for k in 0..192 {
+        let ops = if k < 128 {
+            prop::collection::vec(h1_op(), 40..48)
+                .new_tree(&mut runner)
+                .unwrap()
+                .current()
+        } else {
+            prop::collection::vec(op_with(6), 40..48)
+                .new_tree(&mut runner)
+                .unwrap()
+                .current()
+        };
         for (k, v) in rt.block_on(run(ops)) {
             *total.entry(k).or_default() += v;
         }
@@ -676,10 +913,520 @@ fn the_generated_sequences_reach_every_lease_outcome() {
         "revoked:cancelled_unreachable",
         "revoked:pending_approval",
         "requeue",
+        "midnight_slice",
     ] {
         assert!(
             total.get(want).is_some_and(|n| *n > 0),
             "never reached {want}: {total:?}"
         );
+    }
+}
+
+// --- SI-H2-20: the ledger and the caps stay exact ----------------------------------------------------------------
+
+/// What one step of the cap property test does.
+#[derive(Debug, Clone)]
+enum CapOp {
+    /// A batch job of principal `who % 3`, refused when it does not fit the day's cap.
+    Batch { who: u8, size: u8, long: bool },
+    /// A service of principal `who % 3`, refused when its day reservation buys under 15 minutes.
+    Service { who: u8, size: u8, long: bool },
+    /// A principal cancels a job (`POST /v1/jobs/{id}/cancel`).
+    Cancel(u8),
+    /// A running job exits by itself.
+    Exit(u8),
+    /// Time passes, by this many minutes, with the hub's passes on time.
+    Advance(u16),
+    /// Time passes to the next 00:00 UTC and a little past it.
+    Midnight(u8),
+    /// A node's agent restarts: its `Hello` lists nothing, so its attempts are lost at once and requeued.
+    Lose(u8),
+    /// A node's connection drops; its agent keeps running what it has.
+    Partition(u8),
+    /// A partitioned node comes back with `Hello` listing what it still runs.
+    Reconnect(u8),
+    /// The hub restarts at once and catches up.
+    Restart,
+}
+
+fn cap_op() -> impl Strategy<Value = CapOp> {
+    prop_oneof![
+        3 => (any::<u8>(), any::<u8>(), any::<bool>()).prop_map(|(who, size, long)| CapOp::Batch { who, size, long }),
+        3 => (any::<u8>(), any::<u8>(), prop::bool::weighted(0.7)).prop_map(|(who, size, long)| CapOp::Service { who, size, long }),
+        1 => any::<u8>().prop_map(CapOp::Cancel),
+        1 => any::<u8>().prop_map(CapOp::Exit),
+        4 => (1u16..=600).prop_map(CapOp::Advance),
+        2 => any::<u8>().prop_map(CapOp::Midnight),
+        1 => any::<u8>().prop_map(CapOp::Lose),
+        1 => any::<u8>().prop_map(CapOp::Partition),
+        1 => any::<u8>().prop_map(CapOp::Reconnect),
+        1 => Just(CapOp::Restart),
+    ]
+}
+
+/// The cap test's world: the hub's scheduler, two service nodes, three principals and what was observed.
+struct CapWorld {
+    sched: Scheduler,
+    nodes: Vec<NodeId>,
+    /// `(principal, its cap)`: the key and one device capped, one device not.
+    principals: Vec<(Principal, Option<u64>)>,
+    jobs: Vec<(JobId, Principal)>,
+    /// Every day reservation seen: `(job, day) → milli-units`.
+    reservations: BTreeMap<(String, i64), i64>,
+}
+
+const CAP_GPU_HOUR: Units = Units::from_units(10);
+
+impl CapWorld {
+    fn principal(&self, who: u8) -> (Principal, Option<u64>) {
+        self.principals[usize::from(who) % self.principals.len()]
+    }
+}
+
+/// Creates a job as `POST /v1/jobs` does: the cap check of a batch job, or a service's day reservation.
+async fn cap_create(fx: &Fx, w: &mut CapWorld, who: u8, spec: serde_json::Value) {
+    let (principal, cap) = w.principal(who);
+    let spec: JobSpec = serde_json::from_value(spec).unwrap();
+    let service = spec.kind == p2pc_proto::api::JobKind::Service;
+    let mut tx = store::begin_immediate(&fx.db).await.unwrap();
+    let now = fx.now();
+    let units = if service {
+        Units::ZERO
+    } else {
+        estimate_units(&spec.resources, spec.timeout_s, CAP_GPU_HOUR)
+    };
+    let mut held = None;
+    if let Some(cap) = cap.map(Units::from_milli) {
+        if service {
+            match crate::units::reserve_new_service(&mut tx, fx.account, principal, cap, &spec, CAP_GPU_HOUR, now)
+                .await
+                .unwrap()
+            {
+                Ok(h) => held = Some(h),
+                Err(_) => return,
+            }
+        } else {
+            let spent = crate::units::spent_today(&mut tx, fx.account, principal, now)
+                .await
+                .unwrap();
+            if crate::units::check_cap(cap, spent, units).is_err() {
+                return;
+            }
+        }
+    }
+    let job = NewJob {
+        job_id: JobId::generate(),
+        account_id: fx.account,
+        project_id: fx.project,
+        principal,
+        units_reserved: units,
+        files_meta: p2pc_proto::api::FileMeta::compute_all(&spec).unwrap(),
+        spec,
+        spec_hash: format!("sha256:{}", "0".repeat(64)),
+    };
+    let id = jobs::insert(&mut tx, &job, now).await.unwrap().job_id;
+    if let Some(h) = held {
+        crate::units::hold(&mut tx, id, h, now).await.unwrap();
+    }
+    tx.commit().await.unwrap();
+    w.jobs.push((id, principal));
+}
+
+/// Active leases (accepted or running): `(lease, node, epoch, job, start, timeout_s, kind)`.
+async fn active_leases(fx: &Fx) -> Vec<(LeaseId, NodeId, u64, JobId, i64, i64, String)> {
+    let rows: Vec<(String, String, i64, String, i64, i64, String)> = sqlx::query_as(
+        "SELECT l.id, l.node_id, l.epoch, l.job_id, COALESCE(l.started_at, l.accepted_at), \
+                json_extract(j.spec_view, '$.timeout_s'), j.kind \
+         FROM leases l JOIN jobs j ON j.job_id = l.job_id WHERE l.state IN ('accepted', 'running')",
+    )
+    .fetch_all(&fx.db)
+    .await
+    .unwrap();
+    rows.into_iter()
+        .map(|(l, n, e, j, s, t, k)| {
+            (
+                l.parse().unwrap(),
+                n.parse().unwrap(),
+                u64::try_from(e).unwrap(),
+                j.parse().unwrap(),
+                s,
+                t,
+                k,
+            )
+        })
+        .collect()
+}
+
+/// The agents, well behaved: a connected agent accepts and starts every lease at once, stops a job at once when
+/// told `Cancel` and when its `timeout_s` is reached, and reports its services' usage in each heartbeat. A
+/// partitioned agent does nothing the hub can see.
+async fn agents(fx: &Fx, w: &CapWorld) {
+    for _ in 0..8 {
+        w.sched.tick().await.clean();
+        let now = fx.now().unix_timestamp();
+        let msgs = fx.link.take();
+        let mut acted = false;
+        for (node, msg) in msgs {
+            if !fx.link.is_connected(node) {
+                continue;
+            }
+            match msg {
+                ServerMsg::Lease { lease_id, epoch, .. } => {
+                    w.sched
+                        .on_agent_message(node, AgentMsg::LeaseAccepted { lease_id, epoch })
+                        .await
+                        .unwrap();
+                    w.sched
+                        .on_agent_message(
+                            node,
+                            AgentMsg::JobStarted {
+                                lease_id,
+                                epoch,
+                                started_at: fx.now(),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    acted = true;
+                }
+                ServerMsg::Cancel { lease_id, epoch, .. } => {
+                    let l = fx.lease(lease_id).await;
+                    if l.state.is_active() && l.epoch == epoch && l.state != LeaseState::Offered {
+                        w.sched
+                            .on_agent_message(node, finished(lease_id, epoch, Outcome::Cancelled, None))
+                            .await
+                            .unwrap();
+                        acted = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Timeouts, on the agents' side.
+        for (lease, node, epoch, _, start, timeout, _) in active_leases(fx).await {
+            if fx.link.is_connected(node) && start + timeout <= now {
+                w.sched
+                    .on_agent_message(node, finished(lease, epoch, Outcome::TimedOut, None))
+                    .await
+                    .unwrap();
+                acted = true;
+            }
+        }
+        // Heartbeats: what runs, with the services' cumulative usage; finished leases are freed.
+        for &node in &w.nodes {
+            if !fx.link.is_connected(node) {
+                continue;
+            }
+            let running: Vec<RunningLease> = active_leases(fx)
+                .await
+                .into_iter()
+                .filter(|l| l.1 == node)
+                .map(|(lease, _, epoch, _, start, _, kind)| {
+                    let mut r = RunningLease::new(lease, epoch);
+                    if kind == "service" {
+                        r.used_cpu_ms = Some(u64::try_from((now - start).max(0)).unwrap() * 500);
+                        r.max_rss_mb = Some(64);
+                    }
+                    r
+                })
+                .collect();
+            w.sched.on_heartbeat(node, &running).await.unwrap();
+        }
+        if !acted {
+            break;
+        }
+    }
+}
+
+/// The next instant after `now` at which the hub or an agent must act: a midnight, a cap deadline, a timeout (the
+/// agent's, or the watchdog's for a partitioned node).
+async fn next_event(fx: &Fx, w: &CapWorld, now: i64) -> i64 {
+    let mut next = crate::units::day_of(now) + crate::units::DAY_S;
+    let mut conn = fx.db.acquire().await.unwrap();
+    for (job, _) in &w.jobs {
+        if let Some(d) = crate::units::cap_deadline(&mut conn, *job, CAP_GPU_HOUR).await.unwrap() {
+            let d = d.unix_timestamp();
+            if d > now {
+                next = next.min(d);
+            }
+        }
+    }
+    drop(conn);
+    for (_, node, _, _, start, timeout, _) in active_leases(fx).await {
+        let end = if fx.link.is_connected(node) {
+            start + timeout
+        } else {
+            start + timeout + WATCHDOG_MARGIN.whole_seconds()
+        };
+        if end > now {
+            next = next.min(end);
+        }
+    }
+    next
+}
+
+/// Moves the clock to `target` with the hub's passes on time: it stops at every event on the way.
+async fn run_until(fx: &Fx, w: &mut CapWorld, target: i64) {
+    loop {
+        let now = fx.now().unix_timestamp();
+        let next = next_event(fx, w, now).await.min(target);
+        fx.advance(next - now);
+        agents(fx, w).await;
+        observe(fx, w).await;
+        if next >= target {
+            break;
+        }
+    }
+}
+
+/// Records the day reservations, which a later step replaces.
+async fn observe(fx: &Fx, w: &mut CapWorld) {
+    let rows: Vec<(String, i64, i64)> =
+        sqlx::query_as("SELECT job_id, cap_day, cap_reserved_units FROM service_state WHERE cap_day IS NOT NULL")
+            .fetch_all(&fx.db)
+            .await
+            .unwrap();
+    for (job, day, units) in rows {
+        let seen = w.reservations.entry((job.clone(), day)).or_insert(units);
+        assert_eq!(
+            *seen, units,
+            "the reservation of {job} for {day} changed within its day"
+        );
+    }
+}
+
+async fn cap_step(fx: &Fx, w: &mut CapWorld, op: &CapOp) {
+    let now = fx.now().unix_timestamp();
+    match *op {
+        CapOp::Batch { who, size, long } => {
+            let cpu = [0.5, 1.0, 2.0][usize::from(size % 3)];
+            let timeout = if long { 6 * 3_600 } else { 1_800 };
+            cap_create(
+                fx,
+                w,
+                who,
+                serde_json::json!({
+                    "image": "docker.io/library/alpine:3", "command": ["true"],
+                    "resources": {"cpu": cpu, "memory_mb": 256}, "timeout_s": timeout,
+                }),
+            )
+            .await;
+        }
+        CapOp::Service { who, size, long } => {
+            let cpu = [0.5, 1.0][usize::from(size % 2)];
+            let timeout = if long { 30 * 86_400 } else { 2 * 3_600 };
+            cap_create(
+                fx,
+                w,
+                who,
+                serde_json::json!({
+                    "kind": "service", "image": "docker.io/library/nginx:1.27", "command": ["nginx"],
+                    "resources": {"cpu": cpu, "memory_mb": 256}, "timeout_s": timeout,
+                    "service": {"ports": [{"port": 8080, "name": "http"}]},
+                }),
+            )
+            .await;
+        }
+        CapOp::Cancel(i) => {
+            if w.jobs.is_empty() {
+                return;
+            }
+            let job = w.jobs[usize::from(i) % w.jobs.len()].0;
+            let mut tx = store::begin_immediate(&fx.db).await.unwrap();
+            let row = jobs::get(&mut tx, fx.account, fx.project, job).await.unwrap().unwrap();
+            let service = row.spec_view.kind == p2pc_proto::api::JobKind::Service;
+            match row.status {
+                JobStatus::Queued => {
+                    transition(&mut tx, &row, JobStatus::Cancelled, "cancelled_by_user", fx.now())
+                        .await
+                        .unwrap();
+                }
+                JobStatus::Assigned | JobStatus::Running if service => {
+                    leases::request_stop(&mut tx, job, p2pc_proto::api::REASON_STOPPED, fx.now())
+                        .await
+                        .unwrap();
+                }
+                JobStatus::Assigned | JobStatus::Running => {
+                    jobs::request_cancel(&mut tx, fx.account, fx.project, job, fx.now())
+                        .await
+                        .unwrap();
+                }
+                _ => {}
+            }
+            tx.commit().await.unwrap();
+        }
+        CapOp::Exit(i) => {
+            let active = active_leases(fx).await;
+            if active.is_empty() {
+                return;
+            }
+            let (lease, node, epoch, ..) = active[usize::from(i) % active.len()];
+            if fx.link.is_connected(node) {
+                w.sched
+                    .on_agent_message(node, finished(lease, epoch, Outcome::Exited, Some(0)))
+                    .await
+                    .unwrap();
+            }
+        }
+        CapOp::Advance(minutes) => {
+            run_until(fx, w, now + i64::from(minutes) * 60).await;
+            return;
+        }
+        CapOp::Midnight(k) => {
+            let target = crate::units::day_of(now) + crate::units::DAY_S + i64::from(k % 4);
+            run_until(fx, w, target).await;
+            return;
+        }
+        CapOp::Lose(n) => {
+            let node = w.nodes[usize::from(n) % w.nodes.len()];
+            fx.hello(node, &[]).await;
+        }
+        CapOp::Partition(n) => {
+            let node = w.nodes[usize::from(n) % w.nodes.len()];
+            fx.link.disconnect(node);
+        }
+        CapOp::Reconnect(n) => {
+            let node = w.nodes[usize::from(n) % w.nodes.len()];
+            if !fx.link.is_connected(node) {
+                let held: Vec<(LeaseId, u64)> = active_leases(fx)
+                    .await
+                    .into_iter()
+                    .filter(|l| l.1 == node)
+                    .map(|l| (l.0, l.2))
+                    .collect();
+                fx.hello(node, &held).await;
+            }
+        }
+        CapOp::Restart => {
+            w.sched = fx.another_scheduler();
+            w.sched.catch_up().await;
+        }
+    }
+    agents(fx, w).await;
+    observe(fx, w).await;
+}
+
+/// SI-H2-20, after every step: `spent(P, D)` is the reference sum of H2 §12 and stays within each capped principal's
+/// cap; a service's rows for a day exceed that day's reservation only by estimated slices; and invariant 6 holds.
+async fn check_caps(fx: &Fx, w: &CapWorld) {
+    let now = fx.now();
+    for &(principal, cap) in &w.principals {
+        let (key, device) = crate::store::jobs::principal_binds(principal);
+        for day in days_until(now) {
+            let spent = check_spent(fx, fx.account, principal, day).await;
+            // Only what the hub could not stop on time goes over a cap: an attempt it ended with no report (a
+            // partitioned node's watchdog, H1's margin) is an estimate.
+            let estimated: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(SUM(units), 0) FROM usage_records WHERE charge_day = ?1 AND estimated = 1 \
+                 AND (key_id = ?2 OR device_id = ?3)",
+            )
+            .bind(day)
+            .bind(&key)
+            .bind(&device)
+            .fetch_one(&fx.db)
+            .await
+            .unwrap();
+            if let Some(cap) = cap {
+                let limit = cap + u64::try_from(estimated).unwrap();
+                assert!(
+                    spent <= limit,
+                    "{principal:?} spent {spent} > its cap {cap} on {day} (+{estimated} estimated)"
+                );
+            }
+        }
+    }
+    let rows: Vec<(String, i64, i64, bool)> =
+        sqlx::query_as("SELECT job_id, charge_day, units, estimated FROM usage_records WHERE kind = 'service'")
+            .fetch_all(&fx.db)
+            .await
+            .unwrap();
+    let mut per_day: BTreeMap<(String, i64), (i64, i64)> = BTreeMap::new();
+    for (job, day, units, estimated) in rows {
+        let e = per_day.entry((job, day)).or_default();
+        e.0 += units;
+        if estimated {
+            e.1 += units;
+        }
+    }
+    for ((job, day), (units, estimated)) in per_day {
+        if let Some(reserved) = w.reservations.get(&(job.clone(), day)) {
+            assert!(
+                units <= reserved + estimated,
+                "{job} on {day}: rows {units} over the reservation {reserved}, estimated rows {estimated}"
+            );
+        }
+    }
+    check_slices(fx, true).await;
+}
+
+async fn run_caps(key_cap: u64, device_cap: u64, ops: Vec<CapOp>) {
+    let fx = Fx::new().await;
+    let mut nodes = Vec::new();
+    for _ in 0..2 {
+        let id = fx.node(4.0, 8192, 0).await;
+        sqlx::query("UPDATE nodes SET features = ? WHERE id = ?")
+            .bind(serde_json::json!([p2pc_proto::protocol::capability::SERVICE_JOBS]).to_string())
+            .bind(id.to_string())
+            .execute(&fx.db)
+            .await
+            .unwrap();
+        nodes.push(id);
+    }
+    sqlx::query("UPDATE api_keys SET daily_unit_cap = ? WHERE key_id = ?")
+        .bind(i64::try_from(key_cap).unwrap())
+        .bind(fx.key.to_string())
+        .execute(&fx.db)
+        .await
+        .unwrap();
+    let mut principals = vec![(Principal::Key(fx.key), Some(key_cap))];
+    for cap in [Some(device_cap), None] {
+        let id = p2pc_proto::ids::DeviceId::generate();
+        sqlx::query(
+            "INSERT INTO devices (device_id, account_id, project_id, iroh_node_id, scopes, daily_unit_cap, \
+             created_at) VALUES (?, ?, ?, ?, '[\"admin\"]', ?, 0)",
+        )
+        .bind(id.to_string())
+        .bind(fx.account.to_string())
+        .bind(fx.project.to_string())
+        .bind(format!(
+            "{:0<64}",
+            data_encoding::HEXLOWER.encode(id.to_string().as_bytes())
+        ))
+        .bind(cap.map(|c| i64::try_from(c).unwrap()))
+        .execute(&fx.db)
+        .await
+        .unwrap();
+        principals.push((Principal::Device(id), cap));
+    }
+    let mut w = CapWorld {
+        sched: fx.sched.clone(),
+        nodes,
+        principals,
+        jobs: Vec::new(),
+        reservations: BTreeMap::new(),
+    };
+    for op in &ops {
+        cap_step(&fx, &mut w, op).await;
+        check_caps(&fx, &w).await;
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: cases() / 4,
+        failure_persistence: None,
+        max_shrink_iters: 256,
+        ..ProptestConfig::default()
+    })]
+
+    /// SI-H2-20: the ledger and the caps stay exact with key and device principals and daily slices.
+    #[test]
+    fn the_ledger_and_the_caps_stay_exact(
+        key_cap in 2_000u64..=40_000,
+        device_cap in 2_000u64..=40_000,
+        ops in prop::collection::vec(cap_op(), 8..40),
+    ) {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(run_caps(key_cap, device_cap, ops));
     }
 }
