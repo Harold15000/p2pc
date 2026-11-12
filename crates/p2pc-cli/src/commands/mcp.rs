@@ -2,14 +2,9 @@
 
 //! `p2pc mcp`: check the key, then serve MCP over stdio.
 
-use std::path::PathBuf;
-
 use crate::app::{CliError, Ctx};
 use crate::cli::McpArgs;
-use crate::config::Os;
-use crate::mcp::{
-    Allow, DEFAULT_UPLOAD_DIR_NAME, McpConfig, McpServer, UploadDir, check_key, init_stderr_logging, serve_stdio,
-};
+use crate::mcp::{Allow, McpConfig, McpServer, check_key, init_stderr_logging, serve_stdio};
 
 /// `p2pc mcp`.
 ///
@@ -28,32 +23,39 @@ pub async fn run(ctx: &mut Ctx<'_, '_>, args: McpArgs) -> Result<u8, CliError> {
     for warning in &warnings {
         writeln!(ctx.host.err, "warning: {warning}")?;
     }
-    let upload_dir = upload_dir(ctx, args.upload_dir)?;
+    #[cfg(unix)]
+    let config = McpConfig::new(args.results_dir).with_upload_dir(unix_upload_dir(ctx, args.upload_dir)?);
+    // Elsewhere there is no upload directory: `p2pc_blob_put` refuses every call (see `mcp::upload`).
+    #[cfg(not(unix))]
+    let config = McpConfig::new(args.results_dir);
+    #[cfg(not(unix))]
+    if args.upload_dir.is_some() {
+        writeln!(
+            ctx.host.err,
+            "warning: --upload-dir is ignored: uploads from MCP are not supported on this platform yet"
+        )?;
+    }
     init_stderr_logging((ctx.host.env)("P2PC_LOG").as_deref());
     tracing::info!(key_id = %limits.key_id, "serving MCP over stdio");
     // A long-running session through a tunnel follows network changes (§10).
     let _network_watch = ctx.watch_networks().await;
-    let server = McpServer::new(
-        client,
-        &key,
-        McpConfig::new(args.results_dir).with_upload_dir(upload_dir),
-    );
+    let server = McpServer::new(client, &key, config);
     serve_stdio(server).await.map_err(CliError::Usage)?;
     Ok(0)
 }
 
 /// The upload directory: `--upload-dir`, or `~/p2pc-uploads`, checked against the home and configuration directories.
-fn upload_dir(ctx: &Ctx<'_, '_>, requested: Option<PathBuf>) -> Result<UploadDir, CliError> {
-    let home = (ctx.host.env)(if Os::current() == Os::Windows {
-        "USERPROFILE"
-    } else {
-        "HOME"
-    })
-    .filter(|h| !h.is_empty())
-    .map(PathBuf::from);
+#[cfg(unix)]
+fn unix_upload_dir(
+    ctx: &Ctx<'_, '_>,
+    requested: Option<std::path::PathBuf>,
+) -> Result<crate::mcp::UploadDir, CliError> {
+    use std::path::PathBuf;
+
+    let home = (ctx.host.env)("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
     let dir = match (requested, &home) {
         (Some(dir), _) => dir,
-        (None, Some(home)) => home.join(DEFAULT_UPLOAD_DIR_NAME),
+        (None, Some(home)) => home.join(crate::mcp::DEFAULT_UPLOAD_DIR_NAME),
         (None, None) => {
             return Err(CliError::usage(
                 "cannot tell where the upload directory is: the home directory is unknown; give --upload-dir",
@@ -61,5 +63,5 @@ fn upload_dir(ctx: &Ctx<'_, '_>, requested: Option<PathBuf>) -> Result<UploadDir
         }
     };
     let config_dir = ctx.store()?.dir().to_path_buf();
-    UploadDir::prepare(&dir, home.as_deref(), &config_dir).map_err(CliError::Usage)
+    crate::mcp::UploadDir::prepare(&dir, home.as_deref(), &config_dir).map_err(CliError::Usage)
 }

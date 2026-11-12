@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+// Unix only, like the upload directory itself: elsewhere `p2pc_blob_put` refuses every call.
+#![cfg(unix)]
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,

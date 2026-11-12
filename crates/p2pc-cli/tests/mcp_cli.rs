@@ -275,6 +275,7 @@ impl Process {
             .env_clear()
             .env("P2PC_CONFIG_DIR", config_dir)
             .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
             .env("P2PC_SERVER", server.url())
             .env("P2PC_API_KEY", key.expose())
             .env("RUST_BACKTRACE", "0")
@@ -371,11 +372,11 @@ fn the_binary_serves_mcp_on_stdout_only_and_exits_cleanly_when_stdin_closes() {
     assert_eq!(names.len(), 8, "{names:?}");
     assert!(names.contains(&"p2pc_run") && names.contains(&"p2pc_machines") && names.contains(&"p2pc_blob_put"));
     // `p2pc mcp` created the default upload directory, private to the user (SI-H2-21).
-    let uploads = p.home.path().join("p2pc-uploads");
-    assert!(uploads.is_dir(), "the default upload directory was not created");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        let uploads = p.home.path().join("p2pc-uploads");
+        assert!(uploads.is_dir(), "the default upload directory was not created");
         assert_eq!(std::fs::metadata(&uploads).unwrap().permissions().mode() & 0o777, 0o700);
     }
 

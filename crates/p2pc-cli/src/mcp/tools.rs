@@ -8,10 +8,11 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use p2pc_client::{Client, DownloadError, Error, ListParams, fetch_all};
+#[cfg(unix)]
+use p2pc_proto::api::{BLOB_REF_PREFIX, DEFAULT_MAX_BLOB_MB, Sha256Digest};
 use p2pc_proto::api::{
-    BLOB_REF_PREFIX, BlobInput, BlobRef, DEFAULT_DISK_MB, DEFAULT_MAX_BLOB_MB, DEFAULT_TIMEOUT_S, Egress, InputFile,
-    Job, JobSpec, LogLine, MAX_PAGE_LIMIT, Node, OutputFile, Outputs, Placement, REDACTED, Resources, Retry,
-    Sha256Digest,
+    BlobInput, BlobRef, DEFAULT_DISK_MB, DEFAULT_TIMEOUT_S, Egress, InputFile, Job, JobSpec, LogLine, MAX_PAGE_LIMIT,
+    Node, OutputFile, Outputs, Placement, REDACTED, Resources, Retry,
 };
 use p2pc_proto::ids::JobId;
 use p2pc_proto::validate::{FieldError, ValidationErrors};
@@ -19,6 +20,7 @@ use rmcp::model::JsonObject;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
+#[cfg(unix)]
 use super::upload::{ReadError, read_exact_hashed};
 use super::{
     MAX_INLINE_FILE_BYTES, MAX_INLINE_TOTAL_BYTES, MAX_LOG_BYTES, MAX_WAIT_S, McpConfig, Scrubber, UNTRUSTED_NOTE,
@@ -598,6 +600,7 @@ impl Tools {
     /// uploads by path, which must never be a path the agent named). Both reads stop at the size that was checked,
     /// and the second must give the same hash: a file that changes while it is read is refused. The answer never
     /// holds file contents.
+    #[cfg(unix)]
     async fn blob_put(&self, args: JsonObject) -> Result<Reply, ToolError> {
         let input = parse_args::<BlobPutInput>(args)?;
         let Some(dir) = self.config.upload_dir.clone() else {
@@ -649,6 +652,18 @@ impl Tools {
                 .map_err(|e| ToolError::client(&e, "blobs:write"))?;
         }
         Ok(Reply::ok(json!({"blob": blob, "size": size, "uploaded": !present})))
+    }
+
+    /// `p2pc_blob_put` where there is no safe open of a file below a directory (not Unix): it refuses every call. The
+    /// arguments are still checked, so a malformed call gets the same `invalid_arguments` as everywhere.
+    #[cfg(not(unix))]
+    async fn blob_put(&self, args: JsonObject) -> Result<Reply, ToolError> {
+        parse_args::<BlobPutInput>(args)?;
+        Err(ToolError::new(
+            "path_not_allowed",
+            "uploads from MCP are not supported on this platform yet; nothing was uploaded. Upload the file with \
+             `p2pc blobs put` yourself and pass its digest in `inputs`.",
+        ))
     }
 
     async fn logs(&self, args: JsonObject) -> Result<Reply, ToolError> {
@@ -789,6 +804,7 @@ impl Tools {
 }
 
 /// Runs blocking work (file reads) off the async threads.
+#[cfg(unix)]
 async fn blocking<T, F>(work: F) -> Result<T, ToolError>
 where
     F: FnOnce() -> T + Send + 'static,
@@ -800,6 +816,7 @@ where
 }
 
 /// A private temporary copy of the upload, removed when dropped.
+#[cfg(unix)]
 struct StagedCopy {
     path: PathBuf,
     // Removes the directory (and the copy) on drop.
@@ -808,6 +825,7 @@ struct StagedCopy {
 
 /// Copies the descriptor to a new file in a private (0700) temporary directory, from its start, and checks that the
 /// copy has the hash that was announced: the bytes uploaded are the bytes that were hashed.
+#[cfg(unix)]
 fn stage(mut file: std::fs::File, size: u64, digest: &Sha256Digest) -> Result<StagedCopy, ReadError> {
     use std::io::{Seek, SeekFrom, Write};
 
@@ -827,6 +845,7 @@ fn stage(mut file: std::fs::File, size: u64, digest: &Sha256Digest) -> Result<St
 }
 
 /// A file that changed or could not be read is `path_not_allowed` (the file may not be uploaded as it is) or `io`.
+#[cfg(unix)]
 fn read_failure(e: ReadError) -> ToolError {
     match e {
         ReadError::Shrank | ReadError::Grew => ToolError::new(

@@ -21,6 +21,7 @@ mod schema;
 mod scrub;
 mod server;
 mod tools;
+#[cfg(unix)]
 mod upload;
 
 use std::path::PathBuf;
@@ -30,7 +31,14 @@ pub use check::{Allow, check_key};
 pub use schema::tool_definitions;
 pub use scrub::Scrubber;
 pub use server::McpServer;
+#[cfg(unix)]
 pub use upload::{OpenedUpload, PathNotAllowed, UploadDir};
+
+/// Where `p2pc_blob_put` reads from (H2 §7.8, SI-H2-21). Only Unix has an implementation; on other targets this type
+/// has no value, so [`McpConfig::upload_dir`] is always `None` and the tool refuses every call.
+#[cfg(not(unix))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UploadDir {}
 
 /// The default upload directory of `p2pc mcp`, relative to the user's home directory (spec §7.8).
 pub const DEFAULT_UPLOAD_DIR_NAME: &str = "p2pc-uploads";

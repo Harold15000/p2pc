@@ -7,19 +7,25 @@
 //! that directory when `p2pc mcp` starts; [`UploadDir::open`] turns the agent's path into an open file, or into a
 //! [`PathNotAllowed`] that names the rule that failed. Nothing is opened before the path has passed the lexical rules.
 //!
-//! - **Lexical rules** (every platform): the path is relative to the upload directory (an absolute path is accepted
+//! Unix only. On other targets `p2pc mcp` has no upload directory and `p2pc_blob_put` refuses every call: a Windows
+//! implementation is a task of its own (it needs the canonical directory re-checked on each call and
+//! `FILE_FLAG_OPEN_REPARSE_POINT` with a check of the handle), and none of it is compiled here.
+//!
+//! - **Lexical rules**: the path is relative to the upload directory (an absolute path is accepted
 //!   only when it starts with the upload directory's own text, and is then handled as the rest). Empty, `.` and `..`
 //!   components, and any component that starts with `.`, are refused.
 //! - **No link anywhere** (Unix): the directory is opened with `O_NOFOLLOW | O_DIRECTORY` and each component below it
 //!   with `openat(O_NOFOLLOW)`, so no link is followed in any component. The last component is checked with
 //!   `fstatat(AT_SYMLINK_NOFOLLOW)` to be a regular file, opened with `O_NOFOLLOW | O_NONBLOCK` (a FIFO swapped in
 //!   cannot block), and the descriptor's `fstat` must show a regular file with the same device and inode.
-//! - **Windows** has no `openat` here: the path is canonicalized, the result must lie under the canonical upload
-//!   directory, and any component that is a symbolic link or another reparse point refuses the path.
+//! - **The directory is pinned.** `prepare` stores its canonical path. On every call the directory must still not be a
+//!   symbolic link and must still canonicalize to that same path, so a link put in place of the directory or of one of
+//!   its parents after start-up refuses the call.
 //!
 //! The caller reads the returned descriptor, never the path again.
 
 use std::fs::File;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
 
 /// The most characters in a path the agent gives. Longer is refused before anything is opened.
@@ -48,7 +54,10 @@ pub struct OpenedUpload {
 /// The upload directory, checked at start-up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UploadDir {
+    /// As the user gave it, made absolute: what an absolute path of the agent is compared with.
     path: PathBuf,
+    /// Its real location when `prepare` ran, with no link in it. Every call checks that it is still this.
+    canonical: PathBuf,
 }
 
 impl UploadDir {
@@ -91,7 +100,7 @@ impl UploadDir {
                 "the upload directory {shown} contains the p2pc configuration directory (credentials)"
             ));
         }
-        Ok(Self { path })
+        Ok(Self { path, canonical: real })
     }
 
     /// The directory, as an absolute path without `.` or `..`.
@@ -103,7 +112,23 @@ impl UploadDir {
     /// Opens `requested`, a path as the agent gave it, for reading. See the module documentation for the rules.
     pub fn open(&self, requested: &str) -> Result<OpenedUpload, PathNotAllowed> {
         let components = self.components_of(requested)?;
-        open_checked(&self.path, &components)
+        self.still_pinned()?;
+        open_checked(&self.canonical, &components)
+    }
+
+    /// The directory is still the one `prepare` checked: not a link now, and the same real location.
+    fn still_pinned(&self) -> Result<(), PathNotAllowed> {
+        let moved = || {
+            PathNotAllowed::rule("the upload directory changed since `p2pc mcp` started (it or a parent is a link now)")
+        };
+        let meta = std::fs::symlink_metadata(&self.path).map_err(|_| moved())?;
+        if meta.file_type().is_symlink() {
+            return Err(moved());
+        }
+        match std::fs::canonicalize(&self.path) {
+            Ok(real) if real == self.canonical => Ok(()),
+            _ => Err(moved()),
+        }
     }
 
     /// The components of `requested` below the upload directory, after the lexical rules.
@@ -119,7 +144,7 @@ impl UploadDir {
         }
         let rest = if Path::new(requested).is_absolute() {
             let base = self.path.to_str().unwrap_or_default();
-            let after = requested.strip_prefix(base).and_then(|r| r.strip_prefix(is_separator));
+            let after = requested.strip_prefix(base).and_then(|r| r.strip_prefix('/'));
             match after {
                 Some(rest) => rest,
                 None => {
@@ -132,7 +157,7 @@ impl UploadDir {
             requested
         };
         let mut out = Vec::new();
-        for part in rest.split(is_separator) {
+        for part in rest.split('/') {
             if part.is_empty() {
                 return Err(PathNotAllowed::rule("the path has an empty component"));
             }
@@ -142,19 +167,10 @@ impl UploadDir {
             if part.starts_with('.') {
                 return Err(PathNotAllowed::rule("hidden files and directories are not read"));
             }
-            #[cfg(windows)]
-            if part.contains(':') {
-                return Err(PathNotAllowed::rule("a path component holds `:`"));
-            }
             out.push(part.to_string());
         }
         Ok(out)
     }
-}
-
-/// `/`, and on Windows also `\`.
-fn is_separator(c: char) -> bool {
-    c == '/' || (cfg!(windows) && c == '\\')
 }
 
 /// `dir` as an absolute path, with `.` and the trailing separator removed. A `..` is refused: it would make the
@@ -195,32 +211,20 @@ fn create_private(path: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let mut builder = std::fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
+    builder.mode(0o700);
     match builder.create(path) {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
         other => other,
     }
 }
 
-#[cfg(unix)]
 fn check_owner_and_mode(meta: &std::fs::Metadata) -> Result<(), String> {
-    use std::os::unix::fs::MetadataExt;
     if meta.uid() != rustix::process::geteuid().as_raw() {
         return Err("is not owned by the user".into());
     }
     if meta.mode() & 0o077 != 0 {
         return Err("grants access to its group or to others (use mode 0700: `chmod 700`)".into());
     }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn check_owner_and_mode(_meta: &std::fs::Metadata) -> Result<(), String> {
-    // Windows: the directory lives under the user's profile, whose ACL is per user.
     Ok(())
 }
 
@@ -290,10 +294,9 @@ where
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Opening, Unix
+// Opening
 // ---------------------------------------------------------------------------------------------------------------
 
-#[cfg(unix)]
 fn open_checked(dir: &Path, components: &[String]) -> Result<OpenedUpload, PathNotAllowed> {
     use rustix::fs::{AtFlags, FileType, Mode, OFlags, fstat, open, openat, statat};
 
@@ -358,57 +361,10 @@ fn open_checked(dir: &Path, components: &[String]) -> Result<OpenedUpload, PathN
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Opening, elsewhere (Windows)
-// ---------------------------------------------------------------------------------------------------------------
-
-#[cfg(not(unix))]
-fn open_checked(dir: &Path, components: &[String]) -> Result<OpenedUpload, PathNotAllowed> {
-    let canonical_dir = std::fs::canonicalize(dir)
-        .map_err(|e| PathNotAllowed::rule(format!("the upload directory cannot be resolved: {e}")))?;
-    // Every component below the directory: not a symbolic link, not another reparse point.
-    let mut walked = dir.to_path_buf();
-    for name in components {
-        walked.push(name);
-        let meta = std::fs::symlink_metadata(&walked)
-            .map_err(|e| PathNotAllowed::rule(format!("the file cannot be read: {e}")))?;
-        if meta.file_type().is_symlink() || is_reparse_point(&meta) {
-            return Err(PathNotAllowed::rule(
-                "a component of the path is a symbolic link or another reparse point",
-            ));
-        }
-    }
-    let canonical = std::fs::canonicalize(&walked)
-        .map_err(|e| PathNotAllowed::rule(format!("the file cannot be resolved: {e}")))?;
-    if !canonical.starts_with(&canonical_dir) {
-        return Err(PathNotAllowed::rule("the path leads outside the upload directory"));
-    }
-    let file = File::open(&canonical).map_err(|e| PathNotAllowed::rule(format!("the file cannot be opened: {e}")))?;
-    let meta = file
-        .metadata()
-        .map_err(|e| PathNotAllowed::rule(format!("the file cannot be inspected: {e}")))?;
-    if !meta.is_file() {
-        return Err(PathNotAllowed::rule("only regular files are read"));
-    }
-    Ok(OpenedUpload { size: meta.len(), file })
-}
-
-#[cfg(windows)]
-fn is_reparse_point(meta: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-#[cfg(all(not(unix), not(windows)))]
-fn is_reparse_point(_meta: &std::fs::Metadata) -> bool {
-    false
-}
-
-// ---------------------------------------------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------------------------------------------
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 #[allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -547,6 +503,27 @@ mod tests {
         std::fs::rename(f.up.path(), &moved).unwrap();
         symlink(&moved, f.up.path()).unwrap();
         assert!(f.up.open("a.txt").is_err());
+    }
+
+    #[test]
+    fn a_parent_of_the_directory_replaced_by_a_link_after_start_up_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(root.path()).unwrap();
+        let parent = base.join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let up = UploadDir::prepare(&parent.join("uploads"), None, &base.join("config")).unwrap();
+        std::fs::write(up.path().join("a.txt"), b"x").unwrap();
+        assert!(up.open("a.txt").is_ok());
+        // Another private directory with an `uploads` of the same name, holding a file of the same name.
+        let other = base.join("other");
+        std::fs::create_dir_all(other.join("uploads")).unwrap();
+        private(&other.join("uploads"));
+        std::fs::write(other.join("uploads/a.txt"), b"TOPSECRET").unwrap();
+        std::fs::rename(&parent, base.join("parent-moved")).unwrap();
+        symlink(&other, &parent).unwrap();
+        // `parent/uploads` is a real directory (no link in its last component), but it is not the one that was checked.
+        assert!(!std::fs::symlink_metadata(up.path()).unwrap().file_type().is_symlink());
+        assert!(up.open("a.txt").unwrap_err().0.contains("changed since"));
     }
 
     #[test]
