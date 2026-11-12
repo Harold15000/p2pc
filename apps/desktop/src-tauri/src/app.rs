@@ -29,7 +29,7 @@ use crate::capabilities::MAIN_WINDOW;
 use crate::core::{CommandError, ControlError, Core, NodeControl, StatusView, Unwired};
 use crate::launch::{self, Launch, SecondInstance};
 use crate::navigation::{self, Navigation};
-use crate::settings::{Settings, SettingsFile};
+use crate::settings::{Settings, SettingsFile, Startup, startup};
 use crate::state::Machine;
 use crate::tray::{self as tray_model, Effect, ICON_SIZE, MenuEntry};
 
@@ -91,13 +91,13 @@ pub fn run() -> ExitCode {
 
 fn setup(app: &mut tauri::App, launch: Launch) -> Result<(), Box<dyn Error>> {
     let settings_file = app.path().app_config_dir().ok().map(|dir| SettingsFile::in_dir(&dir));
-    let settings = settings_file
-        .as_ref()
-        .map(SettingsFile::load_or_default)
-        .unwrap_or_default();
-    // Best effort: a refused registry write must not keep the app from starting. Settings shows the stored choice
-    // and the next start tries again.
-    let _ = reconcile_autostart(settings.autostart);
+    let Startup { settings, trusted } = startup(settings_file.as_ref());
+    // Only the user's own settings may change the Run entry: a damaged or unreadable file (defaults as a fallback)
+    // must not undo an opt-out. Best effort: a refused registry write must not keep the app from starting; Settings
+    // shows the stored choice and the next start tries again.
+    if trusted {
+        let _ = reconcile_autostart(settings.autostart);
+    }
     app.manage(Shared {
         core: Mutex::new(Core::new(Machine::new())),
         settings: Mutex::new(settings),
@@ -241,6 +241,15 @@ fn refresh_tray(app: &AppHandle) {
 fn on_menu(app: &AppHandle, id: &str) {
     match tray_model::on_menu(&current_machine(app), id) {
         Effect::ShowWindow => show_main(app),
+        Effect::Confirm(control) => {
+            // The window asks on its next `status` (it refreshes when it gets the focus).
+            if let Some(shared) = app.try_state::<Shared>()
+                && let Ok(mut core) = shared.core.lock()
+            {
+                core.ask_confirmation(control);
+            }
+            show_main(app);
+        }
         Effect::Quit => app.exit(0),
         Effect::RunControl(control) => {
             let app = app.clone();
@@ -272,7 +281,7 @@ async fn run_control(app: &AppHandle, name: &str) -> Result<StatusView, CommandE
 
 #[tauri::command]
 fn status(shared: State<'_, Shared>) -> Result<StatusView, CommandError> {
-    Ok(shared.core()?.status())
+    Ok(shared.core()?.take_status())
 }
 
 #[tauri::command]
@@ -285,8 +294,19 @@ fn settings(shared: State<'_, Shared>) -> Result<Settings, CommandError> {
     Ok(shared.settings()?.clone())
 }
 
+/// Async, with the registry write and the file's `fsync` on a blocking thread: a sync command would run them on the
+/// main (UI) thread.
 #[tauri::command]
-fn set_autostart(shared: State<'_, Shared>, enabled: bool) -> Result<Settings, CommandError> {
+async fn set_autostart(app: AppHandle, enabled: bool) -> Result<Settings, CommandError> {
+    tauri::async_runtime::spawn_blocking(move || apply_autostart(&app, enabled))
+        .await
+        .unwrap_or(Err(CommandError::Failed))
+}
+
+/// Writes the `Run` entry, then the settings file. The settings lock is held throughout, so two toggles never
+/// interleave.
+fn apply_autostart(app: &AppHandle, enabled: bool) -> Result<Settings, CommandError> {
+    let shared = app.state::<Shared>();
     let mut current = shared.settings()?;
     reconcile_autostart(enabled).map_err(|e| match e {
         AutostartError::Unsupported => CommandError::NotAvailable,

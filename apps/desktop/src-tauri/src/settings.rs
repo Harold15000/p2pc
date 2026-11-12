@@ -45,6 +45,34 @@ pub enum SettingsError {
     Invalid,
 }
 
+/// What the app starts with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Startup {
+    /// The settings to use. The defaults when the file could not be used: a damaged settings file must not keep the
+    /// app from starting.
+    pub settings: Settings,
+    /// Whether the settings are the user's (a file that loaded, or a fresh install with no file yet), so that the
+    /// `Run` entry may be made to match them. When they are only a fallback, the registry is left alone, so that a
+    /// damaged or unreadable file never undoes the user's opt-out (§8.1).
+    pub trusted: bool,
+}
+
+/// The settings to start with from `file` (`None` when the OS gives no config folder).
+pub fn startup(file: Option<&SettingsFile>) -> Startup {
+    match file.map(SettingsFile::load) {
+        // A file that loaded, or none yet (`load` gives the defaults for a missing file): the user's settings.
+        Some(Ok(settings)) => Startup {
+            settings,
+            trusted: true,
+        },
+        // Invalid or unreadable file, or no config folder: defaults, as a fallback only.
+        Some(Err(_)) | None => Startup {
+            settings: Settings::default(),
+            trusted: false,
+        },
+    }
+}
+
 /// `settings.json` on disk.
 #[derive(Debug, Clone)]
 pub struct SettingsFile {
@@ -82,12 +110,6 @@ impl SettingsFile {
             return Err(SettingsError::Invalid);
         }
         serde_json::from_value(value).map_err(|_| SettingsError::Invalid)
-    }
-
-    /// The stored settings, or the defaults when the file is missing or invalid. What the app uses at start: a
-    /// damaged settings file must not keep the app from starting.
-    pub fn load_or_default(&self) -> Settings {
-        self.load().unwrap_or_default()
     }
 
     /// Writes `settings` atomically (temporary file, flush, rename).
@@ -168,8 +190,54 @@ mod tests {
         ] {
             fs::write(file.path(), bad).expect("write");
             assert!(matches!(file.load(), Err(SettingsError::Invalid)), "{bad:?}");
-            assert_eq!(file.load_or_default(), Settings::default());
+            let start = startup(Some(&file));
+            assert_eq!(start.settings, Settings::default(), "{bad:?}");
+            assert!(!start.trusted, "a fallback must not rewrite the Run entry: {bad:?}");
         }
+    }
+
+    #[test]
+    fn an_unreadable_file_is_not_trusted() {
+        // A directory where the file should be: opening it for reading fails (Io, not NotFound).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = SettingsFile::in_dir(dir.path());
+        fs::create_dir(file.path()).expect("mkdir");
+        let start = startup(Some(&file));
+        assert_eq!(start.settings, Settings::default());
+        assert!(!start.trusted);
+    }
+
+    #[test]
+    fn no_config_folder_is_not_trusted() {
+        assert_eq!(
+            startup(None),
+            Startup {
+                settings: Settings::default(),
+                trusted: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_loaded_file_or_a_fresh_install_is_trusted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = SettingsFile::in_dir(dir.path());
+        assert_eq!(
+            startup(Some(&file)),
+            Startup {
+                settings: Settings::default(),
+                trusted: true
+            }
+        );
+        let off = Settings { autostart: false };
+        file.save(&off).expect("save");
+        assert_eq!(
+            startup(Some(&file)),
+            Startup {
+                settings: off,
+                trusted: true
+            }
+        );
     }
 
     #[test]

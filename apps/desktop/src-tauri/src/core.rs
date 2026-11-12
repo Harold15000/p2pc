@@ -108,6 +108,8 @@ pub struct StatusView {
     pub hub_notice: Option<&'static str>,
     /// Whether a control is running.
     pub busy: bool,
+    /// A control the user picked in the tray that the window must now ask to confirm (§8.4).
+    pub ask_confirm: Option<Control>,
 }
 
 /// A control that [`Core::begin`] accepted and that must be handed back to [`Core::finish`].
@@ -135,12 +137,35 @@ impl Ticket {
 pub struct Core {
     machine: Machine,
     busy: bool,
+    /// Set by the tray for a control that needs confirmation; shown once by the window ([`Core::take_status`]).
+    pending_confirm: Option<Control>,
 }
 
 impl Core {
     /// A core starting from `machine`.
     pub fn new(machine: Machine) -> Self {
-        Self { machine, busy: false }
+        Self {
+            machine,
+            busy: false,
+            pending_confirm: None,
+        }
+    }
+
+    /// Records that the user picked `control` in the tray and the window must ask to confirm it. Refused (`false`)
+    /// for a control that needs no confirmation or that the state does not offer.
+    pub fn ask_confirmation(&mut self, control: Control) -> bool {
+        let ok = needs_confirmation(control) && self.machine.allows(control);
+        if ok {
+            self.pending_confirm = Some(control);
+        }
+        ok
+    }
+
+    /// What the window shows, handing over a pending confirmation once: the window's `status` command.
+    pub fn take_status(&mut self) -> StatusView {
+        let view = self.status();
+        self.pending_confirm = None;
+        view
     }
 
     /// The state machine.
@@ -172,6 +197,8 @@ impl Core {
             controls,
             hub_notice: (m.role() == Some(Role::Hub)).then_some(HUB_NOTICE),
             busy: self.busy,
+            // Only while the state still offers it (a stale request is dropped).
+            ask_confirm: self.pending_confirm.filter(|c| !self.busy && m.allows(*c)),
         }
     }
 
@@ -186,6 +213,8 @@ impl Core {
             return Err(CommandError::NotAllowed);
         }
         self.busy = true;
+        // The user acted: a confirmation asked from the tray is no longer pending.
+        self.pending_confirm = None;
         Ok(Ticket { control, role })
     }
 
@@ -360,8 +389,42 @@ mod tests {
                 "controls": [],
                 "hub_notice": null,
                 "busy": false,
+                "ask_confirm": null,
             })
         );
+    }
+
+    #[test]
+    fn a_tray_confirmation_is_handed_to_the_window_once() {
+        let mut core = sharing(Role::Joined);
+        assert!(core.ask_confirmation(Control::StopSharing));
+        // A plain read (the tray) does not consume it; the window's `status` does, once.
+        assert_eq!(core.status().ask_confirm, Some(Control::StopSharing));
+        assert_eq!(core.take_status().ask_confirm, Some(Control::StopSharing));
+        assert_eq!(core.take_status().ask_confirm, None);
+    }
+
+    #[test]
+    fn only_offered_controls_that_need_confirmation_are_asked() {
+        let mut core = sharing(Role::Joined);
+        assert!(!core.ask_confirmation(Control::Pause), "no confirmation needed");
+        assert!(!core.ask_confirmation(Control::TurnOffCloud), "hub-only control");
+        assert_eq!(core.take_status().ask_confirm, None);
+    }
+
+    #[test]
+    fn a_stale_confirmation_is_dropped() {
+        // Asked while sharing; the state moved on before the window looked.
+        let mut core = Core::new(Machine::settled(Role::Hub, State::Sharing).expect("settled"));
+        assert!(core.ask_confirmation(Control::StopSharingThisPc));
+        core.apply(Event::Fault(AttentionCode::HubUnreachable)).expect("fault");
+        assert_eq!(core.take_status().ask_confirm, None);
+        // And a control that starts clears it.
+        let mut core = sharing(Role::Joined);
+        assert!(core.ask_confirmation(Control::StopSharing));
+        let ticket = core.begin("pause").expect("begin");
+        core.finish(ticket, Ok(())).expect("finish");
+        assert_eq!(core.take_status().ask_confirm, None);
     }
 
     #[test]

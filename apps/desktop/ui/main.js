@@ -54,6 +54,12 @@ function render(status) {
     button.addEventListener("click", () => (c.confirm ? askConfirmation(c) : runControl(c.id)));
     controls.append(button);
   }
+
+  // A control picked in the tray that needs confirmation: open its confirmation straight away.
+  const asked = status.controls.find((c) => c.id === status.ask_confirm);
+  if (asked) {
+    askConfirmation(asked);
+  }
 }
 
 function askConfirmation(c) {

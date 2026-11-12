@@ -73,6 +73,8 @@ pub enum Effect {
     ShowWindow,
     /// Run this control now.
     RunControl(Control),
+    /// Show the window with this control's confirmation already open (see [`crate::core::Core::ask_confirmation`]).
+    Confirm(Control),
     /// Quit the app.
     Quit,
     /// Nothing (unknown item, or a control the state no longer offers).
@@ -145,7 +147,7 @@ pub fn on_menu(machine: &Machine, id: &str) -> Effect {
         Some(MenuAction::Open) => Effect::ShowWindow,
         Some(MenuAction::Quit) => Effect::Quit,
         Some(MenuAction::Control(c)) if !machine.allows(c) => Effect::Nothing,
-        Some(MenuAction::Control(c)) if needs_confirmation(c) => Effect::ShowWindow,
+        Some(MenuAction::Control(c)) if needs_confirmation(c) => Effect::Confirm(c),
         Some(MenuAction::Control(c)) => Effect::RunControl(c),
         None => Effect::Nothing,
     }
@@ -263,15 +265,40 @@ mod tests {
     }
 
     #[test]
-    fn clicks_run_safe_controls_and_open_the_window_for_the_others() {
+    fn clicks_run_safe_controls_and_ask_the_window_to_confirm_the_others() {
         let hub = sharing(Role::Hub);
         assert_eq!(on_menu(&hub, "control:pause"), Effect::RunControl(Control::Pause));
-        assert_eq!(on_menu(&hub, "control:stop_sharing_this_pc"), Effect::ShowWindow);
-        assert_eq!(on_menu(&hub, "control:turn_off_cloud"), Effect::ShowWindow);
+        assert_eq!(
+            on_menu(&hub, "control:stop_sharing_this_pc"),
+            Effect::Confirm(Control::StopSharingThisPc)
+        );
+        assert_eq!(
+            on_menu(&hub, "control:turn_off_cloud"),
+            Effect::Confirm(Control::TurnOffCloud)
+        );
         let joined = sharing(Role::Joined);
-        assert_eq!(on_menu(&joined, "control:stop_sharing"), Effect::ShowWindow);
+        assert_eq!(
+            on_menu(&joined, "control:stop_sharing"),
+            Effect::Confirm(Control::StopSharing)
+        );
         assert_eq!(on_menu(&joined, "open"), Effect::ShowWindow);
         assert_eq!(on_menu(&joined, "quit"), Effect::Quit);
+    }
+
+    #[test]
+    fn in_attention_the_menu_still_offers_the_stop_control() {
+        for (role, stop, label) in [
+            (Role::Joined, Control::StopSharing, "Stop sharing…"),
+            (Role::Hub, Control::TurnOffCloud, "Turn off my cloud…"),
+        ] {
+            let mut m = sharing(role);
+            m.apply(Event::Fault(AttentionCode::DistroUnhealthy)).expect("fault");
+            assert!(
+                items(&menu(&m)).contains(&(MenuAction::Control(stop), label.into())),
+                "{role:?}"
+            );
+            assert_eq!(on_menu(&m, &MenuAction::Control(stop).id()), Effect::Confirm(stop));
+        }
     }
 
     #[test]
