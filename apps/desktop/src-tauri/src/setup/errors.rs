@@ -47,6 +47,8 @@ pub enum SetupErrorCode {
     /// Not in §8.8: a step-2 check that has no code there (Windows build, WSL default version, a network path, an
     /// unreadable disk). The detail is `p2pc_wsl`'s fixed message for it. Stays at 2.
     ChecksFailed,
+    /// Not in §8.8: `p2pc-agent share set` refused the share or did not run. Stays at 3.
+    ShareFailed,
     /// Not in §8.8: the hub's blob quota would be under 4 GiB: back to step 3 for a smaller share (§8.2).
     ShareTooLarge,
     /// Not in §8.8: a sub-step of "Create my cloud" failed (hub init, its config, starting it, the hub's answers).
@@ -75,6 +77,7 @@ impl SetupErrorCode {
             SetupErrorCode::DistroUnhealthy => "The P2PC distro failed a check",
             SetupErrorCode::JoinRejected => "The join token was refused: ask for a new invite",
             SetupErrorCode::ChecksFailed => "This PC does not meet P2PC's requirements",
+            SetupErrorCode::ShareFailed => "The share could not be applied",
             SetupErrorCode::ShareTooLarge => {
                 "Your cloud's hub needs room for files on this PC: choose a smaller disk share"
             }
@@ -95,6 +98,7 @@ impl SetupErrorCode {
             | SetupErrorCode::ImageHashMismatch
             | SetupErrorCode::ImportFailed
             | SetupErrorCode::DistroUnhealthy
+            | SetupErrorCode::ShareFailed
             | SetupErrorCode::ShareTooLarge => Step::Share,
             SetupErrorCode::JoinRejected | SetupErrorCode::HubFailed => Step::CreateOrJoin,
             // Wherever it happened.
@@ -231,7 +235,7 @@ mod tests {
 
     use super::*;
 
-    const ALL: [SetupErrorCode; 13] = [
+    const ALL: [SetupErrorCode; 14] = [
         SetupErrorCode::VirtualizationOff,
         SetupErrorCode::WslInstallFailed,
         SetupErrorCode::WslTooOld,
@@ -242,6 +246,7 @@ mod tests {
         SetupErrorCode::DistroUnhealthy,
         SetupErrorCode::JoinRejected,
         SetupErrorCode::ChecksFailed,
+        SetupErrorCode::ShareFailed,
         SetupErrorCode::ShareTooLarge,
         SetupErrorCode::HubFailed,
         SetupErrorCode::NotAvailable,

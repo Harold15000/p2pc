@@ -710,7 +710,7 @@ fn the_share_is_split_and_applied() {
 fn a_share_the_agent_refuses_stays_at_step_3() {
     let w = World::new();
     w.host.script().apply_share = Err(SetupError::with_detail(
-        SetupErrorCode::HubFailed,
+        SetupErrorCode::ShareFailed,
         "p2pc-agent share set ended with exit code 2",
     ));
     let s = w.start();
@@ -718,7 +718,7 @@ fn a_share_the_agent_refuses_stays_at_step_3() {
     s.run_checks().expect("checks");
     s.prepare_node().expect("prepare");
     let v = s.apply_share(share(90)).expect("share");
-    assert!(v.error.is_some());
+    assert_eq!(error_code(&v), Some(SetupErrorCode::ShareFailed));
     assert_eq!(v.step, Step::Share);
     assert!(w.saved().share.is_none());
 }
