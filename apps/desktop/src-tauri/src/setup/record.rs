@@ -94,12 +94,13 @@ pub struct ShareRecord {
 }
 
 /// "Create my cloud" (step 4), one flag per sub-step, in the order they run.
+///
+/// Its presence also says that "Create my cloud" was tried on this PC: from then on the Share control leaves room for
+/// the hub's blob quota (`disk::hub_share_range`). That limit is derived from the free space each time and never
+/// stored: earlier builds of this branch wrote a `share_cap_gib` here, which is read and ignored.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HubRecord {
-    /// The largest share that leaves the hub its blob quota, after a share was too large (§8.2: step 4 goes back to
-    /// step 3 and asks for a smaller share).
-    pub share_cap_gib: Option<u64>,
     /// The hub's blob quota, computed from the disk arithmetic before anything else runs.
     pub blobs_quota_mb: Option<u64>,
     /// `p2pc-server init --owner-device` ran (or the hub's data dir was already initialised: `found_existing`).
@@ -435,6 +436,29 @@ mod tests {
         let r = file.load().expect("load");
         assert_eq!(r.step(), Step::Share);
         assert_eq!(r.update_checks, Some(false));
+    }
+
+    #[test]
+    fn an_older_file_with_a_share_cap_still_loads_and_the_cap_is_dropped() {
+        // `share_cap_gib` was stored by earlier builds of this branch; the limit is now derived from the free space.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = RecordFile::in_dir(dir.path());
+        fs::write(
+            file.path(),
+            br#"{"update_checks": true, "checks_passed": true, "hub": {"share_cap_gib": 0, "initialised": true}}"#,
+        )
+        .expect("write");
+        let r = file.load().expect("load");
+        assert_eq!(
+            r.hub,
+            Some(HubRecord {
+                initialised: true,
+                ..HubRecord::default()
+            })
+        );
+        file.save(&r).expect("save");
+        let text = fs::read_to_string(file.path()).expect("read");
+        assert!(!text.contains("share_cap_gib"), "{text}");
     }
 
     #[test]

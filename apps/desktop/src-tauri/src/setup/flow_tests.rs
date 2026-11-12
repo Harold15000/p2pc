@@ -203,6 +203,8 @@ struct FakeHub {
     tickets: Mutex<u32>,
     /// The next mints that fail as unreachable.
     mint_failures: Mutex<u32>,
+    /// The flow whose window closes while the next pairing ticket is being made.
+    close_on_create: Mutex<Option<Arc<Setup>>>,
 }
 
 impl FakeHub {
@@ -237,6 +239,10 @@ impl HubApi for FakeHub {
     }
     fn create_pairing_ticket(&self, request: &PairingTicketRequest) -> Result<PairingTicket, HubError> {
         self.call(format!("create_pairing_ticket {}", request.expires_in_s))?;
+        let closing = self.close_on_create.lock().expect("lock").take();
+        if let Some(setup) = closing {
+            setup.close_pairing().expect("close");
+        }
         let mut n = self.tickets.lock().expect("lock");
         *n += 1;
         Ok(PairingTicket {
@@ -811,7 +817,6 @@ fn a_share_that_leaves_the_hub_under_4_gib_goes_back_to_step_3_before_anything_i
     assert!(w.hub.calls().is_empty());
     let r = w.saved();
     assert!(r.share.is_none());
-    assert_eq!(r.hub.as_ref().and_then(|h| h.share_cap_gib), Some(89));
 
     // A share above the cap is refused; one under it goes on, and the quota is computed for it.
     assert_eq!(s.apply_share(share(90)), Err(CommandError::InvalidArgument));
@@ -1280,16 +1285,102 @@ fn try_again_never_takes_an_agent_enrolled_elsewhere_for_ours() {
 }
 
 #[test]
-fn the_share_cap_is_cleared_once_a_smaller_share_is_applied() {
+fn the_share_limit_after_share_too_large_follows_the_free_space_measured_now() {
     let w = World::new();
     let s = to_create(&w);
     w.host.script().free = VecDeque::from([129 * GIB]);
-    s.create_cloud().expect("create: share too large");
-    assert_eq!(w.saved().hub.and_then(|h| h.share_cap_gib), Some(89));
-    s.apply_share(share(80)).expect("smaller share");
-    assert_eq!(
-        w.saved().hub.expect("hub").share_cap_gib,
-        None,
-        "the create-time check applies the limit again"
+    let v = s.create_cloud().expect("create: share too large");
+    assert_eq!(error_code(&v), Some(SetupErrorCode::ShareTooLarge));
+    // Nothing about the limit is stored: it is derived from the free space, leaving the hub its 4 GiB.
+    assert_eq!(v.share.expect("share").disk_max_gib, Some(129 - 36 - 4));
+    assert_eq!(s.apply_share(share(90)), Err(CommandError::InvalidArgument));
+    // The user frees disk space: the same share now fits, with no restart and nothing to clear.
+    w.host.script().free = VecDeque::from([200 * GIB]);
+    let v = s.apply_share(share(90)).expect("share");
+    assert_eq!((v.step, v.error), (Step::CreateOrJoin, None));
+    assert_eq!(s.create_cloud().expect("create").step, Step::AddPhone);
+}
+
+// --- Review round 3 ---
+
+#[test]
+fn no_share_that_leaves_the_hub_4_gib_is_disk_low_and_never_a_dead_end() {
+    let w = World::new();
+    let s = w.start();
+    s.welcome(true).expect("welcome");
+    s.run_checks().expect("checks");
+    s.prepare_node(false).expect("prepare");
+    assert_eq!(s.apply_share(share(1)).expect("share").step, Step::CreateOrJoin);
+    // 40 GiB free at "Create my cloud": 40 − 36 − 1 = 3 GiB for the hub, and no share at all leaves it 4.
+    w.host.script().free = VecDeque::from([40 * GIB]);
+    let v = s.create_cloud().expect("create");
+    let e = v.error.expect("error");
+    assert_eq!(e.code, SetupErrorCode::DiskLow);
+    assert!(e.detail.expect("detail").contains("41 GiB"), "how much is needed");
+    assert!(e.try_again);
+    assert_eq!(v.step, Step::Share);
+    assert_eq!(v.share.expect("share").disk_max_gib, None, "no range to choose from");
+    assert!(
+        !w.host.calls().iter().any(|c| c.starts_with("init_hub")),
+        "nothing created"
     );
+    // No share is possible while the disk is this full, and the app says why.
+    assert_eq!(
+        s.apply_share(share(1)).map(|v| error_code(&v)),
+        Ok(Some(SetupErrorCode::DiskLow))
+    );
+    // A restart shows the same, not an empty range without an error.
+    drop(s);
+    let s = w.start();
+    assert_eq!(
+        s.prepare_node(false).map(|v| error_code(&v)),
+        Ok(Some(SetupErrorCode::DiskLow))
+    );
+    assert_eq!(w.host.count("install_distro"), 1);
+    // The user frees disk space: 60 GiB free. The share fits again and "Create my cloud" goes on.
+    w.host.script().free = VecDeque::from([60 * GIB]);
+    let v = s.prepare_node(true).expect("try again");
+    assert_eq!(v.error, None);
+    assert_eq!(v.share.expect("share").disk_max_gib, Some(60 - 36 - 4));
+    let v = s.apply_share(share(1)).expect("share");
+    assert_eq!((v.step, v.error), (Step::CreateOrJoin, None));
+    let v = s.create_cloud().expect("create");
+    assert_eq!((v.step, v.error), (Step::AddPhone, None));
+    assert!(w.host.calls().contains(&"set_blobs_quota 20480".to_owned()));
+}
+
+#[test]
+fn reading_the_view_never_takes_the_action_slot() {
+    let w = World::new();
+    let s = w.start();
+    // Held as an action holds it, but with no action running: a view that probed the slot would say "busy" here,
+    // and, the other way round, would make an action that starts while it probes answer `busy`.
+    let slot = s.op.lock().expect("slot");
+    assert!(!s.view().expect("view").busy);
+    drop(slot);
+    assert_eq!(s.welcome(true).expect("welcome").step, Step::Checks);
+    assert!(!s.view().expect("view").busy);
+}
+
+#[test]
+fn a_window_closed_while_a_ticket_is_being_made_leaves_no_ticket_open() {
+    let w = World::new();
+    let s = Arc::new(to_phone(&w));
+    // The window closes after `pair_phone` asked the hub for the ticket and before it has stored it.
+    *w.hub.close_on_create.lock().expect("lock") = Some(Arc::clone(&s));
+    let v = s.pair_phone().expect("pair");
+    assert_eq!(v.error, None);
+    assert_eq!(v.phone.expect("phone").qr, None, "no QR code behind a closed window");
+    assert!(
+        w.hub.calls().contains(&"revoke_pairing_ticket pt_1".to_owned()),
+        "{:?}",
+        w.hub.calls()
+    );
+    // Nothing is left open: another close has nothing to revoke.
+    let before = w.hub.calls().len();
+    s.close_pairing().expect("close");
+    assert_eq!(w.hub.calls().len(), before);
+    // The window is opened again: a new code works as before.
+    let v = s.pair_phone().expect("pair again");
+    assert!(v.phone.expect("phone").qr.is_some());
 }

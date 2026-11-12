@@ -18,6 +18,7 @@
 //! it has its own slot, and the import of step 3 waits for it.
 
 use std::ops::ControlFlow;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use serde::{Deserialize, Serialize};
@@ -97,6 +98,9 @@ struct Inner {
     share_range: Option<ShareRange>,
     error: Option<SetupError>,
     phone: Phone,
+    /// How many times the QR screen was closed ([`Setup::close_pairing`]). `pair_phone` stores a new ticket only if
+    /// this has not changed since it started.
+    pairing_closes: u64,
 }
 
 /// A failed check of step 2, as the window lists it.
@@ -200,12 +204,24 @@ pub struct Setup {
     file: Option<RecordFile>,
     /// One action at a time.
     op: Mutex<()>,
+    /// An action holds the slot. Set and cleared by [`Setup::act`] and read by the view, which never touches `op`: a
+    /// view that probed the slot could make an action that starts at that instant answer `busy`.
+    acting: AtomicBool,
     /// The image download (beside the other actions).
     download: Mutex<()>,
     inner: Mutex<Inner>,
     /// `setup.json` exists but could not be read (an I/O error, not "missing" or "invalid"): every command fails
     /// closed with `internal`, and the file is never overwritten. Restarting the app reads it again.
     unreadable: bool,
+}
+
+/// Clears [`Setup::acting`] when dropped.
+struct Acting<'a>(&'a AtomicBool);
+
+impl Drop for Acting<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 impl std::fmt::Debug for Setup {
@@ -278,6 +294,7 @@ impl Setup {
             device,
             file,
             op: Mutex::new(()),
+            acting: AtomicBool::new(false),
             download: Mutex::new(()),
             inner: Mutex::new(Inner {
                 // A mismatch stays reported across restarts: no download runs until the user asks (§8.8).
@@ -291,6 +308,7 @@ impl Setup {
                 share_range: None,
                 error: None,
                 phone: Phone::default(),
+                pairing_closes: 0,
             }),
             unreadable: false,
         }
@@ -372,6 +390,9 @@ impl Setup {
     fn act(&self, action: impl FnOnce(&Self) -> Result<(), CommandError>) -> Result<SetupView, CommandError> {
         {
             let _op = self.begin()?;
+            // Cleared when the action ends, however it ends, and before the slot is freed.
+            self.acting.store(true, Ordering::SeqCst);
+            let _acting = Acting(&self.acting);
             self.inner()?.error = None;
             action(self)?;
         }
@@ -380,7 +401,7 @@ impl Setup {
 
     /// What the window shows.
     pub fn view(&self) -> Result<SetupView, CommandError> {
-        let busy = matches!(self.op.try_lock(), Err(TryLockError::WouldBlock));
+        let busy = self.acting.load(Ordering::SeqCst);
         let inner = self.inner()?;
         let r = &inner.record;
         let step = r.step();
@@ -425,10 +446,8 @@ impl Setup {
                 error: Some(e.view()),
             },
         };
-        let cap = r.hub.as_ref().and_then(|h| h.share_cap_gib);
         let share = r.node.as_ref().map(|n| {
             let range = inner.share_range;
-            let max = range.map(|g| cap.map_or(g.max_gib, |c| g.max_gib.min(c)));
             ShareView {
                 cpu_max: n.cpu_cores,
                 cpu_default: n.default_cpu.clamp(1, n.cpu_cores.max(1)),
@@ -438,8 +457,8 @@ impl Setup {
                 gpu_offerable: n.gpu_offerable,
                 gpu_default: n.gpu_offerable,
                 disk_min_gib: range.map(|g| g.min_gib),
-                disk_max_gib: max,
-                disk_default_gib: range.zip(max).map(|(g, m)| g.default_gib.min(m)),
+                disk_max_gib: range.map(|g| g.max_gib),
+                disk_default_gib: range.map(|g| g.default_gib),
                 templates_gib: disk::TEMPLATES_SHARE_GIB,
                 chosen: r.share,
             }
@@ -662,9 +681,12 @@ impl Setup {
         })
     }
 
-    /// Measures the free space and stores the Share control's range. `None` (with the error set) when not even the
-    /// smallest share fits.
+    /// Measures the free space and stores the Share control's range. `None` (with the error set, `disk_low` and how
+    /// much is needed) when not even the smallest share fits. Once "Create my cloud" was tried on this PC (the record
+    /// has a hub), the range leaves the hub its least blob quota, so a share from it is not "too large" again; that
+    /// limit comes from the free space measured now and is never stored.
     fn measure_share_range(&self) -> Result<Option<ShareRange>, CommandError> {
+        let for_hub = self.inner()?.record.hub.is_some();
         let free = match self.host.free_bytes() {
             Ok(free) => free,
             Err(e) => {
@@ -672,7 +694,12 @@ impl Setup {
                 return Ok(None);
             }
         };
-        match disk::share_range(free) {
+        let range = if for_hub {
+            disk::hub_share_range(free)
+        } else {
+            disk::share_range(free)
+        };
+        match range {
             Ok(range) => {
                 self.inner()?.share_range = Some(range);
                 Ok(Some(range))
@@ -700,9 +727,7 @@ impl Setup {
             let Some(range) = s.measure_share_range()? else {
                 return Ok(());
             };
-            let cap = record.hub.as_ref().and_then(|h| h.share_cap_gib);
-            let max = cap.map_or(range.max_gib, |c| range.max_gib.min(c));
-            if !(range.min_gib..=max).contains(&request.share_gib) {
+            if !(range.min_gib..=range.max_gib).contains(&request.share_gib) {
                 return Err(CommandError::InvalidArgument);
             }
             let split = disk::split(request.share_gib);
@@ -719,12 +744,10 @@ impl Setup {
             }
             s.commit(|r| {
                 r.share = Some(share);
-                // A new share: the hub's quota is computed again from it, and the cap of an earlier "share too large"
-                // is dropped (the quota check at "Create my cloud" applies the limit again, from fresh free space).
+                // A new share: the hub's quota is computed again from it.
                 if let Some(hub) = r.hub.as_mut() {
                     hub.blobs_quota_mb = None;
                     hub.quota_written = false;
-                    hub.share_cap_gib = None;
                 }
             })
         })
@@ -760,17 +783,17 @@ impl Setup {
                             save(s, &hub)?;
                             q
                         }
-                        Err(too_large) => {
-                            hub.share_cap_gib = Some(too_large.max_share_gib);
-                            let hub = hub.clone();
-                            s.commit(|r| {
-                                r.share = None;
-                                r.hub = Some(hub);
-                            })?;
-                            s.measure_share_range()?;
+                        Err(_) => {
+                            // Back to step 3. The record has a hub by now, so the range measured there leaves the
+                            // hub its room. When no share does (41 GiB free are needed), that is `disk_low`, which
+                            // the measurement has reported with "Try again", and nothing about it is stored.
+                            s.commit(|r| r.share = None)?;
+                            let Some(range) = s.measure_share_range()? else {
+                                return Ok(());
+                            };
                             return s.set_error(SetupError::with_detail(
                                 SetupErrorCode::ShareTooLarge,
-                                format!("Choose at most {} GiB.", too_large.max_share_gib),
+                                format!("Choose at most {} GiB.", range.max_gib),
                             ));
                         }
                     }
@@ -894,6 +917,7 @@ impl Setup {
     pub fn pair_phone(&self) -> Result<SetupView, CommandError> {
         self.act(|s| {
             s.at(Step::AddPhone)?;
+            let closes = s.inner()?.pairing_closes;
             s.revoke_ticket()?;
             let known = match s.hub.devices() {
                 Ok(devices) => devices.into_iter().map(|d| d.id).collect(),
@@ -906,6 +930,13 @@ impl Setup {
             let qr = qr_of(&ticket.url);
             let web_app_url = https_origin(&ticket.url);
             let mut inner = s.inner()?;
+            if inner.pairing_closes != closes {
+                // The window closed while the ticket was being made: there is no QR screen to show it on, so it is
+                // revoked at once (§5.2), not stored behind a hidden window.
+                drop(inner);
+                let _ = s.hub.revoke_pairing_ticket(&ticket.id);
+                return Ok(());
+            }
             inner.phone = Phone {
                 ticket: Some(ticket),
                 qr,
@@ -963,6 +994,9 @@ impl Setup {
     /// ticket is revoked, best effort (§5.2), and its QR code is gone; step 5 shows "Show the pairing code" again. Not
     /// an action: it runs while another one does, and never fails because of the step.
     pub fn close_pairing(&self) -> Result<(), CommandError> {
+        // Counted first: a `pair_phone` that is making a ticket right now sees it and revokes that ticket itself;
+        // one that has already stored its ticket has it revoked just below.
+        self.inner()?.pairing_closes += 1;
         self.revoke_ticket()
     }
 

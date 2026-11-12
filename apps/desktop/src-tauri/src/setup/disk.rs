@@ -69,7 +69,8 @@ pub struct ShareRange {
     pub templates_gib: u64,
 }
 
-/// Not even the smallest share fits: the free space is under `20 GiB + I + 1 GiB`.
+/// Not even the smallest share fits: the free space is under `20 GiB + I + 1 GiB` (plus the hub's least blob quota,
+/// 4 GiB, on a PC that is creating its cloud).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("{free_gib} GiB free; P2PC needs at least {needed_gib} GiB free")]
 pub struct NotEnoughDisk {
@@ -81,12 +82,26 @@ pub struct NotEnoughDisk {
 
 /// The Share control's range for this much free space (step 3: the PC's role is not known yet, so `B = 0`).
 pub fn share_range(free_bytes: u64) -> Result<ShareRange, NotEnoughDisk> {
+    range_leaving(free_bytes, 0)
+}
+
+/// The Share control's range once "Create my cloud" found the share too large (§8.2: step 4 goes back to step 3 and
+/// asks for a smaller share): the largest share is the one that leaves the hub [`MIN_BLOB_QUOTA_GIB`], so every share
+/// in the range passes [`hub_blob_quota`] with the same free space. Always derived from the free space measured now,
+/// never stored.
+pub fn hub_share_range(free_bytes: u64) -> Result<ShareRange, NotEnoughDisk> {
+    range_leaving(free_bytes, MIN_BLOB_QUOTA_GIB)
+}
+
+/// The range that leaves `reserve_gib` beside the floor and the image store.
+fn range_leaving(free_bytes: u64, reserve_gib: u64) -> Result<ShareRange, NotEnoughDisk> {
     let free = free_gib(free_bytes);
-    let max_gib = free.saturating_sub(FLOOR_GIB + IMAGE_ALLOWANCE_GIB);
+    let fixed = FLOOR_GIB + IMAGE_ALLOWANCE_GIB + reserve_gib;
+    let max_gib = free.saturating_sub(fixed);
     if max_gib < MIN_SHARE_GIB {
         return Err(NotEnoughDisk {
             free_gib: free,
-            needed_gib: FLOOR_GIB + IMAGE_ALLOWANCE_GIB + MIN_SHARE_GIB,
+            needed_gib: fixed + MIN_SHARE_GIB,
         });
     }
     Ok(ShareRange {
@@ -207,6 +222,32 @@ mod tests {
                 needed_gib: 37
             })
         );
+    }
+
+    #[test]
+    fn the_hub_pc_s_share_range_leaves_the_hub_its_4_gib() {
+        // Every share in the range passes `hub_blob_quota`, and one more GiB does not.
+        for free in [41, 60, 129, 146, 500] {
+            let r = hub_share_range(gib(free)).expect("fits");
+            assert_eq!((r.min_gib, r.max_gib), (1, free - 20 - 16 - 4), "{free}");
+            assert_eq!(r.default_gib, r.max_gib.min(90), "{free}");
+            assert!(hub_blob_quota(gib(free), r.max_gib).is_ok(), "{free}");
+            assert!(hub_blob_quota(gib(free), r.max_gib + 1).is_err(), "{free}");
+        }
+    }
+
+    #[test]
+    fn under_41_gib_no_share_leaves_the_hub_its_4_gib() {
+        for free in [0, 20, 37, 40] {
+            assert_eq!(
+                hub_share_range(gib(free)),
+                Err(NotEnoughDisk {
+                    free_gib: free,
+                    needed_gib: 41
+                }),
+                "{free}"
+            );
+        }
     }
 
     #[test]
