@@ -81,7 +81,7 @@ pub enum CompileError {
     TooLarge(usize),
 }
 
-fn list(problems: &[Problem]) -> String {
+pub(crate) fn list(problems: &[Problem]) -> String {
     problems
         .iter()
         .map(|p| format!("  - {p}"))

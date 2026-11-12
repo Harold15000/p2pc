@@ -15,6 +15,7 @@ use std::io::Cursor;
 use minisign::{PublicKey, SecretKey, SignatureBox};
 
 use crate::bundle::{Bundle, MAX_BUNDLE_BYTES};
+use crate::check::{Mode, Problem, check_bundle};
 
 /// The trusted comment a signature of a bundle of `bundle_version` carries.
 #[must_use]
@@ -28,6 +29,14 @@ pub enum SignError {
     /// The bytes are not a bundle, or are too large to be one.
     #[error("the bytes are not a template bundle: {0}")]
     NotABundle(String),
+    /// The bundle breaks a release rule: a placeholder or missing image digest, a bad target, a bad route… The release
+    /// key signs only what [`check_bundle`] accepts in [`Mode::Release`].
+    #[error("the bundle breaks {} release rule(s), so it is not signed:\n{}", .0.len(), crate::bundle::list(.0))]
+    Rules(Vec<Problem>),
+    /// The bytes parse as a bundle but are not the canonical bytes of it (other whitespace, other key order, a field
+    /// the bundle type drops). The signature would cover bytes the hub does not see as they are.
+    #[error("the bytes are not the canonical form of the bundle they parse to: sign the output of `compile`")]
+    NotCanonical,
     /// minisign refused to sign (an encrypted key that was not decrypted, for example).
     #[error("cannot sign: {0}")]
     Minisign(String),
@@ -61,11 +70,25 @@ fn parse_bundle(bytes: &[u8]) -> Result<Bundle, String> {
 
 /// Signs `bundle_json` (the bytes of `templates.json`) with `secret_key`, which must not be encrypted. Returns the
 /// text of the `.minisig` file.
+///
+/// The signer does not trust that `bundle_json` came out of `compile`: it refuses unless the bundle passes
+/// [`check_bundle`] in [`Mode::Release`] (so a Dev-mode build with a placeholder digest, or a hand-written bundle with
+/// an unpinned image, is never signed) and the bytes are exactly the canonical bytes of the bundle they parse to.
 pub fn sign_bundle(bundle_json: &[u8], secret_key: &SecretKey) -> Result<String, SignError> {
     if bundle_json.len() > MAX_BUNDLE_BYTES {
         return Err(SignError::NotABundle("over the size limit".to_string()));
     }
     let bundle = parse_bundle(bundle_json).map_err(SignError::NotABundle)?;
+    let problems = check_bundle(&bundle, Mode::Release);
+    if !problems.is_empty() {
+        return Err(SignError::Rules(problems));
+    }
+    let canonical = bundle
+        .to_canonical_json()
+        .map_err(|e| SignError::NotABundle(e.to_string()))?;
+    if canonical != bundle_json {
+        return Err(SignError::NotCanonical);
+    }
     let comment = trusted_comment(bundle.bundle_version);
     minisign::sign(
         None,

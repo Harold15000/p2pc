@@ -205,10 +205,17 @@ fn an_inline_file_is_read_whole_and_bounded() {
 
 // ---- signing -----------------------------------------------------------------------------------------------------
 
+/// A bundle that passes the release rules, so that `sign_bundle` accepts it (the shipped templates carry placeholder
+/// digests until someone takes the real ones from the registry, and are not signable).
+fn release_bundle() -> (Bundle, Vec<u8>) {
+    let dir = fixture_dir(1);
+    compile_dir(dir.path(), Mode::Release).expect("a release-grade fixture compiles")
+}
+
 #[test]
 fn a_signed_bundle_verifies_with_its_key_and_gives_back_the_bundle() {
     let kp = keys();
-    let (bundle, bytes) = compile_dir(&shipped_dir(), Mode::Dev).expect("compiles");
+    let (bundle, bytes) = release_bundle();
     let sig = sign_bundle(&bytes, &kp.sk).expect("signs");
     let verified = verify_bundle(&bytes, &sig, &kp.pk).expect("verifies");
     assert_eq!(verified, bundle);
@@ -217,7 +224,7 @@ fn a_signed_bundle_verifies_with_its_key_and_gives_back_the_bundle() {
 #[test]
 fn one_changed_byte_breaks_the_signature() {
     let kp = keys();
-    let (_, bytes) = compile_dir(&shipped_dir(), Mode::Dev).expect("compiles");
+    let (_, bytes) = release_bundle();
     let sig = sign_bundle(&bytes, &kp.sk).expect("signs");
     for i in [0, bytes.len() / 2, bytes.len() - 1] {
         let mut bad = bytes.clone();
@@ -236,7 +243,7 @@ fn one_changed_byte_breaks_the_signature() {
 #[test]
 fn another_key_does_not_verify() {
     let (signer, other) = (keys(), keys());
-    let (_, bytes) = compile_dir(&shipped_dir(), Mode::Dev).expect("compiles");
+    let (_, bytes) = release_bundle();
     let sig = sign_bundle(&bytes, &signer.sk).expect("signs");
     assert!(matches!(
         verify_bundle(&bytes, &sig, &other.pk),
@@ -402,6 +409,74 @@ fn the_cli_compiles_signs_and_verifies() {
         &p(&pk_path),
     ])
     .failure();
+}
+
+/// Writes a throwaway secret key and returns its path.
+fn write_secret_key(dir: &Path) -> std::path::PathBuf {
+    let kp = keys();
+    let path = dir.join("release.key");
+    fs::write(&path, kp.sk.to_box(None).expect("sk box").into_string()).expect("write");
+    path
+}
+
+fn cli_sign(bundle: &Path, key: &Path, out: &Path) -> assert_cmd::assert::Assert {
+    assert_cmd::Command::cargo_bin("templates-bundle")
+        .expect("binary")
+        .args([
+            "sign",
+            "--bundle",
+            bundle.to_str().expect("utf-8"),
+            "--secret-key",
+            key.to_str().expect("utf-8"),
+            "--out",
+            out.to_str().expect("utf-8"),
+        ])
+        .assert()
+}
+
+#[test]
+fn the_cli_refuses_to_sign_a_bundle_compiled_in_dev_mode() {
+    // The shipped templates carry placeholder digests, so a Dev compile of them is exactly what a release must not sign.
+    let work = tempfile::tempdir().expect("tempdir");
+    let key = write_secret_key(work.path());
+    let bundle = work.path().join("templates.json");
+    let sig = work.path().join("templates.json.minisig");
+    assert_cmd::Command::cargo_bin("templates-bundle")
+        .expect("binary")
+        .args([
+            "compile",
+            "--templates-dir",
+            shipped_dir().to_str().expect("utf-8"),
+            "--out",
+            bundle.to_str().expect("utf-8"),
+        ])
+        .assert()
+        .success();
+    let loaded = templates_bundle::source::load_dir(&shipped_dir()).expect("loads");
+    assert!(
+        loaded.templates.iter().any(|t| t.spec.image.ends_with(&"0".repeat(64))),
+        "this test needs the shipped placeholder; if the digests are real now, use a fixture with a placeholder"
+    );
+    cli_sign(&bundle, &key, &sig)
+        .failure()
+        .stderr(predicates::str::contains("placeholder digest"));
+    assert!(!sig.exists(), "no signature file is written for a refused bundle");
+}
+
+#[test]
+fn the_cli_refuses_to_sign_a_bundle_with_an_unpinned_image() {
+    // A hand-written `templates.json` that never went through `compile`: the signer re-checks it.
+    let work = tempfile::tempdir().expect("tempdir");
+    let key = write_secret_key(work.path());
+    let broken = common::parse_ok(&service_toml().replace(&format!("@sha256:{}", digest()), ":latest"));
+    let bytes = Bundle::new(1, "0.1.0", vec![broken]).to_canonical_json().expect("json");
+    let bundle = work.path().join("templates.json");
+    let sig = work.path().join("templates.json.minisig");
+    fs::write(&bundle, bytes).expect("write");
+    cli_sign(&bundle, &key, &sig)
+        .failure()
+        .stderr(predicates::str::contains("pinned by @sha256: digest"));
+    assert!(!sig.exists(), "no signature file is written for a refused bundle");
 }
 
 #[test]
