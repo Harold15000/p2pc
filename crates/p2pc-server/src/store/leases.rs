@@ -1245,94 +1245,161 @@ pub async fn idle_candidates(conn: &mut Conn) -> Result<Vec<IdleCandidate>, Stor
 
 // --- Usage ledger -------------------------------------------------------------------------------------------------
 
-/// Appends one usage record (one finished attempt), as **one slice** (H2 §12): a batch attempt is one slice from its
-/// start to its end, the attempt's last, charged to the UTC day of its job's creation, exactly as H1 counts it.
+/// Appends the ledger rows of a finished attempt (H2 §12), as **slices**:
+/// - a **batch** attempt is one slice from its start to its end, the attempt's last, charged to the UTC day of its
+///   job's creation (the day whose cap admitted it), with `rec` as it is: exactly H1's row;
+/// - a **service** attempt is cut at every 00:00 UTC it ran through. The scheduler's metering writes each midnight's
+///   slice as the clock passes it ([`crate::units::meter`]); this writes the last slice, from the latest cut (or the
+///   attempt's start) to the end, and first any midnight slice not written yet (the end came before the pass), with
+///   no report of its own, so `estimated`. Reserved time and units are exact for each slice, at the lease's
+///   reserved rate (`gpu_hour`); the last slice takes `rec.used_cpu_ms` (cumulative over the attempt) minus what the
+///   earlier slices recorded, `rec.max_rss_mb` and `rec.estimated`. A service attempt that ended with no report thus
+///   gets H1's estimate, cut into slices the same way.
 ///
-/// The principal (key or device), `kind` and `template_id` come from the job's own row, never from `rec`, so a ledger
-/// row always names the principal that submitted the job (H2 §5.6). Cutting service attempts at midnight is T2-16's.
-pub async fn insert_usage(conn: &mut Conn, lease_id: LeaseId, rec: &UsageRecord) -> Result<(), StoreError> {
-    let int = |v: u64, c: &'static str| i64::try_from(v).map_err(|_| StoreError::Corrupt(c));
-    let done = sqlx::query(
-        "INSERT INTO usage_records (job_id, attempt, lease_id, node_id, key_id, device_id, account_id, project_id, \
-         kind, template_id, started_at, ended_at, slice_start, slice_end, last_slice, charge_day, reserved_cpu_ms, \
-         reserved_gpu_ms, used_cpu_ms, max_rss_mb, units, estimated) \
-         SELECT ?1, ?2, ?3, ?4, j.key_id, j.device_id, ?5, ?6, j.kind, j.template_id, ?7, ?8, ?7, ?8, 1, \
-                j.created_at - ((j.created_at % 86400) + 86400) % 86400, ?9, ?10, ?11, ?12, ?13, ?14 \
-         FROM jobs j WHERE j.job_id = ?1",
-    )
-    .bind(rec.job_id.to_string())
-    .bind(i64::from(rec.attempt))
-    .bind(lease_id.to_string())
-    .bind(rec.node_id.to_string())
-    .bind(rec.account_id.to_string())
-    .bind(rec.project_id.to_string())
-    .bind(ts(rec.started_at))
-    .bind(ts(rec.ended_at))
-    .bind(int(rec.reserved_cpu_ms, "usage_records.reserved_cpu_ms")?)
-    .bind(int(rec.reserved_gpu_ms, "usage_records.reserved_gpu_ms")?)
-    .bind(int(rec.used_cpu_ms, "usage_records.used_cpu_ms")?)
-    .bind(int(rec.max_rss_mb, "usage_records.max_rss_mb")?)
-    .bind(int(rec.units.milli(), "usage_records.units")?)
-    .bind(rec.estimated)
-    .execute(&mut *conn)
-    .await?
-    .rows_affected();
-    if done == 1 {
-        Ok(())
-    } else {
-        Err(StoreError::Corrupt("usage_records.job_id"))
+/// The principal (key or device), `kind` and `template_id` come from the job's own row, never from `rec` (H2 §5.6).
+pub async fn insert_usage(
+    conn: &mut Conn,
+    lease_id: LeaseId,
+    rec: &UsageRecord,
+    gpu_hour: Units,
+) -> Result<(), StoreError> {
+    use super::usage::{self, NewSlice};
+    use crate::units::{Amounts, DAY_S, Rate, day_of, midnights};
+
+    let lease = get(conn, lease_id).await?.ok_or(StoreError::Corrupt("leases.id"))?;
+    let started = ts(rec.started_at);
+    let ended = ts(rec.ended_at).max(started);
+    let slice = |slice_start: i64, slice_end: i64| NewSlice {
+        job_id: rec.job_id,
+        attempt: rec.attempt,
+        lease_id,
+        node_id: rec.node_id,
+        started_at: started,
+        slice_start,
+        slice_end,
+        last_slice: true,
+        charge_day: day_of(slice_start),
+        amounts: Amounts::default(),
+        used_cpu_ms: 0,
+        max_rss_mb: 0,
+        estimated: true,
+    };
+    if lease.job_kind != JobKind::Service {
+        let created: i64 = sqlx::query_scalar("SELECT created_at FROM jobs WHERE job_id = ?")
+            .bind(rec.job_id.to_string())
+            .fetch_one(&mut *conn)
+            .await?;
+        return usage::insert_slice(
+            conn,
+            &NewSlice {
+                charge_day: day_of(created),
+                amounts: Amounts {
+                    reserved_cpu_ms: rec.reserved_cpu_ms,
+                    reserved_gpu_ms: rec.reserved_gpu_ms,
+                    units: rec.units,
+                },
+                used_cpu_ms: rec.used_cpu_ms,
+                max_rss_mb: rec.max_rss_mb,
+                estimated: rec.estimated,
+                ..slice(started, ended)
+            },
+        )
+        .await;
     }
+    let rate = Rate::of_reserved(&lease.reserved, gpu_hour);
+    let so_far = usage::attempt_so_far(conn, rec.job_id, rec.attempt).await?;
+    // Every slice of an attempt keeps the start its first slice recorded.
+    let started = so_far.started_at.unwrap_or(started);
+    let mut cut = so_far.cut_at.unwrap_or(started).max(started);
+    let ended = ended.max(cut);
+    let ms = |from: i64, to: i64| u64::try_from(to - from).unwrap_or(0).saturating_mul(1000);
+    // The midnights the metering has not cut yet, strictly before the end: the end itself closes the last slice.
+    for m in midnights(cut, ended).filter(|m| *m < ended).collect::<Vec<_>>() {
+        usage::insert_slice(
+            conn,
+            &NewSlice {
+                started_at: started,
+                last_slice: false,
+                charge_day: m - DAY_S,
+                amounts: rate.amounts(ms(cut, m)),
+                ..slice(cut, m)
+            },
+        )
+        .await?;
+        cut = m;
+    }
+    usage::insert_slice(
+        conn,
+        &NewSlice {
+            started_at: started,
+            amounts: rate.amounts(ms(cut, ended)),
+            used_cpu_ms: rec.used_cpu_ms.saturating_sub(so_far.used_cpu_ms),
+            max_rss_mb: rec.max_rss_mb,
+            estimated: rec.estimated,
+            ..slice(cut, ended)
+        },
+    )
+    .await
 }
 
-/// What a principal (an API key or a device, H2 §5.6) spent on jobs created in `[from, to)` (Unix seconds), in
-/// milli-units. The device branch is H1's rule applied to the device column; `spent(P, D)` of H2 §12 replaces this
-/// in T2-16. Every attempt that ended has a
-/// usage row (reported, or estimated by the server when it ended with no report, §11), so per job:
-/// - a terminal job counts its usage rows; with none, nothing if it was cancelled before it ever ran, and its
-///   reservation otherwise;
-/// - a job still queued or running counts the rows of its ended attempts **plus** its reservation, which the current
-///   or next attempt may still use.
+/// `spent(P, D)` (H2 §12): what principal `P` (an API key or a device, H2 §5.6) has spent against its cap for the UTC
+/// day that starts at `day` (00:00 UTC, Unix seconds), in milli-units. It replaces H1's `spent_between`. The sum of:
+/// 1. the `units` of P's ledger rows charged to `D` (`charge_day = D`): a batch row is charged to its job's creation
+///    day, a service slice to the day it lies in;
+/// 2. for each **batch** job of P created on `D`: its `units_reserved` while it is not terminal (its current or next
+///    attempt may still use it); once it is terminal with no ledger row, H1's rule: nothing if it was cancelled
+///    before it ever ran, its reservation otherwise;
+/// 3. for each **service** of P that is not terminal and holds a reservation for `D` (`service_state.cap_day = D`):
+///    `max(0, cap_reserved_units − the units of that job's rows charged to D)`.
 ///
-/// So the cap and `GET /v1/usage` count the same units for every attempt that ended.
-pub async fn spent_between(
-    conn: &mut Conn,
-    account_id: AccountId,
-    principal: Principal,
-    from: i64,
-    to: i64,
-) -> Result<u64, StoreError> {
-    let (key, device) = super::jobs::principal_binds(principal);
-    let total: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(CASE \
-             WHEN status IN ('succeeded', 'failed', 'timed_out', 'cancelled', 'lost') THEN \
-                 CASE \
-                     WHEN EXISTS (SELECT 1 FROM usage_records u WHERE u.job_id = jobs.job_id) \
-                         THEN (SELECT SUM(u.units) FROM usage_records u WHERE u.job_id = jobs.job_id) \
-                     WHEN status = 'cancelled' AND NOT EXISTS \
-                          (SELECT 1 FROM job_events e WHERE e.job_id = jobs.job_id AND e.to_status = 'running') THEN 0 \
-                     ELSE units_reserved END \
-             ELSE units_reserved \
-                  + COALESCE((SELECT SUM(u.units) FROM usage_records u WHERE u.job_id = jobs.job_id), 0) \
-             END), 0) \
-         FROM jobs WHERE account_id = ?1 AND created_at >= ?3 AND created_at < ?4 \
-           AND ((?2 IS NOT NULL AND key_id = ?2) OR (?5 IS NOT NULL AND device_id = ?5))",
-    )
-    .bind(account_id.to_string())
-    .bind(key)
-    .bind(from)
-    .bind(to)
-    .bind(device)
-    .fetch_one(&mut *conn)
-    .await?;
+/// Term 3 is what stops double counting: a slice written against a day's reservation uses it up instead of adding to
+/// it. For batch jobs terms 1 and 2 give exactly H1's numbers, since every batch row is charged to its job's creation
+/// day. Each term reads the principal's own column, so the ledger's per-principal `charge_day` indexes serve it.
+pub async fn spent(conn: &mut Conn, account_id: AccountId, principal: Principal, day: i64) -> Result<u64, StoreError> {
+    macro_rules! spent_sql {
+        ($col:literal) => {
+            concat!(
+                "SELECT \
+                   (SELECT COALESCE(SUM(u.units), 0) FROM usage_records u \
+                    WHERE u.", $col, " = ?2 AND u.charge_day = ?3 AND u.account_id = ?1) \
+                 + (SELECT COALESCE(SUM(CASE \
+                       WHEN j.status NOT IN ('succeeded', 'failed', 'timed_out', 'cancelled', 'lost') \
+                           THEN j.units_reserved \
+                       WHEN EXISTS (SELECT 1 FROM usage_records u WHERE u.job_id = j.job_id) THEN 0 \
+                       WHEN j.status = 'cancelled' AND NOT EXISTS \
+                            (SELECT 1 FROM job_events e WHERE e.job_id = j.job_id AND e.to_status = 'running') THEN 0 \
+                       ELSE j.units_reserved END), 0) \
+                    FROM jobs j WHERE j.", $col, " = ?2 AND j.account_id = ?1 AND j.kind = 'batch' \
+                      AND j.created_at >= ?3 AND j.created_at < ?3 + 86400) \
+                 + (SELECT COALESCE(SUM(MAX(0, s.cap_reserved_units - \
+                       (SELECT COALESCE(SUM(u.units), 0) FROM usage_records u \
+                        WHERE u.job_id = j.job_id AND u.charge_day = ?3))), 0) \
+                    FROM jobs j JOIN service_state s ON s.job_id = j.job_id \
+                    WHERE j.", $col, " = ?2 AND j.account_id = ?1 AND j.kind = 'service' \
+                      AND j.status IN ('queued', 'assigned', 'running') AND s.cap_day = ?3)"
+            )
+        };
+    }
+    let (sql, id) = match principal {
+        Principal::Key(k) => (spent_sql!("key_id"), k.to_string()),
+        Principal::Device(d) => (spent_sql!("device_id"), d.to_string()),
+    };
+    let total: i64 = sqlx::query_scalar(sql)
+        .bind(account_id.to_string())
+        .bind(id)
+        .bind(day)
+        .fetch_one(&mut *conn)
+        .await?;
     u64_col(total, "usage_records.units")
 }
 
-/// Totals of a group of usage records.
+/// Totals of a group of ledger rows.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct UsageTotalsRow {
-    /// The group key (a job, node or key ID); empty for the grand total.
+    /// The group key (a job, node, key, device or template ID, `key:<id>` or `device:<id>`, or a kind); empty for the
+    /// grand total.
     pub key: String,
-    /// Finished attempts.
+    /// Finished attempts: rows that are their attempt's last slice.
     pub attempts: u64,
     /// Reserved vCPU-milliseconds.
     pub reserved_cpu_ms: u64,
@@ -1344,11 +1411,13 @@ pub struct UsageTotalsRow {
     pub max_rss_mb: u64,
     /// Milli-units.
     pub units: Units,
-    /// How many of the attempts are server estimates.
+    /// How many of the attempts are server estimates (last slices that are estimates).
     pub estimated_attempts: u64,
+    /// How many rows (slices) are server estimates, midnight slices included.
+    pub estimated_slices: u64,
 }
 
-type TotalsRaw = (String, i64, i64, i64, i64, i64, i64, i64);
+type TotalsRaw = (String, i64, i64, i64, i64, i64, i64, i64, i64);
 
 fn decode_totals(r: TotalsRaw) -> Result<UsageTotalsRow, StoreError> {
     let c = "usage_records";
@@ -1361,6 +1430,7 @@ fn decode_totals(r: TotalsRaw) -> Result<UsageTotalsRow, StoreError> {
         max_rss_mb: u64_col(r.5, c)?,
         units: Units::from_milli(u64_col(r.6, c)?),
         estimated_attempts: u64_col(r.7, c)?,
+        estimated_slices: u64_col(r.8, c)?,
     })
 }
 
@@ -1379,8 +1449,24 @@ pub struct UsageQuery<'a> {
     pub limit: u32,
 }
 
-/// `GET /v1/usage`: the records of the principal's account and project that ended in `[from, to)`, grouped, ordered
-/// by group key, after `after`, at most `limit` groups; and the grand total of the whole range.
+/// The column (or expression) of the ledger a grouping groups by. `key`, `device` and `template` are NULL on some
+/// rows, which the query filters out before grouping: a group is never NULL (H2 §12).
+fn group_column(group_by: UsageGroupBy) -> &'static str {
+    match group_by {
+        UsageGroupBy::Job => "job",
+        UsageGroupBy::Node => "node",
+        UsageGroupBy::Key => "key",
+        UsageGroupBy::Device => "device",
+        UsageGroupBy::Principal => "principal",
+        UsageGroupBy::Kind => "kind",
+        UsageGroupBy::Template => "template",
+    }
+}
+
+/// `GET /v1/usage` (H2 §12): the rows (slices) of the principal's account and project that ended in `[from, to)`,
+/// grouped, ordered by group key, after `after`, at most `limit` groups; and the grand total of the whole range.
+/// The sums add every selected row, `max_rss_mb` is their maximum, `attempts` counts last slices (finished
+/// attempts), `estimated_attempts` the last slices that are estimates and `estimated_slices` every estimated row.
 pub async fn usage_report(
     conn: &mut Conn,
     account_id: AccountId,
@@ -1394,16 +1480,15 @@ pub async fn usage_report(
         after,
         limit,
     } = *q;
-    let group = match group_by {
-        UsageGroupBy::Job => "job",
-        UsageGroupBy::Node => "node",
-        UsageGroupBy::Key => "key",
-    };
     let rows: Vec<TotalsRaw> = sqlx::query_as(
-        "SELECT g, COUNT(*), SUM(reserved_cpu_ms), SUM(reserved_gpu_ms), SUM(used_cpu_ms), MAX(max_rss_mb), \
-                SUM(units), SUM(estimated) \
-         FROM (SELECT CASE ?5 WHEN 'job' THEN job_id WHEN 'node' THEN node_id ELSE key_id END AS g, \
-                      reserved_cpu_ms, reserved_gpu_ms, used_cpu_ms, max_rss_mb, units, estimated \
+        "SELECT g, SUM(last_slice), SUM(reserved_cpu_ms), SUM(reserved_gpu_ms), SUM(used_cpu_ms), MAX(max_rss_mb), \
+                SUM(units), SUM(last_slice * estimated), SUM(estimated) \
+         FROM (SELECT CASE ?5 WHEN 'job' THEN job_id WHEN 'node' THEN node_id WHEN 'key' THEN key_id \
+                      WHEN 'device' THEN device_id WHEN 'kind' THEN kind WHEN 'template' THEN template_id \
+                      WHEN 'principal' THEN CASE WHEN key_id IS NOT NULL THEN 'key:' || key_id \
+                                                 ELSE 'device:' || device_id END \
+                      END AS g, \
+                      last_slice, reserved_cpu_ms, reserved_gpu_ms, used_cpu_ms, max_rss_mb, units, estimated \
                FROM usage_records \
                WHERE account_id = ?1 AND project_id = ?2 AND ended_at >= ?3 AND ended_at < ?4) \
          WHERE g IS NOT NULL AND (?6 IS NULL OR g > ?6) \
@@ -1413,15 +1498,15 @@ pub async fn usage_report(
     .bind(project_id.to_string())
     .bind(ts(from))
     .bind(ts(to))
-    .bind(group)
+    .bind(group_column(group_by))
     .bind(after)
     .bind(i64::from(limit))
     .fetch_all(&mut *conn)
     .await?;
     let total: TotalsRaw = sqlx::query_as(
-        "SELECT '', COUNT(*), COALESCE(SUM(reserved_cpu_ms), 0), COALESCE(SUM(reserved_gpu_ms), 0), \
-                COALESCE(SUM(used_cpu_ms), 0), COALESCE(MAX(max_rss_mb), 0), COALESCE(SUM(units), 0), \
-                COALESCE(SUM(estimated), 0) \
+        "SELECT '', COALESCE(SUM(last_slice), 0), COALESCE(SUM(reserved_cpu_ms), 0), \
+                COALESCE(SUM(reserved_gpu_ms), 0), COALESCE(SUM(used_cpu_ms), 0), COALESCE(MAX(max_rss_mb), 0), \
+                COALESCE(SUM(units), 0), COALESCE(SUM(last_slice * estimated), 0), COALESCE(SUM(estimated), 0) \
          FROM usage_records WHERE account_id = ?1 AND project_id = ?2 AND ended_at >= ?3 AND ended_at < ?4",
     )
     .bind(account_id.to_string())
