@@ -137,6 +137,15 @@ pub enum AttentionCode {
     NodeRemoved,
 }
 
+impl AttentionCode {
+    /// Whether the error is final: the node does not come back by itself, so clearing the error, or an update, must
+    /// not return to a state where it runs.
+    pub fn is_terminal(self) -> bool {
+        // `hub_gone`: the app runs H1 `-Stop` and never retries on its own (§8.8). `node_removed`: agent exit 7.
+        matches!(self, AttentionCode::HubGone | AttentionCode::NodeRemoved)
+    }
+}
+
 /// The controls of §8.4 that the user can pick in the tray or the window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -291,7 +300,10 @@ impl Machine {
             (State::Sharing, Role::Hub) => vec![Control::Pause, Control::StopSharingThisPc, Control::TurnOffCloud],
             (State::Paused, Role::Hub) => vec![Control::Resume, Control::StopSharingThisPc, Control::TurnOffCloud],
             (State::Stopped, _) => vec![Control::Start],
-            (State::Setup | State::Updating | State::Attention, _) => Vec::new(),
+            // "You can stop […] at any time" (§8.2 step 1), errors included: the role's H1 `-Stop`.
+            (State::Attention, Role::Joined) => vec![Control::StopSharing],
+            (State::Attention, Role::Hub) => vec![Control::TurnOffCloud],
+            (State::Setup | State::Updating, _) => Vec::new(),
         }
     }
 
@@ -327,6 +339,10 @@ impl Machine {
                 State::Sharing | State::Paused | State::Stopped | State::Updating | State::Attention,
                 Event::Fault(code),
             ) => {
+                // A final error never leads back to a running state, whether it is cleared or an update follows.
+                if code.is_terminal() {
+                    self.resume_to = State::Stopped;
+                }
                 self.attention = Some(code);
                 self.state = State::Attention;
             }
@@ -512,12 +528,75 @@ mod tests {
     }
 
     #[test]
-    fn updating_and_attention_offer_no_control() {
+    fn updating_offers_no_control() {
         for role in ROLES {
-            for state in [State::Updating, State::Attention] {
-                assert!(at(role, state).controls().is_empty(), "{role:?} {state:?}");
+            assert!(at(role, State::Updating).controls().is_empty(), "{role:?}");
+        }
+    }
+
+    #[test]
+    fn attention_offers_only_the_role_s_stop_control() {
+        // §8.2 step 1: "you can stop or uninstall at any time", errors included.
+        let expected = [(Role::Joined, Control::StopSharing), (Role::Hub, Control::TurnOffCloud)];
+        for (role, stop) in expected {
+            for code in CODES {
+                for state in [State::Sharing, State::Paused, State::Stopped] {
+                    let mut m = at(role, state);
+                    m.apply(Event::Fault(code)).expect("fault");
+                    assert_eq!(m.controls(), vec![stop], "{role:?} {code:?} {state:?}");
+                }
             }
         }
+    }
+
+    #[test]
+    fn stopping_from_attention_enters_stopped_and_clears_the_error() {
+        for (role, stop) in [(Role::Joined, Control::StopSharing), (Role::Hub, Control::TurnOffCloud)] {
+            let mut m = at(role, State::Sharing);
+            m.apply(Event::Fault(AttentionCode::DistroUnhealthy)).expect("fault");
+            assert_eq!(m.apply(Event::Control(stop)), Ok(State::Stopped));
+            assert_eq!(m.attention(), None);
+            // Where to return is now `stopped`: an update comes back there, not to `sharing`.
+            m.apply(Event::UpdateStarted).expect("update");
+            assert_eq!(m.apply(Event::UpdateFinished), Ok(State::Stopped));
+        }
+    }
+
+    #[test]
+    fn terminal_errors_return_to_stopped_by_clearing_or_by_an_update() {
+        // §8.8: `hub_gone` stops the watchdog and never retries; `node_removed` is agent exit 7.
+        for code in [AttentionCode::HubGone, AttentionCode::NodeRemoved] {
+            assert!(code.is_terminal(), "{code:?}");
+            for role in ROLES {
+                for state in [State::Sharing, State::Paused, State::Stopped, State::Updating] {
+                    let mut m = at(role, state);
+                    m.apply(Event::Fault(code)).expect("fault");
+                    assert_eq!(
+                        m.apply(Event::FaultCleared),
+                        Ok(State::Stopped),
+                        "clear {code:?} {state:?}"
+                    );
+
+                    let mut m = at(role, state);
+                    m.apply(Event::Fault(code)).expect("fault");
+                    m.apply(Event::UpdateStarted).expect("update");
+                    assert_eq!(
+                        m.apply(Event::UpdateFinished),
+                        Ok(State::Stopped),
+                        "update {code:?} {state:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_later_fault_does_not_undo_a_terminal_one() {
+        let mut m = at(Role::Joined, State::Sharing);
+        m.apply(Event::Fault(AttentionCode::NodeRemoved)).expect("terminal");
+        m.apply(Event::Fault(AttentionCode::HubUnreachable))
+            .expect("later fault");
+        assert_eq!(m.apply(Event::FaultCleared), Ok(State::Stopped));
     }
 
     #[test]
@@ -534,10 +613,11 @@ mod tests {
     }
 
     #[test]
-    fn a_fault_enters_attention_and_clearing_it_returns() {
+    fn a_temporary_fault_enters_attention_and_clearing_it_returns() {
         for role in ROLES {
             for state in [State::Sharing, State::Paused, State::Stopped] {
-                for code in CODES {
+                for code in [AttentionCode::DistroUnhealthy, AttentionCode::HubUnreachable] {
+                    assert!(!code.is_terminal(), "{code:?}");
                     let mut m = at(role, state);
                     assert_eq!(m.apply(Event::Fault(code)), Ok(State::Attention));
                     assert_eq!(m.attention(), Some(code));
@@ -553,8 +633,9 @@ mod tests {
     fn a_second_fault_replaces_the_first_and_keeps_where_to_return() {
         let mut m = at(Role::Joined, State::Paused);
         m.apply(Event::Fault(AttentionCode::HubUnreachable)).expect("fault");
-        m.apply(Event::Fault(AttentionCode::HubGone)).expect("second fault");
-        assert_eq!(m.attention(), Some(AttentionCode::HubGone));
+        m.apply(Event::Fault(AttentionCode::DistroUnhealthy))
+            .expect("second fault");
+        assert_eq!(m.attention(), Some(AttentionCode::DistroUnhealthy));
         assert_eq!(m.apply(Event::FaultCleared), Ok(State::Paused));
     }
 
