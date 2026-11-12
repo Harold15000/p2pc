@@ -20,8 +20,9 @@ source "$runner"
 make_scratch
 
 # The runner's hub poll interval in these tests: a value no backoff ever takes (1 2 4 8 16 30), so the fake sleep can tell
-# the poll from a backoff.
+# the poll from a backoff. CHECK_S: the hub supervisor's listener check interval in these tests (another such value).
 TICK_S=7
+CHECK_S=11
 
 # --- pure helpers ---------------------------------------------------------------------------------------------------
 assert_eq "2" "$(next_delay 1)" "1 s doubles to 2 s"
@@ -63,6 +64,21 @@ for bad in 'bind = 7477' 'bind = """127.0.0.1:7477"""' 'bind = "127.0.0.1:7477" 
 done
 toml '"bind" = "0.0.0.0:7477"\n'
 assert_eq "0.0.0.0:7477" "$(toml_root_string "$SCRATCH/server.toml" bind)" "a quoted key is the same key (never ignored)"
+# A multi-line string at the root could hide a key line from a line-based reader (or fake one): any root-level line with
+# """ or ''' makes the whole file unreadable (5), whichever key is asked for. So does a byte order mark.
+for ml in 'note = """\nbind = "127.0.0.1:1"\n"""\nbind = "0.0.0.0:7477"\n' "note = '''\nx\n'''\nbind = \"127.0.0.1:7477\"\n" \
+  'bind = "127.0.0.1:7477"\nnote = """one line"""\n'; do
+  toml "$ml"
+  toml_root_string "$SCRATCH/server.toml" bind >/dev/null
+  assert_eq "5" "$?" "a root-level multi-line string marker makes the file unreadable: $ml"
+  toml_root_string "$SCRATCH/server.toml" data_dir >/dev/null
+  assert_eq "5" "$?" "for every key: $ml"
+done
+toml 'bind = "127.0.0.1:7477"\n[iroh]\nnote = """\nx\n"""\n'
+assert_eq "127.0.0.1:7477" "$(toml_root_string "$SCRATCH/server.toml" bind)" "a multi-line string inside a table is not at the root"
+printf '\xef\xbb\xbfbind = "127.0.0.1:7477"\n' >"$SCRATCH/server.toml"
+toml_root_string "$SCRATCH/server.toml" bind >/dev/null
+assert_eq "5" "$?" "a file that starts with a byte order mark is unreadable"
 
 for addr in 127.0.0.1:7477 127.0.0.2:9000 '[::1]:7477'; do
   assert_true "$addr is a loopback bind" is_loopback_bind "$addr"
@@ -87,6 +103,27 @@ assert_false "an unreadable bind is refused" cfgcheck "data_dir = \"$hub\"\nbind
 assert_false "data outside the hub directory is refused (the upgrade would not carry it)" cfgcheck "data_dir = \"/srv/p2pc\"\n"
 assert_contains "$(cfgcheck "data_dir = \"/srv/p2pc\"\n")" "/srv/p2pc" "and the reason names it"
 assert_false "no data_dir is refused" cfgcheck "bind = \"127.0.0.1:7477\"\n"
+assert_false "a root-level multi-line string is refused" cfgcheck "data_dir = \"$hub\"\nnote = \"\"\"\nbind = \"127.0.0.1:1\"\n\"\"\"\n"
+printf '\xef\xbb\xbfdata_dir = "%s"\n' "$hub" >"$hub/server.toml"
+assert_false "a byte order mark is refused" hub_config_problem "$hub/server.toml" "$hub"
+assert_contains "$(hub_config_problem "$hub/server.toml" "$hub")" "cannot read" "and the reason says it cannot be read"
+
+# --- pid_exposed_tcp_listeners (listeners.sh): the hub's own non-loopback TCP listeners, from /proc -------------------------
+fp="$SCRATCH/fakeproc-unit"
+mkdir -p "$fp/net" "$fp/42/fd" "$fp/43/fd"
+{
+  printf '  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n'
+  printf '   0: 0100007F:1D35 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 501 1 0 100 0 0 10 0\n'
+  printf '   1: 00000000:1D35 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 502 1 0 100 0 0 10 0\n'
+  printf '   2: 0A0200C0:0050 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 503 1 0 100 0 0 10 0\n'
+} >"$fp/net/tcp"
+ln -s 'socket:[501]' "$fp/42/fd/3"
+ln -s 'socket:[503]' "$fp/43/fd/3"
+assert_eq "" "$(pid_exposed_tcp_listeners "$fp" 42)" "a process with a loopback listener only: nothing"
+assert_eq "192.0.2.10:80" "$(pid_exposed_tcp_listeners "$fp" 43)" "a process on a host address: named"
+assert_eq "" "$(pid_exposed_tcp_listeners "$fp" 44)" "a process that is gone: nothing"
+ln -s 'socket:[502]' "$fp/42/fd/4"
+assert_eq "0.0.0.0:7477" "$(pid_exposed_tcp_listeners "$fp" 42)" "the wildcard is exposed (0.0.0.0 is not held by another pid here)"
 rm -f "$hub/server.toml"
 assert_false "no server.toml (the hub was never initialised) is refused" hub_config_problem "$hub/server.toml" "$hub"
 assert_contains "$(hub_config_problem "$hub/server.toml" "$hub")" "init" "and the reason says to initialise it"
@@ -103,6 +140,16 @@ if [ "$1" = "$NR_TICK_S" ]; then
   if [ -p "$NR_STATE/tick.fifo" ]; then
     exec 3<>"$NR_STATE/go.fifo"
     echo tick >"$NR_STATE/tick.fifo"
+    read -r _ <&3
+    exit 0
+  fi
+  exec /bin/sleep 1000
+fi
+# The hub supervisor's listener check ($NR_CHECK_S): the same, on check.fifo and checkgo.fifo.
+if [ "$1" = "$NR_CHECK_S" ]; then
+  if [ -p "$NR_STATE/check.fifo" ]; then
+    exec 3<>"$NR_STATE/checkgo.fifo"
+    echo check >"$NR_STATE/check.fifo"
     read -r _ <&3
     exit 0
   fi
@@ -184,6 +231,14 @@ sed -n 's/^SigIgn:[[:space:]]*//p' "/proc/$$/status" >"$state/hub-sigign"
 echo "hub line: listening" # the hub's own output goes to hub.log
 code="$(head -n 1 "$state/hub-codes" 2>/dev/null)"
 sed -i '1d' "$state/hub-codes" 2>/dev/null
+# hub-listen holds a /proc/net/tcp address ("0100007F:1D35"): the fake hub "listens" there, in the fake /proc the runner
+# reads (P2PC_RUN_PROC): a listening socket in net/tcp, and a descriptor of this process ($$, the runner's child) on it.
+if [ -s "$state/hub-listen" ]; then
+  mkdir -p "$state/fakeproc/net" "$state/fakeproc/$$/fd"
+  printf '  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: %s 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 4242 1 0 100 0 0 10 0\n' \
+    "$(cat "$state/hub-listen")" >"$state/fakeproc/net/tcp"
+  ln -sfn 'socket:[4242]' "$state/fakeproc/$$/fd/3"
+fi
 if [ -z "$code" ]; then
   trap 'echo TERM >>"$state/hub-signals"; kill "$idle" 2>/dev/null; [ -p "$state/hub-stopped.fifo" ] && echo stopped >"$state/hub-stopped.fifo"; exit 0' TERM
   sleep 1000 >/dev/null 2>&1 &
@@ -215,10 +270,11 @@ disable_hub() { rm -f "$NR_STATE/hub/hub.enabled"; }
 # runner_exec: replaces the current (sub)shell with the runner and its fakes. `runner_exec &` therefore gives the
 # runner's own PID in $!, so signals reach it.
 runner_exec() {
-  exec env -i PATH="$fakebin:/usr/bin:/bin" NR_STATE="$NR_STATE" NR_TICK_S="$TICK_S" P2PC_PROC="$NR_STATE/proc" \
+  exec env -i PATH="$fakebin:/usr/bin:/bin" NR_STATE="$NR_STATE" NR_TICK_S="$TICK_S" NR_CHECK_S="$CHECK_S" \
+    P2PC_PROC="$NR_STATE/proc" P2PC_RUN_PROC="$NR_STATE/fakeproc" \
     P2PC_RUN_AGENT="$NR_STATE/p2pc-agent" P2PC_RUN_SERVER="$NR_STATE/p2pc-server" P2PC_RUN_STATE_DIR="$NR_STATE/lib" \
     P2PC_RUN_HUB_DIR="$NR_STATE/hub" P2PC_RUN_LOG_DIR="$NR_STATE/log" P2PC_RUN_AGENT_LOCK="$NR_STATE/agent.lock" \
-    P2PC_RUN_HUB_LOCK="$NR_STATE/hub.lock" P2PC_RUN_HUB_POLL_S="$TICK_S" \
+    P2PC_RUN_HUB_LOCK="$NR_STATE/hub.lock" P2PC_RUN_HUB_POLL_S="$TICK_S" P2PC_RUN_LISTEN_CHECK_S="$CHECK_S" \
     P2PC_RUN_LOG_MAX_BYTES="${LOG_MAX:-10485760}" WSL_INTEROP=/run/WSL/1_interop WSLENV=SECRETISH \
     NR_FLOCK_FIFO="${NR_FLOCK_FIFO:-}" \
     bash "$runner" >"$NR_STATE/stdout" 2>&1
@@ -571,6 +627,46 @@ assert_eq "sleeping" "$(read_fifo "$NR_STATE/sleeping.fifo")" "no p2pc-server: t
 kill -TERM "$runner_pid"
 wait "$runner_pid"
 assert_contains "$(hub_log)" "is missing" "hub.log says the binary is missing"
+
+# After the hub started, the runner checks its listeners in /proc every LISTEN_CHECK_S: a TCP listener of the hub that is
+# not loopback stops it (TERM), whatever server.toml said; then the backoff, as after any exit.
+new_run
+enable_hub
+touch "$NR_STATE/long" "$NR_STATE/hold-sleep"
+mkfifo "$NR_STATE/started.fifo" "$NR_STATE/hub-started.fifo" "$NR_STATE/sleeping.fifo" "$NR_STATE/check.fifo" "$NR_STATE/checkgo.fifo"
+printf '00000000:1D35\n' >"$NR_STATE/hub-listen"
+runner_exec &
+runner_pid=$!
+read_fifo "$NR_STATE/started.fifo" >/dev/null
+assert_eq "started" "$(read_fifo "$NR_STATE/hub-started.fifo")" "the hub started (and listens on 0.0.0.0:7477)"
+assert_eq "check" "$(read_fifo "$NR_STATE/check.fifo")" "the runner waits for its listener check"
+write_fifo "$NR_STATE/checkgo.fifo" go
+assert_eq "sleeping" "$(read_fifo "$NR_STATE/sleeping.fifo")" "the check found a LAN listener: the hub was stopped and the runner backs off"
+assert_eq "TERM" "$(cat "$NR_STATE/hub-signals" 2>/dev/null)" "the hub got TERM"
+assert_eq "1" "$(hub_runs)" "it ran once"
+kill -TERM "$runner_pid"
+wait "$runner_pid"
+assert_contains "$(hub_log)" "not loopback" "hub.log says why"
+assert_contains "$(hub_log)" "0.0.0.0:7477" "and names the address"
+assert_eq "1" "$(agent_runs)" "the agent ran beside it, once"
+# The same check with a loopback listener: the hub stays up, check after check.
+new_run
+enable_hub
+touch "$NR_STATE/long"
+mkfifo "$NR_STATE/started.fifo" "$NR_STATE/hub-started.fifo" "$NR_STATE/check.fifo" "$NR_STATE/checkgo.fifo"
+printf '0100007F:1D35\n' >"$NR_STATE/hub-listen"
+runner_exec &
+runner_pid=$!
+read_fifo "$NR_STATE/started.fifo" >/dev/null
+read_fifo "$NR_STATE/hub-started.fifo" >/dev/null
+assert_eq "check" "$(read_fifo "$NR_STATE/check.fifo")" "the first listener check"
+write_fifo "$NR_STATE/checkgo.fifo" go
+assert_eq "check" "$(read_fifo "$NR_STATE/check.fifo")" "a loopback listener passes: the runner checks again later"
+assert_false "and the hub was not stopped" test -e "$NR_STATE/hub-signals"
+kill -TERM "$runner_pid"
+wait "$runner_pid"
+assert_eq "1" "$(hub_runs)" "the hub ran once"
+assert_false "hub.log reports no LAN listener" grep -q 'not loopback' "$NR_STATE/log/hub.log"
 
 # The hub has its own lock: while another runner's hub holds it, this one waits for it, and the agent is not held up.
 new_run

@@ -563,7 +563,9 @@ $(containers_conf_content | sed 's/^/         /')
      /usr/local/sbin/p2pc-test-distro (from deploy/wsl/test-distro.sh, mode 0755)
      /usr/local/lib/p2pc/nvidia.sh    (from deploy/wsl/nvidia.sh, mode 0644; sourced by both scripts above)
      /usr/local/lib/p2pc/boot-status.sh (from deploy/wsl/boot-status.sh, mode 0644; "is the boot status of this start?")
-     /usr/local/sbin/p2pc-run         (from deploy/wsl/p2pc-run, mode 0755; the Scheduled Task runs it: the agent, and
+     /usr/local/lib/p2pc/listeners.sh (from deploy/wsl/listeners.sh, mode 0644; which TCP sockets listen, and whose:
+                                       p2pc-run stops a hub on a non-loopback address, p2pc-test-distro checks it)
+     /usr/local/sbin/p2pc-run        (from deploy/wsl/p2pc-run, mode 0755; the Scheduled Task runs it: the agent, and
                                        the hub while /var/lib/p2pc-server/hub.enabled exists)
      /usr/local/sbin/p2pc-node-run -> p2pc-run   (the old path, kept as a symlink for one release)
      /usr/local/bin/p2pc-agent        (only with --agent-from or --agent)
@@ -861,6 +863,9 @@ write_configuration() {
   # The one definition of "is this boot status from this start of the distro?", sourced by p2pc-boot,
   # p2pc-test-distro and p2pc-run.
   install -D -m 0644 -o 0 -g 0 "$SCRIPT_DIR/boot-status.sh" "$ROOTFS/usr/local/lib/p2pc/boot-status.sh"
+  # The one reading of the TCP listeners in /proc, sourced by p2pc-run (it stops a hub that listens on a non-loopback
+  # address) and p2pc-test-distro.
+  install -D -m 0644 -o 0 -g 0 "$SCRIPT_DIR/listeners.sh" "$ROOTFS/usr/local/lib/p2pc/listeners.sh"
   # What the "P2PC node" Scheduled Task runs (install.ps1 -Join): it keeps the agent running, and the hub while it is
   # enabled (H2 §8.5).
   install -D -m 0755 -o 0 -g 0 "$SCRIPT_DIR/p2pc-run" "$ROOTFS/usr/local/sbin/p2pc-run"

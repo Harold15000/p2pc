@@ -37,6 +37,9 @@
 #       listener binds loopback only, as in H1 (H2 §8.5 "Hub listener"; hard rule 4: nothing listens beyond the
 #       loopback REST listener and the hub's own iroh endpoint);
 #     - `data_dir` is /var/lib/p2pc-server, the directory the upgrade carries over (H2 §8.3).
+#     A file that starts with a byte order mark, or that has """ or ''' on a root-level line, is refused too.
+#   While the hub runs, the runner reads its TCP listeners from /proc every 5 s (listeners.sh) and stops it (TERM, then
+#   the backoff) when one of them is not loopback, whatever server.toml said.
 #   The hub has no terminal exit code: while the flag exists it is restarted after every exit, with its backoff.
 #
 # Terminal stops (H2 §8.5). An agent terminal code stops only the agent. p2pc-run exits 64 (the task's wrapper,
@@ -59,6 +62,16 @@ for _bs in "${P2PC_BOOT_STATUS_LIB:-}" "$(dirname "${BASH_SOURCE[0]}")/boot-stat
   fi
 done
 unset _bs
+# The listener reading of /proc (pid_exposed_tcp_listeners), shared with p2pc-test-distro: the same search. Without it
+# the hub is never started (see supervise_hub).
+for _ls in "${P2PC_LISTENERS_LIB:-}" "$(dirname "${BASH_SOURCE[0]}")/listeners.sh" /usr/local/lib/p2pc/listeners.sh; do
+  if [[ -n "$_ls" && -r "$_ls" ]]; then
+    # shellcheck source=deploy/wsl/listeners.sh
+    source "$_ls"
+    break
+  fi
+done
+unset _ls
 
 # H2 §8.5: each child's backoff is 1 s doubling to 30 s. A run that lasted BACKOFF_RESET_S (H1's 60 s) resets it.
 readonly BACKOFF_MAX_S=30
@@ -103,14 +116,18 @@ terminal_reason() {
 # string without escapes ("...") or a literal string ('...'), with an optional trailing comment. A bare, double-quoted
 # or single-quoted key is the same key. Returns 3 when the key is absent, 4 when it is given more than once, 5 when its
 # value is anything else (a number, a multi-line or escaped string, trailing text): the callers fail closed on those.
+# The whole file is unreadable (5, whatever the key) when it starts with a byte order mark, or when any root-level line
+# holds """ or ''': a multi-line string could hide a key line from this reader, or fake one.
 # This is a line-based read of what `p2pc-server init` writes, not a TOML parser.
 toml_root_string() {
   local file="$1" key="$2" line k rest n=0 raw=""
   local re_key='^[[:space:]]*("([^"\\]*)"|'"'"'([^'"'"']*)'"'"'|([A-Za-z0-9_-]+))[[:space:]]*=[[:space:]]*(.*)$'
   local re_basic='^"([^"\\]*)"[[:space:]]*(#.*)?$'
   local re_literal="^'([^']*)'[[:space:]]*(#.*)?\$"
+  [[ "$(head -c 3 -- "$file" 2>/dev/null | od -An -tx1 | tr -d ' \n')" == efbbbf ]] && return 5
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ "$line" =~ ^[[:space:]]*\[ ]] && break
+    [[ "$line" == *'"""'* || "$line" == *"'''"* ]] && return 5
     [[ "$line" =~ $re_key ]] || continue
     k="${BASH_REMATCH[2]}${BASH_REMATCH[3]}${BASH_REMATCH[4]}"
     rest="${BASH_REMATCH[5]}"
@@ -273,11 +290,15 @@ start_log() {
   WRITER_PID=$!
 }
 
-# stop_child: TERM to the running child and wait for it; the backoff's sleep, if any, ends too.
+# stop_child: TERM to the running child and wait for it; the backoff's sleep and the hub's check sleep, if any, end too.
 stop_child() {
   if [[ -n "${SLEEP_PID:-}" ]]; then
     kill "$SLEEP_PID" 2>/dev/null
     wait "$SLEEP_PID" 2>/dev/null
+  fi
+  if [[ -n "${CHECK_PID:-}" ]]; then
+    kill "$CHECK_PID" 2>/dev/null
+    wait "$CHECK_PID" 2>/dev/null
   fi
   if [[ -n "${CHILD_PID:-}" ]]; then
     kill -TERM "$CHILD_PID" 2>/dev/null
@@ -395,21 +416,56 @@ hub_on_signal() {
   finish 0
 }
 
+# watch_hub: waits for the running hub (CHILD_PID) to exit, and meanwhile, every LISTEN_CHECK_S, reads its TCP
+# listeners from /proc (pid_exposed_tcp_listeners, listeners.sh). One that is not loopback stops the hub at once (TERM):
+# the start check reads server.toml, this one what the hub really bound (hard rule 4; H2 §8.5: REST on loopback only).
+# Sets HUB_RC to the hub's exit status.
+watch_hub() {
+  local ended rc exposed
+  while :; do
+    sleep "$LISTEN_CHECK_S" 9>&- >/dev/null 2>&1 &
+    CHECK_PID=$!
+    ended=""
+    wait -n -p ended "$CHILD_PID" "$CHECK_PID"
+    rc=$?
+    if [[ "$ended" == "$CHILD_PID" ]]; then
+      kill "$CHECK_PID" 2>/dev/null
+      wait "$CHECK_PID" 2>/dev/null
+      CHECK_PID=""
+      HUB_RC=$rc
+      return 0
+    fi
+    [[ "$ended" == "$CHECK_PID" ]] && CHECK_PID=""
+    exposed="$(pid_exposed_tcp_listeners "$PROC_ROOT" "$CHILD_PID" | paste -sd' ' -)"
+    if [[ -n "$exposed" ]]; then
+      log "the hub listens on TCP $exposed, which is not loopback: stopping it (its REST listener binds loopback only)"
+      kill -TERM "$CHILD_PID" 2>/dev/null
+      wait "$CHILD_PID"
+      HUB_RC=$?
+      return 0
+    fi
+  done
+}
+
 # supervise_hub: keeps `p2pc-server serve` running until TERM. It never ends by itself (only on TERM, or exit 1 when its
-# lock cannot be taken): a refused config, a missing binary and every exit of the hub are retried after the backoff.
+# lock cannot be taken): a refused config, a missing binary, a hub stopped for a LAN listener and every exit of the hub
+# are retried after the backoff.
 supervise_hub() {
   CHILD_PID=""
   SLEEP_PID=""
+  CHECK_PID=""
   WRITER_PID=""
   take_lock "$HUB_LOCK" "$LOG_DIR/hub.log"
   start_log "$LOG_DIR/hub.log"
   trap hub_on_signal TERM INT HUP
   log "starting (hub $SERVER, data in $HUB_DIR, because $HUB_FLAG exists)"
-  local delay=1 rc start ran problem
+  local delay=1 start ran problem
   while :; do
     start="$(date +%s)"
     if [[ ! -x "$SERVER" ]]; then
       log "$SERVER is missing: this image has no hub; retrying in ${delay} s"
+    elif ! declare -F pid_exposed_tcp_listeners >/dev/null; then
+      log "refusing to start the hub: listeners.sh was not found, so its listeners could not be checked; retrying in ${delay} s"
     elif ! problem="$(hub_config_problem "$HUB_DIR/server.toml" "$HUB_DIR")"; then
       log "refusing to start the hub: $problem; retrying in ${delay} s"
     else
@@ -419,12 +475,11 @@ supervise_hub() {
         exec env -i PATH="$CLEAN_PATH" HOME=/root LANG=C.UTF-8 P2PC_DATA_DIR="$HUB_DIR" "$SERVER" serve
       ) 9>&- &
       CHILD_PID=$!
-      wait "$CHILD_PID"
-      rc=$?
+      watch_hub
       CHILD_PID=""
       ran=$(($(date +%s) - start))
       ((ran >= BACKOFF_RESET_S)) && delay=1
-      log "p2pc-server exited with $rc; restarting in ${delay} s"
+      log "p2pc-server exited with $HUB_RC; restarting in ${delay} s"
     fi
     backoff "$delay"
     delay="$(next_delay "$delay")"
@@ -481,6 +536,8 @@ main() {
   HUB_LOCK="${P2PC_RUN_HUB_LOCK:-/run/p2pc-run-hub.lock}"
   LOG_MAX_BYTES="${P2PC_RUN_LOG_MAX_BYTES:-10485760}"
   local poll="${P2PC_RUN_HUB_POLL_S:-5}"
+  LISTEN_CHECK_S="${P2PC_RUN_LISTEN_CHECK_S:-5}"
+  PROC_ROOT="${P2PC_RUN_PROC:-/proc}"
   BOOT_STATUS="$STATE_DIR/boot-status.json"
   AGENT_CONFIG="$STATE_DIR/agent.toml"
   HUB_FLAG="$HUB_DIR/hub.enabled"

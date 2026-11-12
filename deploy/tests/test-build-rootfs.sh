@@ -432,10 +432,10 @@ assert_contains "$default_plan" "/var/lib/p2pc/agent.toml" "the plan names the a
 assert_true "the builder writes it 0600" grep -qF 'write_rootfs_file 0600 /var/lib/p2pc/agent.toml' "$script"
 assert_eq "" "$(agent_config_content | grep -v '^#')" "it holds no setting (the built-in defaults), only comments"
 assert_eq "0" "$(grep -c '/etc/p2pc/agent.toml' <<<"$(sed -n '/^write_configuration()/,/^}/p' "$script" | grep -v '^[[:space:]]*#')")" "the image writes no /etc/p2pc/agent.toml"
-for needle in "/usr/local/sbin/p2pc-run" "/usr/local/lib/p2pc/boot-status.sh" "/var/log/p2pc"; do
+for needle in "/usr/local/sbin/p2pc-run" "/usr/local/lib/p2pc/boot-status.sh" "/usr/local/lib/p2pc/listeners.sh" "/var/log/p2pc"; do
   assert_contains "$plan" "$needle" "dry-run plan installs $needle"
 done
-for src in p2pc-run boot-status.sh; do
+for src in p2pc-run boot-status.sh listeners.sh; do
   assert_true "the builder installs $src into the image" grep -qF "\"\$SCRIPT_DIR/$src\"" "$script"
 done
 # H2 §8.5: p2pc-run replaces p2pc-node-run, whose path stays as a symlink for one release (an existing task, and
