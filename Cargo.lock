@@ -2573,9 +2573,11 @@ dependencies = [
  "n0-watcher",
  "netwatch",
  "p2pc-proto",
+ "reqwest",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

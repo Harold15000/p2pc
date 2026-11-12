@@ -26,7 +26,12 @@
 //!   [`EgressGate`]: besides open and closed it says when it can never open ([`IPV4_NOT_BOUND`], or
 //!   [`IPV4_UPLINK_NAMED_LIKE_BRIDGE`] when the uplink's name looks like a container bridge).
 //!
+//! - [`relays`]: the relay-map rules of H2 §10.3 (schemes, hosts, address discovery for nodes, browser reach for the
+//!   hub) and the per-relay reachability probe of `p2pc-agent doctor`.
+//!
 //! Remote peers' addresses cannot be filtered with iroh 1.4: see `docs/security/residual-risks.md` (R-1).
+
+pub mod relays;
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
