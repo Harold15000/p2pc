@@ -615,7 +615,14 @@ async fn store_open_upgrades_an_h1_database_file() {
         .fetch_one(&mut *conn)
         .await
         .unwrap();
-    assert_eq!(applied, applied_before + 2, "the two H2 migrations were applied");
+    // Every migration from the first H2 one on: the two of §5.6, and the additive ones after them (T2-18).
+    let h2_migrations = MIGRATOR.iter().filter(|m| m.version >= FIRST_H2).count();
+    assert!(h2_migrations >= 2);
+    assert_eq!(
+        applied,
+        applied_before + i64::try_from(h2_migrations).unwrap(),
+        "every H2 migration was applied"
+    );
     // The H2 code works on it: a device can be registered next to the H1 keys.
     let device = store::devices::NewDevice {
         device_id: p2pc_proto::ids::DeviceId::generate(),

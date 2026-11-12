@@ -14,8 +14,8 @@ use p2pc_proto::api::{
     JoinRequestInfo, JoinRequestState, JoinRequestToken, JoinTokenInfo, JoinTokenResponse, LaunchTemplate, LogLine,
     LogStream, NewApiKey, Node, NodeApproval, NodeState, OutputEntry, Page, PairingTicketCreated, PairingTicketInfo,
     ParamType, ParamValue, Platform, Principal, Problem, RevealJoinRequest, SandboxCapability, SandboxClass, Scope,
-    ServerInfo, SmokeResult, TemplateInfo, TemplateList, TemplateParam, TemplateRequirements, TemplateUi, UsageGroupBy,
-    UsageReport, UsageTotals, VolumeInfo, WhoAmI, Wsl2Health,
+    ServerInfo, SmokeResult, TemplateInfo, TemplateList, TemplateParam, TemplateRequirements, TemplateUi, UpdateServer,
+    UsageGroupBy, UsageReport, UsageTotals, VolumeInfo, WhoAmI, Wsl2Health,
 };
 use p2pc_proto::validate::{ErrorCode, FieldError};
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
@@ -47,6 +47,7 @@ pub const BEARER: &str = "bearer";
         app::revoke_key,
         app::list_audit,
         nodes_api::get_server,
+        nodes_api::patch_server,
         nodes_api::create_join_token,
         nodes_api::list_join_tokens,
         nodes_api::revoke_join_token,
@@ -103,6 +104,7 @@ pub const BEARER: &str = "bearer";
         Page<ApiKeyInfo>,
         Page<AuditEvent>,
         ServerInfo,
+        UpdateServer,
         CreateJoinToken,
         JoinTokenResponse,
         JoinTokenInfo,

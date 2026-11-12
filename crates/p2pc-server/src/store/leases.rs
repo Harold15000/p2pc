@@ -741,7 +741,7 @@ struct RawQueued {
     timeout_s: Option<i64>,
     created_at: i64,
     kind: String,
-    volumes: Option<i64>,
+    volumes: Option<String>,
     blob_inputs: Option<i64>,
     reason: Option<String>,
     queued_at: Option<i64>,
@@ -758,6 +758,13 @@ struct PlacementCols {
     labels: BTreeMap<String, String>,
 }
 
+/// One entry of `volumes` in the redacted view: what placement needs of it (H2 §11.3).
+#[derive(serde::Deserialize)]
+struct VolumeCols {
+    name: String,
+    max_mb: u64,
+}
+
 macro_rules! select_queued {
     ($tail:literal) => {
         concat!(
@@ -768,7 +775,7 @@ macro_rules! select_queued {
              json_extract(spec_view, '$.resources.gpu') AS gpu, \
              json_extract(spec_view, '$.placement') AS placement, \
              json_extract(spec_view, '$.timeout_s') AS timeout_s, created_at, kind, \
-             json_array_length(spec_view, '$.volumes') AS volumes, \
+             json_extract(spec_view, '$.volumes') AS volumes, \
              json_array_length(spec_view, '$.inputs') AS blob_inputs, reason, \
              (SELECT MAX(e.at) FROM job_events e WHERE e.job_id = jobs.job_id AND e.to_status = 'queued') \
                  AS queued_at \
@@ -784,7 +791,9 @@ fn decode_queued(raw: RawQueued) -> Result<QueuedJob, StoreError> {
     let placement: PlacementCols = serde_json::from_str(raw.placement.as_deref().unwrap_or("{}"))
         .map_err(|_| StoreError::Corrupt("jobs.spec_view.placement"))?;
     let kind = kind(&raw.kind)?;
-    let has_volumes = raw.volumes.unwrap_or(0) > 0;
+    let volumes: Vec<VolumeCols> = serde_json::from_str(raw.volumes.as_deref().unwrap_or("[]"))
+        .map_err(|_| StoreError::Corrupt("jobs.spec_view.volumes"))?;
+    let has_volumes = !volumes.is_empty();
     let has_blob_inputs = raw.blob_inputs.unwrap_or(0) > 0;
     Ok(QueuedJob {
         job_id: parse_col(&raw.job_id, "jobs.job_id")?,
@@ -806,6 +815,13 @@ fn decode_queued(raw: RawQueued) -> Result<QueuedJob, StoreError> {
             labels: placement.labels,
             node_id: placement.node_id,
             needs: crate::scheduler::fit::needs(kind, has_volumes, has_blob_inputs),
+            volumes: volumes
+                .into_iter()
+                .map(|v| crate::scheduler::fit::VolumeNeed {
+                    name: v.name,
+                    max_mb: v.max_mb,
+                })
+                .collect(),
         },
         timeout_s: u32_col(raw.timeout_s.unwrap_or(0), "jobs.spec_view.timeout_s")?,
         kind,

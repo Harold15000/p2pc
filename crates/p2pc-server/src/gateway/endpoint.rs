@@ -99,7 +99,8 @@ impl ServerIdentity {
         ServerAddress::new(self.node_id().to_string(), self.relays.clone())
     }
 
-    /// The body of `GET /v1/server`.
+    /// The endpoint's part of `GET /v1/server`: address and version, with the H1 defaults for the rest
+    /// ([`crate::nodes_api::server_info`] fills the H2 fields).
     #[must_use]
     pub fn info(&self) -> ServerInfo {
         ServerInfo::new(self.address(), env!("CARGO_PKG_VERSION"))

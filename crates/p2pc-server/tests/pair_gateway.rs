@@ -166,7 +166,7 @@ async fn a_valid_ticket_pairs_a_device_once_and_the_retry_is_idempotent() {
     assert_eq!(answer.validate(), Ok(()));
     let PairResponse::Paired {
         device_id,
-        hub_name: _,
+        hub_name,
         account_id,
         scopes,
         server_version,
@@ -185,6 +185,9 @@ async fn a_valid_ticket_pairs_a_device_once_and_the_retry_is_idempotent() {
     // What `GET /v1/server` says.
     let server = hub.app.get("/v1/server", &hub.app.admin).await.json();
     assert_eq!(u64::from(api_version), server["api_version"].as_u64().unwrap_or(1));
+    assert_eq!(api_version, 2, "an H2 hub");
+    // A hub nobody named yet has an empty name in `Paired` (`GET /v1/server` leaves it out).
+    assert_eq!(hub_name, "");
     // Then the hub closes the connection.
     peer.closed_with_no_detail().await;
 
@@ -230,6 +233,29 @@ async fn a_valid_ticket_pairs_a_device_once_and_the_retry_is_idempotent() {
     device.closed_not_paired().await;
     assert_eq!(hub.pair(&phone, &ticket).await, invalid_ticket());
     assert_eq!(device_count(&hub).await, 1);
+}
+
+/// H2 §5.3 step 3: `Paired.hub_name` is the name an `admin` gave the hub with `PATCH /v1/server` (§7.3).
+#[tokio::test]
+async fn paired_carries_the_hub_name() {
+    let hub = Hub::start().await;
+    let r = hub
+        .app
+        .call(
+            Method::PATCH,
+            "/v1/server",
+            Some(&hub.app.admin),
+            Some(json!({"hub_name": "Home cloud"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    let (ticket, _) = hub.ticket(json!({})).await;
+    let answer = hub.pair(&SecretKey::generate(), &ticket).await.unwrap();
+    assert_eq!(answer.validate(), Ok(()));
+    match answer {
+        PairResponse::Paired { hub_name, .. } => assert_eq!(hub_name, "Home cloud"),
+        other => panic!("{other:?}"),
+    }
 }
 
 /// H2 §5.2 "The payload is not authenticated": the hub uses its own row's expiry, whatever the presented ticket says.
