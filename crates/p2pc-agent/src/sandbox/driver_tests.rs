@@ -3828,6 +3828,8 @@ enum HubAnswer {
     Forge,
     /// `ok: false`, `gone`.
     Gone,
+    /// No stream opens: the connection to the hub is gone.
+    Unreachable,
 }
 
 /// The hub end of the agent connection: serves the blobs it holds on every stream the agent opens, and records each
@@ -3910,6 +3912,11 @@ impl crate::connection::StreamOpener for BlobHubStreams {
     > {
         let hub = Arc::clone(&self.0);
         Box::pin(async move {
+            if hub.answer == HubAnswer::Unreachable {
+                return Err(crate::connection::transport::ConnectError(
+                    "the connection is gone".into(),
+                ));
+            }
             let (agent, far) = tokio::io::duplex(1 << 20);
             let (ar, aw) = tokio::io::split(agent);
             let (fr, fw) = tokio::io::split(far);
@@ -4105,5 +4112,62 @@ fn a_cancel_ends_a_blob_fetch_waiting_for_a_session() {
         assert_eq!(engine.count("pull"), 0, "{:?}", engine.calls());
         d.drain_background().await;
         assert!(!fx.jobs_dir().join(id.to_string()).exists());
+    });
+}
+
+/// Review P3 of T2-24: a fetch that failed on the way every time is the link's failure, not the job's input: it is
+/// reported as `sandbox_setup`, never as `invalid_input`.
+#[test]
+fn a_blob_fetch_that_keeps_failing_on_the_way_is_sandbox_setup_not_invalid_input() {
+    guarded(Clock::Paused, || async {
+        let fx = Fx::new();
+        let hub = BlobHub::new(HubAnswer::Unreachable);
+        let blob = hub.hold(b"never delivered");
+        let engine = MockEngine::default();
+        let (d, _session) = blob_driver(&fx, &hub, engine.clone());
+        let f = finished(run(&d, &fx, blob_lease(&fx, blob, 128)).await.0);
+        assert_eq!(
+            (f.outcome, f.error.as_deref()),
+            (Outcome::Error, Some(error_code::SANDBOX_SETUP))
+        );
+        assert_eq!(engine.count("create"), 0, "{:?}", engine.calls());
+    });
+}
+
+/// Review P3 of T2-24: the blob inputs sit in `inputs/`, outside the running disk measurement (the writable layer
+/// and `outputs/`), so what they take comes off the job's disk limit: inputs and what the job writes stay within
+/// `resources.disk_mb` together (H2 §7.1 leaves the job at least 64 MiB).
+#[test]
+fn delivered_blob_inputs_count_against_the_disk_limit() {
+    guarded(Clock::Paused, || async {
+        const MIB: u64 = 1024 * 1024;
+        let fx = Fx::new();
+        let hub = BlobHub::new(HubAnswer::Serve);
+        let blob = hub.hold(&vec![7u8; 1024 * 1024]);
+        // disk_mb = 66 with a 1 MiB blob: the job may write 65 MiB. Its writable layer grows to 65.5 MiB.
+        let engine = MockEngine::with(|s| s.sizes = VecDeque::from([0, 65 * MIB + MIB / 2]));
+        let (d, _session) = blob_driver(&fx, &hub, engine.clone());
+        let mut lease = blob_lease(&fx, blob, 66);
+        lease.job.timeout_s = 3600;
+        mark_t0();
+        let mut job = prepare_and_start(&d, &fx, lease, CancelHandle::new()).await;
+        let f = d.wait(&mut job).await.unwrap();
+        assert_eq!(
+            (f.outcome, f.error.as_deref()),
+            (Outcome::Error, Some(error_code::DISK_LIMIT))
+        );
+        assert_eq!(kills(&engine), ["kill Kill at 4s"]);
+        d.cleanup(job).await;
+
+        // The same growth without a blob input is within `disk_mb`: H1's rule, unchanged.
+        let engine = MockEngine::with(|s| s.sizes = VecDeque::from([0, 65 * MIB + MIB / 2]));
+        let d = fx.driver(engine.clone());
+        let mut lease = fx.lease();
+        lease.job.resources.disk_mb = 66;
+        lease.job.timeout_s = 60;
+        let mut job = prepare_and_start(&d, &fx, lease, CancelHandle::new()).await;
+        let f = d.wait(&mut job).await.unwrap();
+        assert_eq!((f.outcome, f.error), (Outcome::TimedOut, None));
+        d.cleanup(job).await;
     });
 }

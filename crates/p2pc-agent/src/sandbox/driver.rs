@@ -983,7 +983,10 @@ impl<E: Engine, C: Cgroups, X: Egress> PodmanDriver<E, C, X> {
     /// `BlobFetch` stream named by the lease and its epoch. Together with the inline files they must fit in
     /// `resources.disk_mb` minus 64 MiB (§7.1): each fetch may take only what is left, and a larger blob is refused
     /// before any of its bytes is read. A cancel ends the fetch at once. On an error what was written stays in the job
-    /// directory, which the cleanup guard removes.
+    /// directory, which the cleanup guard removes. Returns the bytes delivered.
+    ///
+    /// A failure on the way (the link or the hub, after the retries) or a local write failure is `sandbox_setup`:
+    /// only what is wrong with the input itself (a refusal, a blob that does not fit) is `invalid_input`.
     async fn fetch_blob_inputs(
         &self,
         dir: &JobDir,
@@ -991,9 +994,9 @@ impl<E: Engine, C: Cgroups, X: Egress> PodmanDriver<E, C, X> {
         epoch: u64,
         job: &JobSpec,
         cancel: &watch::Receiver<bool>,
-    ) -> Result<(), SandboxError> {
+    ) -> Result<u64, SandboxError> {
         if job.inputs.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         let Some(blobs) = &self.cfg.blobs else {
             return Err(reject(LeaseRejectReason::InvalidJob));
@@ -1030,7 +1033,7 @@ impl<E: Engine, C: Cgroups, X: Egress> PodmanDriver<E, C, X> {
             let size = fetched.map_err(|e| {
                 let code = match &e {
                     FetchError::Integrity => error_code::INPUT_INTEGRITY,
-                    FetchError::Write(_) => error_code::SANDBOX_SETUP,
+                    FetchError::Transport(_) | FetchError::Write(_) => error_code::SANDBOX_SETUP,
                     _ => error_code::INVALID_INPUT,
                 };
                 SandboxError::failed(code, format!("blob input {}: {e}", input.path))
@@ -1039,7 +1042,7 @@ impl<E: Engine, C: Cgroups, X: Egress> PodmanDriver<E, C, X> {
             total = total.saturating_add(size);
         }
         tracing::info!(lease = %lease_id, blobs = job.inputs.len(), bytes = total, "blob inputs fetched and verified");
-        Ok(())
+        Ok(total)
     }
 
     /// Makes `image` available within the size cap (§9 "Images").
@@ -1373,7 +1376,7 @@ impl<E: Engine, C: Cgroups, X: Egress> Sandbox for PodmanDriver<E, C, X> {
             .await??;
         }
         // H2 §7.5: the blob inputs, next to the inline files, before the env file exists (a fetch may take minutes).
-        self.fetch_blob_inputs(&dir, lease_id, epoch, &job, &cancel).await?;
+        let blob_bytes = self.fetch_blob_inputs(&dir, lease_id, epoch, &job, &cancel).await?;
         let env_file = {
             let (dir, shim) = (dir.clone(), self.cfg.shim_path.clone());
             let ports = service_ports.clone();
@@ -1488,7 +1491,9 @@ impl<E: Engine, C: Cgroups, X: Egress> Sandbox for PodmanDriver<E, C, X> {
             name,
             dir,
             timeout: Duration::from_secs(u64::from(job.timeout_s)),
-            disk_limit_bytes: job.resources.disk_mb.saturating_mul(MIB),
+            // The blob inputs are in `inputs/`, which the disk measurement does not walk: what they take comes off
+            // the limit, so the job stays within `resources.disk_mb` with them (at least 64 MiB are left, H2 §7.1).
+            disk_limit_bytes: job.resources.disk_mb.saturating_mul(MIB).saturating_sub(blob_bytes),
             outputs_max_bytes: job.outputs.max_mb.saturating_mul(MIB),
             events,
             cancel,
