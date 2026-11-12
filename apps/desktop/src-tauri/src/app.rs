@@ -107,12 +107,18 @@ pub fn run() -> ExitCode {
     let Ok(app) = builder.build(tauri::generate_context!()) else {
         return ExitCode::FAILURE;
     };
-    app.run(|_, event| {
+    app.run(|app, event| match event {
         // Closing the window is not quitting: the app stays in the tray. Only "Quit" (an explicit exit, which has an
         // exit code) ends the process.
-        if let RunEvent::ExitRequested { code: None, api, .. } = event {
-            api.prevent_exit();
+        RunEvent::ExitRequested { code: None, api, .. } => api.prevent_exit(),
+        // Quitting closes step 5's QR screen too: its pairing ticket is revoked (§5.2), best effort, before the
+        // process ends.
+        RunEvent::Exit => {
+            if let Some(shared) = app.try_state::<Shared>() {
+                let _ = shared.setup.close_pairing();
+            }
         }
+        _ => {}
     });
     ExitCode::SUCCESS
 }
@@ -236,6 +242,14 @@ fn build_main_window(app: &AppHandle) -> Result<WebviewWindow, Box<dyn Error>> {
         if let WindowEvent::CloseRequested { api, .. } = event {
             api.prevent_close();
             let _ = to_hide.hide();
+            // The QR screen of first-run step 5 closes with the window: its pairing ticket is revoked (§5.2), off the
+            // UI thread, best effort.
+            if let Some(shared) = to_hide.app_handle().try_state::<Shared>() {
+                let setup = Arc::clone(&shared.setup);
+                tauri::async_runtime::spawn_blocking(move || {
+                    let _ = setup.close_pairing();
+                });
+            }
         }
     });
     Ok(window)
@@ -462,16 +476,18 @@ async fn setup_install_wsl(app: AppHandle) -> Result<SetupView, CommandError> {
     blocking(move || s.install_wsl()).await
 }
 
+/// `retry` is the user's "Try again": only then is an image that failed its hash check downloaded again (§8.8).
 #[tauri::command]
-async fn setup_download(app: AppHandle) -> Result<SetupView, CommandError> {
+async fn setup_download(app: AppHandle, retry: bool) -> Result<SetupView, CommandError> {
     let s = first_run(&app);
-    blocking(move || s.download_image()).await
+    blocking(move || s.download_image(retry)).await
 }
 
+/// `retry` as for `setup_download`.
 #[tauri::command]
-async fn setup_prepare_node(app: AppHandle) -> Result<SetupView, CommandError> {
+async fn setup_prepare_node(app: AppHandle, retry: bool) -> Result<SetupView, CommandError> {
     let s = first_run(&app);
-    blocking(move || s.prepare_node()).await
+    blocking(move || s.prepare_node(retry)).await
 }
 
 #[tauri::command(rename_all = "snake_case")]

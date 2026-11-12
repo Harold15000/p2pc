@@ -35,7 +35,9 @@ use super::host::{JoinResult, SetupHost, WslInstall};
 use super::hub::{
     HUB_NAME, HubApi, HubError, JoinTokenRequest, OWNER_DEVICE_LABEL, OwnerDevice, PairingTicket, PairingTicketRequest,
 };
-use super::record::{HubRecord, NetworkingMode, NodeRecord, PhoneOutcome, RecordFile, SetupRecord, ShareRecord, Step};
+use super::record::{
+    HubRecord, NetworkingMode, NodeRecord, PhoneOutcome, RecordError, RecordFile, SetupRecord, ShareRecord, Step,
+};
 
 /// The warning of §10.5 when WSL runs with mirrored networking.
 pub const MIRRORED_WARNING: &str = "WSL on this PC uses mirrored networking: devices on your network that know the \
@@ -201,6 +203,9 @@ pub struct Setup {
     /// The image download (beside the other actions).
     download: Mutex<()>,
     inner: Mutex<Inner>,
+    /// `setup.json` exists but could not be read (an I/O error, not "missing" or "invalid"): every command fails
+    /// closed with `internal`, and the file is never overwritten. Restarting the app reads it again.
+    unreadable: bool,
 }
 
 impl std::fmt::Debug for Setup {
@@ -275,26 +280,42 @@ impl Setup {
             op: Mutex::new(()),
             download: Mutex::new(()),
             inner: Mutex::new(Inner {
+                // A mismatch stays reported across restarts: no download runs until the user asks (§8.8).
+                download: if record.image_hash_mismatch {
+                    Download::Failed(SetupError::new(SetupErrorCode::ImageHashMismatch))
+                } else {
+                    Download::Idle
+                },
                 record,
                 checks: None,
-                download: Download::Idle,
                 share_range: None,
                 error: None,
                 phone: Phone::default(),
             }),
+            unreadable: false,
         }
     }
 
-    /// First run resuming from `file`. A file that cannot be read starts over: every step is safe to run again (the
-    /// import is not repeated for a distro that exists, the hub's init not for a data dir that exists).
+    /// First run resuming from `file`. A missing file, or one that is not a valid record, starts over: every step is
+    /// safe to run again (the import is not repeated for a distro that exists, the hub's init not for a data dir that
+    /// exists). A file that exists but cannot be read (locked, denied) fails closed instead: starting over would
+    /// overwrite a good record at the next step, so every command answers `internal` and nothing is written.
     pub fn load(
         host: Arc<dyn SetupHost>,
         hub: Arc<dyn HubApi>,
         device: Arc<dyn OwnerDevice>,
         file: Option<RecordFile>,
     ) -> Self {
-        let record = file.as_ref().and_then(|f| f.load().ok()).unwrap_or_default();
-        Self::new(host, hub, device, file, record)
+        let (record, unreadable) = match file.as_ref().map(RecordFile::load) {
+            None => (SetupRecord::default(), false),
+            Some(Ok(record)) => (record, false),
+            Some(Err(RecordError::Invalid)) => (SetupRecord::default(), false),
+            Some(Err(RecordError::Io(_))) => (SetupRecord::default(), true),
+        };
+        Self {
+            unreadable,
+            ..Self::new(host, hub, device, file, record)
+        }
     }
 
     /// A copy of the record.
@@ -308,6 +329,9 @@ impl Setup {
     }
 
     fn inner(&self) -> Result<MutexGuard<'_, Inner>, CommandError> {
+        if self.unreadable {
+            return Err(CommandError::Internal);
+        }
         self.inner.lock().map_err(|_| CommandError::Internal)
     }
 
@@ -538,8 +562,10 @@ impl Setup {
     // --- The image download (from step 2 on) ---
 
     /// Downloads the node image in the background of steps 2 and 3. A download already running is not started
-    /// twice; once the distro is imported there is nothing to download.
-    pub fn download_image(&self) -> Result<SetupView, CommandError> {
+    /// twice; once the distro is imported there is nothing to download. A failure becomes the view's error, so the
+    /// window stops its automatic actions. After a hash mismatch nothing is downloaded again unless `retry` (the user's
+    /// "Try again"): a mismatch is never retried silently (§8.8).
+    pub fn download_image(&self, retry: bool) -> Result<SetupView, CommandError> {
         {
             let record = self.record()?;
             if !matches!(record.step(), Step::Checks | Step::Share) || record.node.is_some() {
@@ -550,14 +576,29 @@ impl Setup {
                 Err(TryLockError::WouldBlock) => return self.view(),
                 Err(TryLockError::Poisoned(_)) => return Err(CommandError::Internal),
             };
-            let _ = self.download_now()?;
+            if let Err(e) = self.download_now(retry)? {
+                self.set_error(e)?;
+            }
         }
         self.view()
     }
 
-    /// Runs the download with the download slot held by the caller.
-    fn download_now(&self) -> Result<Result<(), SetupError>, CommandError> {
-        self.inner()?.download = Download::Running(Progress { done: 0, total: None });
+    /// Runs the download with the download slot held by the caller. After a hash mismatch it returns that error again
+    /// without downloading, unless `retry`; a new mismatch is recorded in `setup.json`, so a restart keeps it.
+    fn download_now(&self, retry: bool) -> Result<Result<(), SetupError>, CommandError> {
+        {
+            let mut inner = self.inner()?;
+            if let Download::Failed(e) = &inner.download
+                && e.code == SetupErrorCode::ImageHashMismatch
+                && !retry
+            {
+                return Ok(Err(e.clone()));
+            }
+            inner.download = Download::Running(Progress { done: 0, total: None });
+        }
+        if retry && self.record()?.image_hash_mismatch {
+            self.commit(|r| r.image_hash_mismatch = false)?;
+        }
         let mut last = 0u64;
         let mut progress = |p: Progress| {
             // At most one update per MiB (and the last one).
@@ -574,6 +615,9 @@ impl Setup {
             Ok(()) => Download::Done,
             Err(e) => Download::Failed(e.clone()),
         };
+        if matches!(&result, Err(e) if e.code == SetupErrorCode::ImageHashMismatch) {
+            self.commit(|r| r.image_hash_mismatch = true)?;
+        }
         Ok(result)
     }
 
@@ -581,14 +625,15 @@ impl Setup {
 
     /// Step 3, first half: waits for the download, imports and verifies the distro, registers the task (disabled),
     /// reads the node's hardware and WSL's networking mode; then measures the free space for the Share control. Run
-    /// again after a restart, it only measures the free space: the import is never repeated.
-    pub fn prepare_node(&self) -> Result<SetupView, CommandError> {
+    /// again after a restart, it only measures the free space: the import is never repeated. `retry` is the user's "Try
+    /// again": only then is an image that failed its hash check downloaded again.
+    pub fn prepare_node(&self, retry: bool) -> Result<SetupView, CommandError> {
         self.act(|s| {
             let record = s.at(Step::Share)?;
             if record.node.is_none() {
                 {
                     let _slot = s.download.lock().map_err(|_| CommandError::Internal)?;
-                    if let Err(e) = s.download_now()? {
+                    if let Err(e) = s.download_now(retry)? {
                         return s.set_error(e);
                     }
                 }
@@ -791,12 +836,13 @@ impl Setup {
                 // An "already enrolled" answer is ours only if an earlier attempt minted a token, or the hub's data
                 // dir was there before (an attempt whose record was lost).
                 let ours_if_enrolled = hub.join_started || hub.found_existing;
-                hub.join_started = true;
-                save(s, &hub)?;
                 let token = match s.hub.mint_join_token(&JoinTokenRequest::OWN_NODE) {
                     Ok(token) => token,
                     Err(e) => return s.set_error(hub_error(e)),
                 };
+                // Recorded once a token exists, before it is used: a join whose answer is lost is ours on the retry.
+                hub.join_started = true;
+                save(s, &hub)?;
                 match s.host.join_agent(&token) {
                     JoinResult::Joined => {}
                     JoinResult::AlreadyEnrolled if ours_if_enrolled => {}
@@ -904,6 +950,13 @@ impl Setup {
             s.commit(|r| r.phone = Some(outcome))
         })?;
         Ok((view, self.finished()?))
+    }
+
+    /// The QR screen closes without finishing step 5 (the window is closed to the tray, or the app quits): the open
+    /// ticket is revoked, best effort (§5.2), and its QR code is gone; step 5 shows "Show the pairing code" again. Not
+    /// an action: it runs while another one does, and never fails because of the step.
+    pub fn close_pairing(&self) -> Result<(), CommandError> {
+        self.revoke_ticket()
     }
 
     /// Revokes the open ticket, best effort (it expires within 10 minutes anyway).

@@ -201,6 +201,8 @@ struct FakeHub {
     token_requests: Mutex<Vec<JoinTokenRequest>>,
     devices: Mutex<Vec<PairedDevice>>,
     tickets: Mutex<u32>,
+    /// The next mints that fail as unreachable.
+    mint_failures: Mutex<u32>,
 }
 
 impl FakeHub {
@@ -223,6 +225,13 @@ impl HubApi for FakeHub {
     }
     fn mint_join_token(&self, request: &JoinTokenRequest) -> Result<JoinToken, HubError> {
         self.call("mint_join_token")?;
+        {
+            let mut failures = self.mint_failures.lock().expect("lock");
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(HubError::Unreachable);
+            }
+        }
         self.token_requests.lock().expect("lock").push(*request);
         Ok(JoinToken::new(TOKEN.into()))
     }
@@ -305,7 +314,7 @@ fn to_create(w: &World) -> Setup {
     let s = w.start();
     s.welcome(true).expect("welcome");
     s.run_checks().expect("checks");
-    s.prepare_node().expect("prepare");
+    s.prepare_node(false).expect("prepare");
     let v = s.apply_share(share(90)).expect("share");
     assert_eq!(v.step, Step::CreateOrJoin, "{v:?}");
     s
@@ -338,12 +347,12 @@ fn no_command_runs_outside_its_step() {
     let w = World::new();
     let s = w.start();
     assert_eq!(s.run_checks(), Err(CommandError::NotAllowed));
-    assert_eq!(s.prepare_node(), Err(CommandError::NotAllowed));
+    assert_eq!(s.prepare_node(false), Err(CommandError::NotAllowed));
     assert_eq!(s.apply_share(share(90)), Err(CommandError::NotAllowed));
     assert_eq!(s.create_cloud(), Err(CommandError::NotAllowed));
     assert_eq!(s.pair_phone(), Err(CommandError::NotAllowed));
     assert_eq!(s.finish_phone().map(|_| ()), Err(CommandError::NotAllowed));
-    assert_eq!(s.download_image(), Err(CommandError::NotAllowed));
+    assert_eq!(s.download_image(false), Err(CommandError::NotAllowed));
     assert!(w.host.calls().is_empty(), "{:?}", w.host.calls());
 }
 
@@ -539,7 +548,7 @@ fn the_download_runs_in_the_background_of_step_2_and_reports_progress() {
     let w = World::new();
     let s = w.start();
     s.welcome(true).expect("welcome");
-    let v = s.download_image().expect("download");
+    let v = s.download_image(false).expect("download");
     assert_eq!(v.download.state, "done");
     assert_eq!(v.step, Step::Checks, "the download finishes no step");
 }
@@ -551,7 +560,7 @@ fn a_hash_mismatch_stays_at_step_3_and_is_retried_only_when_asked() {
     let s = w.start();
     s.welcome(true).expect("welcome");
     s.run_checks().expect("checks");
-    let v = s.prepare_node().expect("prepare");
+    let v = s.prepare_node(false).expect("prepare");
     assert_eq!(error_code(&v), Some(SetupErrorCode::ImageHashMismatch));
     assert_eq!(v.download.state, "failed");
     assert_eq!(v.step, Step::Share);
@@ -559,7 +568,7 @@ fn a_hash_mismatch_stays_at_step_3_and_is_retried_only_when_asked() {
     assert_eq!(w.host.count("install_distro"), 0, "nothing imported");
     assert_eq!(w.host.count("download_image"), 1, "not retried silently");
     // "Try again".
-    let v = s.prepare_node().expect("prepare");
+    let v = s.prepare_node(true).expect("prepare");
     assert_eq!(v.error, None);
     assert!(w.saved().node.is_some());
 }
@@ -574,7 +583,7 @@ fn an_import_failure_stays_at_step_3() {
     let s = w.start();
     s.welcome(true).expect("welcome");
     s.run_checks().expect("checks");
-    let v = s.prepare_node().expect("prepare");
+    let v = s.prepare_node(false).expect("prepare");
     assert_eq!(error_code(&v), Some(SetupErrorCode::ImportFailed));
     assert_eq!(v.step, Step::Share);
     assert!(w.saved().node.is_none());
@@ -586,7 +595,7 @@ fn the_import_is_never_repeated_after_a_restart() {
     let s = w.start();
     s.welcome(true).expect("welcome");
     s.run_checks().expect("checks");
-    s.prepare_node().expect("prepare");
+    s.prepare_node(false).expect("prepare");
     drop(s);
     let s = w.start();
     let v = s.view().expect("view");
@@ -594,7 +603,7 @@ fn the_import_is_never_repeated_after_a_restart() {
     // The controls are known; the disk range waits for a fresh measurement.
     let share = v.share.expect("share");
     assert_eq!(share.disk_max_gib, None);
-    let v = s.prepare_node().expect("prepare again");
+    let v = s.prepare_node(false).expect("prepare again");
     assert_eq!(v.share.expect("share").disk_max_gib, Some(200 - 36));
     assert_eq!(w.host.count("install_distro"), 1);
     assert_eq!(w.host.count("download_image"), 1);
@@ -608,7 +617,7 @@ fn step_3_offers_the_node_s_hardware_and_the_disk_arithmetic() {
     let s = w.start();
     s.welcome(true).expect("welcome");
     s.run_checks().expect("checks");
-    let v = s.prepare_node().expect("prepare");
+    let v = s.prepare_node(false).expect("prepare");
     let share = v.share.expect("share");
     assert_eq!((share.cpu_max, share.cpu_default), (16, 15));
     assert_eq!(
@@ -630,7 +639,7 @@ fn too_little_room_for_any_share_is_disk_low_at_step_3() {
     let s = w.start();
     s.welcome(true).expect("welcome");
     s.run_checks().expect("checks");
-    let v = s.prepare_node().expect("prepare");
+    let v = s.prepare_node(false).expect("prepare");
     let e = v.error.expect("error");
     assert_eq!(e.code, SetupErrorCode::DiskLow);
     assert!(e.detail.expect("detail").contains("37 GiB"));
@@ -648,7 +657,7 @@ fn the_share_is_validated_in_rust_before_anything_runs() {
     let s = w.start();
     s.welcome(true).expect("welcome");
     s.run_checks().expect("checks");
-    s.prepare_node().expect("prepare");
+    s.prepare_node(false).expect("prepare");
     let bad = [
         ShareRequest { cpu: 0, ..share(90) },
         ShareRequest { cpu: 17, ..share(90) },
@@ -681,7 +690,7 @@ fn the_share_is_split_and_applied() {
     let s = w.start();
     s.welcome(true).expect("welcome");
     s.run_checks().expect("checks");
-    s.prepare_node().expect("prepare");
+    s.prepare_node(false).expect("prepare");
     let v = s
         .apply_share(ShareRequest {
             cpu: 6,
@@ -716,7 +725,7 @@ fn a_share_the_agent_refuses_stays_at_step_3() {
     let s = w.start();
     s.welcome(true).expect("welcome");
     s.run_checks().expect("checks");
-    s.prepare_node().expect("prepare");
+    s.prepare_node(false).expect("prepare");
     let v = s.apply_share(share(90)).expect("share");
     assert_eq!(error_code(&v), Some(SetupErrorCode::ShareFailed));
     assert_eq!(v.step, Step::Share);
@@ -924,7 +933,7 @@ fn mirrored_networking_is_warned_about_from_step_4_on() {
     let s = w.start();
     s.welcome(true).expect("welcome");
     s.run_checks().expect("checks");
-    let v = s.prepare_node().expect("prepare");
+    let v = s.prepare_node(false).expect("prepare");
     assert!(v.warnings.is_empty(), "the role is not chosen yet");
     let v = s.apply_share(share(90)).expect("share");
     assert_eq!(v.warnings, vec![MIRRORED_WARNING]);
@@ -1098,4 +1107,142 @@ fn the_view_s_json_has_the_window_s_fields() {
     );
     assert_eq!(v["step"], "welcome");
     assert_eq!(v["update_checks"], serde_json::Value::Null);
+}
+
+// --- Review fixes ---
+
+fn mismatch() -> SetupError {
+    SetupError::new(SetupErrorCode::ImageHashMismatch)
+}
+
+#[test]
+fn a_mismatch_in_the_background_download_is_never_retried_silently() {
+    let w = World::new();
+    w.host.script().download = VecDeque::from([Err(mismatch()), Ok(())]);
+    let s = w.start();
+    s.welcome(true).expect("welcome");
+    // The background download of step 2: its failure is the view's error, so the window stops its automatic actions.
+    let v = s.download_image(false).expect("download");
+    assert_eq!(error_code(&v), Some(SetupErrorCode::ImageHashMismatch));
+    assert_eq!(v.download.state, "failed");
+    s.run_checks().expect("checks");
+    // Step 3 opens and the window prepares the node by itself: no second download.
+    let v = s.prepare_node(false).expect("prepare");
+    assert_eq!(error_code(&v), Some(SetupErrorCode::ImageHashMismatch));
+    assert_eq!(
+        s.download_image(false).map(|v| error_code(&v)),
+        Ok(Some(SetupErrorCode::ImageHashMismatch))
+    );
+    assert_eq!(
+        w.host.count("download_image"),
+        1,
+        "never downloaded again without the user"
+    );
+    assert_eq!(w.host.count("install_distro"), 0);
+    assert!(w.saved().node.is_none());
+    // "Try again" is the user asking.
+    let v = s.prepare_node(true).expect("retry");
+    assert_eq!(v.error, None);
+    assert_eq!(w.host.count("download_image"), 2);
+    assert!(w.saved().node.is_some());
+    assert!(!w.saved().image_hash_mismatch);
+}
+
+#[test]
+fn a_mismatch_stays_sticky_across_a_restart() {
+    let w = World::new();
+    w.host.script().download = VecDeque::from([Err(mismatch()), Ok(())]);
+    let s = w.start();
+    s.welcome(true).expect("welcome");
+    s.download_image(false).expect("download");
+    assert!(w.saved().image_hash_mismatch);
+    drop(s);
+    let s = w.start();
+    assert_eq!(s.view().expect("view").download.state, "failed");
+    let v = s.download_image(false).expect("download after restart");
+    assert_eq!(error_code(&v), Some(SetupErrorCode::ImageHashMismatch));
+    s.run_checks().expect("checks");
+    assert_eq!(
+        s.prepare_node(false).map(|v| error_code(&v)),
+        Ok(Some(SetupErrorCode::ImageHashMismatch))
+    );
+    assert_eq!(w.host.count("download_image"), 1);
+    s.download_image(true).expect("explicit retry");
+    assert_eq!(w.host.count("download_image"), 2);
+    assert!(!w.saved().image_hash_mismatch);
+}
+
+#[test]
+fn a_background_download_failure_is_shown_and_may_be_resumed() {
+    let w = World::new();
+    w.host.script().download = VecDeque::from([Err(SetupError::new(SetupErrorCode::ImageDownloadFailed)), Ok(())]);
+    let s = w.start();
+    s.welcome(true).expect("welcome");
+    let v = s.download_image(false).expect("download");
+    assert_eq!(error_code(&v), Some(SetupErrorCode::ImageDownloadFailed));
+    assert!(!w.saved().image_hash_mismatch);
+    s.run_checks().expect("checks");
+    // Not a mismatch: the import's own download resumes it.
+    let v = s.prepare_node(false).expect("prepare");
+    assert_eq!(v.error, None);
+    assert_eq!(w.host.count("download_image"), 2);
+}
+
+#[test]
+fn a_failed_mint_does_not_make_a_foreign_enrollment_ours() {
+    let w = World::new();
+    w.host.script().join = VecDeque::from([JoinResult::AlreadyEnrolled]);
+    *w.hub.mint_failures.lock().expect("lock") = 1;
+    let s = to_create(&w);
+    let v = s.create_cloud().expect("create");
+    assert_eq!(error_code(&v), Some(SetupErrorCode::HubFailed));
+    assert!(!w.saved().hub.expect("hub").join_started, "no token was minted");
+    let v = s.create_cloud().expect("retry");
+    let e = v.error.expect("error");
+    assert_eq!(e.code, SetupErrorCode::HubFailed);
+    assert!(e.detail.expect("detail").contains("another cloud"));
+    assert_eq!(v.step, Step::CreateOrJoin);
+    assert_eq!(v.role, None);
+}
+
+#[test]
+fn an_unreadable_setup_json_fails_closed_and_is_not_overwritten() {
+    let w = World::new();
+    // A directory where the file should be: opening it works, reading it fails (an I/O error, not "not found").
+    std::fs::create_dir(w.file().path()).expect("mkdir");
+    let s = w.start();
+    assert_eq!(s.view(), Err(CommandError::Internal));
+    assert_eq!(s.record(), Err(CommandError::Internal));
+    assert_eq!(s.welcome(true), Err(CommandError::Internal));
+    assert_eq!(s.run_checks(), Err(CommandError::Internal));
+    assert_eq!(s.download_image(false), Err(CommandError::Internal));
+    assert!(w.file().path().is_dir(), "left as it was");
+    assert!(w.host.calls().is_empty());
+}
+
+#[test]
+fn a_missing_or_invalid_setup_json_starts_over() {
+    let w = World::new();
+    assert_eq!(w.start().view().expect("view").step, Step::Welcome);
+    std::fs::write(w.file().path(), b"not json").expect("write");
+    let s = w.start();
+    assert_eq!(s.view().expect("view").step, Step::Welcome);
+    s.welcome(true).expect("welcome");
+    assert_eq!(w.saved().update_checks, Some(true));
+}
+
+#[test]
+fn closing_the_window_revokes_the_open_pairing_ticket() {
+    let w = World::new();
+    let s = to_phone(&w);
+    s.pair_phone().expect("pair");
+    s.close_pairing().expect("close");
+    assert!(w.hub.calls().contains(&"revoke_pairing_ticket pt_1".to_owned()));
+    let v = s.view().expect("view");
+    assert_eq!(v.step, Step::AddPhone, "first run goes on");
+    assert_eq!(v.phone.expect("phone").qr, None, "the QR code is gone with its ticket");
+    // Nothing open: nothing to revoke, and no hub call.
+    let before = w.hub.calls().len();
+    s.close_pairing().expect("close again");
+    assert_eq!(w.hub.calls().len(), before);
 }

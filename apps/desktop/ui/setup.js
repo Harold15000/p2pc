@@ -84,7 +84,7 @@ function autoActions() {
   }
   if ((view.step === "checks" || (view.step === "share" && !view.share)) && !downloadAsked) {
     downloadAsked = true;
-    invoke("setup_download")
+    invoke("setup_download", { retry: false })
       .then((v) => {
         view = v;
         render();
@@ -94,7 +94,7 @@ function autoActions() {
   if (view.step === "checks" && !view.checks && !view.reboot_pending) {
     act("setup_checks", {}, "Checking this PC…");
   } else if (view.step === "share" && (!view.share || view.share.disk_max_gib === null)) {
-    act("setup_prepare_node", {}, "Preparing P2PC on this PC. This takes about a minute…");
+    act("setup_prepare_node", { retry: false }, "Preparing P2PC on this PC. This takes about a minute…");
   }
   if (view.step === "add_phone" && view.phone?.qr && !view.phone.paired) {
     if (!phoneTimer) {
@@ -169,14 +169,21 @@ function renderError(error) {
   return box;
 }
 
+// "Try again": the user asking. Only this sends `retry: true`, which downloads an image that failed its hash check
+// again (§8.8: a mismatch is never retried silently).
 function retry() {
+  const download = ["image_hash_mismatch", "image_download_failed"].includes(view.error?.code);
   switch (view.step) {
     case "checks":
-      act("setup_checks", {}, "Checking this PC…");
+      if (download) {
+        act("setup_download", { retry: true }, "Downloading P2PC again…");
+      } else {
+        act("setup_checks", {}, "Checking this PC…");
+      }
       break;
     case "share":
       if (!view.share || view.share.disk_max_gib === null) {
-        act("setup_prepare_node", {}, "Preparing P2PC on this PC…");
+        act("setup_prepare_node", { retry: true }, "Preparing P2PC on this PC…");
       } else {
         commandError = null;
         view.error = null;

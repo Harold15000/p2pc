@@ -149,6 +149,9 @@ pub struct SetupRecord {
     pub wsl_installed: bool,
     /// Step 2a asked for the reboot and registered the `RunOnce` entry.
     pub reboot_pending: bool,
+    /// The last image download failed its SHA-256 check (§8.8 `image_hash_mismatch`). It is never retried silently: no
+    /// download runs again, across restarts too, until the user asks ("Try again").
+    pub image_hash_mismatch: bool,
     /// Step 3: the distro is in place.
     pub node: Option<NodeRecord>,
     /// Step 3: the share is applied.
@@ -169,6 +172,7 @@ impl Default for SetupRecord {
             checks_passed: false,
             wsl_installed: false,
             reboot_pending: false,
+            image_hash_mismatch: false,
             node: None,
             share: None,
             hub: None,
