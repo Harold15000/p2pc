@@ -29,32 +29,73 @@ fn the_shipped_templates_pass_every_rule() {
 }
 
 #[test]
-fn the_shipped_templates_pin_their_images_and_say_so_while_a_digest_is_a_placeholder() {
-    // Until the digests are taken from the registry (T2-50 follow-up), the shipped images carry the all-zero
-    // placeholder. That is accepted in development and refused in a release: a bundle with it cannot be signed.
+fn the_shipped_templates_pass_the_release_rules_with_the_verified_digests() {
+    // The digests were taken from the registries and the images were run on a test node (Ollama 0.40.16 and the
+    // whisper.cpp `main-cuda` image). A release build refuses a placeholder, so the shipped bundle must pass it.
     let loaded = load_dir(&shipped_dir()).expect("templates/ loads");
-    for t in &loaded.templates {
-        let image = &t.spec.image;
-        assert!(
-            image.contains("@sha256:"),
-            "{} is not pinned by digest: {image}",
-            t.info.id
-        );
-    }
+    let image_of = |id: &str| {
+        loaded
+            .templates
+            .iter()
+            .find(|t| t.info.id == id)
+            .unwrap_or_else(|| panic!("no template {id}"))
+            .spec
+            .image
+            .clone()
+    };
+    assert_eq!(
+        image_of("private-chat"),
+        "docker.io/ollama/ollama@sha256:910d0d8107b538fb0894e63163eb195de0cc7aefcbc666dc62d3b18f71124592"
+    );
+    assert_eq!(
+        image_of("transcribe"),
+        "ghcr.io/ggml-org/whisper.cpp@sha256:fe01def3d6e6f1463eb94b7bcdbe93a5e65fbfd51381050f0b0d77601b18bb1f"
+    );
     let release = check_bundle(&loaded, Mode::Release);
-    let placeholders = release
-        .iter()
-        .filter(|p| p.to_string().contains("placeholder digest"))
-        .count();
-    let still_placeholders = loaded
+    assert!(
+        release.is_empty(),
+        "the shipped bundle fails the release rules: {release:#?}"
+    );
+}
+
+#[test]
+fn the_shipped_chat_template_reaches_every_host_a_model_pull_uses() {
+    // Measured on a test node through a logging CONNECT proxy: a pull reached these three hosts and no other.
+    let loaded = load_dir(&shipped_dir()).expect("templates/ loads");
+    let chat = loaded
         .templates
         .iter()
-        .filter(|t| t.spec.image.ends_with(&"0".repeat(64)))
-        .count();
+        .find(|t| t.info.id == "private-chat")
+        .expect("private-chat");
+    let mut allow = chat.spec.egress.allow.clone();
+    allow.sort();
     assert_eq!(
-        placeholders, still_placeholders,
-        "Release mode must flag exactly the placeholder digests"
+        allow,
+        [
+            "dd20bb891979d25aebc8bec07b2b3bbc.r2.cloudflarestorage.com",
+            "ollama.com",
+            "registry.ollama.ai"
+        ]
     );
+}
+
+#[test]
+fn the_shipped_transcribe_template_reaches_hugging_face_and_its_cdn() {
+    // `huggingface.co` redirects the model file to `us.aws.cdn.hf.co`; an entry matches its subdomains, so `hf.co`
+    // covers every CDN host.
+    let loaded = load_dir(&shipped_dir()).expect("templates/ loads");
+    let t = loaded
+        .templates
+        .iter()
+        .find(|t| t.info.id == "transcribe")
+        .expect("transcribe");
+    let mut allow = t.spec.egress.allow.clone();
+    allow.sort();
+    assert_eq!(allow, ["hf.co", "huggingface.co"]);
+    assert!(p2pc_proto::validate::domain_allowed(
+        &t.spec.egress.allow,
+        "us.aws.cdn.hf.co"
+    ));
 }
 
 #[test]

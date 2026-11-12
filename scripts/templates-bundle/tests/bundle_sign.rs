@@ -205,8 +205,7 @@ fn an_inline_file_is_read_whole_and_bounded() {
 
 // ---- signing -----------------------------------------------------------------------------------------------------
 
-/// A bundle that passes the release rules, so that `sign_bundle` accepts it (the shipped templates carry placeholder
-/// digests until someone takes the real ones from the registry, and are not signable).
+/// A small bundle of fixtures that passes the release rules, so that `sign_bundle` accepts it.
 fn release_bundle() -> (Bundle, Vec<u8>) {
     let dir = fixture_dir(1);
     compile_dir(dir.path(), Mode::Release).expect("a release-grade fixture compiles")
@@ -436,9 +435,15 @@ fn cli_sign(bundle: &Path, key: &Path, out: &Path) -> assert_cmd::assert::Assert
 
 #[test]
 fn the_cli_refuses_to_sign_a_bundle_compiled_in_dev_mode() {
-    // The shipped templates carry placeholder digests, so a Dev compile of them is exactly what a release must not sign.
+    // A fixture directory with a placeholder digest: a Dev compile of it is exactly what a release must not sign.
     let work = tempfile::tempdir().expect("tempdir");
     let key = write_secret_key(work.path());
+    let src = fixture_dir(1);
+    let chat = src.path().join("fixture-chat.toml");
+    let text = fs::read_to_string(&chat)
+        .expect("read")
+        .replace(&digest(), &"0".repeat(64));
+    fs::write(&chat, text).expect("write");
     let bundle = work.path().join("templates.json");
     let sig = work.path().join("templates.json.minisig");
     assert_cmd::Command::cargo_bin("templates-bundle")
@@ -446,17 +451,12 @@ fn the_cli_refuses_to_sign_a_bundle_compiled_in_dev_mode() {
         .args([
             "compile",
             "--templates-dir",
-            shipped_dir().to_str().expect("utf-8"),
+            src.path().to_str().expect("utf-8"),
             "--out",
             bundle.to_str().expect("utf-8"),
         ])
         .assert()
         .success();
-    let loaded = templates_bundle::source::load_dir(&shipped_dir()).expect("loads");
-    assert!(
-        loaded.templates.iter().any(|t| t.spec.image.ends_with(&"0".repeat(64))),
-        "this test needs the shipped placeholder; if the digests are real now, use a fixture with a placeholder"
-    );
     cli_sign(&bundle, &key, &sig)
         .failure()
         .stderr(predicates::str::contains("placeholder digest"));
@@ -480,28 +480,72 @@ fn the_cli_refuses_to_sign_a_bundle_with_an_unpinned_image() {
 }
 
 #[test]
-fn the_cli_release_build_of_the_shipped_templates_fails_while_a_digest_is_a_placeholder() {
+fn the_cli_compiles_signs_and_verifies_the_shipped_templates_for_release() {
+    // What the release pipeline does, with a throwaway key: the shipped templates pass `--release`.
     use assert_cmd::Command;
 
-    let loaded = templates_bundle::source::load_dir(&shipped_dir()).expect("loads");
-    let has_placeholder = loaded.templates.iter().any(|t| t.spec.image.ends_with(&"0".repeat(64)));
+    let work = tempfile::tempdir().expect("tempdir");
+    let kp = keys();
+    let key = work.path().join("release.key");
+    let public = work.path().join("release.pub");
+    fs::write(&key, kp.sk.to_box(None).expect("sk box").into_string()).expect("write");
+    fs::write(&public, kp.pk.to_box().expect("pk box").into_string()).expect("write");
+    let bundle = work.path().join("templates.json");
+    let sig = work.path().join("templates.json.minisig");
+    let s = |p: &Path| p.to_str().expect("utf-8").to_string();
+    let run = |args: &[&str]| {
+        Command::cargo_bin("templates-bundle")
+            .expect("binary")
+            .args(args)
+            .assert()
+    };
+
+    run(&[
+        "compile",
+        "--templates-dir",
+        &s(&shipped_dir()),
+        "--out",
+        &s(&bundle),
+        "--release",
+    ])
+    .success();
+    cli_sign(&bundle, &key, &sig).success();
+    run(&[
+        "verify",
+        "--bundle",
+        &s(&bundle),
+        "--signature",
+        &s(&sig),
+        "--public-key",
+        &s(&public),
+    ])
+    .success();
+}
+
+#[test]
+fn the_cli_release_build_refuses_a_placeholder_digest_and_writes_nothing() {
+    use assert_cmd::Command;
+
+    let src = fixture_dir(1);
+    let chat = src.path().join("fixture-chat.toml");
+    let text = fs::read_to_string(&chat)
+        .expect("read")
+        .replace(&digest(), &"0".repeat(64));
+    fs::write(&chat, text).expect("write");
     let work = tempfile::tempdir().expect("tempdir");
     let out = work.path().join("templates.json");
-    let assert = Command::cargo_bin("templates-bundle")
+    Command::cargo_bin("templates-bundle")
         .expect("binary")
         .args([
             "compile",
             "--templates-dir",
-            shipped_dir().to_str().expect("utf-8"),
+            src.path().to_str().expect("utf-8"),
             "--out",
             out.to_str().expect("utf-8"),
             "--release",
         ])
-        .assert();
-    if has_placeholder {
-        assert.failure();
-        assert!(!out.exists(), "nothing is written when the build is refused");
-    } else {
-        assert.success();
-    }
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("placeholder digest"));
+    assert!(!out.exists(), "nothing is written when the build is refused");
 }

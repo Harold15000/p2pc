@@ -35,9 +35,16 @@ cargo run -p templates-bundle -- check --release       # a release: a placeholde
 
 ## Image digests
 
-An image digest in a template may be the all-zero **placeholder** until someone takes the real one from the registry
-(`skopeo inspect docker://<image>:<tag>` or `crane digest <image>:<tag>`). The release build (`--release`) refuses a
-placeholder, so a bundle that carries one cannot be signed. Ollama images must be pinned by digest: an old tag can no
-longer pull current models. When you move a digest, raise `bundle_version` in `bundle.toml`.
+Both shipped images are pinned by the digest that was checked on a test node (Ollama 0.40.16 for `private-chat`, the
+`main-cuda` image of whisper.cpp for `transcribe`). To move one, take the new digest from the registry
+(`skopeo inspect docker://<image>:<tag>` or `crane digest <image>:<tag>`), run the image on a test node, and raise
+`bundle_version` in `bundle.toml`. Ollama images must be pinned by digest: an old tag can no longer pull current
+models.
+
+While a digest is not known yet, a template may carry the all-zero **placeholder**. The development check accepts it;
+the release build (`--release`) and the signer refuse it, so a bundle that carries one cannot be signed.
+
+`private-chat` uses `qwen3` models, which answer with a reasoning block first and which a template cannot stop from
+doing so: the chat UI strips a leading reasoning block (see the comment in `private-chat.toml`).
 
 The compiler and signer are documented in [`scripts/templates-bundle/README.md`](../scripts/templates-bundle/README.md).

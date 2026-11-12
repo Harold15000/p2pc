@@ -36,14 +36,31 @@ fn a_release_grade_canonical_bundle_signs_and_verifies() {
 }
 
 #[test]
-fn a_bundle_compiled_in_dev_mode_with_a_placeholder_digest_does_not_sign() {
+fn the_shipped_bundle_compiled_for_release_signs_and_verifies() {
+    // The shipped templates carry the digests taken from the registries, so the pipeline's own steps work on them:
+    // compile in release mode, sign with a (throwaway) key, verify.
     let kp = keys();
-    let (_, bytes) = compile_dir(&shipped_dir(), Mode::Dev).expect("a dev compile accepts the placeholder");
-    let loaded = templates_bundle::source::load_dir(&shipped_dir()).expect("loads");
-    assert!(
-        loaded.templates.iter().any(|t| t.spec.image.ends_with(&"0".repeat(64))),
-        "this test needs a placeholder digest in the shipped templates"
-    );
+    let (bundle, bytes) = compile_dir(&shipped_dir(), Mode::Release).expect("the shipped templates pass --release");
+    let sig = sign_bundle(&bytes, &kp.sk).expect("signs");
+    assert_eq!(verify_bundle(&bytes, &sig, &kp.pk).expect("verifies"), bundle);
+}
+
+#[test]
+fn a_bundle_compiled_in_dev_mode_with_a_placeholder_digest_does_not_sign() {
+    // A directory of fixtures where one image still has the placeholder: a Dev compile accepts it, the signer must not.
+    let kp = keys();
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("bundle.toml"),
+        "bundle_version = 1\nmin_hub_version = \"0.1.0\"\n",
+    )
+    .expect("write");
+    std::fs::write(
+        dir.path().join("fixture-chat.toml"),
+        service_toml().replace(&digest(), &"0".repeat(64)),
+    )
+    .expect("write");
+    let (_, bytes) = compile_dir(dir.path(), Mode::Dev).expect("a dev compile accepts the placeholder");
     let err = sign_bundle(&bytes, &kp.sk).expect_err("must not sign");
     assert!(matches!(err, SignError::Rules(_)), "{err:?}");
     assert!(err.to_string().contains("placeholder digest"), "{err}");

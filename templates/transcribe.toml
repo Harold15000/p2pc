@@ -1,14 +1,17 @@
 # Transcribe audio: whisper.cpp as a batch job (H2 spec §7.6 "Templates shipped with the beta").
 #
-# OPEN ITEMS (T2-50 follow-ups; the release build refuses a placeholder digest, so none of this can ship by accident):
-#  - The image digest is a PLACEHOLDER (all zeros). Take the digest of `ghcr.io/ggml-org/whisper.cpp:main-cuda` (an
-#    upstream image with ffmpeg and CUDA) from the registry (`skopeo inspect` or `crane digest`) and write it in, or
-#    publish our own build by digest if E11 prefers one.
-#  - `transcribe.sh` was tested with fake ffmpeg, whisper-cli and curl programs only. Run it once on a test node with
-#    the real image (and a container runtime) before the first release: the program paths and flags are the upstream
-#    image's, and the model download hosts below were not re-checked against it here.
-#  - Models are downloaded without a checksum. E11 should record the SHA-256 of base, small and medium so the script
-#    can verify them.
+# The image is the upstream `ghcr.io/ggml-org/whisper.cpp:main-cuda` (3.72 GB, ffmpeg included), pinned by digest. It was
+# checked on a test node with plain Podman, through a logging CONNECT proxy: ffmpeg is at /usr/bin/ffmpeg and the
+# whisper binaries are in /app/build/bin. The `small` model (466 MB) comes from `huggingface.co`, redirected to
+# `us.aws.cdn.hf.co`; `hf.co` covers it because an egress entry matches its subdomains. To move the digest, take the new
+# one from the registry (`skopeo inspect` or `crane digest`), raise `bundle_version` in `bundle.toml` and run
+# `templates-bundle check --release`.
+#
+# OPEN ITEMS:
+#  - `transcribe.sh` calls the CLI as `whisper-cli` (the name in current upstream), falling back to
+#    /app/build/bin/whisper-cli. The name inside this digest was not confirmed against the upstream Dockerfile or by a
+#    run of the script on the image: run it once on the test node.
+#  - Models are downloaded without a checksum. Record the SHA-256 of base, small and medium so the script can verify them.
 
 id = "transcribe"
 version = 1
@@ -21,8 +24,8 @@ licenses = [
   "Whisper models: MIT",
   "FFmpeg in the image: LGPL-2.1-or-later, or GPL when built with GPL parts",
 ]
-# Image plus the default `small` model, in MiB. An estimate: confirm with the real digest.
-download_mb = 4500
+# The 3.72 GB image (about 3550 MiB) plus the default `small` model (466 MB, counted as 466 MiB to stay on the safe side).
+download_mb = 4050
 
 [requirements]
 gpu = "preferred"
@@ -54,8 +57,8 @@ target = "env:MODEL"
 
 [spec]
 name = "Transcribe audio"
-# PLACEHOLDER digest: see the open items above.
-image = "ghcr.io/ggml-org/whisper.cpp@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+# `main-cuda`.
+image = "ghcr.io/ggml-org/whisper.cpp@sha256:fe01def3d6e6f1463eb94b7bcdbe93a5e65fbfd51381050f0b0d77601b18bb1f"
 command = ["/bin/sh", "/inputs/.template/transcribe.sh"]
 # One hour fits the daily caps this template is meant for (it is a batch job, 1 s to 24 h).
 timeout_s = 3600
@@ -71,8 +74,8 @@ memory_mb = 4096
 gpu = 1
 disk_mb = 4096
 
-# Fixed by the template: where the script downloads a model from (Hugging Face, which serves files from its own CDN
-# hosts under hf.co).
+# Fixed by the template: where the script downloads a model from (Hugging Face, which redirects the file to a CDN host
+# under hf.co, `us.aws.cdn.hf.co` on the test node).
 [spec.egress]
 allow = ["huggingface.co", "hf.co"]
 
