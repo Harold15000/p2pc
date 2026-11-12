@@ -8,18 +8,19 @@
 use std::sync::OnceLock;
 
 use p2pc_proto::api::{
-    ApiKeyInfo, AuditEvent, AuditKind, Capacity, CpuInfo, CreateApiKey, CreateJoinRequest, CreateJoinToken,
-    CreatePairingTicket, DeviceInfo, Estimate, GpuInfo, GpuStatus, GpuStatusKind, Health, Inventory, Job, JobAttempt,
-    JobSpec, JobSpecView, JobStatus, JoinRequestCreated, JoinRequestInfo, JoinRequestState, JoinRequestToken,
-    JoinTokenInfo, JoinTokenResponse, LogLine, LogStream, NewApiKey, Node, NodeApproval, NodeState, OutputEntry, Page,
-    PairingTicketCreated, PairingTicketInfo, Platform, Principal, Problem, RevealJoinRequest, SandboxCapability,
-    SandboxClass, Scope, ServerInfo, SmokeResult, UsageGroupBy, UsageReport, UsageTotals, WhoAmI, Wsl2Health,
+    ApiKeyInfo, AuditEvent, AuditKind, BlobInfo, BlobList, BlobUploaded, Capacity, CpuInfo, CreateApiKey,
+    CreateJoinRequest, CreateJoinToken, CreatePairingTicket, DeviceInfo, Estimate, GpuInfo, GpuStatus, GpuStatusKind,
+    Health, Inventory, Job, JobAttempt, JobSpec, JobSpecView, JobStatus, JoinRequestCreated, JoinRequestInfo,
+    JoinRequestState, JoinRequestToken, JoinTokenInfo, JoinTokenResponse, LogLine, LogStream, NewApiKey, Node,
+    NodeApproval, NodeState, OutputEntry, Page, PairingTicketCreated, PairingTicketInfo, Platform, Principal, Problem,
+    RevealJoinRequest, SandboxCapability, SandboxClass, Scope, ServerInfo, SmokeResult, UsageGroupBy, UsageReport,
+    UsageTotals, WhoAmI, Wsl2Health,
 };
 use p2pc_proto::validate::{ErrorCode, FieldError};
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
-use crate::{app, artifacts_api, devices_api, jobs_api, join_requests_api, nodes_api, ports_api, usage_api};
+use crate::{app, artifacts_api, blobs_api, devices_api, jobs_api, join_requests_api, nodes_api, ports_api, usage_api};
 
 /// Name of the security scheme.
 pub const BEARER: &str = "bearer";
@@ -74,6 +75,10 @@ pub const BEARER: &str = "bearer";
         artifacts_api::list_outputs,
         artifacts_api::download_output,
         usage_api::get_usage,
+        blobs_api::upload_blob,
+        blobs_api::head_blob,
+        blobs_api::list_blobs,
+        blobs_api::delete_blob,
     ),
     components(schemas(
         Problem,
@@ -137,6 +142,9 @@ pub const BEARER: &str = "bearer";
         JoinRequestInfo,
         Page<JoinRequestInfo>,
         JoinRequestToken,
+        BlobUploaded,
+        BlobInfo,
+        BlobList,
     )),
     modifiers(&BearerAuth),
     security(("bearer" = [])),
@@ -150,6 +158,7 @@ pub const BEARER: &str = "bearer";
         (name = "devices", description = "Pairing tickets and paired devices (H2 §5)."),
         (name = "jobs", description = "Submit, list, inspect, cancel and estimate jobs."),
         (name = "usage", description = "The usage ledger: finished attempts and the units they cost."),
+        (name = "blobs", description = "Content-addressed job inputs, per account (H2 §7.5). No route returns blob contents."),
     )
 )]
 pub struct ApiDoc;

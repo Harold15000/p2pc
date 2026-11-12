@@ -370,15 +370,29 @@ def test_every_sdk_model_is_covered_by_the_contract() -> None:
     assert {p[0] for p in PAGES} <= covered
 
 
-def test_the_blob_and_template_models_move_here_when_the_document_gains_their_routes(
+def test_the_template_models_move_here_when_the_document_gains_their_routes(
     openapi: dict[str, Any],
 ) -> None:
-    """``p2pc.h2`` holds the blob and template models because ``docs/api/openapi.json`` has no
-    schema to compare them with yet. The day it gains these routes, this test fails: move the
+    """``p2pc.h2`` holds the template models because ``docs/api/openapi.json`` has no schema to
+    compare them with yet. The day it gains these routes, this test fails: move the template
     models of ``p2pc/h2.py`` into ``p2pc.models`` and register them above, then delete this test.
     """
-    waiting = [p for p in openapi["paths"] if p.startswith(("/v1/blobs", "/v1/templates"))]
+    waiting = [p for p in openapi["paths"] if p.startswith("/v1/templates")]
     assert waiting == [], f"the document now has {waiting}: register the models of p2pc/h2.py"
+
+
+def test_the_blob_model_reads_every_field_of_an_upload_answer(schemas: dict[str, Any]) -> None:
+    """``p2pc.h2.Blob`` is what ``client.blobs.put`` returns: the server's ``BlobUploaded`` plus
+    the client-side ``uploaded`` flag (and ``created_at``/``expires_at`` unknown when the hub
+    already had the blob and nothing was sent), so it is checked field by field here rather than
+    registered as a wire model above.
+    """
+    api = api_schema(schemas, "BlobUploaded")
+    sdk = sdk_schema(p2pc.h2.Blob)
+    assert set(api.properties()) == set(sdk.properties()) - {"uploaded"}
+    for name, field in api.properties().items():
+        sdk_kind = sdk.properties()[name].normal()[0].kind()
+        assert sdk_kind == field.normal()[0].kind(), name
 
 
 # --- the checker itself: it must notice drift ----------------------------------------------
@@ -521,6 +535,8 @@ SDK_ENDPOINTS = [
     ("get", "/v1/jobs/{id}/outputs"),
     ("get", "/v1/jobs/{id}/outputs/{path}"),
     ("get", "/v1/usage"),
+    ("head", "/v1/blobs/{sha256}"),
+    ("post", "/v1/blobs"),
 ]
 
 

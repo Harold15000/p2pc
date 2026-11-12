@@ -13,6 +13,7 @@
 
 pub mod accounts;
 pub mod audit;
+pub mod blobs;
 pub mod devices;
 // Crate-private (T04 review): the compiler, not only the `status_writes` tripwire, keeps every status write inside
 // this crate.

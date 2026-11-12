@@ -19,15 +19,25 @@
 //! by it, rows never tried first: a few undeletable directories go to the back instead of using every pass's limit.
 //! Each pass handles at most `limit` jobs and `limit` attempts, and deletion never follows
 //! a symbolic link ([`crate::fsutil::remove_tree`], which resolves no link even in front of the directory). Time comes from the state's clock.
+//!
+//! **Blobs** (H2 §7.5 "Lifetime", §13). Each pass also deletes up to `limit` expired blobs, in three steps under the
+//! blob's `(account, digest)` lock, never the file before its row is dead: (1) the **tombstone**, set in one short
+//! `BEGIN IMMEDIATE` transaction that re-checks the blob is expired and that no non-terminal job references it; from
+//! then on every reader treats it as absent; (2) the **file**, outside any transaction; (3) the **row**, with its
+//! claims. A blob whose file cannot be deleted keeps its tombstone and goes to the back of the queue
+//! (`last_attempt_at`); a pass that stopped between steps is resumed from the tombstone. Then it sweeps the blob
+//! staging directory: a file no upload holds whose last write is over an hour old ([`sweep_staging_at_start`] sweeps
+//! every unheld one, whatever its age, when the hub starts).
 
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
 
-use p2pc_proto::ids::JobId;
+use p2pc_proto::api::Sha256Digest;
+use p2pc_proto::ids::{AccountId, JobId};
 
 use crate::app::AppState;
-use crate::store::{self, StoreError, outputs};
+use crate::store::{self, StoreError, blobs, outputs};
 
 /// How often the GC runs.
 pub const INTERVAL: Duration = Duration::from_secs(600);
@@ -43,6 +53,10 @@ pub struct GcReport {
     pub jobs_expired: usize,
     /// Staging directories deleted.
     pub staging_removed: usize,
+    /// Expired blobs deleted (H2 §7.5).
+    pub blobs_removed: usize,
+    /// Blob staging files swept (H2 §13).
+    pub staging_swept: usize,
     /// Steps that failed (logged); the next pass retries them.
     pub errors: usize,
 }
@@ -51,6 +65,11 @@ pub struct GcReport {
 #[must_use]
 pub fn spawn(state: AppState) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // No upload is in progress yet: every blob staging file is a leftover (H2 §13).
+        let swept = sweep_staging_at_start(&state).await;
+        if swept > 0 {
+            tracing::info!(swept, "blob staging swept at start");
+        }
         let mut tick = tokio::time::interval(INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -60,6 +79,8 @@ pub fn spawn(state: AppState) -> JoinHandle<()> {
                 tracing::info!(
                     jobs_expired = r.jobs_expired,
                     staging_removed = r.staging_removed,
+                    blobs_removed = r.blobs_removed,
+                    staging_swept = r.staging_swept,
                     errors = r.errors,
                     "storage GC pass"
                 );
@@ -86,7 +107,96 @@ pub async fn run_pass(state: &AppState, limit: u32) -> GcReport {
             tracing::warn!(error = %e, "GC: cannot list abandoned staging");
         }
     }
+    match expire_blobs(state, now, limit, &mut r).await {
+        Ok(()) => {}
+        Err(e) => {
+            r.errors += 1;
+            tracing::warn!(error = %e, "GC: cannot list expired blobs");
+        }
+    }
+    match state
+        .blobs
+        .sweep_staging(Some(now - crate::blobs::STAGING_MAX_AGE), limit as usize)
+        .await
+    {
+        Ok(n) => r.staging_swept += n,
+        Err(e) => {
+            r.errors += 1;
+            tracing::warn!(error = %e, "GC: cannot sweep the blob staging directory");
+        }
+    }
     r
+}
+
+/// Deletes every blob staging file that no upload holds, whatever its age: at start, when none can be in progress
+/// (H2 §13). Returns how many went.
+pub async fn sweep_staging_at_start(state: &AppState) -> usize {
+    match state.blobs.sweep_staging(None, usize::MAX).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot sweep the blob staging directory");
+            0
+        }
+    }
+}
+
+async fn expire_blobs(
+    state: &AppState,
+    now: time::OffsetDateTime,
+    limit: u32,
+    r: &mut GcReport,
+) -> Result<(), StoreError> {
+    let retention = state.config.storage.retention();
+    let due = {
+        let mut conn = state.db.acquire().await?;
+        blobs::gc_candidates(&mut conn, now, retention, limit).await?
+    };
+    for (account, digest) in due {
+        match expire_blob(state, account, digest, now).await {
+            Ok(true) => r.blobs_removed += 1,
+            Ok(false) => {}
+            Err(e) => {
+                r.errors += 1;
+                tracing::warn!(error = %e, sha256 = %digest, "GC: cannot delete a blob; the next pass retries it");
+                let noted = transaction(state, |tx| Box::pin(blobs::record_attempt(tx, account, digest, now))).await;
+                if let Err(e) = noted {
+                    tracing::warn!(error = %e, "GC: cannot note a failed blob deletion");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The three steps for one blob, under its lock. `Ok(false)`: it is no longer due (a job referenced it, or an
+/// upload replaced it, since it was listed).
+async fn expire_blob(
+    state: &AppState,
+    account: AccountId,
+    digest: Sha256Digest,
+    now: time::OffsetDateTime,
+) -> Result<bool, StoreError> {
+    let _lock = state.blobs.lock(account, digest).await;
+    let retention = state.config.storage.retention();
+    // Step 1: the tombstone, after the re-check, in one transaction with the write lock.
+    let mut tx = store::begin_immediate(&state.db).await?;
+    let Some(view) = blobs::get(&mut tx, account, digest).await? else {
+        return Ok(false);
+    };
+    if view.deleting_at.is_none() {
+        if !view.is_expired(retention, now) {
+            return Ok(false);
+        }
+        blobs::tombstone(&mut tx, account, digest, now).await?;
+    }
+    tx.commit().await?;
+    // Step 2: the file, outside any transaction.
+    state.blobs.remove(account, digest).await?;
+    // Step 3: the row, and its claims with it.
+    let mut tx = store::begin_immediate(&state.db).await?;
+    let removed = blobs::delete_tombstoned(&mut tx, account, digest).await?;
+    tx.commit().await?;
+    Ok(removed)
 }
 
 async fn expire_jobs(

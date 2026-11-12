@@ -229,7 +229,8 @@ fn json<T: serde::Serialize>(value: &T, column: &'static str) -> Result<String, 
 /// `(key_id, idempotency_key)` or `(device_id, idempotency_key)` refuses the second insert with an error.
 ///
 /// `kind` and `template_id` are copied from the spec into their own columns (H2 §5.6), for the `kind` filter and the
-/// template view. A service also gets its `service_state` row.
+/// template view. A service also gets its `service_state` row, and blob `inputs` their `blob_refs` rows (the caller
+/// checked the blobs in the same transaction, [`super::blobs::resolve_inputs`]).
 pub async fn insert(conn: &mut Conn, job: &NewJob, now: OffsetDateTime) -> Result<JobRow, StoreError> {
     let units = i64::try_from(job.units_reserved.milli()).map_err(|_| StoreError::Corrupt("jobs.units_reserved"))?;
     // The redacted view that every API read will serve, built once, here, from the file metadata computed at
@@ -264,6 +265,8 @@ pub async fn insert(conn: &mut Conn, job: &NewJob, now: OffsetDateTime) -> Resul
     .execute(&mut *conn)
     .await?;
     super::job_state::record_creation(conn, job.job_id, now).await?;
+    // Its blob inputs (H2 §7.5), in the same transaction as the check of the blobs: they keep them alive.
+    super::blobs::insert_refs(conn, job.account_id, job.job_id, &job.spec.inputs).await?;
     // The hub's state of a service (health, restart counters, H2 §7.2), one row from the start.
     if job.spec.kind == JobKind::Service {
         super::leases::create_service_state(conn, job.job_id, now).await?;

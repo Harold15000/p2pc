@@ -9,7 +9,7 @@ use axum::extract::{MatchedPath, Path, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, head, post};
 use axum::{Json, Router};
 use p2pc_proto::api::{
     ApiKeyInfo, AuditEvent, AuditKind, CreateApiKey, Health, MAX_PAGE_LIMIT, NewApiKey, Page, Problem, WhoAmI,
@@ -36,7 +36,7 @@ use crate::nodes_api;
 use crate::store::audit::NewEvent;
 use crate::store::keys::{KeyCursor, MAX_DAILY_UNIT_CAP_MILLI, NewKey, Revoke};
 use crate::store::{self, Db, StoreError};
-use crate::{devices_api, jobs_api, join_requests_api};
+use crate::{blobs_api, devices_api, jobs_api, join_requests_api};
 
 /// Default page size of list endpoints.
 pub const DEFAULT_PAGE_LIMIT: u32 = 50;
@@ -83,6 +83,8 @@ pub struct AppState {
     /// The port relay (H2 §7.4): the limits and the accounting of the service port connections. It counts them in
     /// `connections`.
     pub ports: crate::gateway::ports::PortRelay,
+    /// The blob files and the uploads in progress (H2 §7.5): the blob routes, `BlobFetch` and the GC.
+    pub blobs: crate::blobs::BlobStore,
 }
 
 impl AppState {
@@ -108,7 +110,9 @@ impl AppState {
         let ports = crate::gateway::ports::PortRelay::new(&config, connections.clone());
         let logs = crate::logs::LogStore::new(&config.data_dir);
         let outputs = crate::outputs::OutputStore::new(&config.data_dir, db.clone(), clock.clone(), logs.clone());
+        let blobs = crate::blobs::BlobStore::new(&config.data_dir);
         Ok(Self {
+            blobs,
             logs,
             outputs,
             auth_failures: AuthFailureQueue::spawn(db.clone(), queue_capacity),
@@ -220,7 +224,12 @@ fn build(state: AppState, transport: Transport) -> Router {
         .route("/v1/jobs/{id}/cancel", post(jobs_api::cancel_job))
         .route("/v1/jobs/{id}/outputs", get(crate::artifacts_api::list_outputs))
         .route("/v1/estimate", post(jobs_api::estimate))
-        .route("/v1/usage", get(crate::usage_api::get_usage));
+        .route("/v1/usage", get(crate::usage_api::get_usage))
+        .route("/v1/blobs", get(blobs_api::list_blobs))
+        .route(
+            "/v1/blobs/{sha256}",
+            head(blobs_api::head_blob).delete(blobs_api::delete_blob),
+        );
     // Streaming routes opt out of the whole-request limit by being added here instead of to `bounded`. Each bounds
     // itself with an idle limit (`http.keepalive_idle_ms`): no data taken or sent for that long ends the stream
     // (§10, see `artifacts_api`). Logs in both modes (a 64 MiB page can outlast 30 s on a slow link) and downloads.
@@ -233,14 +242,19 @@ fn build(state: AppState, transport: Transport) -> Router {
             get(crate::artifacts_api::download_output),
         )
         .route("/v1/jobs/{id}/ports/{port}/connect", post(crate::ports_api::connect));
-    let (authenticated, streaming) = match transport {
+    // A blob upload (H2 §7.5 "Timeouts") leaves both the whole-request limit and the per-frame body limit: it has its
+    // own 60 s idle limit and a 16 KiB/s floor over every 60 s (`blobs_api`), which allow a 2 GiB upload over a relay.
+    let uploads: Router<AppState> = Router::new().route("/v1/blobs", post(blobs_api::upload_blob));
+    let (authenticated, streaming, uploads) = match transport {
         Transport::Keys => (
             authenticated.route_layer(middleware::from_fn_with_state(state.clone(), require_api_key)),
             streaming.route_layer(middleware::from_fn_with_state(state.clone(), require_api_key)),
+            uploads.route_layer(middleware::from_fn_with_state(state.clone(), require_api_key)),
         ),
         Transport::Devices => (
             authenticated.route_layer(middleware::from_fn_with_state(state.clone(), require_device)),
             streaming.route_layer(middleware::from_fn_with_state(state.clone(), require_device)),
+            uploads.route_layer(middleware::from_fn_with_state(state.clone(), require_device)),
         ),
     };
     let public = Router::new()
@@ -260,6 +274,8 @@ fn build(state: AppState, transport: Transport) -> Router {
         // Every route, streaming ones included: a body that stops arriving for this long fails with 408. The
         // limit is between body frames; the whole-request limit above bounds a body that trickles.
         .layer(RequestBodyTimeoutLayer::new(http.body_read_timeout()))
+        // Merged after the layers above, so it gets neither (a layer applies to the routes it is added over).
+        .merge(uploads.route_layer(middleware::from_fn(record_route)))
         .with_state(state);
     with_layers(app)
 }

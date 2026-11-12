@@ -181,10 +181,11 @@ fn prepare(state: &AppState, mut spec: JobSpec, headers: &HeaderMap) -> Result<P
     }
     let limits = Limits {
         allowed_registries: Some(state.config.allowed_registries.clone()),
-        // Service jobs are served from T2-12 on. Volumes and blob inputs stay refused until their own tasks (T2-15,
-        // T2-14) turn them on.
+        // Service jobs are served from T2-12 on, blob inputs from T2-14 on. Volumes stay refused until their own task
+        // (T2-15) turns them on.
         h2: H2Features {
             services: true,
+            blob_inputs: true,
             ..H2Features::default()
         },
         ..Limits::default()
@@ -243,7 +244,7 @@ fn parse_job_id(id: &str) -> Result<JobId, ApiError> {
         (status = 402, description = "`cap_exceeded`: the job's estimate would exceed the key's daily unit cap.", content_type = "application/problem+json", body = Problem),
         (status = 403, description = "`forbidden`: the key lacks `jobs:write`. `image_not_allowed`: the key's allowed images do not cover the image.", content_type = "application/problem+json", body = Problem),
         (status = 409, description = "`idempotency_conflict`: this API key already used the idempotency key with a different request. (Idempotency keys are scoped to the API key; another key reusing it gets its own job.)", content_type = "application/problem+json", body = Problem),
-        (status = 422, description = "Invalid job: `errors` lists each field. Codes: `validation_failed`, `unsupported_pool`, `too_large` (the job does not fit its `Lease` frame), `invalid_body`.", content_type = "application/problem+json", body = Problem),
+        (status = 422, description = "Invalid job: `errors` lists each field. Codes: `validation_failed`, `unsupported_pool`, `too_large` (the job does not fit its `Lease` frame), `invalid_body`, `unknown_blob` (an `inputs` blob the caller's account does not hold), `inputs_exceed_disk` (blob inputs and inline files over `resources.disk_mb` minus 64 MiB).", content_type = "application/problem+json", body = Problem),
     )
 )]
 pub async fn create_job(
@@ -296,6 +297,24 @@ pub async fn create_job(
         } else {
             Err(ApiError::idempotency_conflict())
         };
+    }
+    // Blob inputs (H2 §7.1, §7.5): every blob must be a live blob of the caller's account, checked in this
+    // transaction, which also inserts the references (`jobs::insert`). Either the reference exists before the GC's
+    // re-check, which then keeps the blob, or the tombstone exists before this check, and the job gets `422
+    // unknown_blob`.
+    if !prepared.spec.inputs.is_empty() {
+        let blob_bytes = store::blobs::resolve_inputs(&mut tx, p.account_id, &prepared.spec.inputs)
+            .await?
+            .map_err(|i| {
+                ApiError::unprocessable(
+                    "unknown_blob",
+                    format!("inputs[{i}].blob: this account has no such blob (upload it with POST /v1/blobs first)."),
+                )
+            })?;
+        prepared
+            .spec
+            .check_inputs_fit_disk(blob_bytes)
+            .map_err(|e| ApiError::validation(&e))?;
     }
     let mut day_hold = None;
     if let Some(cap) = caller.daily_unit_cap {

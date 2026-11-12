@@ -235,6 +235,13 @@ impl DecodeGate {
         Some(p2pc_proto::protocol::decode_frame(body))
     }
 
+    /// Waits for a slot, then runs `decode` (a decoder that is not a plain `Deserialize`, such as the agent stream
+    /// header's) and releases the slot. `None` if the gate is closed.
+    pub async fn decode_with<T>(&self, decode: impl FnOnce() -> T) -> Option<T> {
+        let _permit = self.permits.acquire().await.ok()?;
+        Some(decode())
+    }
+
     /// Slots free right now.
     #[must_use]
     pub fn available(&self) -> usize {
