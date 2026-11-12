@@ -13,6 +13,11 @@ use crate::state::{Control, Machine, Role, State, TrayColor};
 pub const HUB_NOTICE: &str =
     "This PC is your cloud's hub. Your phone can reach your cloud only while this PC is on, awake and signed in.";
 
+/// What the hub PC says when its own node was removed from the cloud (§8.8 `node_removed`). The hub keeps running
+/// (§8.5), so the sentence says so: the phone and the other PCs are not affected.
+pub const NODE_REMOVED_HUB_NOTICE: &str =
+    "This PC was removed from your cloud. Your cloud keeps running; this PC no longer takes work.";
+
 /// The side of the square tray icon, in pixels.
 pub const ICON_SIZE: u32 = 32;
 
@@ -112,6 +117,9 @@ pub fn menu(machine: &Machine) -> Vec<MenuEntry> {
     let mut entries = vec![MenuEntry::Text(tooltip(machine))];
     if machine.role() == Some(Role::Hub) {
         entries.push(MenuEntry::Text(HUB_NOTICE.to_owned()));
+        if machine.node_removed() {
+            entries.push(MenuEntry::Text(NODE_REMOVED_HUB_NOTICE.to_owned()));
+        }
     }
     entries.push(MenuEntry::Separator);
     let controls = machine.controls();
@@ -245,6 +253,23 @@ mod tests {
         );
         let stopped = Machine::settled(Role::Hub, State::Stopped).expect("settled");
         assert!(items(&menu(&stopped)).contains(&(MenuAction::Control(Control::Start), "Turn on my cloud".into())));
+    }
+
+    #[test]
+    fn the_hub_pc_menu_shows_a_removed_node_and_offers_only_the_cloud_s_own_control() {
+        let mut m = sharing(Role::Hub);
+        m.apply(Event::Fault(AttentionCode::NodeRemoved)).expect("fault");
+        m.apply(Event::FaultCleared).expect("cleared");
+        let entries = menu(&m);
+        assert_eq!(entries[0], MenuEntry::Text("P2PC: Paused".into()));
+        assert_eq!(entries[1], MenuEntry::Text(HUB_NOTICE.into()));
+        assert_eq!(entries[2], MenuEntry::Text(NODE_REMOVED_HUB_NOTICE.into()));
+        let labels: Vec<_> = items(&entries).into_iter().map(|(_, l)| l).collect();
+        assert_eq!(labels, vec!["Turn off my cloud…", "Open P2PC", "Quit"]);
+        // A joined PC never shows it.
+        let mut joined = sharing(Role::Joined);
+        joined.apply(Event::Fault(AttentionCode::NodeRemoved)).expect("fault");
+        assert!(!menu(&joined).contains(&MenuEntry::Text(NODE_REMOVED_HUB_NOTICE.into())));
     }
 
     #[test]
