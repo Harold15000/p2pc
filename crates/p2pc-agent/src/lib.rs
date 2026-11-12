@@ -8,6 +8,7 @@
 //! - [`connection`]: the connection to the control plane (T05b): `join`, then `run`'s single control connection
 //!   with heartbeats, the agent-side lease timer (SI-13), reconnects, inventory updates and lease routing. It only
 //!   dials out, over iroh (SI-12).
+//! - [`blobs`]: the `BlobFetch` client (H2 §6.1, §7.5): a lease's blob input over its own stream, verified.
 //! - [`config`]: `agent.toml`, the owner's share limits (U9), `[iroh]` and the `[server]` written by `join`.
 //! - [`identity`]: the persistent Ed25519 node key, iroh-compatible (§5).
 //! - [`inventory`]: CPU, RAM, OS, GPUs, Podman, CDI and gVisor, built into `p2pc_proto`'s `Inventory` (§6).
@@ -24,6 +25,7 @@
 //!   the no-follow check before every mount, the budget, eviction and deletion.
 //! - [`host`] and [`parse`]: file access under a configurable root, and pure parsers.
 
+pub mod blobs;
 pub mod config;
 pub mod connection;
 pub mod doctor;

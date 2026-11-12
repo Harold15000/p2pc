@@ -45,10 +45,11 @@ pub use self::lease::{LeaseDecision, LeaseHandler, LeaseOffer, LeaseSupervisor, 
 pub use self::session::InventorySource;
 pub use self::transport::{Connector, Link, StreamOpener};
 pub use self::uplink::{Port, Uplink};
-use crate::config::Config;
+use crate::config::{Config, ResolvedShare};
 use crate::executor::capacity::{DriverLimits, Offer};
 use crate::host::Host;
 use crate::runner::SystemRunner;
+use crate::volumes::VolumeStore;
 
 /// A boxed, sendable future, for the object-safe traits of this module.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -71,21 +72,166 @@ pub struct DetectInventory {
     pub config: Config,
     /// Where each successful detection publishes its offer, if anywhere. A failed detection keeps the last one.
     pub offers: Option<OfferFeed>,
+    /// The owner's share in force, when it can change while the agent runs (`p2pc-agent share set`, H2 §8.4): each
+    /// detection uses it instead of `config.share`.
+    pub live_share: Option<tokio::sync::watch::Receiver<crate::config::Share>>,
+    /// The node's volume store, when it started with volume space (H2 §11.3): each detection sets its budget to the
+    /// `share.volumes_mb` in force.
+    pub volumes: Option<VolumeStore>,
+}
+
+/// What a successful detection does with its result before the inventory goes to the server.
+///
+/// - **The offer** goes to the executor, limited to what the sandbox driver serves ([`Offer::from_detection`]).
+/// - **`offered.gpu` is what the executor admits.** The share can change while the agent runs (`share set`), but the
+///   driver serves only the GPUs it was built with at start. A GPU the owner turned on since then is not reported as
+///   offered: the hub would send GPU leases that this agent refuses with `insufficient_capacity`, and count them
+///   against the job's offers. Such a GPU is offered once the agent restarts; turning one off is live.
+/// - **What the driver cannot serve is not reported ready** (T10a review, P3-5).
+/// - **The volume budget** follows `share.volumes_mb`, so a lower disk limit is in force at once. A node that started
+///   without volume space has no store here: it declares `volumes` only after a restart.
+fn settle(offers: Option<&OfferFeed>, volumes: Option<&VolumeStore>, inventory: &mut Inventory, share: &ResolvedShare) {
+    if let Some(feed) = offers {
+        let offer = Offer::from_detection(inventory, share, &feed.driver);
+        let served = u32::try_from(offer.gpus.len()).unwrap_or(u32::MAX);
+        if inventory.offered.gpu > served {
+            tracing::warn!(
+                in_share = inventory.offered.gpu,
+                served,
+                "the share lists GPUs the sandbox driver was not started with; they are offered once the agent restarts"
+            );
+            inventory.offered.gpu = served;
+        }
+        feed.tx.send_replace(Some(offer));
+        feed.driver.apply(inventory);
+    }
+    if let Some(store) = volumes {
+        store.set_budget_mb(share.volumes_mb);
+    }
 }
 
 impl InventorySource for DetectInventory {
     fn detect(&self) -> BoxFuture<'_, Result<Inventory, String>> {
         Box::pin(async move {
-            let mut report = crate::inventory::detect_periodic(&self.host, &SystemRunner::default(), &self.config)
+            let config = match &self.live_share {
+                Some(share) => Config {
+                    share: share.borrow().clone(),
+                    ..self.config.clone()
+                },
+                None => self.config.clone(),
+            };
+            let mut report = crate::inventory::detect_periodic(&self.host, &SystemRunner::default(), &config)
                 .await
                 .map_err(|e| e.to_string())?;
-            if let Some(feed) = &self.offers {
-                let offer = Offer::from_detection(&report.inventory, &report.local.share, &feed.driver);
-                feed.tx.send_replace(Some(offer));
-                // What the driver cannot serve is not reported ready (T10a review, P3-5).
-                feed.driver.apply(&mut report.inventory);
-            }
+            settle(
+                self.offers.as_ref(),
+                self.volumes.as_ref(),
+                &mut report.inventory,
+                &report.local.share,
+            );
             Ok(report.inventory)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use p2pc_proto::ids::AccountId;
+
+    use super::*;
+    use crate::executor::SystemClock;
+    use crate::volumes::StoreConfig;
+
+    /// An inventory as a detection builds it for `share`: it offers every GPU of the share.
+    fn detected(share: &ResolvedShare) -> Inventory {
+        serde_json::from_value(serde_json::json!({
+            "hostname": "node-1", "platform": "linux", "cpu": {"model": "Example CPU", "cores": 8},
+            "memory_mb": 16384, "os": "Ubuntu 24.04", "arch": "x86_64", "gpu_status": {"status": "ok"},
+            "sandbox": [{"driver": "podman", "class": "container", "runtimes": ["crun"], "ready": true}],
+            "offered": {"cpu": share.cpu_cores, "memory_mb": share.memory_mb, "gpu": share.gpus.len()},
+            "agent_version": "0.1.0",
+        }))
+        .unwrap()
+    }
+
+    fn share(gpus: &[&str], volumes_mb: u64) -> ResolvedShare {
+        ResolvedShare {
+            cpu_cores: 6.0,
+            memory_mb: 12_288,
+            gpus: gpus.iter().map(ToString::to_string).collect(),
+            disk_mb: 50_000,
+            volumes_mb,
+            warnings: vec![],
+        }
+    }
+
+    fn feed(driver_gpus: &[&str]) -> OfferFeed {
+        OfferFeed {
+            tx: tokio::sync::watch::channel(None).0,
+            driver: DriverLimits {
+                ready: true,
+                gpus: driver_gpus.iter().map(ToString::to_string).collect(),
+                problems: vec![],
+            },
+        }
+    }
+
+    /// Review P2 of T2-23 (round 2): the share can change while the agent runs, but the driver serves only the GPUs it
+    /// was started with. A GPU the owner turned on since then (`share set --gpu all`) is never reported to the hub as
+    /// offered: `offered.gpu` is what the executor admits, so the hub offers no GPU lease this agent would refuse.
+    #[test]
+    fn the_inventory_never_offers_a_gpu_the_driver_was_not_started_with() {
+        // Started with `gpus = "none"`, then `share set --gpu all` on a two-GPU machine.
+        let now = share(&["GPU-a", "GPU-b"], 0);
+        let feed_none = feed(&[]);
+        let mut inventory = detected(&now);
+        assert_eq!(inventory.offered.gpu, 2, "what the detection alone would report");
+        settle(Some(&feed_none), None, &mut inventory, &now);
+        assert_eq!(inventory.offered.gpu, 0);
+        assert!(feed_none.tx.borrow().as_ref().unwrap().gpus.is_empty());
+        // Started with one GPU, now two in the share: the one the driver has is offered, to the hub and the executor.
+        let feed_one = feed(&["GPU-a"]);
+        let mut inventory = detected(&now);
+        settle(Some(&feed_one), None, &mut inventory, &now);
+        assert_eq!(inventory.offered.gpu, 1);
+        assert_eq!(feed_one.tx.borrow().as_ref().unwrap().gpus, ["GPU-a"]);
+        // Turning a GPU off is live, and a share the driver fully serves is reported as it is.
+        let fewer = share(&["GPU-b"], 0);
+        let feed_both = feed(&["GPU-a", "GPU-b"]);
+        let mut inventory = detected(&fewer);
+        settle(Some(&feed_both), None, &mut inventory, &fewer);
+        assert_eq!(inventory.offered.gpu, 1);
+        assert_eq!(feed_both.tx.borrow().as_ref().unwrap().gpus, ["GPU-b"]);
+        let mut inventory = detected(&now);
+        settle(Some(&feed_both), None, &mut inventory, &now);
+        assert_eq!(inventory.offered.gpu, 2);
+        // Without an offer feed (no executor), the inventory is the detection's.
+        let mut inventory = detected(&now);
+        settle(None, None, &mut inventory, &now);
+        assert_eq!(inventory.offered.gpu, 2);
+    }
+
+    /// Review P3 of T2-23 (round 2): `share set --volumes-mb` reaches the volume store with the next detection, so a
+    /// lower disk limit is in force without a restart (and a higher one too).
+    #[test]
+    fn a_detection_sets_the_volume_budget_to_the_share_in_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = VolumeStore::open(StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            owner: AccountId::generate(),
+            budget_mb: 40_000,
+            retention_days: 30,
+            entry_budget: 1000,
+            clock: Arc::new(SystemClock),
+        })
+        .unwrap();
+        for volumes_mb in [10_000, 60_000, 0] {
+            let now = share(&[], volumes_mb);
+            let mut inventory = detected(&now);
+            settle(None, Some(&store), &mut inventory, &now);
+            assert_eq!(store.budget_mb(), volumes_mb);
+        }
     }
 }
